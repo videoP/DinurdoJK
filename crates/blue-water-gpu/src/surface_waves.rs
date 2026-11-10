@@ -40,6 +40,11 @@ impl SpectrumStats {
             }
         }
     }
+    /// Each cascade's significant height 4σ (m) as built (big tile first).
+    pub fn heights(&self) -> [f32; 4] {
+        self.heights
+    }
+
     pub fn from_spectrum(spectrum: &spectrum::WaveSpectrum) -> Self {
         let mut stats = Self {
             tail: spectrum.tail_slope_variance as f32,

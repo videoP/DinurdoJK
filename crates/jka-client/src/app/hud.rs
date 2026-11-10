@@ -211,6 +211,8 @@ impl App {
 
         let mut snapshot = UiSnapshot {
             jk2_mode: self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2(),
+            falling_death_fade: self.falling_death_alpha(),
+            falling_death_active: self.falling_death.is_some(),
             studio_race: None,
             frontend_main_scene: self.asset_mapping.is_none() && self.front_end && matches!(self.frontend_page,
                 crate::app::FrontendPage::Main | crate::app::FrontendPage::Play
@@ -269,7 +271,10 @@ impl App {
                 && self.overlay == OverlayMode::Game { Some(self.native_demo_browser_ui()) } else { None },
             prediction_debug,
             hud,
+            jk2_flags: self.jk2_flags_ui(),
+            jk2_inventory: self.jk2_persistent_inventory_ui(),
             team_overlay: self.team_overlay_ui(),
+            spectator_broadcast: self.spectator_broadcast_ui(),
             hud_layout: self.hud_layout,
             studio_hud_virtual_layout: false,
             studio_world_labels: Vec::new(),
@@ -280,6 +285,9 @@ impl App {
                 let mut images = self.extensions.hud_images.clone();
                 ui::append_native_hud_images(&mut images, self.video.hud_style,
                     self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2());
+                if self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2() {
+                    ui::append_jk2_ctf_images(&mut images);
+                }
                 ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
                 images
             },
@@ -325,6 +333,7 @@ impl App {
             sun_bake_progress: self.sun_bake_progress.and_then(|(completed, stage)| {
                 (!matches!(stage, crate::renderer::SunBakeStage::Off | crate::renderer::SunBakeStage::Ready | crate::renderer::SunBakeStage::Fallback | crate::renderer::SunBakeStage::Failed))
                     .then_some(MapLoadingBar {
+                        phase: crate::ui::MapLoadingPhase::Gpu,
                         label: match stage {
                             crate::renderer::SunBakeStage::Preparing => "BAKE: GEOMETRY",
                             crate::renderer::SunBakeStage::Tracing => "BAKE: SUN RAYS",
@@ -343,6 +352,7 @@ impl App {
             static_ao_progress: self
                 .static_ao_progress
                 .map(|(completed, total)| MapLoadingBar {
+                    phase: crate::ui::MapLoadingPhase::Gpu,
                     label: "BAKED AO",
                     completed,
                     total,
@@ -842,7 +852,7 @@ impl App {
         // CG_DrawEnemyInfo suppresses the stock panel while cg_specHud is
         // active for a spectator/follow view. The native minimap isn't enabled
         // by this client, so there is no additional cg_drawRadar override.
-        if self.japro_cg.spec_hud && (session.live && self.live_spec_hud_eligible()
+        if self.japro_cg.spec_hud != 0 && (session.live && self.live_spec_hud_eligible()
             || !session.live && (snapshot_ps.persistant[3] == TEAM_SPECTATOR
                 || snapshot_ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0))
         { return None; }
@@ -1236,6 +1246,8 @@ impl App {
             rage_recovery_until_ms: ps.field_i32("fd.forceRageRecoveryTime").unwrap_or(0),
             time_ms: self.game_session.as_ref().map_or(0, |session| session.cgame_time),
             force_icons_hidden: ps.field_i32("zoomMode").unwrap_or(0) != 0 || ps.persistant[3] == 3,
+            jk2_has_bacta: jk2 && jka_protocol::jk2::presentation::presented_holdable(3)
+                .is_some_and(|tag| ps.stats[2] & (1 << tag) != 0),
         }
     }
 
@@ -1399,6 +1411,87 @@ impl App {
         })
     }
 
+
+    /// MVSDK CG_DrawInventory: stable inventory source separate from the transient
+    /// invnext/invprev carousel. Adapter playerstate tags are JKA-numbered, so
+    /// translate each *JK2* HI tag rather than using raw wire bit positions.
+    pub(in crate::app) fn jk2_persistent_inventory_ui(&self) -> Option<ui::Jk2InventoryUi> {
+        if !(self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2())
+            || !self.video.jk2_draw_inventory
+        { return None; }
+        let ps = self.live_player_state()?;
+        if ps.stats[0] <= 0 || ps.persistant[3] == 3
+            || matches!(ps.field_i32("pm_type"), Some(4 | 7 | 8))
+            || ps.field_i32("pm_flags").unwrap_or(0) & 4096 != 0
+        { return None; }
+        let owned_bits = (1..=6).filter(|&tag| {
+            jka_protocol::jk2::presentation::presented_holdable(tag)
+                .is_some_and(|presented| ps.stats[2] & (1 << presented) != 0)
+        }).fold(0_u32, |bits, tag| bits | (1 << tag));
+        // Trip mines are a weapon + ammo, not a HI_* holdable item.
+        let tripmine_owned = jka_protocol::jk2::presentation::presented_weapon(12)
+            .is_some_and(|weapon| ps.stats[4] & (1 << weapon) != 0);
+        Some(ui::Jk2InventoryUi {
+            owned_bits,
+            trip_mines: if tripmine_owned { ps.ammo[ui::jk2_ammo_index(12)].max(0) } else { 0 },
+        })
+    }
+
+    /// Enhanced CTF status. The CS_FLAGSTATUS change is authoritative for
+    /// taken/dropped; only actually observed powerups identify a carrier.
+    /// For off-PVS enemies the icon remains visible without fabricating a name.
+    pub(in crate::app) fn jk2_flags_ui(&self) -> Vec<ui::Jk2FlagUi> {
+        if !(self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2())
+            || self.video.jk2_enhanced_flag_status == 0
+        { return Vec::new(); }
+        let Some(session) = self.game_session.as_ref() else { return Vec::new(); };
+        if !matches!(session.client_game.gametype(), 8 | 9) { return Vec::new(); }
+        let flags = session.client_game.jk2_ctf_flags();
+        let local_team = session.current_snapshot.as_ref()
+            .map(|snap| snap.player_state.persistant[3]).unwrap_or(3);
+        let ps = session.presented_player_state();
+        let local_client = ps.and_then(|ps| ps.field_i32("clientNum"));
+        flags.into_iter().enumerate().filter_map(|(index, (status, taken_since))| {
+            if !matches!(status, 1 | 4) { return None; }
+            let powerup = (4 + index) as usize;
+            let carrier_client = if status == 1 {
+                // Current POV may not be represented in presented_entities.
+                let local = ps.filter(|ps| ps.powerups.get(powerup).copied().unwrap_or(0) != 0)
+                    .and(local_client);
+                local.or_else(|| session.presented_entities.iter()
+                    .find(|entity| entity.entity_type == ET_PLAYER
+                        && entity.state.field_i32("powerups").unwrap_or(0) & (1 << powerup) != 0)
+                    .map(|entity| i32::from(entity.number)))
+            } else { None };
+            let carrier_team = carrier_client.and_then(|client| usize::try_from(client).ok())
+                .and_then(|client| session.client_game.client_info(client, &session.siege_classes))
+                .map(|info| info.team);
+            let carrier = carrier_client.and_then(|client| usize::try_from(client).ok())
+                .and_then(|client| session.client_game.client_name(client));
+            let health_armor = if carrier_team == Some(local_team) {
+                carrier_client.and_then(|client| {
+                    if Some(client) == local_client {
+                        ps.map(|ps| (ps.stats[0], ps.stats[5]))
+                    } else {
+                        session.client_game.team_info().iter()
+                            .find(|info| i32::from(info.client) == client)
+                            .map(|info| (info.health, info.armor))
+                    }
+                })
+            } else { None };
+            Some(ui::Jk2FlagUi {
+                team: match index { 0 => 1, 1 => 2, _ => 0 },
+                status,
+                carrier,
+                carrier_team,
+                health_armor,
+                held_ms: if taken_since > 0 && status == 1 {
+                    (session.cgame_time.saturating_sub(taken_since) as u32 / 1000) * 1000
+                } else { 0 },
+            })
+        }).collect()
+    }
+
     /// TaystJK CG_DrawTeamOverlay data projection. `tinfo` remains the only
     /// remote data source; this function only applies the same client-side
     /// filtering/unpacking/icon lookup metadata used by cg_draw.c.
@@ -1410,6 +1503,13 @@ impl App {
         }
         let session = self.game_session.as_ref()?;
         if session.client_game.gametype() < GT_TEAM {
+            return None;
+        }
+        // The broadcast bars replace (rather than stack on) the teammate-only
+        // TaystJK table for spectator/demo presentation. Active players keep tinfo.
+        if self.japro_cg.spec_hud >= 2
+            && (self.demo_playback_active() || self.live_spec_hud_eligible())
+        {
             return None;
         }
         let snapshot = session.client_game.current_snapshot()?;

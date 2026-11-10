@@ -349,7 +349,8 @@ commands! {
         self.push_console_line(format!("^2FS:^7 jk2basepath = {} (JK2 root containing base/)", jka_assets::pk3::jk2_root_directory(&self.base, &effective).map_or("(not set: JK2 disabled)".into(), |p| p.display().to_string())));
         self.push_console_line(format!("^2FS:^7 jk2homepath = {}", effective.jk2homepath.as_ref().map_or("(JK2 root)".into(), |p| p.display().to_string())));
         self.push_console_line(format!("^2FS:^7 jk2cdpath = {} (JK2 retail fallback; not mounted in JKA)", effective.jk2cdpath.as_ref().map_or("(none)".into(), |p| p.display().to_string())));
-        self.push_console_line(format!("^2FS:^7 forcegame = {}", effective.forcegame.as_deref().unwrap_or("(none)")));
+        self.push_console_line(format!("^2FS:^7 forcegame (JKA) = {}", effective.forcegame.as_deref().unwrap_or("(none)")));
+        self.push_console_line(format!("^2FS:^7 jk2forcegame (JK2) = {}", effective.jk2forcegame.as_deref().unwrap_or("(none)")));
         self.push_console_line(format!("^2FS:^7 writes = {}", jka_assets::pk3::game_write_directory(&self.base, self.game.as_deref()).display()));
         for (i, dir) in jka_assets::pk3::filesystem_search_dirs(&self.base, self.game.as_deref(), &effective).iter().enumerate() {
             self.push_console_line(format!("^5FS:^7 {:>2}. {}", i + 1, dir.display()));

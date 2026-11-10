@@ -240,11 +240,22 @@ impl GameSession {
                     self.client_game.synchronous_clients(),
                     &next.player_state,
                 ) {
-                    self.client_game.transition_predicted_player_state(
+                    self.client_game.transition_snapshot_player_state(
                         &next.player_state,
                         &current.player_state,
                         next.server_time,
                     )?;
+                } else {
+                    // OpenJK uses prediction to dispatch these events. Stage
+                    // each authoritative G_AddEvent transition until that
+                    // CG_TransitionPlayerState call: a render frame may skip
+                    // several snapshots or replay no movement command.
+                    self.client_game.queue_snapshot_playerstate_external_event(
+                        &next.player_state,
+                        &current.player_state,
+                        next.server_time,
+                        (current.snap_flags ^ next.snap_flags) & crate::cgame::SNAPFLAG_SERVERCOUNT != 0,
+                    );
                 }
             }
             self.client_game.transition_snapshot(target_server_time)?;
@@ -322,6 +333,10 @@ impl GameSession {
                 target_server_time,
             )?;
         }
+        // If prediction yielded no committed state (e.g. exhausted command
+        // backup, startup or a prediction error), server external events must
+        // still be heard. Both paths use the same CGame event dispatcher.
+        self.client_game.flush_snapshot_playerstate_external_events()?;
         // Prediction/pmove has already consumed the authoritative entity slice.
         // Only now replace REMOTE visual poses, so collision traces, prediction,
         // usercmds, and gameplay events never inherit an artificial buffer delay.
@@ -375,6 +390,8 @@ impl GameSession {
         };
         let ghoul2_view = if let Some(view) = self.studio_presentation_view {
             Some(view)
+        } else if self.app_camera_view {
+            ghoul2_view
         } else if sample.teleported {
             None
         } else if !sample_third_person {
@@ -1366,7 +1383,7 @@ impl GameSession {
         if !self.suppress_audio {
             if let Some(sound) = &mut self.sound_presenter {
                 for fx_sound in &fx_frame.sounds {
-                    sound.play_fx_sound(&fx_sound.qpath, fx_sound.origin);
+                    sound.play_fx_sound(&fx_sound.qpath, fx_sound.origin, fx_sound.entity, fx_sound.channel);
                 }
             }
         }

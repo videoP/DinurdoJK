@@ -3,6 +3,7 @@ use crate::app::{Cursor, DemoReader, ServerMessageDecoder, ServerMessageEvent};
 
 pub(in crate::app) struct DemoGamestateProbe {
     pub(in crate::app) fs_game: Vec<u8>,
+    pub(in crate::app) referenced_paks: Vec<i32>,
     pub(in crate::app) map_name: String,
 }
 
@@ -46,7 +47,12 @@ pub(in crate::app) fn probe_demo_gamestate(bytes: &[u8]) -> Result<DemoGamestate
                     let map_name = decoder
                         .map_name()
                         .ok_or_else(|| "DEMO GAMESTATE HAS NO MAPNAME".to_owned())?;
-                    return Ok(DemoGamestateProbe { fs_game, map_name });
+                    let referenced_paks = crate::download::server_referenced_checksums(
+                        decoder.configstrings
+                            .get(&jka_protocol::session::CS_SYSTEMINFO)
+                            .map(Vec::as_slice).unwrap_or_default(),
+                    );
+                    return Ok(DemoGamestateProbe { fs_game, referenced_paks, map_name });
                 }
                 _ => {}
             }

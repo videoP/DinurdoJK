@@ -5,7 +5,12 @@ mod collision;
 mod ffi;
 mod jump_trace;
 pub mod jk2;
+mod sailing;
 pub use jump_trace::JumpTraceEvent;
+pub use sailing::{
+    sailing_apply_ocean_state, sailing_apply_weather_state, sailing_load, sailing_reset, sailing_sea,
+    sailing_wave_height, SailingSea, SailingSeaWave, SailingSpawn, SAILING_SEA_MAX_WAVES,
+};
 pub use collision::{collision_merge_enabled, set_collision_merge_enabled, CollisionWorld, EntityClip, PlacedInlineCollision, SourceCollisionBrush, SourceCollisionPlane};
 use std::{
     ffi::{c_void, CStr},
@@ -586,6 +591,16 @@ pub fn jk2_g2_player_angles(
     } else {
         Ok(result)
     }
+}
+
+/// MVSDK `BG_FlippingAnim` / `BG_InDeathAnim` for a JK2 (`2` = 1.02,
+/// `4` = 1.04) animation in MVSDK 1.04 numbering, `ANIM_TOGGLEBIT` (2048)
+/// included where the caller has it: 1.02 `BG_FlippingAnim` does not strip it.
+/// Returns `(flipping, death)`.
+pub fn jk2_animation_flags(version: u8, anim: i32) -> (bool, bool) {
+    let _guard = ffi::NativeGuard::new();
+    let flags = unsafe { ffi::jk2_bg_anim_flags(i32::from(version), anim) };
+    if flags < 0 { (false, false) } else { (flags & 1 != 0, flags & 2 != 0) }
 }
 
 /// Read-only result of OpenJK `BG_PlayerStateToEntityState`, plus the

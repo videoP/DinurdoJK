@@ -973,12 +973,19 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     if !oceans.is_empty() {
                         let map = map.as_mut();
-                        scene::append_authored_ocean_planes(
-                            &oceans,
-                            &mut map.vertices,
-                            &mut map.batches,
-                            &mut map.pvs_batches,
-                        );
+                        // Prepare already built the planes from this BSP's own
+                        // markers, inside the PVS plan. Rebuilding them here
+                        // empties those planned pieces and appends unplanned
+                        // ones, which made the water vanish. Only a map whose
+                        // BSP has no markers (server-only oceans) needs them.
+                        if map.authored_oceans.is_empty() {
+                            scene::append_authored_ocean_planes(
+                                &oceans,
+                                &mut map.vertices,
+                                &mut map.batches,
+                                &mut map.pvs_batches,
+                            );
+                        }
                         map.authored_oceans = oceans;
                     }
                 }
@@ -1243,8 +1250,17 @@ impl ApplicationHandler<UserEvent> for App {
                     .distance_cull
                     .unwrap_or(crate::camera::DEFAULT_DISTANCE_CULL);
                 self.map_authored_sun = map.sun;
+                // Sample the real clock AFTER assigning this map's authored sun
+                // but BEFORE its first sky/lightmap configuration and upload.
+                // Baked never follows the clock again during this map session.
+                self.sync_relighting_system_clock(true, true);
                 self.map_authored_oceans = map.authored_oceans.clone();
                 self.authored_ocean_preview = false;
+                // jaPRO sailing prediction: this map's markers, then (in
+                // refresh_authored_oceans) the server's CS_SAILING_OCEANS state.
+                jka_movement::sailing_load(&map.sailing_spawns);
+                self.sailing_ocean_states = Default::default();
+                self.sailing_weather_states = Default::default();
                 self.refresh_authored_oceans();
                 self.map_collision = map.collision.clone();
                 self.map_mark_surfaces = map.mark_surfaces.clone();
@@ -2907,11 +2923,7 @@ impl ApplicationHandler<UserEvent> for App {
                 button: MouseButton::Left,
                 ..
             } if self.overlay == OverlayMode::Console => {
-                self.console_selecting = false;
-                if self.console_selection_anchor == self.console_selection_focus {
-                    self.console_selection_anchor = None;
-                    self.console_selection_focus = None;
-                }
+                self.finish_console_selection();
                 self.publish_ui();
             }
             WindowEvent::MouseInput {
@@ -3402,7 +3414,9 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 return;
             }
-            if self.demo_playback_active() && self.demo_view_mode == DemoViewMode::Free {
+            if (self.demo_playback_active() && self.demo_view_mode == DemoViewMode::Free)
+                || self.spectator_broadcast.free_active()
+            {
                 let yaw_degrees =
                     delta.0 as f32 * self.mouse_input.sensitivity * self.mouse_input.yaw;
                 let pitch_degrees =

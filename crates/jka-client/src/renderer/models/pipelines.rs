@@ -15,7 +15,8 @@ use crate::renderer::reflections::planar::PLANAR_COLOR_FORMAT;
 fn studio_capture_blend(mode:DynamicModelAlphaMode, mut blend:Option<wgpu::BlendState>, capture:bool) -> Option<wgpu::BlendState> {
     if capture && matches!(mode, DynamicModelAlphaMode::AdditiveOne|DynamicModelAlphaMode::Additive
         |DynamicModelAlphaMode::Modulate|DynamicModelAlphaMode::DstColorAdd
-        |DynamicModelAlphaMode::Modulate2x|DynamicModelAlphaMode::Darken) {
+        |DynamicModelAlphaMode::Modulate2x|DynamicModelAlphaMode::Darken
+        |DynamicModelAlphaMode::Screen) {
         if let Some(blend)=&mut blend {
             // Retain the exact authored RGB equation, including SrcAlpha FX.
             // Light and color modifiers do not create geometric coverage.
@@ -80,6 +81,7 @@ impl DynamicModelRenderer {
         self.fx_sprite_dst_color_add_pipeline = None;
         self.fx_sprite_modulate2x_pipeline = None;
         self.fx_sprite_darken_pipeline = None;
+        self.fx_sprite_screen_pipeline = None;
         self.fx_sprite_glow_pipelines = Default::default();
         if let Some(resident) = self.resident_fx.as_mut() { resident.rebuild(); }
         self.skin_pipelines = Default::default();
@@ -465,6 +467,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::DstColorAdd => self.fx_sprite_dst_color_add_pipeline.is_some(),
             DynamicModelAlphaMode::Modulate2x => self.fx_sprite_modulate2x_pipeline.is_some(),
             DynamicModelAlphaMode::Darken => self.fx_sprite_darken_pipeline.is_some(),
+            DynamicModelAlphaMode::Screen => self.fx_sprite_screen_pipeline.is_some(),
         }
     }
 
@@ -485,6 +488,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::DstColorAdd => self.fx_sprite_dst_color_add_pipeline.as_ref(),
             DynamicModelAlphaMode::Modulate2x => self.fx_sprite_modulate2x_pipeline.as_ref(),
             DynamicModelAlphaMode::Darken => self.fx_sprite_darken_pipeline.as_ref(),
+            DynamicModelAlphaMode::Screen => self.fx_sprite_screen_pipeline.as_ref(),
         }
     }
 
@@ -514,6 +518,7 @@ impl DynamicModelRenderer {
                 self.fx_sprite_modulate2x_pipeline = Some(pipeline)
             }
             DynamicModelAlphaMode::Darken => self.fx_sprite_darken_pipeline = Some(pipeline),
+            DynamicModelAlphaMode::Screen => self.fx_sprite_screen_pipeline = Some(pipeline),
         }
     }
 
@@ -1032,6 +1037,19 @@ pub(in crate::renderer) fn fx_sprite_blend(
             },
             alpha: wgpu::BlendComponent::OVER,
         }),
+        DynamicModelAlphaMode::Screen => Some(wgpu::BlendState {
+            // OpenJK GL_ONE GL_ONE_MINUS_SRC_COLOR, NOT alpha blending.
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
         _ => None,
     }
 }
@@ -1155,6 +1173,7 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
             DynamicModelAlphaMode::DstColorAdd => "JKA GPU FX sprite GL_DST_COLOR GL_ONE pipeline",
             DynamicModelAlphaMode::Modulate2x => "JKA GPU FX sprite modulate2x pipeline",
             DynamicModelAlphaMode::Darken => "JKA GPU FX sprite darken pipeline",
+            DynamicModelAlphaMode::Screen => "JKA GPU FX sprite GL_ONE GL_ONE_MINUS_SRC_COLOR pipeline",
             DynamicModelAlphaMode::Glass => "JKA GPU FX sprite glass fallback pipeline",
         }),
         layout: Some(layout),
@@ -1207,7 +1226,8 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
                 | DynamicModelAlphaMode::BlendUnlitDepthWrite
                 | DynamicModelAlphaMode::DstColorAdd
                 | DynamicModelAlphaMode::Modulate2x
-                | DynamicModelAlphaMode::Darken => "fs_unlit",
+                | DynamicModelAlphaMode::Darken
+                | DynamicModelAlphaMode::Screen => "fs_unlit",
                 _ => "fs_main",
             }),
             compilation_options: wgpu::PipelineCompilationOptions {
@@ -1463,6 +1483,19 @@ fn create_dynamic_model_pipeline_inner_winding(
             },
             alpha: wgpu::BlendComponent::OVER,
         }),
+        DynamicModelAlphaMode::Screen => Some(wgpu::BlendState {
+            // OpenJK GL_ONE GL_ONE_MINUS_SRC_COLOR, NOT alpha blending.
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
         _ => None,
     };
     let blend=studio_capture_blend(alpha_mode,blend,studio_capture);
@@ -1489,6 +1522,7 @@ fn create_dynamic_model_pipeline_inner_winding(
                 "JKA dynamic model GL_DST_COLOR GL_SRC_COLOR pipeline"
             }
             DynamicModelAlphaMode::Darken => "JKA dynamic model darken unlit pipeline",
+            DynamicModelAlphaMode::Screen => "JKA dynamic model GL_ONE GL_ONE_MINUS_SRC_COLOR pipeline",
             DynamicModelAlphaMode::Glass => "JKA dynamic model glass transmission pipeline",
         }),
         layout: Some(layout),
@@ -1538,7 +1572,8 @@ fn create_dynamic_model_pipeline_inner_winding(
                 | DynamicModelAlphaMode::BlendUnlitDepthWrite
                 | DynamicModelAlphaMode::DstColorAdd
                 | DynamicModelAlphaMode::Modulate2x
-                | DynamicModelAlphaMode::Darken => "fs_unlit",
+                | DynamicModelAlphaMode::Darken
+                | DynamicModelAlphaMode::Screen => "fs_unlit",
                 _ => "fs_main",
             }),
             compilation_options: wgpu::PipelineCompilationOptions {
@@ -1659,6 +1694,19 @@ fn create_ghoul2_skin_pipeline_winding(
             },
             alpha: wgpu::BlendComponent::OVER,
         }),
+        DynamicModelAlphaMode::Screen => Some(wgpu::BlendState {
+            // OpenJK GL_ONE GL_ONE_MINUS_SRC_COLOR, NOT alpha blending.
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        }),
         _ => None,
     };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1686,6 +1734,7 @@ fn create_ghoul2_skin_pipeline_winding(
                 "JKA Ghoul2 GPU skin GL_DST_COLOR GL_SRC_COLOR pipeline"
             }
             DynamicModelAlphaMode::Darken => "JKA Ghoul2 GPU skin darken unlit pipeline",
+            DynamicModelAlphaMode::Screen => "JKA Ghoul2 GPU skin GL_ONE GL_ONE_MINUS_SRC_COLOR pipeline",
             DynamicModelAlphaMode::Glass => "JKA Ghoul2 GPU skin glass transmission pipeline",
         }),
         layout: Some(layout),
@@ -1747,7 +1796,8 @@ fn create_ghoul2_skin_pipeline_winding(
                 | DynamicModelAlphaMode::BlendUnlitDepthWrite
                 | DynamicModelAlphaMode::DstColorAdd
                 | DynamicModelAlphaMode::Modulate2x
-                | DynamicModelAlphaMode::Darken => "fs_unlit",
+                | DynamicModelAlphaMode::Darken
+                | DynamicModelAlphaMode::Screen => "fs_unlit",
                 _ => "fs_main",
             }),
             compilation_options: wgpu::PipelineCompilationOptions {

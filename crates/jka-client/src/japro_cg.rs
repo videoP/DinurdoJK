@@ -230,8 +230,13 @@ pub struct JaproCgame {
     pub start_goal: f32,
     /// TaystJK cg_leadIndicator: 0 off, 1 snapshot-ping, >=2 manual latency (ms).
     pub lead_indicator: f32,
-    /// `cg_specHud`: draw team-coloured through-wall player outlines while spectating or watching demos.
-    pub spec_hud: bool,
+    /// `cg_specHud`: 0 off, 1 outlines, 2 broadcast, 3 broadcast+scores,
+    /// 4 broadcast + follow-cycle telemetry sweeps.
+    pub spec_hud: u8,
+    /// TaystJK cg_autoKillWhenFalling (archive, default off).
+    pub auto_kill_when_falling: bool,
+    /// `cg_specHudMap`: broadcast radar. 0 off, 1 whole map, 2 follows the view.
+    pub spec_hud_map: u8,
     /// `cg_specFollowFastest`: while spectating, automatically follow the fastest player.
     pub follow_fastest: bool,
     /// `cg_speedometer` and its position/size cvars, plus `cg_jumpGoal`.
@@ -265,7 +270,9 @@ impl Default for JaproCgame {
             race_start_y: 280.0,
             start_goal: 0.0,
             lead_indicator: 0.0,
-            spec_hud: true,
+            spec_hud: 1,
+            auto_kill_when_falling: false,
+            spec_hud_map: 1,
             follow_fastest: false,
             speedometer: crate::speedometer::Settings::default(),
             lagometer: crate::lagometer::Settings::default(),

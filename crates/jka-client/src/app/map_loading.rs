@@ -35,6 +35,21 @@ pub(in crate::app) struct PreparedMapCache {
     pub(in crate::app) map: Arc<scene::PreparedMap>,
 }
 
+/// Map the actual preparation task to the dependency group its result
+/// contributes to. UI never infers task identities from display labels.
+fn preparation_phase(task: crate::thread_activity::Task) -> crate::ui::MapLoadingPhase {
+    use crate::thread_activity::Task;
+    use crate::ui::MapLoadingPhase as Phase;
+    match task {
+        Task::MapBspParse | Task::MapShaderParse | Task::MapTextureDecode
+        | Task::MapFxLightProfiles => Phase::Assets,
+        Task::MapCollision | Task::MapMaterials | Task::MapGeometry
+        | Task::MapGi | Task::MapPortalPlans | Task::MapGrass
+        | Task::MapOcean | Task::MapAcoustics => Phase::Build,
+        _ => Phase::Build,
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(in crate::app) struct MapLoadingBarState {
     pub(in crate::app) task: crate::thread_activity::Task,
@@ -236,8 +251,8 @@ impl MapLoadingState {
         // and build_loading_screen used to hide them as soon as upload began.
         // MapPrepared guarantees that CPU preparation has finished, regardless
         // of whether the stages ran now or during the vote delay. Preserve the
-        // rows as completed while the permanent RENDERER SETUP row remains
-        // pending until the first successful world frame.
+        // rows as completed while GPU setup and first-frame readiness remain
+        // pending until WorldUploaded.
         for bar in &mut self.bars {
             if bar.skipped {
                 continue; // Settings-disabled stages stay hidden.
@@ -311,6 +326,7 @@ impl MapLoadingState {
             .bars
             .iter()
             .map(|bar| MapLoadingBar {
+                phase: preparation_phase(bar.task),
                 label: bar.label,
                 completed: bar.completed,
                 total: bar.total,
@@ -322,7 +338,19 @@ impl MapLoadingState {
         // render thread blocks while uploading, so 0/1 is the honest progress
         // until it finishes the upload AND presents the first world frame.
         bars.push(MapLoadingBar {
+            phase: crate::ui::MapLoadingPhase::Gpu,
             label: "RENDERER SETUP",
+            completed: 0,
+            total: u32::from(self.preparation_finished),
+            skipped: false,
+            no_work: false,
+        });
+        // WorldUploaded is the real end boundary: renderer setup AND the
+        // first world frame. This is a terminal dependency, not another CPU
+        // task or a speculative time estimate.
+        bars.push(MapLoadingBar {
+            phase: crate::ui::MapLoadingPhase::Ready,
+            label: "FIRST WORLD FRAME",
             completed: 0,
             total: u32::from(self.preparation_finished),
             skipped: false,
@@ -370,8 +398,10 @@ pub(in crate::app) fn prepared_map_has_ocean_surface(map: &scene::PreparedMap) -
 /// Fixed row set for the full server join. The rows precede/follow the map
 /// stages even before the server tells us which BSP to load, and survive the
 /// interval between `WorldUploaded` and `CL_FirstSnapshot`.
-fn join_bar(label: &'static str, completed: u32, total: u32) -> MapLoadingBar {
-    MapLoadingBar { label, completed, total, skipped: false, no_work: false }
+fn join_bar(phase: crate::ui::MapLoadingPhase, label: &'static str,
+    completed: u32, total: u32) -> MapLoadingBar
+{
+    MapLoadingBar { phase, label, completed, total, skipped: false, no_work: false }
 }
 
 /// The network content slot displays one file at a time; the header must
@@ -386,9 +416,10 @@ fn download_content_progress(download: &LiveDownloadState) -> (MapLoadingBar, f3
     let overall = ((download.index.min(count) as f64 + fraction) / count as f64)
         .clamp(0.0, 1.0) as f32;
     let bar = if download.total.is_some_and(|total| total > 0) {
-        join_bar("SERVER CONTENT", (fraction * 1000.0) as u32, 1000)
+        join_bar(crate::ui::MapLoadingPhase::Assets,
+            "SERVER CONTENT", (fraction * 1000.0) as u32, 1000)
     } else {
-        join_bar("SERVER CONTENT", 0, 1)
+        join_bar(crate::ui::MapLoadingPhase::Assets, "SERVER CONTENT", 0, 1)
     };
     (bar, overall)
 }
@@ -419,6 +450,7 @@ impl App {
             };
             let mut ui = MapLoadingState::new(0, label, self.game.as_deref()).ui();
             ui.bars = vec![MapLoadingBar {
+                phase: crate::ui::MapLoadingPhase::Gpu,
                 label: "VIDEO", completed: 0, total: 1, skipped: false, no_work: false,
             }];
             ui.status_line = Some("RESTARTING VIDEO...".to_owned());
@@ -480,9 +512,10 @@ impl App {
             }
             let mut ui = pending.ui();
             if ready_map || self.live_without_world {
-                if let Some(renderer) = ui.bars.last_mut() {
-                    renderer.total = 1;
-                    renderer.completed = 1;
+                for bar in ui.bars.iter_mut().filter(|bar|
+                    bar.label == "RENDERER SETUP" || bar.label == "FIRST WORLD FRAME") {
+                    bar.total = 1;
+                    bar.completed = 1;
                 }
             }
             if self.live_without_world {
@@ -506,7 +539,7 @@ impl App {
             ConnectionState::Primed | ConnectionState::Active => 3,
             ConnectionState::Disconnected => 0,
         }).unwrap_or(0);
-        let connection = join_bar("SERVER CONNECTION", connected, 3);
+        let connection = join_bar(crate::ui::MapLoadingPhase::Assets, "SERVER CONNECTION", connected, 3);
 
         let content = if let Some(download) = self.live_download.as_ref() {
             let (bar, overall) = download_content_progress(download);
@@ -519,7 +552,8 @@ impl App {
                 || self.live_join_ui.as_ref().is_some_and(|join| {
                     join.phase == crate::app::LiveJoinUiPhase::Synchronizing
                 });
-            join_bar("SERVER CONTENT", u32::from(checked), u32::from(checked))
+            join_bar(crate::ui::MapLoadingPhase::Assets,
+                "SERVER CONTENT", u32::from(checked), u32::from(checked))
         };
 
         // The first *active* snapshot enters CGame. WorldUploaded is not that
@@ -527,7 +561,8 @@ impl App {
         let primed = self.game_session.as_ref().is_some_and(|session| {
             session.live && session.phase == crate::app::SessionPhase::WaitingForSnapshot
         });
-        let snapshot = join_bar("SERVER SNAPSHOT", 0, u32::from(primed));
+        let snapshot = join_bar(crate::ui::MapLoadingPhase::Ready,
+            "SERVER SNAPSHOT", 0, u32::from(primed));
         ui = with_join_rows(ui, connection, content, snapshot);
         ui.connection_prompt = if let Some(prompt) = self.missing_map_prompt.as_ref() {
             Some(crate::ui::loading_layout::ConnectionPromptUi::MissingMap {
@@ -557,8 +592,12 @@ impl App {
         }) {
             "Refreshing downloaded assets and requesting a new gamestate...".to_owned()
         } else if let Some(prompt) = self.missing_map_prompt.as_ref() {
-            format!("Map {} is not installed - choose auto-download, connect anyway, or abort.",
-                prompt.map_name)
+            if prompt.reason.starts_with("Missing server-referenced PK3") {
+                "Server-referenced PK3s are missing - choose auto-download, connect anyway, or abort.".to_owned()
+            } else {
+                format!("Map {} is not installed - choose auto-download, connect anyway, or abort.",
+                    prompt.map_name)
+            }
         } else if self.server_password_prompt.is_some() {
             "Server password required - enter it to continue connecting.".to_owned()
         } else if !has_gamestate {
@@ -2069,15 +2108,16 @@ mod loading_row_tests {
         let mut loading = MapLoadingState::new(10, "mp/ffa3".into(), None);
         loading.skip_task(Task::MapOcean);
         let build = |ui, connected, content, snapshot| {
-            with_join_rows(ui, join_bar("SERVER CONNECTION", connected, 3),
-                join_bar("SERVER CONTENT", content, 1),
-                join_bar("SERVER SNAPSHOT", 0, snapshot))
+            with_join_rows(ui, join_bar(crate::ui::MapLoadingPhase::Assets, "SERVER CONNECTION", connected, 3),
+                join_bar(crate::ui::MapLoadingPhase::Assets, "SERVER CONTENT", content, 1),
+                join_bar(crate::ui::MapLoadingPhase::Ready, "SERVER SNAPSHOT", 0, snapshot))
         };
         let before = build(loading.ui(), 0, 0, 0);
         loading.begin_upload();
         let after_upload = build(loading.ui(), 3, 1, 0);
         let mut uploaded = loading.ui();
-        uploaded.bars.last_mut().unwrap().completed = 1;
+        uploaded.bars.iter_mut().find(|bar| bar.label == "RENDERER SETUP")
+            .unwrap().completed = 1;
         let awaiting_snapshot = build(uploaded, 3, 1, 1);
         let labels = |ui: &crate::ui::MapLoadingUi| ui.bars.iter()
             .filter(|bar| !bar.skipped).map(|bar| bar.label).collect::<Vec<_>>();
@@ -2114,17 +2154,32 @@ mod loading_row_tests {
     }
 
     #[test]
+    fn map_tasks_are_grouped_by_dependency_not_worker_count() {
+        use crate::ui::MapLoadingPhase as Phase;
+        let loading = MapLoadingState::new(3, "mp/ffa3".into(), None);
+        let ui = loading.ui();
+        assert_eq!(ui.bars.iter().filter(|bar| bar.phase == Phase::Assets).count(), 4);
+        assert_eq!(ui.bars.iter().filter(|bar| bar.phase == Phase::Build).count(), 8);
+        assert_eq!(ui.bars.iter().filter(|bar| bar.phase == Phase::Gpu).count(), 1);
+        assert_eq!(ui.bars.iter().filter(|bar| bar.phase == Phase::Ready).count(), 1);
+        assert_eq!(ui.bars.iter().find(|bar| bar.label == "FIRST WORLD FRAME")
+            .unwrap().completed, 0);
+    }
+
+    #[test]
     fn renderer_row_exists_before_cpu_preparation_and_stays_in_place() {
         let mut loading = MapLoadingState::new(10, "mp/ffa3".into(), None);
         let initial = loading.ui();
-        assert_eq!(initial.bars.last().unwrap().label, "RENDERER SETUP");
-        assert_eq!(initial.bars.last().unwrap().total, 0);
+        assert_eq!(initial.bars.iter().find(|bar| bar.label == "RENDERER SETUP")
+            .unwrap().total, 0);
+        assert_eq!(initial.bars.last().unwrap().label, "FIRST WORLD FRAME");
         let labels = initial.bars.iter().filter(|row| !row.skipped)
             .map(|row| row.label).collect::<Vec<_>>();
         loading.begin_upload();
         let upload = loading.ui();
-        assert_eq!(upload.bars.last().unwrap().label, "RENDERER SETUP");
-        assert_eq!(upload.bars.last().unwrap().total, 1);
+        assert_eq!(upload.bars.iter().find(|bar| bar.label == "RENDERER SETUP")
+            .unwrap().total, 1);
+        assert_eq!(upload.bars.last().unwrap().label, "FIRST WORLD FRAME");
         assert_eq!(labels, upload.bars.iter().filter(|row| !row.skipped)
             .map(|row| row.label).collect::<Vec<_>>());
         assert!(loading.progress_fraction() < 1.0);

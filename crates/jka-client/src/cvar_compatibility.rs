@@ -53,6 +53,8 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", dynamic_light_falloff: ", ", rt_denoiser_mode: 0, dynamic_light_falloff: ")
         .replace("OceanSettings { interaction: false, interaction_strength: 1.0, interaction_splash_mode: 3, interaction_debug: false, ", "OceanSettings { ")
         .replace("interaction_splash_mode: 3, ", "")
+        .replace(", hybrid_swell_absolute: false", "")
+        .replace(", long_waves: 0, medium_waves: 0, small_wave_detail: 1.0, medium_wave_detail: 1.0", "")
         .replace("interaction_lifetime: 2.5, interaction_fade: 1.0, interaction_damping: 2.0, interaction_edge_fade: 81.92, ", "")
         // The prediction backend/rounding cvars were deleted. Preserve the old
         // NetworkSettings Debug-layout for unrelated frozen compatibility hashes.
@@ -64,6 +66,7 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", third_person_flag_alpha: 1.0", "")
         .replace(", mouse_repeat_mode: 0", "")
         .replace(", mouse_repeat_delay: 0", "")
+        .replace(", confine_cursor: true", "")
         .replace(", console_notify_lines: 3", "")
         .replace(", score_spectator_guess: true", "")
         .replace(", steam_audio_hrtf_interpolation: 0", "")
@@ -214,6 +217,7 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta r_oceanInteractionEdgeFade ")
                     && !line.starts_with("seta in_mouserepeat ")
                     && !line.starts_with("seta in_mouserepeatDelay ")
+                    && !line.starts_with("seta in_confineCursor ")
                     && !line.starts_with("seta cg_drawGun ")
                     && !line.starts_with("seta cg_gunX ")
                     && !line.starts_with("seta cg_gunY ")

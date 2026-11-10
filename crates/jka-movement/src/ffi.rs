@@ -25,6 +25,19 @@ unsafe extern "C" {
     pub fn jka_taunt_action_should_cancel(buttons: i32) -> i32;
     fn jka_lock();
     fn jka_unlock();
+    // native/japro_sailing.c: jaPRO sailing BG state (jaPRO backend only).
+    pub fn jka_sailing_reset();
+    pub fn jka_sailing_spawn(
+        keys: *const *const c_char,
+        values: *const *const c_char,
+        count: i32,
+        model_mins: *const f32,
+        model_maxs: *const f32,
+    ) -> i32;
+    pub fn jka_sailing_apply_ocean_state(index: i32, state: *const c_char) -> i32;
+    pub fn jka_sailing_wave_height(x: f32, y: f32, time: i32, height: *mut f32) -> i32;
+    pub fn jka_sailing_apply_weather_state(index: i32, state: *const c_char) -> i32;
+    pub fn jka_sailing_sea(index: i32, params: *mut f32, waves: *mut f32, max_waves: i32) -> i32;
     #[cfg(test)]
     fn jka_contract(index: i32) -> i32;
     #[cfg(test)]
@@ -67,6 +80,7 @@ unsafe extern "C" {
         state: *mut PlayerAngleState,
         result: *mut PlayerAngleResult,
     ) -> i32;
+    pub fn jk2_bg_anim_flags(version: i32, anim: i32) -> i32;
     pub fn jka_player_jump_level(player: *mut c_void, level: i32);
     pub fn jka_player_knockback(player: *mut c_void, velocity: *const f32, duration: i32);
     pub fn jka_player_set_noclip(player: *mut c_void, enabled: i32);

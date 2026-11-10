@@ -451,7 +451,7 @@ fn weather_coat_strength(weather: WeatherSurfaceResponse, n_dot_v: f32) -> f32 {
 fn weather_surface_coat(input: VertexOut, weather: WeatherSurfaceResponse) -> vec3<f32> {
     let wetness = weather.wetness;
     let puddle = weather.puddle;
-    if (lighting_settings.feature_flags.w < 1u || (wetness <= 0.001 && puddle <= 0.001)) {
+    if ((lighting_settings.feature_flags.w & 255u) < 1u || (wetness <= 0.001 && puddle <= 0.001)) {
         return vec3<f32>(0.0);
     }
     let n = weather_reflection_normal(input.world_normal, weather);

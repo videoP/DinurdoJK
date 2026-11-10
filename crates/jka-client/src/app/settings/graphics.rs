@@ -386,6 +386,11 @@ impl App {
         self.sync_map_light_simulation();
         self.sync_cascaded_shadows();
         self.sync_post_effects();
+        // The same master gate is used by r_relightMap / r_sunOverride and
+        // the menu; enable live clock tracking on either entry path.
+        if enabled && self.video.relight_match_system_time && self.video.active_relighting_mode() == 2 {
+            self.sync_relighting_system_clock(false, true);
+        }
         self.mark_config_dirty();
         self.publish_ui();
     }
@@ -395,30 +400,86 @@ impl App {
         self.set_sun_override(mode != 0, mode != 0);
     }
 
-    /// One complete 24-hour synthetic arc. At noon the sun faces the map's
-    /// authored midday azimuth, and the moon occupies the opposing sky direction.
-    /// This is an artistic game clock, not an astronomical date/location model.
-    pub(in crate::app) fn set_relighting_time(&mut self, hour: f32) {
-        if !hour.is_finite() { return; }
-        let hour = hour.clamp(3.0, 27.0);
+    /// Apply one point on the existing artistic sun/moon arc. The caller chooses
+    /// whether it is a user edit (archived) or a sampled OS clock (transient).
+    pub(in crate::app) fn apply_relighting_celestial_time(&mut self, hour: f32) {
         let noon_yaw = self.map_sun_editor_values()
             .map(|(yaw, _, _, _)| yaw)
             .unwrap_or_else(|| crate::ui::VideoSettings::default().sun_yaw);
         let arc = relighting_celestial_arc(hour, noon_yaw);
-        self.video.relight_time = hour;
         self.video.sun_yaw = arc.sun_yaw;
         self.video.sun_pitch = arc.sun_elevation;
-        // Keep the authored solar intensity and chromaticity. Blue Water
-        // atmosphere/Relighting already fade the direct sun at sunset.
+        // Retain authored intensity/color, moon phase and chosen shadow method.
         self.video.blue_water_environment.moon_custom = true;
         self.video.blue_water_environment.moon_azimuth = arc.moon_azimuth;
         self.video.blue_water_environment.moon_elevation = arc.moon_elevation;
-        // Moon phase controls visual brightness only; it never moves the clock's moon.
         self.sun_custom_initialized = true;
+    }
+
+    /// Manual adjustment takes back control from Match system time.
+    pub(in crate::app) fn set_relighting_time(&mut self, hour: f32) {
+        if !hour.is_finite() { return; }
+        let hour = hour.clamp(3.0, 27.0);
+        self.video.relight_time = hour;
+        self.video.relight_match_system_time = false;
+        self.relight_clock_effective = None;
+        self.apply_relighting_celestial_time(hour);
         self.touch_sun_ray();
         self.sync_post_effects();
         self.mark_config_dirty();
         self.publish_ui();
+    }
+
+    pub(in crate::app) fn set_relighting_match_system_time(&mut self, enabled: bool) {
+        if self.video.relight_match_system_time == enabled { return; }
+        self.video.relight_match_system_time = enabled;
+        // In Baked, toggling does NOT rebuild the current map's lighting.
+        // In Realtime, changing the source should be effective immediately.
+        self.relight_clock_effective = None;
+        if enabled {
+            if self.video.active_relighting_mode() == 2 {
+                self.sync_relighting_system_clock(false, true);
+            }
+            // In Baked, choosing the clock does not touch this map's bake.
+        } else {
+            // Turning off the clock explicitly restores the archived manual
+            // time, rather than leaving the last system-clock sun in place.
+            self.apply_relighting_celestial_time(self.video.relight_time);
+            self.sync_post_effects();
+        }
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    /// The clock source is the local OS wall clock, not UTC or a simulated
+    /// game time. 00:00-02:59 maps to 24:00-26:59 on the existing 3..27 arc.
+    /// Realtime is polled at most once a second and applied once per minute;
+    /// Baked is only sampled at the MapPrepared -> LoadMap boundary.
+    pub(in crate::app) fn sync_relighting_system_clock(&mut self, at_map_load: bool, force: bool) {
+        if !self.video.relight_match_system_time || !self.video.sun_override {
+            return;
+        }
+        if !at_map_load && self.video.active_relighting_mode() != 2 {
+            return;
+        }
+        if !force && !at_map_load && self.relight_clock_last_poll.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        self.relight_clock_last_poll = Instant::now();
+        use chrono::Timelike;
+        let local_now = chrono::Local::now();
+        let hour = system_clock_relighting_hour(local_now.hour(), local_now.minute());
+        if !force && !at_map_load && self.relight_clock_effective == Some(hour) {
+            return;
+        }
+        self.apply_relighting_celestial_time(hour);
+        self.relight_clock_effective = Some(hour);
+        // Map upload sends the complete current settings after the new map's
+        // authored sun is assigned. Avoid sending a redundant earlier bake.
+        if !at_map_load {
+            self.sync_post_effects();
+            self.publish_ui();
+        }
     }
 
     /// Shows the sun-to-head beam for a moment; called on every yaw/pitch edit and
@@ -902,6 +963,7 @@ impl App {
     pub(in crate::app) fn sync_pbr(&self) {
         self.render_command(RenderCommand::SetPbrSettings {
             enabled: self.video.pbr,
+            cubemaps: self.video.pbr_cubemaps,
             deluxe_mapping: self.video.deluxe_mapping,
             deluxe_specular: self.video.deluxe_specular,
         });
@@ -1057,6 +1119,17 @@ impl App {
                         "GENERATED NORMAL MAPS: PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART"
                             .into();
                 }
+            }
+            ui::VIDEO_ROW_POM => {
+                // r_pom is a live/session-only cvar, not an archived video setting.
+                self.video.pom = !self.video.pom;
+                self.render_command(RenderCommand::SetPom(self.video.pom));
+                self.console_status = format!("PARALLAX OCCLUSION MAPPING: {}", if self.video.pom { "ON" } else { "OFF" });
+            }
+            ui::VIDEO_ROW_PBR_CUBEMAPS => {
+                self.video.pbr_cubemaps = !self.video.pbr_cubemaps;
+                self.sync_pbr();
+                self.mark_config_dirty();
             }
             ui::VIDEO_ROW_DELUXE_MAPPING => {
                 self.video.deluxe_mapping = !self.video.deluxe_mapping;
@@ -1759,7 +1832,36 @@ impl App {
         settings.lake.wake_strength = if settings.interaction {
             settings.interaction_strength.clamp(0.0, 10.0)
         } else { 0.0 };
+        // A map (jaPRO) ocean drives the shared Blue Water/Hybrid simulation:
+        // those backends have one FFT for every pool, so the map's waves are
+        // the shared waves. Gerstner (type 5) keeps its own upstream sea.
+        if let (Some(ocean), Some(sea)) = (self.authored_oceans.first(), self.hybrid_sailing_sea()) {
+            ocean.apply_to_hybrid(&sea, &mut settings);
+        }
         settings
+    }
+
+    /// The map ocean's sea (`BG_SailingSea`, the waves physics floats in) when
+    /// it drives the shared Blue Water/Hybrid simulation: those backends have
+    /// one FFT for every pool, so the map's waves are the shared waves.
+    /// Gerstner (type 5) keeps its own upstream sea.
+    pub(in crate::app) fn hybrid_sailing_sea(&self) -> Option<jka_movement::SailingSea> {
+        let settings = &self.video.ocean_settings;
+        if !matches!(settings.backend, 1 | 2) || settings.gerstner_water {
+            return None;
+        }
+        jka_movement::sailing_sea(self.authored_oceans.first()?.index)
+    }
+
+    /// Sends the map sea's physics waves to the renderer's FFT when they change
+    /// (a preset, the weather, or the backend switching to/from Hybrid).
+    pub(in crate::app) fn publish_sailing_sea(&mut self) {
+        let sea = self.hybrid_sailing_sea();
+        if sea != self.sailing_sea_published {
+            self.sailing_sea_published = sea.clone();
+            self.render_command(RenderCommand::SetSailingSea(sea.map(std::sync::Arc::new)));
+            self.render_command(RenderCommand::SetOceanSettings(self.effective_ocean_settings()));
+        }
     }
 
     /// Single ocean selector. No promotion uses the existing resource-off path,
@@ -1827,10 +1929,9 @@ impl App {
                 ocean.waves = self.video.ocean_settings.authored;
             }
         }
-        // There is one atmospheric wind for the whole rendered world. Map/server
-        // ocean descriptors still author swell and volume data, but do not create
-        // a second independent wind source.
-        for ocean in &mut oceans {
+        // A map ocean keeps the map's wind (jaPRO misc_dynamic_weather, which
+        // the server owns); only oceans without one take the local wind.
+        for ocean in oceans.iter_mut().filter(|ocean| !ocean.server_wind) {
             ocean.wind = self.video.weather_wind;
         }
         self.render_command(RenderCommand::SetAuthoredOceans(oceans));
@@ -1844,6 +1945,27 @@ impl App {
             Vec::new()
         };
         if let Some(session) = &self.game_session {
+            // jaPRO sailing prediction runs the server's own analytic ocean;
+            // push each changed CS_SAILING_OCEANS string into the native BG state.
+            for index in 0..8 {
+                let bytes = session.client_game.configstring(CS_OCEANS + index as u16);
+                if bytes != self.sailing_ocean_states[index].as_deref() {
+                    self.sailing_ocean_states[index] = bytes.map(<[u8]>::to_vec);
+                    if let Some(bytes) = bytes {
+                        jka_movement::sailing_apply_ocean_state(index, bytes);
+                    }
+                }
+            }
+            // The map wind (misc_dynamic_weather) shapes the sea's spectrum.
+            for index in 0..self.sailing_weather_states.len() {
+                let bytes = session.client_game.configstring(CS_WEATHER + index as u16);
+                if bytes != self.sailing_weather_states[index].as_deref() {
+                    self.sailing_weather_states[index] = bytes.map(<[u8]>::to_vec);
+                    if let Some(bytes) = bytes {
+                        jka_movement::sailing_apply_weather_state(index, bytes);
+                    }
+                }
+            }
             for index in 0..8 {
                 let Some(bytes) = session.client_game.configstring(CS_OCEANS + index as u16) else {
                     continue;
@@ -1871,7 +1993,10 @@ impl App {
                 self.authored_ocean_preview = false;
             }
             self.publish_authored_oceans();
+            // Blue Water/Hybrid take the map ocean through the shared settings.
+            self.render_command(RenderCommand::SetOceanSettings(self.effective_ocean_settings()));
         }
+        self.publish_sailing_sea();
         if let Some(net) = &self.net {
             self.render_command(RenderCommand::SetOceanTime(
                 net.session().server_time() as f32 * 0.001,
@@ -1884,6 +2009,85 @@ impl App {
         {
             self.render_command(RenderCommand::SetOceanTime(time as f32 * 0.001));
         }
+    }
+
+    /// `sailingdebug`: line from the predicted head straight down to the
+    /// predicted (server-physics) ocean surface, plus crosses for what Hybrid's
+    /// analytic swell draws. Rebuilt every tick while on; a few vertices.
+    pub(in crate::app) fn update_sailing_debug(&mut self) {
+        if !self.sailing_debug {
+            return;
+        }
+        let Some(ps) = self.predictor.predicted() else { return };
+        let origin = [
+            ps.field_f32("origin[0]").unwrap_or(0.0),
+            ps.field_f32("origin[1]").unwrap_or(0.0),
+            ps.field_f32("origin[2]").unwrap_or(0.0),
+        ];
+        let command_time = ps.field_i32("commandTime").unwrap_or(0);
+        let eye = [origin[0], origin[1], origin[2] + ps.field_i32("viewheight").unwrap_or(0) as f32];
+        let render_time = self.net.as_ref().map(|net| net.session().server_time()).unwrap_or(command_time);
+        let mut mesh = jka_assets::bsp::DebugVolumeMesh::default();
+        let cross = |mesh: &mut jka_assets::bsp::DebugVolumeMesh, z: f32, arm: f32, color: [u8; 4]| {
+            mesh.push_line([eye[0] - arm, eye[1], z], [eye[0] + arm, eye[1], z], color);
+            mesh.push_line([eye[0], eye[1] - arm, z], [eye[0], eye[1] + arm, z], color);
+        };
+        const YELLOW: [u8; 4] = [0xFF, 0xE0, 0x20, 0xFF];
+        const MAGENTA: [u8; 4] = [0xFF, 0x30, 0xFF, 0xFF];
+        // Server physics: the native BG surface prediction swims in.
+        let physics_here = jka_movement::sailing_wave_height(eye[0], eye[1], command_time);
+        if let Some(surface) = physics_here {
+            mesh.push_line(eye, [eye[0], eye[1], surface], YELLOW);
+            cross(&mut mesh, surface, 64.0, YELLOW);
+        }
+        // Console readout, twice a second: player vs physics at the player's XY,
+        // and rendered (GPU probe) vs physics at the camera's XY and render clock.
+        let now = Instant::now();
+        if self.sailing_debug_print.is_none_or(|last| now.duration_since(last).as_millis() >= 500) {
+            self.sailing_debug_print = Some(now);
+            let fmt = |v: Option<f32>| v.map_or("-".to_owned(), |v| format!("{v:.0}"));
+            let diff = |a: Option<f32>, b: Option<f32>| fmt(a.zip(b).map(|(a, b)| a - b));
+            let drawn = crate::ocean::authoring::SAILING_DEBUG_DRAWN.lock().ok().and_then(|slot| *slot);
+            let (camera, drawn_at_camera) = drawn.map_or((None, None), |(c, d)| (Some(c), d));
+            let physics_at_camera = camera.and_then(|c| jka_movement::sailing_wave_height(c[0], c[1], render_time));
+            self.push_console_line(format!(
+                "SAILING player feet={:.0} eye={:.0} physics_surface={} eye-surface={} | camera ({}) drawn={} physics={} drawn-physics={} | t_cmd={} t_render={}",
+                origin[2] - 24.0, eye[2], fmt(physics_here), diff(Some(eye[2]), physics_here),
+                camera.map_or("-".to_owned(), |c| format!("{:.0} {:.0}", c[0], c[1])),
+                fmt(drawn_at_camera), fmt(physics_at_camera), diff(drawn_at_camera, physics_at_camera),
+                command_time, render_time,
+            ));
+            // Per-tile significant heights as drawn; physics sums big + medium,
+            // so only the small (fine chop) tile is drawn without physics.
+            if let Some((heights, blend)) = crate::ocean::authoring::SAILING_DEBUG_TILES.lock().ok().and_then(|slot| *slot) {
+                let units = crate::ocean::OCEAN_UNITS_PER_METER;
+                let hs = heights.map(|h| h * units * blend);
+                self.push_console_line(format!(
+                    "SAILING tiles Hs (as drawn, blend {blend:.2}): big={:.0}u medium={:.0}u small={:.0}u (not in physics, ~{:.0}u RMS) | map sea waves={}",
+                    hs[0], hs[1], hs[2], hs[2] / 4.0,
+                    self.sailing_sea_published.as_ref().map_or(0, |sea| sea.waves.len()),
+                ));
+            }
+            // What Hybrid is actually drawing with (after any map ocean replaced
+            // the menu values), so devmap and server can be compared line by line.
+            let s = self.effective_ocean_settings();
+            let swell = s.hybrid_swell;
+            let bw = s.blue_water_waves;
+            self.push_console_line(format!(
+                "SAILING hybrid source={} | swell amp={:.0}u len={:.0}u steep={:.2} dir={:.0} speed={:.0} absolute={} | fft_blend={:.2} | fft Hs={:.2}m peak_len={:.1}m chop={:.2} wind={:.1}m/s dir={:.0} | long={} medium={} medium_detail={:.2} small_detail={:.2}",
+                if self.authored_oceans.is_empty() { "menu" } else { "map" },
+                swell.amplitude, swell.wavelength, swell.steepness, swell.direction, swell.speed, s.hybrid_swell_absolute,
+                s.hybrid_fft_blend,
+                bw.height, bw.wavelength, bw.choppiness, bw.wind_speed, bw.direction,
+                s.long_waves, s.medium_waves, s.medium_wave_detail, s.small_wave_detail,
+            ));
+        }
+        // The physics surface at the render clock (magenta): where the drawn
+        // water should be when the two agree.
+        if let Some(surface) = jka_movement::sailing_wave_height(eye[0], eye[1], render_time) {
+            cross(&mut mesh, surface, 48.0, MAGENTA);
+        }
+        self.render_command(RenderCommand::SetEntityMarkers(Some(mesh)));
     }
 
     pub(in crate::app) fn change_environment_setting(&mut self, direction: i32) {
@@ -2127,6 +2331,11 @@ struct RelightingCelestialArc {
     moon_elevation: f32,
 }
 
+fn system_clock_relighting_hour(local_hour: u32, local_minute: u32) -> f32 {
+    let hour = local_hour as f32 + local_minute as f32 / 60.0;
+    if local_hour < 3 { hour + 24.0 } else { hour }
+}
+
 fn relighting_celestial_arc(hour: f32, noon_sun_yaw: f32) -> RelightingCelestialArc {
     let time = hour.rem_euclid(24.0);
     let sun_yaw = (noon_sun_yaw + (time - 12.0) * 15.0).rem_euclid(360.0);
@@ -2143,7 +2352,15 @@ fn relighting_celestial_arc(hour: f32, noon_sun_yaw: f32) -> RelightingCelestial
 
 #[cfg(test)]
 mod relighting_clock_tests {
-    use super::relighting_celestial_arc;
+    use super::{relighting_celestial_arc, system_clock_relighting_hour};
+
+    #[test]
+    fn local_clock_wraps_midnight_to_the_existing_three_am_arc() {
+        assert_eq!(system_clock_relighting_hour(0, 0), 24.0);
+        assert_eq!(system_clock_relighting_hour(2, 30), 26.5);
+        assert_eq!(system_clock_relighting_hour(3, 0), 3.0);
+        assert_eq!(system_clock_relighting_hour(15, 15), 15.25);
+    }
 
     #[test]
     fn midnight_moon_visible_noon_sun_visible_and_day_wraps() {

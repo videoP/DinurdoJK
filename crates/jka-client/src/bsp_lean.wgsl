@@ -82,7 +82,8 @@ struct LightingSettings {
     runtime_sun_radiance: vec4<f32>, // xyz radiance, w live BSP sunlight enabled
 };
 struct PbrSettings {
-    // x: PBR companions enabled, y: parallax enabled, z: height scale * 1000.
+    // x: PBR companions, y: parallax, z: height scale * 1000,
+    // w: bit 0 LDR baked BRDF, bit 1 promoted lightmaps retain UNORM intensity.
     values: vec4<u32>,
     // x: directional baked lighting enabled, y: deluxe specular scale,
     // z: detail distance fade enabled, w: detail fade distance in JKA units.
@@ -96,6 +97,7 @@ struct StaticLightGridSettings {
 struct StaticPbrLighting {
     diffuse_factor: vec3<f32>,
     specular: vec3<f32>,
+    ibl_radiance: vec3<f32>,
 };
 struct ShadowSettings {
     view_proj: array<mat4x4<f32>, 4>,
@@ -258,6 +260,7 @@ fn material_alpha_rejects(alpha: f32) -> bool {
 @group(1) @binding(18) var emissive_texture: texture_2d<f32>;
 @group(1) @binding(19) var reflection_probe_texture: texture_cube<f32>;
 @group(1) @binding(20) var reflection_probe_sampler: sampler;
+@group(1) @binding(36) var environment_brdf: texture_2d<f32>;
 @group(1) @binding(28) var pbr_sampler: sampler;
 @group(1) @binding(29) var deluxemap_texture: texture_2d<f32>;
 @group(1) @binding(30) var detail_texture: texture_2d<f32>;
@@ -295,8 +298,8 @@ struct VertexIn {
 };
 struct VertexOut {
     @builtin(position) @invariant clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) lightmap_uv: vec2<f32>,
+    @location(0) @interpolate(perspective, centroid) uv: vec2<f32>,
+    @location(1) @interpolate(perspective, centroid) lightmap_uv: vec2<f32>,
     @location(2) color: vec4<f32>,
     // xyz: sky direction, w: cached static BSP AO. Packing AO here avoids
     // allocating another interpolator slot.
@@ -318,15 +321,15 @@ struct VertexOut {
 // each stage's coordinates per vertex as the original JKA stage path did.
 struct AdditiveVertexOut {
     @builtin(position) @invariant clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) additive_uv1: vec2<f32>,
+    @location(0) @interpolate(perspective, centroid) uv: vec2<f32>,
+    @location(1) @interpolate(perspective, centroid) additive_uv1: vec2<f32>,
     @location(2) color: vec4<f32>,
-    @location(3) additive_uv2: vec2<f32>,
+    @location(3) @interpolate(perspective, centroid) additive_uv2: vec2<f32>,
     @location(4) world_position: vec3<f32>,
     @location(5) world_normal: vec3<f32>,
     @location(6) @interpolate(flat) shell_kind: u32,
     @location(7) shell_coverage: f32,
-    @location(8) lightmap_uv: vec2<f32>,
+    @location(8) @interpolate(perspective, centroid) lightmap_uv: vec2<f32>,
 };
 
 
@@ -470,7 +473,26 @@ struct VertexLightgridSample {
     lighting: vec4<f32>,
 };
 
-fn sample_vertex_static_lightgrid(world_position: vec3<f32>) -> VertexLightgridSample {
+// Match JKSunny's R_SetupEntityLightingGrid: lightmapped surfaces outside
+// the grid still use its boundary samples instead of losing all PBR response.
+fn pbr_lightgrid_uvw(position: vec3<f32>, origin: vec3<f32>, inverse_size: vec3<f32>, bounds: vec3<f32>) -> vec3<f32> {
+    let grid = clamp((position - origin) * inverse_size, vec3<f32>(0.0), max(bounds - vec3<f32>(1.0), vec3<f32>(0.0)));
+    return (grid + vec3<f32>(0.5)) / max(bounds, vec3<f32>(1.0));
+}
+
+// R_LightDirForPoint falls back to the surface normal for a lightgrid
+// direction behind the face. This is the baked-light approximation, not
+// an extra light or a change to authored deluxemaps.
+fn pbr_lightgrid_direction(encoded: vec3<f32>, geometric_normal: vec3<f32>) -> vec3<f32> {
+    let direction = encoded * 2.0 - vec3<f32>(1.0);
+    if (dot(direction, direction) > 1e-5) {
+        let normalized = normalize(direction);
+        if (dot(normalized, geometric_normal) > 0.2) { return normalized; }
+    }
+    return geometric_normal;
+}
+
+fn sample_vertex_static_lightgrid(world_position: vec3<f32>, geometric_normal: vec3<f32>) -> VertexLightgridSample {
     var result: VertexLightgridSample;
     result.direction = vec4<f32>(0.0);
     result.lighting = vec4<f32>(0.0);
@@ -479,19 +501,21 @@ fn sample_vertex_static_lightgrid(world_position: vec3<f32>) -> VertexLightgridS
         || !ENABLE_PBR
         || !ENABLE_DELUXE
         || static_lightgrid.origin_enabled.w < 0.5
-        || (material_flags() & 2u) == 0u
+        || (material_flags() & (2u | 131072u)) == 0u
         || !has_pbr_brdf_map) {
         return result;
     }
     let jka_position = vec3<f32>(world_position.x, -world_position.z, world_position.y);
-    let grid = (jka_position - static_lightgrid.origin_enabled.xyz) * static_lightgrid.inv_size.xyz;
-    let bounds = static_lightgrid.bounds.xyz;
-    if (any(grid < vec3<f32>(-0.5)) || any(grid > bounds - vec3<f32>(0.5))) {
-        return result;
+    let uvw = pbr_lightgrid_uvw(jka_position, static_lightgrid.origin_enabled.xyz,
+        static_lightgrid.inv_size.xyz, static_lightgrid.bounds.xyz);
+    let sampled = textureSampleLevel(static_lightgrid_direction, static_lightgrid_sampler, uvw, 0.0);
+    if (sampled.a > 0.0) {
+        // Rend2 R_LightDirForPoint uses the geometric-normal fallback at each
+        // BSP vertex, NOT independently for every fragment. Interpolate those
+        // resolved vectors across the surface before the normal-map BRDF.
+        let direction = pbr_lightgrid_direction(sampled.rgb, geometric_normal);
+        result.direction = vec4<f32>(direction, 1.0);
     }
-    let uvw = (grid + vec3<f32>(0.5)) / max(bounds, vec3<f32>(1.0));
-    result.direction = textureSampleLevel(static_lightgrid_direction, static_lightgrid_sampler, uvw, 0.0);
-    result.lighting = textureSampleLevel(static_lightgrid_lighting, static_lightgrid_sampler, uvw, 0.0);
     return result;
 }
 
@@ -652,7 +676,7 @@ fn world_vertex(input: VertexIn, instance_index: u32, legacy_dlight_surface_id: 
     output.vertex_dlight = transient_vertex_dlight(world_position, output.world_normal);
     output.shell_kind = select(0u, 1u, instance_index != 0u);
     output.shell_coverage = deformation.w;
-    let vertex_lightgrid = sample_vertex_static_lightgrid(world_position);
+    let vertex_lightgrid = sample_vertex_static_lightgrid(world_position, output.world_normal);
     output.pbr_lightgrid_direction = vertex_lightgrid.direction;
     output.pbr_lightgrid_lighting = vertex_lightgrid.lighting;
     // Legacy dlight membership is constant for an authored BSP surface. Resolve
@@ -1827,6 +1851,7 @@ struct PbrSurface {
     metallic: f32,
     ao: f32,
     f0: vec3<f32>,
+    baked_f0: vec3<f32>,
 };
 
 fn default_pbr_surface(input: VertexOut, albedo: vec3<f32>, weather: WeatherSurfaceResponse) -> PbrSurface {
@@ -1840,6 +1865,7 @@ fn default_pbr_surface(input: VertexOut, albedo: vec3<f32>, weather: WeatherSurf
     result.metallic = 0.0;
     result.ao = 1.0;
     result.f0 = vec3<f32>(0.04);
+    result.baked_f0 = result.f0;
     return result;
 }
 
@@ -1858,6 +1884,10 @@ fn evaluate_pbr_surface(
     result.metallic = pbr.metallic;
     result.ao = pbr.ao;
     result.f0 = mix(pbr.dielectric_f0, albedo, pbr.metallic) * pbr.specular_scale;
+    result.baked_f0 = result.f0;
+    if (pbr_settings.values.w != 0u) {
+        result.baked_f0 = mix(pbr.dielectric_f0, legacy_rgb_encode(albedo), pbr.metallic) * pbr.specular_scale;
+    }
     return result;
 }
 
@@ -1876,53 +1906,57 @@ fn pbr_surface_for_path(
 }
 
 fn reflection_probe_specular(
-    input: VertexOut,
-    albedo: vec3<f32>,
-    uv: vec2<f32>,
-    weather: WeatherSurfaceResponse,
-    shared_frame: mat3x3<f32>,
-    shared_surface: PbrSurface,
+    input: VertexOut, albedo: vec3<f32>, uv: vec2<f32>, weather: WeatherSurfaceResponse,
+    shared_frame: mat3x3<f32>, shared_surface: PbrSurface, lighting: vec3<f32>,
 ) -> vec3<f32> {
-    if (!ENABLE_PBR || lighting_settings.feature_flags.w < 1u || (material_flags() & 2048u) == 0u) {
+    if (!ENABLE_PBR || (lighting_settings.feature_flags.w & 256u) == 0u || (material_flags() & 2048u) == 0u) {
         return vec3<f32>(0.0);
     }
     let surface = pbr_surface_for_path(input, albedo, uv, weather, shared_frame, shared_surface);
-    let n = surface.specular_n;
-    let v = surface.v;
-    var reflection = reflect(-v, n);
+    // Rend2 lightall CalcIBLContribution's cheap parallax correction:
+    // cubeMapInfo=(probe-camera)/radius, viewDir=camera-fragment.
+    let offset = (input.world_position - material.reflection_probe.xyz) / max(material.reflection_probe.w, 1.0);
+    let reflection = reflect(-surface.v, surface.specular_n) + offset;
+    let jka_reflection = vec3<f32>(reflection.x, -reflection.z, reflection.y);
+    let lod = surface.roughness * f32(min(max(textureNumLevels(reflection_probe_texture), 1u) - 1u, 6u));
+    let environment = textureSampleLevel(reflection_probe_texture, reflection_probe_sampler, jka_reflection, lod);
+    let light_luma = dot(lighting, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let light_scale = clamp(light_luma / max(environment.a, 0.0001), 0.0, 1.0);
+    let nv = clamp(abs(dot(surface.specular_n, surface.v)) + 1e-5, 0.0, 1.0);
+    let dfg = textureSampleLevel(environment_brdf, reflection_probe_sampler, vec2(surface.roughness, nv), 0.0).rg;
+    return environment.rgb * light_scale * (surface.f0 * surface.ao * dfg.x + vec3<f32>(dfg.y));
+}
 
-    // Rend2's Radius is a parallax-proxy size. Approximate a local spherical
-    // proxy so reflections translate as the viewer moves instead of behaving
-    // like an infinitely distant skybox.
-    let probe_center = material.reflection_probe.xyz;
-    let probe_radius = max(material.reflection_probe.w, 1.0);
-    let offset = input.world_position - probe_center;
-    let b = dot(offset, reflection);
-    let c = dot(offset, offset) - probe_radius * probe_radius;
-    let discriminant = b * b - c;
-    if (discriminant > 0.0) {
-        let distance_to_proxy = -b + sqrt(discriminant);
-        if (distance_to_proxy > 0.0) {
-            let hit = input.world_position + reflection * distance_to_proxy;
-            reflection = normalize(hit - probe_center);
-        }
+// Rend2 lightall reconstructs directed light from the baked lightmap.
+// Lightgrid RGB describes entity lighting; it must not attenuate the already
+// baked world lighting a second time. Return direct scale, ambient share and
+// the normal-mapped diffuse response relative to the original lightmap.
+// Rend2's ordinary BSP lightmaps and diffuse images are UNORM. Only authored
+// HDR lightmaps select IMGFLAG_SRGB and a linear-light BRDF. Reproduce the LDR
+// material operation in that domain, then decode once for our linear scene.
+fn rend2_baked_color(albedo: vec3<f32>, illumination: vec3<f32>, diffuse_factor: vec3<f32>, specular: vec3<f32>, legacy: bool) -> vec3<f32> {
+    if (legacy) {
+        return legacy_rgb_decode(legacy_rgb_encode(albedo) * legacy_rgb_encode(illumination) * diffuse_factor + specular);
     }
+    return albedo * illumination * diffuse_factor + specular;
+}
 
-    let fresnel = fresnel_schlick(max(dot(n, v), 0.0), surface.f0);
-    // The DDS faces are authored in JKA/OpenGL world axes; convert this
-    // renderer's [x,z,-y] direction back to JKA [x,y,z] for cube lookup.
-    let jka_reflection = normalize(vec3<f32>(reflection.x, -reflection.z, reflection.y));
-    let mip_count = max(textureNumLevels(reflection_probe_texture), 1u);
-    let lod = surface.roughness * f32(mip_count - 1u);
-    let environment = textureSampleLevel(
-        reflection_probe_texture,
-        reflection_probe_sampler,
-        jka_reflection,
-        lod
-    ).rgb;
-    // Roughness changes the reflection bandwidth through the prefiltered mip
-    // selection; it should not also arbitrarily erase most reflection energy.
-    return environment * fresnel * mix(0.35, 1.0, surface.ao);
+fn rend2_baked_light_factors(geometric_ndotl: f32, mapped_ndotl: f32) -> vec3<f32> {
+    let direct_scale = 1.0 / max(geometric_ndotl, 0.25);
+    let ambient_share = max(1.0 - geometric_ndotl * direct_scale, 0.0);
+    return vec3<f32>(direct_scale, ambient_share, mapped_ndotl * direct_scale + ambient_share);
+}
+
+// Match Rend2 D_GGX + V_SmithJointApprox for authored RMO roughness. Its
+// roughness is alpha, not the perceptual roughness used by our runtime lights.
+// Include the PI radiance conversion and N.L from lightall here.
+fn rend2_baked_specular_lobe(roughness: f32, nh: f32, nv: f32, nl: f32) -> f32 {
+    let a2 = roughness * roughness;
+    let d = (nh * a2 - nh) * nh + 1.0;
+    let visibility = 0.5 / max(
+        nl * (nv * (1.0 - roughness) + roughness)
+        + nv * (nl * (1.0 - roughness) + roughness), 1e-6);
+    return a2 * visibility * nl / max(d * d, 1e-8);
 }
 
 fn static_baked_pbr(
@@ -1937,123 +1971,67 @@ fn static_baked_pbr(
     var result: StaticPbrLighting;
     result.diffuse_factor = vec3<f32>(1.0);
     result.specular = vec3<f32>(0.0);
+    result.ibl_radiance = lightmap_color;
     if (!ENABLE_PBR || !ENABLE_DELUXE) {
         return result;
     }
 
-    // Prefer a compiled q3map2 deluxemap. The CPU supplies a neutral 1x1
-    // texture with alpha=0 when no companion exists, reserving alpha purely as
-    // a validity marker. q3map2 stores the direction in JKA world axes; convert
-    // it to this renderer's [x,z,-y] world basis before evaluating the BRDF.
+    // Prefer a compiled deluxemap. Otherwise use the lightgrid direction,
+    // with Rend2 R_LightDirForPoint's normal fallback for missing/invalid cells.
+    let geometric_n = normalize(input.world_normal);
+    var l = geometric_n;
     let deluxe_sample = textureSample(deluxemap_texture, lightmap_sampler, input.lightmap_uv);
-    var compiled_deluxe = deluxe_sample.a > 0.5;
-    var encoded_direction = vec4<f32>(0.0);
-    var lighting = vec4<f32>(0.0);
-    var l = vec3<f32>(0.0, 1.0, 0.0);
+    let jka_direction = deluxe_sample.rgb * 2.0 - vec3<f32>(1.0);
+    let renderer_direction = vec3<f32>(jka_direction.x, jka_direction.z, -jka_direction.y);
+    let compiled_deluxe = deluxe_sample.a > 0.5 && dot(renderer_direction, renderer_direction) >= 1e-5;
     if (compiled_deluxe) {
-        let jka_direction = deluxe_sample.rgb * 2.0 - vec3<f32>(1.0);
-        let renderer_direction = vec3<f32>(jka_direction.x, jka_direction.z, -jka_direction.y);
-        if (dot(renderer_direction, renderer_direction) < 1e-5) {
-            compiled_deluxe = false;
-        } else {
-            l = normalize(renderer_direction);
-        }
-    }
-
-    // Rend2 falls back to an approximation derived from the BSP lightgrid on
-    // maps that were not compiled with deluxemaps. Preserve that behavior so
-    // old JKA maps still gain directional normal/specular response.
-    if (!compiled_deluxe) {
-        if (static_lightgrid.origin_enabled.w < 0.5) {
-            return result;
-        }
+        l = normalize(renderer_direction);
+    } else if (static_lightgrid.origin_enabled.w > 0.5) {
         if (PBR_VERTEX_LIGHTGRID) {
-            encoded_direction = input.pbr_lightgrid_direction;
-            lighting = input.pbr_lightgrid_lighting;
-        } else {
-            let jka_position = vec3<f32>(
-                input.world_position.x,
-                -input.world_position.z,
-                input.world_position.y
-            );
-            let grid = (jka_position - static_lightgrid.origin_enabled.xyz) * static_lightgrid.inv_size.xyz;
-            let bounds = static_lightgrid.bounds.xyz;
-            if (any(grid < vec3<f32>(-0.5)) || any(grid > bounds - vec3<f32>(0.5))) {
-                return result;
+            // The vertex shader already resolved Rend2's normal fallback.
+            // Interpolating the direction avoids a hard per-pixel 0.2 cutoff.
+            let interpolated_direction = input.pbr_lightgrid_direction.rgb;
+            if (input.pbr_lightgrid_direction.a > 0.0
+                && dot(interpolated_direction, interpolated_direction) > 1e-5) {
+                l = normalize(interpolated_direction);
             }
-            let uvw = (grid + vec3<f32>(0.5)) / max(bounds, vec3<f32>(1.0));
-            encoded_direction = textureSample(static_lightgrid_direction, static_lightgrid_sampler, uvw);
-            lighting = textureSample(static_lightgrid_lighting, static_lightgrid_sampler, uvw);
+        } else {
+            // Kept for A/B builds with PBR_PROFILE_VERTEX_LIGHTGRID=false.
+            let jka_position = vec3<f32>(input.world_position.x, -input.world_position.z, input.world_position.y);
+            let uvw = pbr_lightgrid_uvw(jka_position, static_lightgrid.origin_enabled.xyz,
+                static_lightgrid.inv_size.xyz, static_lightgrid.bounds.xyz);
+            let encoded_direction = textureSample(static_lightgrid_direction, static_lightgrid_sampler, uvw);
+            if (encoded_direction.a > 0.0) {
+                l = pbr_lightgrid_direction(encoded_direction.rgb, geometric_n);
+            }
         }
-        if (lighting.a < 0.01 || encoded_direction.a < 0.005) {
-            return result;
-        }
-        l = normalize(encoded_direction.rgb * 2.0 - vec3<f32>(1.0));
     }
 
     let surface = pbr_surface_for_path(input, albedo, uv, weather, shared_frame, shared_surface);
-    let geometric_ndotl = max(dot(surface.geometric_n, l), 0.0);
-    let mapped_ndotl = max(dot(surface.n, l), 0.0);
-    var ambient_fraction = 1.0;
-    var specular_radiance = vec3<f32>(0.0);
-
-    if (compiled_deluxe) {
-        // Match Rend2's lightmap+deluxemap reconstruction: the baked lightmap
-        // already contains the geometric N.L attenuation, so recover a directed
-        // term and leave any unrecoverable energy as ambient before applying the
-        // normal-mapped N.L. This avoids double-darkening grazing surfaces.
-        //
-        // recovered_direct = lightmap * direct_scale, and the leftover ambient is
-        // the same fraction of the lightmap in every channel, so the whole
-        // reconstruction reduces to scalars (no per-channel divides or luma
-        // ratios): remapped / lightmap == remap_factor for all channels.
-        let direct_scale = 1.0 / max(geometric_ndotl, 0.25);
-        let ambient_share = max(1.0 - geometric_ndotl * direct_scale, 0.0);
-        if ((material_flags() & 8u) != 0u) {
-            let remap_factor = mapped_ndotl * direct_scale + ambient_share;
-            result.diffuse_factor *= vec3<f32>(clamp(remap_factor, 0.25, 1.85));
-        }
-        ambient_fraction = clamp(ambient_share, 0.0, 1.0);
-        specular_radiance = lightmap_color * direct_scale;
-    } else {
-        if ((material_flags() & 8u) != 0u) {
-            let safe_geometric_ndotl = max(geometric_ndotl, 0.12);
-            let ratio = clamp(mapped_ndotl / safe_geometric_ndotl, 0.25, 1.85);
-            result.diffuse_factor *= vec3<f32>(mix(1.0, ratio, encoded_direction.a * 0.85));
-        }
-        ambient_fraction = 1.0 - encoded_direction.a;
-        specular_radiance = lightmap_color * lighting.rgb * encoded_direction.a;
-    }
-
-    let ambient_ao = mix(1.0, surface.ao, ambient_fraction);
-    result.diffuse_factor *= vec3<f32>((1.0 - surface.metallic) * ambient_ao);
+    let factors = rend2_baked_light_factors(max(dot(surface.geometric_n, l), 0.0), max(dot(surface.n, l), 0.0));
+    result.diffuse_factor = vec3<f32>(factors.z * (1.0 - surface.metallic) * mix(1.0, surface.ao, factors.y));
+    result.ibl_radiance = lightmap_color * (factors.x * 3.14159265359 + factors.y * surface.ao);
 
     let deluxe_specular_scale = clamp(pbr_settings.deluxe.y, 0.0, 1.0);
     if (ENABLE_DELUXE_SPECULAR && deluxe_specular_scale > 0.0) {
         let n = surface.specular_n;
         let v = surface.v;
-        let h = normalize(v + l);
         let ndotl = max(dot(n, l), 0.0);
-        let ndotv = max(dot(n, v), 0.0);
-        if (ndotl > 0.0 && ndotv > 0.0) {
-            // Rend2 multiplies gloss by r_deluxeSpecular before rebuilding the
-            // specular lobe, then scales the resulting specular energy by the
-            // cvar as well. In roughness space, gloss scaling is equivalent to
-            // moving roughness toward 1.0 as the control approaches zero.
-            let deluxe_roughness = clamp(
-                mix(1.0, surface.roughness, deluxe_specular_scale),
-                0.04,
-                1.0
-            );
-            let ndf = distribution_ggx(n, h, deluxe_roughness);
-            let visibility = smith_ggx_visibility(ndotv, ndotl, deluxe_roughness);
-            let f = fresnel_schlick(max(dot(h, v), 0.0), surface.f0);
-            let specular = (ndf * visibility) * f;
-            result.specular = specular * specular_radiance * ndotl * deluxe_specular_scale;
+        let ndotv = abs(dot(n, v)) + 1e-5;
+        let half_vector = v + l;
+        if (ndotl > 0.0 && dot(half_vector, half_vector) > 1e-8) {
+            let h = normalize(half_vector);
+            let lobe = rend2_baked_specular_lobe(surface.roughness, max(dot(n, h), 0.0), ndotv, ndotl);
+            let legacy = pbr_settings.values.w != 0u;
+            let f = fresnel_schlick(max(dot(h, v), 0.0), select(surface.f0, surface.baked_f0, legacy));
+            let radiance = select(lightmap_color, legacy_rgb_encode(lightmap_color), legacy);
+            result.specular = f * radiance * factors.x * lobe * deluxe_specular_scale;
         }
     }
     return result;
 }
+
+
 
 fn clustered_dynamic_light_pbr(
     input: VertexOut,
@@ -2813,6 +2791,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     let explicit_lightmap_stage = (material_flags() & MATERIAL_EXPLICIT_LIGHTMAP) != 0u;
     let has_lightmap = (material_flags() & MATERIAL_HAS_LIGHTMAP) != 0u;
     let opaque_stage = (material_flags() & MATERIAL_OPAQUE_STAGE) != 0u;
+    let vertex_baked_pbr = opaque_stage && (material_flags() & 131072u) != 0u && (material_flags() & 1u) != 0u;
 
     var stage_color = material.color;
     if ((material_flags() & 1u) != 0u) {
@@ -2888,8 +2867,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     let static_pbr_path = ENABLE_DELUXE
         && has_pbr_brdf_map
         && classic_flags == 0u
-        && (material_flags() & 2u) != 0u
-        && input.lightmap_uv.x >= 0.0;
+        && (((material_flags() & 2u) != 0u && input.lightmap_uv.x >= 0.0) || vertex_baked_pbr);
     let reflection_pbr_path = (material_flags() & 2048u) != 0u;
     let gi_pbr_path = ENABLE_VOXEL_GI && (material_flags() & 4u) != 0u;
     let dynamic_pbr_path = has_pbr_brdf_map
@@ -3087,7 +3065,9 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     if (ENABLE_WEATHER_SURFACE && wetness > 0.001) {
         base = vec4<f32>(weather_wet_albedo(base.rgb, weather) * weather_ripple_relief(weather) * weather_water_depth_tint(weather), base.a);
     }
-    let albedo = base.rgb;
+    // Vertex RGB is baked illumination, not the metal's base reflectance.
+    // Rend2 lightall samples diffuse/F0 before multiplying by vertex lighting.
+    let albedo = select(base.rgb, source_sample.rgb * material.color.rgb, vertex_baked_pbr);
     let source_map_unbaked_receiver = ENABLE_SOURCE_MAP_WORLD
         && (material_flags() & 4u) != 0u
         && input.lightmap_uv.x < 0.0
@@ -3100,6 +3080,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         // (tinted by worldspawn `_color`) before direct lights are accumulated.
         base = vec4<f32>(albedo * lighting_settings.map_ambient.rgb, base.a);
     }
+    var reflection_lighting = stage_color.rgb;
     var shared_pbr: PbrSurface;
     if (ENABLE_PBR) {
         shared_pbr = default_pbr_surface(input, albedo, weather);
@@ -3137,10 +3118,24 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         } else {
             base = vec4<f32>(base.rgb * lightmap_color, base.a);
         }
+        reflection_lighting = lightmap_color;
         if (ENABLE_PBR && ENABLE_DELUXE && has_pbr_brdf_map && classic_flags == 0u) {
-            let baked = static_baked_pbr(input, albedo, surface_uv, lightmap_color, weather, shared_frame, shared_pbr);
-            base = vec4<f32>(base.rgb * baked.diffuse_factor + baked.specular, base.a);
+            // FP16 promotion retains the original UNORM byte intensity. Recover
+            // a linear input for the helper, which reproduces Rend2's LDR math.
+            let pbr_lightmap = select(lightmap_color, legacy_rgb_decode(lightmap_color), (pbr_settings.values.w & 2u) != 0u);
+            let baked = static_baked_pbr(input, albedo, surface_uv, pbr_lightmap, weather, shared_frame, shared_pbr);
+            base = vec4<f32>(rend2_baked_color(albedo, pbr_lightmap, baked.diffuse_factor, baked.specular, pbr_settings.values.w != 0u), base.a);
+            reflection_lighting = baked.ibl_radiance;
         }
+    }
+
+    if (ENABLE_PBR && ENABLE_DELUXE && has_pbr_brdf_map && classic_flags == 0u
+        && vertex_baked_pbr && (material_flags() & 2u) == 0u) {
+        // BSP vertex lighting reaches the shader as the original UNORM bytes.
+        let vertex_lighting = select(input.color.rgb, legacy_rgb_decode(input.color.rgb), pbr_settings.values.w != 0u);
+        let baked = static_baked_pbr(input, albedo, surface_uv, vertex_lighting, weather, shared_frame, shared_pbr);
+        base = vec4<f32>(rend2_baked_color(albedo, vertex_lighting, baked.diffuse_factor, baked.specular, pbr_settings.values.w != 0u), base.a);
+        reflection_lighting = baked.ibl_radiance;
     }
 
     // Static extra styles are only another authored lightmap contribution.
@@ -3165,8 +3160,8 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         let static_ao = clamp(input.sky_dir_ao.w, 0.0, 1.0);
         base = vec4<f32>(base.rgb * static_ao, base.a);
     }
-    if (ENABLE_PBR && lighting_settings.feature_flags.w >= 1u && (material_flags() & 2048u) != 0u) {
-        base = vec4<f32>(base.rgb + reflection_probe_specular(input, albedo, surface_uv, weather, shared_frame, shared_pbr), base.a);
+    if (ENABLE_PBR && (lighting_settings.feature_flags.w & 256u) != 0u && (material_flags() & 2048u) != 0u) {
+        base = vec4<f32>(base.rgb + reflection_probe_specular(input, albedo, surface_uv, weather, shared_frame, shared_pbr, reflection_lighting), base.a);
     }
     if (ENABLE_CASCADED_SHADOWS && (material_flags() & 4u) != 0u) {
         // When direct sun is added explicitly, its visibility already casts
@@ -3512,9 +3507,12 @@ fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f3
     if (LEGACY_WORLD_ENCODED_BLEND) {
         sample = vec4<f32>(legacy_rgb_encode(sample.rgb), sample.a);
     }
-    // Authored source blend is GL_SRC_ALPHA GL_ONE. Fused fixed blend is ONE/ONE,
-    // so preweight RGB and alpha by the source alpha as before.
-    return vec4<f32>(sample.rgb * sample.a, sample.a * sample.a);
+    // Fixed hardware blend is ONE/ONE for every fused chain. Each authored
+    // source blend retains its original factor: GL_ONE contributes raw color
+    // and alpha; GL_SRC_ALPHA weights both by source alpha. The per-stage
+    // uniform bit works for mixed chains without an additional PSO variant.
+    let weight = select(sample.a, 1.0, (m.header.w & (1u << 21u)) != 0u);
+    return vec4<f32>(sample.rgb * weight, sample.a * weight);
 }
 fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f32> {
     var overlay_sky_gain = vec3<f32>(1.0);
@@ -3963,8 +3961,8 @@ fn sky_box_uv(uv: vec2<f32>) -> vec2<f32> {
 // per-material override constants fold them exactly as in mode 1.
 struct MinimalVertexOut {
     @builtin(position) @invariant clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) lightmap_uv: vec2<f32>,
+    @location(0) @interpolate(perspective, centroid) uv: vec2<f32>,
+    @location(1) @interpolate(perspective, centroid) lightmap_uv: vec2<f32>,
     @location(2) color: vec4<f32>,
     // xyz: world position (legacy fog, jump shade); w: cached static BSP AO.
     @location(3) world_ao: vec4<f32>,

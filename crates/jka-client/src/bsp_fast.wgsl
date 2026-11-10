@@ -86,8 +86,8 @@ struct VertexIn {
 };
 struct VertexOut {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) lightmap_uv: vec2<f32>,
+    @location(0) @interpolate(perspective, centroid) uv: vec2<f32>,
+    @location(1) @interpolate(perspective, centroid) lightmap_uv: vec2<f32>,
     @location(2) color: vec4<f32>,
     // xyz: sky direction, w: cached static BSP AO. Packing AO here avoids
     // allocating another interpolator slot.
@@ -104,10 +104,10 @@ struct VertexOut {
 // each stage's coordinates per vertex as the original JKA stage path did.
 struct AdditiveVertexOut {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) additive_uv1: vec2<f32>,
+    @location(0) @interpolate(perspective, centroid) uv: vec2<f32>,
+    @location(1) @interpolate(perspective, centroid) additive_uv1: vec2<f32>,
     @location(2) color: vec4<f32>,
-    @location(3) additive_uv2: vec2<f32>,
+    @location(3) @interpolate(perspective, centroid) additive_uv2: vec2<f32>,
     @location(4) world_position: vec3<f32>,
     @location(5) world_normal: vec3<f32>,
     @location(6) @interpolate(flat) shell_kind: u32,
@@ -611,9 +611,12 @@ fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f3
     if (LEGACY_WORLD_ENCODED_BLEND) {
         sample = vec4<f32>(legacy_rgb_encode(sample.rgb), sample.a);
     }
-    // Authored source blend is GL_SRC_ALPHA GL_ONE. Fused fixed blend is ONE/ONE,
-    // so preweight RGB and alpha by the source alpha as before.
-    return vec4<f32>(sample.rgb * sample.a, sample.a * sample.a);
+    // Fixed hardware blend is ONE/ONE for every fused chain. Each authored
+    // source blend retains its original factor: GL_ONE contributes raw color
+    // and alpha; GL_SRC_ALPHA weights both by source alpha. The per-stage
+    // uniform bit works for mixed chains without an additional PSO variant.
+    let weight = select(sample.a, 1.0, (m.header.w & (1u << 21u)) != 0u);
+    return vec4<f32>(sample.rgb * weight, sample.a * weight);
 }
 fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f32> {
     let base = textureSample(base_texture, base_sampler, input.uv);

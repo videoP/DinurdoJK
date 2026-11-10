@@ -150,6 +150,11 @@ pub fn build_dynamic_static_vertices(
     // Mirror TaystJK CG_DrawHUD: only the main status HUD is behind
     // cg_drawHud; movement helpers and other screen overlays are not.
     if ui.video.draw_hud {
+        // The JK2 selector's animated chrome is behind the status clusters,
+        // not in the later transient selector-icon batch.
+        if ui.jk2_mode && ui.video.hud_style == 1 {
+            crate::ui::hud::jk2_retail::build_select_chrome(out, ui, width, height);
+        }
         build_hud(out, ui, width, height);
         build_extension_hud(ui, out, &ui.extension_hud, &ui.extension_images,
             &ui.extension_shader_flags, &ui.extension_image_dimensions,
@@ -213,8 +218,8 @@ pub fn build_transient_vertices(
             build_crosshair_name(out, ui, small_font, width, height);
         });
         if ui.jk2_mode && ui.video.hud_style == 1 {
-            // JK2 native selectors use their own background, prongs and source icons.
-            crate::ui::hud::jk2_retail::build_select_chrome(out, ui, width, height);
+            // Animated chrome was drawn behind the status HUD in the stable batch;
+            // only source icons and labels overlay it here.
             build_force_select(out, ui, small_font, width, height);
             crate::ui::hud::jk2_retail::build_weapon_select(out, ui, small_font, width, height);
             crate::ui::hud::jk2_retail::build_inventory_select(out, ui, small_font, width, height);
@@ -231,6 +236,11 @@ pub fn build_transient_vertices(
             build_follow_indicator(out, ui, small_font, width, height);
         });
         build_team_overlay(out, ui, small_font, width, height);
+        if ui.jk2_mode {
+            crate::ui::hud::jk2_retail::build_enhanced_flag_status(out, ui, small_font, width, height);
+            crate::ui::hud::jk2_retail::build_persistent_inventory(out, ui, width, height);
+        }
+        super::broadcast::draw(out, ui, small_font, width, height);
         build_race_timer(out, ui, small_font, width, height);
         build_speedometer(out, ui, small_font, width, height);
         build_lagometer(out, ui, small_font, width, height);
@@ -276,18 +286,29 @@ pub fn build_transient_vertices(
         // cg_drawScore is snapshot-dependent: keep it in the transient HUD
         // batch so score and team deltas update on score changes without
         // rebuilding the large static health/force HUD.
-        if ui.video.draw_hud {
+        // The broadcast HUD already shows team scores, player scores and
+        // deaths: cg_drawScore and cg_drawScores step aside while it is up.
+        let broadcast = ui.spectator_broadcast.is_some();
+        if ui.video.draw_hud && !broadcast {
             draw_placed(out, ui, HudElementId::Score, width, height, |out| {
                 build_hud_score(out, ui, width, height);
             });
         }
-        draw_placed(out, ui, HudElementId::MiniScores, width, height, |out| {
-            build_mini_scores(out, ui, small_font, width, height);
-        });
+        if !broadcast {
+            draw_placed(out, ui, HudElementId::MiniScores, width, height, |out| {
+                build_mini_scores(out, ui, small_font, width, height);
+            });
+        }
         build_siege_hud(out, ui, small_font, width, height);
         // Demo transport is the last gameplay overlay: legacy Score/Team HUD
         // text must not draw on top of its playback buttons.
         build_demo_timeline(out, ui, width, height);
+    }
+    // CG_Draw2D fallingToDeath: fill the entire 2D viewport after the HUD,
+    // without a full retained-UI rebuild or any GPU post-process permutation.
+    if ui.falling_death_fade > 0.0 && ui.loading.is_none() {
+        crate::ui::rect(out, 0.0, 0.0, width as f32, height as f32,
+            [0.0, 0.0, 0.0, ui.falling_death_fade.clamp(0.0, 1.0)], width, height);
     }
     if ui.mode == OverlayMode::Chat {
         // TaystJK message entry is a console/notify field, not a child of the

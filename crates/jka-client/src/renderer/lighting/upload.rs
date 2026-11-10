@@ -41,10 +41,20 @@ pub(in crate::renderer) fn upload_reflection_probes(
         uploaded.push(GpuReflectionProbe {
             _texture: texture,
             view,
+            capture_position: None,
         });
     } else {
         for probe in probes {
-            let texture = device.create_texture_with_data(
+            let texture = if probe.rgba.is_empty() {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(&probe.label),
+                    size: wgpu::Extent3d { width: probe.width, height: probe.height, depth_or_array_layers: 6 },
+                    mip_level_count: probe.mip_level_count, sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                })
+            } else { device.create_texture_with_data(
                 queue,
                 &wgpu::TextureDescriptor {
                     label: Some(&probe.label),
@@ -62,7 +72,7 @@ pub(in crate::renderer) fn upload_reflection_probes(
                 },
                 wgpu::util::TextureDataOrder::LayerMajor,
                 &probe.rgba,
-            );
+            ) };
             let view = texture.create_view(&wgpu::TextureViewDescriptor {
                 label: Some("JKA Rend2 reflection cubemap view"),
                 dimension: Some(wgpu::TextureViewDimension::Cube),
@@ -72,6 +82,7 @@ pub(in crate::renderer) fn upload_reflection_probes(
             uploaded.push(GpuReflectionProbe {
                 _texture: texture,
                 view,
+                capture_position: probe.rgba.is_empty().then_some(probe.position),
             });
         }
     }
@@ -89,6 +100,8 @@ pub(in crate::renderer) fn upload_reflection_probes(
         probes: uploaded,
         sampler,
         source_count: probes.len(),
+        capture_pending: probes.iter().any(|p| p.rgba.is_empty()),
+        brdf_view: crate::renderer::reflections::cubemap::create_brdf_lut(device, queue),
     }
 }
 

@@ -35,25 +35,32 @@ DEPENDENCY_FILES = (
 DEPENDENCY_PREFIX = "DinurdoJK/dependencies/"
 CLIENT_ASSET = "DinurdoJK/shared/dinurdo-assets.pk4"
 
-ALLOWED_FILES = (
+# Only runtime/installable files are signed for the auto-updater. Notices are
+# distributed inside the full manual ZIP and never become per-file update assets.
+UPDATE_FILES = (
     "DinurdoJK.exe",
     *(DEPENDENCY_PREFIX + name for name in DEPENDENCY_FILES),
     CLIENT_ASSET,
-    "OpenAL-Soft-LGPL-2.0.txt",
-    "EalMan-LGPL-2.1.txt",
-    "Bevy-Solari-MIT.txt",
-    "NVIDIA-DLSS-SDK-LICENSE.txt",
-    "DXC-LICENSE.txt",
-    "DXC-ThirdPartyNotices.txt",
 )
-LICENSE_FILES = {
+
+NOTICE_FILES = (
     "OpenAL-Soft-LGPL-2.0.txt",
     "EalMan-LGPL-2.1.txt",
     "Bevy-Solari-MIT.txt",
     "NVIDIA-DLSS-SDK-LICENSE.txt",
     "DXC-LICENSE.txt",
     "DXC-ThirdPartyNotices.txt",
-}
+    "FFmpeg-GPL-3.0.txt",
+    "FFmpeg-SOURCE-NOTICE.txt",
+)
+REQUIRED_NOTICES = (
+    "OpenAL-Soft-LGPL-2.0.txt",
+    "NVIDIA-DLSS-SDK-LICENSE.txt",
+    "DXC-LICENSE.txt",
+    "DXC-ThirdPartyNotices.txt",
+    "FFmpeg-GPL-3.0.txt",
+    "FFmpeg-SOURCE-NOTICE.txt",
+)
 MAX_BYTES = 1024 * 1024 * 1024
 MAX_MANIFEST = 16 * 1024
 
@@ -116,11 +123,9 @@ def create(runtime, output, tag):
         raise ValueError(f"{tag!r} does not match Cargo version {version_tag()!r}")
     private, public = signing_key()
     payload = {}
-    for name in ALLOWED_FILES:
+    for name in UPDATE_FILES:
         if name == CLIENT_ASSET:
             source = Path("assets/dinurdo-assets.pk4")
-        elif name in LICENSE_FILES:
-            source = runtime / "licenses" / name
         elif name.startswith(DEPENDENCY_PREFIX):
             # Support both updated build.ps1 outputs and legacy root-level
             # Cargo staging. The *published* layout is always the new one.
@@ -133,11 +138,20 @@ def create(runtime, output, tag):
             payload[name] = read_file(source)
     for required in ("DinurdoJK.exe", *(DEPENDENCY_PREFIX + dll for dll in
                      ("OpenALSoft.x86_64.dll", "nvngx_dlss.dll", "dxcompiler.dll", "dxil.dll")),
-                     "DXC-LICENSE.txt", "DXC-ThirdPartyNotices.txt",
-                     "NVIDIA-DLSS-SDK-LICENSE.txt", CLIENT_ASSET):
+                     CLIENT_ASSET):
         if required not in payload:
-            raise ValueError(f"mandatory release file is missing: {required}")
-    if len(payload) > len(ALLOWED_FILES) or sum(map(len, payload.values())) > MAX_BYTES:
+            raise ValueError(f"mandatory update file is missing: {required}")
+
+    notices = {}
+    for name in NOTICE_FILES:
+        source = runtime / "licenses" / name
+        if source.is_file():
+            notices[f"licenses/{name}"] = read_file(source)
+    for name in REQUIRED_NOTICES:
+        if f"licenses/{name}" not in notices:
+            raise ValueError(f"mandatory full-ZIP notice is missing: {name}")
+
+    if len(payload) > len(UPDATE_FILES) or sum(map(len, payload.values())) > MAX_BYTES:
         raise ValueError("signed release exceeds file/count/size limits")
 
     if output.exists() and any(output.iterdir()):
@@ -155,6 +169,13 @@ def create(runtime, output, tag):
             item.external_attr = 0o100644 << 16
             z.writestr(item, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=6)
             (output / asset_name(name)).write_bytes(data)
+        # The standalone ZIP includes notices, but they are not part of the
+        # signed update manifest and have no individual GitHub update assets.
+        for name, data in sorted(notices.items()):
+            item = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+            item.compress_type = zipfile.ZIP_DEFLATED
+            item.external_attr = 0o100644 << 16
+            z.writestr(item, data, compress_type=zipfile.ZIP_DEFLATED, compresslevel=6)
 
     manifest = {
         "format": 2,
@@ -170,14 +191,17 @@ def create(runtime, output, tag):
     if len(signature) != 64:
         raise AssertionError("incorrect Ed25519 signature length")
     with zipfile.ZipFile(full_path, "r") as z:
-        if set(z.namelist()) != set(payload):
-            raise AssertionError("full ZIP layout does not match manifest")
+        if set(z.namelist()) != set(payload) | set(notices):
+            raise AssertionError("full ZIP layout does not match runtime files and notices")
         for name, data in payload.items():
             if z.read(name) != data or read_file(output / asset_name(name)) != data:
-                raise AssertionError(f"ZIP or individual asset mismatch: {name}")
+                raise AssertionError(f"ZIP or individual runtime asset mismatch: {name}")
+        for name, data in notices.items():
+            if z.read(name) != data:
+                raise AssertionError(f"ZIP notice mismatch: {name}")
     (output / "release-manifest.json").write_bytes(raw)
     (output / "release-manifest.sig").write_bytes(signature)
-    print(f"Signed {tag}: {len(payload)} individual files and {full_name}")
+    print(f"Signed {tag}: {len(payload)} runtime update files, {len(notices)} ZIP-only notices, and {full_name}")
     print("These release assets will be published:")
     for path in sorted(output.iterdir()):
         print(f"  {path.name}: {path.stat().st_size:,} bytes")

@@ -6,6 +6,9 @@ impl App {
     pub(in crate::app) fn forward_command_to_server(&mut self, line: &str) {
         let line = line.trim();
         let verb = line.split_whitespace().next().unwrap_or("");
+        if matches!(verb.to_ascii_lowercase().as_str(), "follow" | "follownext" | "followprev" | "follow1" | "follow2" | "team") {
+            self.spectator_broadcast.cancel_for_user();
+        }
         if verb.starts_with('-') {
             return;
         }
@@ -291,6 +294,13 @@ impl App {
                 return true;
             }
             Some(GameCommand::Flipkick) => { self.start_japro_flipkick(); return true; }
+            Some(GameCommand::Generic(27)) if self.live_input.is_jk2() => {
+                // MVSDK bg_pmove.c PM_Animate handles JK2 taunts via
+                // BUTTON_GESTURE (usercmd bit 3), not a generic command.
+                // IN_KeyDown's one-frame latch preserves a quick /taunt tap.
+                self.live_input.note_pressed("+button3");
+                return true;
+            }
             Some(GameCommand::Generic(value))
                 if self.live_input.is_jk2()
                     && jka_protocol::jk2::presentation::wire_generic_command(value).is_none() =>

@@ -7,6 +7,9 @@ mod match_stats;
 mod chat_anim;
 mod chat_translation;
 mod scoreboard_cursor;
+mod spectator_broadcast;
+mod spectator_broadcast_map;
+mod spectator_broadcast_bars;
 mod capture;
 mod chat;
 mod commands;
@@ -23,6 +26,7 @@ mod gamma;
 mod filesystem;
 mod frame;
 mod frontend_previews;
+mod falling_death;
 mod frontend_scene_cache;
 mod hud;
 mod hud_edit_history;
@@ -636,6 +640,11 @@ pub struct App {
     scores_showing: bool,
     /// CG `scoresRequestTime`: score refreshes are throttled to roughly 2 seconds.
     last_scores_request: Option<Instant>,
+    spectator_broadcast: spectator_broadcast::SpectatorBroadcast,
+    /// cg_specHudMap floor plan and last-seen player positions.
+    broadcast_minimap: spectator_broadcast_map::BroadcastMinimapState,
+    /// cg_specHud card bar easing; advanced while building the UI (`&self`).
+    broadcast_bars: std::cell::RefCell<spectator_broadcast_bars::BarAnimations>,
     /// When the last usercmd was created (cl_commandRate pacing).
     last_command_at: Option<Instant>,
     /// `cl.serverTime` (ms, fractional for rates that do not divide 1000) the next
@@ -729,6 +738,9 @@ pub struct App {
     enemy_info_shown: Option<ui::UiEnemyInfo>,
     mini_scores_shown: Option<ui::UiMiniScores>,
     team_overlay_shown: Option<ui::TeamOverlayUi>,
+    /// Latest displayed MVSDK JK2 CTF/inventory state (detect changes at app tick).
+    jk2_flags_shown: Vec<ui::Jk2FlagUi>,
+    jk2_inventory_shown: Option<ui::Jk2InventoryUi>,
     cg_debug_events: u8,
     /// A/B switch: side-effect-free event semantic preparation on the dedicated Rayon pool.
     cg_event_workers: bool,
@@ -777,6 +789,9 @@ pub struct App {
     /// Active chat resize corner as [move_left_edge, move_top_edge].
     hud_edit_chat_resize_corner: Option<[bool; 2]>,
     third_person_camera: ThirdPersonCameraState,
+    falling_death: Option<falling_death::FallingDeathCamera>,
+    falling_death_fade_shown: u8,
+    falling_death_active_shown: bool,
     local_player_presenter: Option<PlayerPresenter>,
     solo_dynamic_models: Arc<Vec<DynamicModelSurface>>,
     solo_client_info: ClientInfo,
@@ -794,6 +809,8 @@ pub struct App {
     mouse_repeat_next: [Option<Instant>; 2],
     in_mouserepeat: u8,
     in_mouserepeat_delay: u32,
+    /// UI cursor-only window confinement; gameplay capture is independent.
+    in_confine_cursor: bool,
     modifiers: ModifiersState,
     captured: bool,
     mouse_grab_mode: &'static str,
@@ -971,6 +988,10 @@ pub struct App {
     console_scale: f32,
     console_hl2: bool,
     console_hl2_rect: [f32; 4],
+    /// One-shot HL2 log scroll request; the classic console has its own scroll index.
+    console_hl2_scroll_to: Option<usize>,
+    /// Keyboard PageUp/PageDown distance pending for the HL2 log viewport.
+    console_hl2_page_delta: i32,
     console_selection_anchor: Option<ConsolePoint>,
     console_selection_focus: Option<ConsolePoint>,
     console_selecting: bool,
@@ -1005,6 +1026,15 @@ pub struct App {
     ocean_settings_open: bool,
     authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
     map_authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
+    /// Last `CS_SAILING_OCEANS + i` pushed into the jaPRO prediction backend.
+    sailing_ocean_states: [Option<Vec<u8>>; 8],
+    /// Last `CS_DYNAMIC_WEATHER + i` pushed into the jaPRO prediction backend.
+    sailing_weather_states: [Option<Vec<u8>>; 2],
+    /// The map sea last sent to the renderer's FFT (`publish_sailing_sea`).
+    sailing_sea_published: Option<jka_movement::SailingSea>,
+    /// `sailingdebug`: head-to-predicted-surface line overlay (session only).
+    sailing_debug: bool,
+    sailing_debug_print: Option<std::time::Instant>,
     authored_ocean_selected: usize,
     authored_ocean_preview: bool,
     ocean_selected: usize,
@@ -1023,6 +1053,10 @@ pub struct App {
     cloud_tuning_open: bool,
     cloud_tuning_selected: usize,
     video: VideoSettings,
+    /// Clock time actually applied to the sky, distinct from the archived manual slider.
+    relight_clock_effective: Option<f32>,
+    /// Avoid touching the OS clock at render-frame frequency.
+    relight_clock_last_poll: Instant,
     /// Session-only opt-in, keeps inactive rendering at its original cost.
     frame_time_graph: bool,
     /// OpenJK/TaystJK renderer world-effect state shared by `/r_we` and

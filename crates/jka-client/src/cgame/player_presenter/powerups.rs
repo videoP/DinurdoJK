@@ -10,7 +10,7 @@ const PW_REDFLAG: i32 = 4;
 const PW_BLUEFLAG: i32 = 5;
 const PW_NEUTRALFLAG: i32 = 6;
 
-fn flag_model(powerup: i32, gametype: i32, japro_server: bool) -> Option<&'static str> {
+fn flag_model(powerup: i32, gametype: i32, japro_server: bool, ctf3: bool) -> Option<&'static str> {
     // CG_RegisterGraphics gives jaPRO the ordinary flag models even in CTY,
     // allowing its server to switch gametypes without re-registering media.
     let cty = gametype == 9 && !japro_server;
@@ -19,7 +19,7 @@ fn flag_model(powerup: i32, gametype: i32, japro_server: bool) -> Option<&'stati
         PW_BLUEFLAG if cty => Some("models/flags/b_flag_ysal.md3"),
         PW_REDFLAG => Some("models/flags/r_flag.md3"),
         PW_BLUEFLAG => Some("models/flags/b_flag.md3"),
-        PW_NEUTRALFLAG if gametype == 7 => Some("models/flags/n_flag.md3"),
+        PW_NEUTRALFLAG if gametype == 7 || ctf3 => Some("models/flags/n_flag.md3"),
         PW_NEUTRALFLAG if japro_server && matches!(gametype, 0 | 6 | 8) => {
             Some("models/flags/n_flag.md3")
         }
@@ -69,6 +69,7 @@ impl PlayerPresenter {
         &mut self,
         entity: &PresentedEntity,
         gametype: i32,
+        ctf3: bool,
         model: &PlayerModelAsset,
         pose: &[Matrix3x4],
         axis: [[f32; 3]; 3],
@@ -116,7 +117,7 @@ impl PlayerPresenter {
             if powerups & (1 << bit) == 0 {
                 continue;
             }
-            if let Some(model) = flag_model(bit, gametype, self.viewer_style.japro) {
+            if let Some(model) = flag_model(bit, gametype, self.viewer_style.japro, ctf3) {
                 self.cosmetic_draws.push(CosmeticDraw {
                     face_camera: None,
                     entity_num: entity.number,
@@ -140,11 +141,11 @@ mod tests {
     #[test]
     fn siege_flags_use_existing_carrier_models_on_stock_and_japro_servers() {
         for japro in [false, true] {
-            assert_eq!(flag_model(PW_REDFLAG, 7, japro), Some("models/flags/r_flag.md3"));
-            assert_eq!(flag_model(PW_BLUEFLAG, 7, japro), Some("models/flags/b_flag.md3"));
-            assert_eq!(flag_model(PW_NEUTRALFLAG, 7, japro), Some("models/flags/n_flag.md3"));
+            assert_eq!(flag_model(PW_REDFLAG, 7, japro, false), Some("models/flags/r_flag.md3"));
+            assert_eq!(flag_model(PW_BLUEFLAG, 7, japro, false), Some("models/flags/b_flag.md3"));
+            assert_eq!(flag_model(PW_NEUTRALFLAG, 7, japro, false), Some("models/flags/n_flag.md3"));
         }
-        assert_eq!(flag_model(PW_REDFLAG, 9, false), Some("models/flags/r_flag_ysal.md3"));
+        assert_eq!(flag_model(PW_REDFLAG, 9, false, false), Some("models/flags/r_flag_ysal.md3"));
     }
 
     #[test]
@@ -181,7 +182,7 @@ mod tests {
         presenter.japro.third_person_flag_alpha = 0.25;
         let axis = angles_to_axis(entity.angles);
         presenter
-            .queue_player_powerups(&entity, 8, &model, &pose, axis, entity.origin, false)
+            .queue_player_powerups(&entity, 8, false, &model, &pose, axis, entity.origin, false)
             .unwrap();
         assert!(
             presenter.drain_cosmetic_draws().is_empty(),
@@ -194,7 +195,7 @@ mod tests {
         );
 
         presenter
-            .queue_player_powerups(&entity, 8, &model, &pose, axis, entity.origin, true)
+            .queue_player_powerups(&entity, 8, false, &model, &pose, axis, entity.origin, true)
             .unwrap();
         let flags = presenter.drain_cosmetic_draws();
         assert_eq!(
@@ -221,7 +222,7 @@ mod tests {
 
         presenter.viewer_client = 7;
         presenter
-            .queue_player_powerups(&entity, 8, &model, &pose, axis, entity.origin, true)
+            .queue_player_powerups(&entity, 8, false, &model, &pose, axis, entity.origin, true)
             .unwrap();
         assert!(
             presenter
@@ -235,23 +236,24 @@ mod tests {
     #[test]
     fn flag_media_matches_japro_and_stock_cty_registration() {
         assert_eq!(
-            flag_model(PW_REDFLAG, 8, false),
+            flag_model(PW_REDFLAG, 8, false, false),
             Some("models/flags/r_flag.md3")
         );
         assert_eq!(
-            flag_model(PW_BLUEFLAG, 9, false),
+            flag_model(PW_BLUEFLAG, 9, false, false),
             Some("models/flags/b_flag_ysal.md3")
         );
         assert_eq!(
-            flag_model(PW_REDFLAG, 9, true),
+            flag_model(PW_REDFLAG, 9, true, false),
             Some("models/flags/r_flag.md3")
         );
         assert_eq!(
-            flag_model(PW_NEUTRALFLAG, 8, true),
+            flag_model(PW_NEUTRALFLAG, 8, true, false),
             Some("models/flags/n_flag.md3")
         );
-        assert_eq!(flag_model(PW_NEUTRALFLAG, 8, false), None);
-        assert_eq!(flag_model(PW_NEUTRALFLAG, 9, true), None);
+        assert_eq!(flag_model(PW_NEUTRALFLAG, 8, false, false), None);
+        assert_eq!(flag_model(PW_NEUTRALFLAG, 9, true, false), None);
+        assert_eq!(flag_model(PW_NEUTRALFLAG, 8, false, true), Some("models/flags/n_flag.md3"));
     }
 
     #[test]

@@ -1269,9 +1269,20 @@ impl PlayerPresenter {
             // OpenJK's CBoneCache::Eval is lazy: BG_G2PlayerAngles only needs the
             // pre-angle Motion bolt, so evaluate Motion + its ancestors here rather
             // than materializing all humanoid bones a first time.
+            // JK2 reads the bolt through GetBoltMatrix_NoReconstruct /
+            // _NoRecNoRot: the skeleton last built, i.e. the previous frame's
+            // render time with its installed animations (jk2mv G2_API.cpp).
+            let motion_time = if jk2_version.is_some()
+                && runtime.last_angle_time > 0
+                && runtime.last_angle_time <= current_time
+            {
+                runtime.last_angle_time
+            } else {
+                current_time
+            };
             let motion_pose = runtime.animation.animator.evaluate_bone_openjk_root(
                 &model.animation_gla,
-                current_time,
+                motion_time,
                 motion_index,
             )?;
             record_motion_pose_eval(&mut self.perf, pose_started);
@@ -1340,8 +1351,11 @@ impl PlayerPresenter {
                 use jka_protocol::jk2::presentation as jk2_ids;
                 let anim = |value: i32| jk2_ids::wire_animation(value).unwrap_or(-1);
                 let mut jk2_entity = angle_entity;
-                jk2_entity.legs_anim = anim(angle_entity.legs_anim);
-                jk2_entity.torso_anim = anim(angle_entity.torso_anim);
+                // MVSDK's entityState anims carry ANIM_TOGGLEBIT (2048), which
+                // 1.02 CG_G2ClientSpineAngles' flip/spin predicates observe.
+                let toggle = |flip: &str| if entity.state.field_i32(flip).unwrap_or(0) != 0 { 2048 } else { 0 };
+                jk2_entity.legs_anim = anim(angle_entity.legs_anim) | toggle("legsFlip");
+                jk2_entity.torso_anim = anim(angle_entity.torso_anim) | toggle("torsoFlip");
                 jk2_entity.weapon = jk2_ids::wire_weapon(angle_entity.weapon).unwrap_or(0);
                 jk2_entity.saber_move = jk2_ids::wire_saber_move(angle_entity.saber_move).unwrap_or(0);
                 jk2_entity.e_flags = jk2_ids::wire_entity_flags(angle_entity.e_flags);
@@ -1509,6 +1523,7 @@ impl PlayerPresenter {
             // Never blend idle through the hidden native taunt's bone state.
             anim_blend && emote_animation_state.is_none() && !(swing_fix == 1 && swing_boundary),
             model.humanoid,
+            jk2_version,
         )?;
 
         let anim_debug = ViewerAnimDebug {
@@ -1951,6 +1966,7 @@ impl PlayerPresenter {
         self.queue_player_powerups(
             entity,
             info.gametype,
+            info.jk2_ctf3,
             &model,
             &pose,
             render_axis,

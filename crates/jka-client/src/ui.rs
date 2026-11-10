@@ -19,6 +19,7 @@ pub(crate) use hud::siege::{append_mp_timer_image, load_mp_timer};
 /// Register only the stock artwork matching the active game protocol.
 /// Never mount both JK2 and JKA HUD names in a single native image atlas.
 pub(crate) use hud::jk2_retail::jk2_ammo_index;
+pub(crate) use hud::jk2_retail::chrome_key as jk2_chrome_key;
 
 /// Resolve a read-only native HUD atlas cell. Extensions reference category +
 /// game ID, never duplicated qpaths or extension-image atlas slots. The JK2
@@ -41,6 +42,10 @@ pub(crate) fn native_hud_icon_index(category: &str, id: i64) -> Option<usize> {
         "rage_recovery" if id == 8 => Some(ICON_RAGE_RECOVERY),
         _ => None,
     }
+}
+
+pub(crate) fn append_jk2_ctf_images(images: &mut Vec<String>) {
+    hud::jk2_retail::append_jk2_ctf_images(images);
 }
 
 pub(crate) fn append_native_hud_images(images: &mut Vec<String>, style: u8, jk2_mode: bool) {
@@ -78,6 +83,9 @@ mod loading;
 pub(crate) mod update_notice;
 pub(crate) mod loading_layout;
 mod scoreboard;
+mod broadcast;
+mod broadcast_map;
+pub(crate) use broadcast_map::{BroadcastMinimap, MinimapHandle, MAX_RADAR_EDGES, MAX_RADAR_TRIANGLES};
 pub(crate) mod flex;
 mod glyphs;
 mod killfeed;
@@ -191,7 +199,7 @@ pub use settings::rendering::{
     VIDEO_ROW_GPU_DRIVEN, VIDEO_ROW_GPU_TIMINGS, VIDEO_ROW_HALATION, VIDEO_ROW_HDR, VIDEO_ROW_HIZ,
     VIDEO_ROW_LIGHTMAP_ONLY, VIDEO_ROW_LOCAL_LIGHT_SHADOWS, VIDEO_ROW_LUT_STRENGTH,
     VIDEO_ROW_MAP_LIGHT_SIMULATION, VIDEO_ROW_MAX_FRAME_LATENCY, VIDEO_ROW_MODEL_BRIGHTNESS,
-    VIDEO_ROW_MODERN_SABERS, VIDEO_ROW_SABER_CORE_MODE, VIDEO_ROW_MOTION_BLUR, VIDEO_ROW_PBR, VIDEO_ROW_PERF_TRACE,
+    VIDEO_ROW_MODERN_SABERS, VIDEO_ROW_SABER_CORE_MODE, VIDEO_ROW_MOTION_BLUR, VIDEO_ROW_PBR, VIDEO_ROW_PBR_CUBEMAPS, VIDEO_ROW_POM, VIDEO_ROW_PERF_TRACE,
     VIDEO_ROW_PICMIP, VIDEO_ROW_PLANAR_REFLECTIONS,
     VIDEO_ROW_PLANAR_REFLECTION_DEBUG, VIDEO_ROW_PVS, VIDEO_ROW_QUALITY_PRESET,
     VIDEO_ROW_RENDERER_VERBOSE, VIDEO_ROW_RENDER_BACKEND, VIDEO_ROW_GPU_ADAPTER, VIDEO_ROW_RESOLUTION,
@@ -376,6 +384,85 @@ pub struct UiScoreEntry {
     pub gauntlet: i32,
     /// Server-reported perfect award (rank 0 without a death).
     pub perfect: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastVitals {
+    pub health: Option<i32>,
+    /// `STAT_MAX_HEALTH`; the health fill is scaled against it.
+    pub max_health: Option<i32>,
+    pub armor: Option<i32>,
+    pub force: Option<i32>,
+    /// Age of the last observed playerState, NOT a prediction.
+    pub age_ms: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastPlayerUi {
+    pub client: i32,
+    pub team: i32,
+    pub name: String,
+    pub score: Option<i32>,
+    pub deaths: Option<i32>,
+    pub weapon: Option<i32>,
+    /// Ammo of `weapon`, from an observed playerState of that same weapon.
+    pub ammo: Option<i32>,
+    pub alive: Option<bool>,
+    pub vitals: Option<BroadcastVitals>,
+    /// `model/skin` and its missing-model stand-in, for the card avatar
+    /// (`AvatarAtlas`, as the scoreboard draws it).
+    pub model: String,
+    pub model_fallback: String,
+    /// Radar position (world units) and yaw (degrees); None while unknown.
+    pub position: Option<[i32; 3]>,
+    pub yaw: i16,
+    /// The position is a last-known one, no longer presented.
+    pub position_stale: bool,
+    /// Team whose flag this player carries (CTF/CTY).
+    pub carrying_flag: Option<i32>,
+    /// Animated bar fills as per-mille (shown fill, damage-trail end); the
+    /// numbers stay exact. None hides the bar.
+    pub health_bar: Option<(u16, u16)>,
+    pub force_bar: Option<(u16, u16)>,
+}
+
+/// The player the camera is presenting (CS2 bottom-centre observer card).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastObservedUi {
+    pub client: i32,
+    /// Ammo of the current weapon; None for the saber or unknown.
+    pub ammo: Option<i32>,
+    /// `fd.saberDrawAnimLevel` while the saber is out.
+    pub saber_style: Option<i32>,
+    /// True when the observed card replaces the native health/shield/ammo/Force.
+    pub replaces_native: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpectatorBroadcastUi {
+    pub team_scores: [i32; 2],
+    pub game_type: i32,
+    /// Match clock: remaining time under a timelimit, elapsed otherwise.
+    pub clock: Option<String>,
+    /// Capture/frag limit shown under the clock ("FIRST TO N").
+    pub score_limit: Option<i32>,
+    pub players: Vec<BroadcastPlayerUi>,
+    pub observed: Option<BroadcastObservedUi>,
+    pub scanning: bool,
+    /// cg_specHudMap: 0 off, 1 whole-map radar, 2 radar following the view.
+    pub map_mode: u8,
+    /// Floor plan of the current map, once built.
+    pub minimap: Option<MinimapHandle>,
+    /// Free camera (no observed player): world position and yaw.
+    pub camera: Option<([i32; 3], i16)>,
+}
+
+impl SpectatorBroadcastUi {
+    /// The native health/shield/ammo/Force meters step aside: the observed
+    /// player's values are on its card.
+    pub fn replaces_native_vitals(&self) -> bool {
+        self.observed.as_ref().is_some_and(|observed| observed.replaces_native)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -893,6 +980,26 @@ pub struct TeamOverlayUi {
     pub entries: Vec<TeamOverlayEntry>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Jk2FlagUi {
+    /// Flag team 1 red / 2 blue / 0 yellow. Server says taken or dropped.
+    pub team: i32,
+    pub status: i32,
+    /// Only available if the carrier can be resolved from an observed powerup.
+    pub carrier: Option<String>,
+    pub carrier_team: Option<i32>,
+    /// Only use team info for friendly carriers; never invent enemy vitals.
+    pub health_armor: Option<(i32, i32)>,
+    pub held_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Jk2InventoryUi {
+    /// Source-native JK2 holdable_t, not JKA's presentation tag numbers.
+    pub owned_bits: u32,
+    pub trip_mines: i32,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HudState {
     pub health: i32,
@@ -929,6 +1036,8 @@ pub struct HudState {
     pub time_ms: i32,
     /// Force icons are suppressed for zoomed and spectator POVs (TaystJK).
     pub force_icons_hidden: bool,
+    /// JK2 native health tick turns blue if HI_MEDPAC is held.
+    pub jk2_has_bacta: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1411,8 +1520,33 @@ impl Default for ThreadPerfStats {
     }
 }
 
+/// Real loading dependency groups, independent of worker/thread identity.
+/// Parallel jobs can progress within a group; completed prerequisites allow
+/// later groups to run without forcing an artificial execution barrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapLoadingPhase {
+    Assets,
+    Build,
+    Gpu,
+    Ready,
+}
+
+impl MapLoadingPhase {
+    pub const ALL: [Self; 4] = [Self::Assets, Self::Build, Self::Gpu, Self::Ready];
+
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::Assets => "ASSETS",
+            Self::Build => "BUILD",
+            Self::Gpu => "GPU",
+            Self::Ready => "READY",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MapLoadingBar {
+    pub phase: MapLoadingPhase,
     pub label: &'static str,
     pub completed: u32,
     pub total: u32,
@@ -1566,6 +1700,9 @@ pub struct UiSiegeHud {
 pub struct UiSnapshot {
     /// Active multiplayer protocol controls which game the Native HUD recreates.
     pub jk2_mode: bool,
+    /// TaystJK CG_Draw2D fallingToDeath black fade (transient, 0..1).
+    pub falling_death_fade: f32,
+    pub falling_death_active: bool,
     pub studio_race: Option<studio_race::StudioRaceUi>,
     /// The live frontend Main page: render it at its original color and contrast.
     pub frontend_main_scene: bool,
@@ -1640,7 +1777,10 @@ pub struct UiSnapshot {
     pub asset_mapping: Option<asset_mapping::AssetMappingUi>,
     pub prediction_debug: Option<PredictionDebugUi>,
     pub hud: Option<HudState>,
+    pub jk2_flags: Vec<Jk2FlagUi>,
+    pub jk2_inventory: Option<Jk2InventoryUi>,
     pub team_overlay: Option<TeamOverlayUi>,
+    pub spectator_broadcast: Option<SpectatorBroadcastUi>,
     pub hud_layout: HudLayout,
     /// Studio layouts are stored as 1280x720-relative offsets. The render
     /// source applies them at its actual offscreen dimensions (preview/export).
@@ -1719,6 +1859,8 @@ impl Default for UiSnapshot {
     fn default() -> Self {
         Self {
             jk2_mode: false,
+            falling_death_fade: 0.0,
+            falling_death_active: false,
             frontend_main_scene: false,
             video_restart_loading: false,
             setup_selected: 1,
@@ -1773,7 +1915,10 @@ impl Default for UiSnapshot {
             asset_mapping: None,
             prediction_debug: None,
             hud: None,
+            jk2_flags: Vec::new(),
+            jk2_inventory: None,
             team_overlay: None,
+            spectator_broadcast: None,
             hud_layout: HudLayout::default(),
             studio_hud_virtual_layout: false,
             studio_race: None,

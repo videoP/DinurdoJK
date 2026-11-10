@@ -50,10 +50,9 @@ impl App {
             })
     }
 
-    /// 2D input still owns the native pointer: keep it visible and confined to
-    /// our client area while this window has focus. On Alt+Tab, minimize, or
-    /// renderer restart, release the OS clip immediately. Studio free-look has
-    /// its own relative-mouse grab and must not be overwritten here.
+    /// The visible UI pointer is optionally confined to our focused client
+    /// area. Turning confinement off (or Alt+Tab, minimize, renderer restart)
+    /// releases the OS clip. Gameplay and Studio relative grabs are independent.
     pub(in crate::app) fn sync_visible_cursor_grab(&mut self) {
         if self.captured || self.render_studio.navigation.looking {
             return;
@@ -62,7 +61,8 @@ impl App {
             return;
         };
         let size = window.inner_size();
-        let should_confine = self.window_focused
+        let should_confine = self.in_confine_cursor
+            && self.window_focused
             && !self.renderer_restart_suspended
             && !super::lifecycle::headless()
             && size.width > 0

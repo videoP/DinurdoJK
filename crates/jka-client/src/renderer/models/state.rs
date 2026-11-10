@@ -450,6 +450,7 @@ impl DynamicModelRenderer {
             fx_sprite_dst_color_add_pipeline: None,
             fx_sprite_modulate2x_pipeline: None,
             fx_sprite_darken_pipeline: None,
+            fx_sprite_screen_pipeline: None,
             fx_sprite_glow_pipelines: Default::default(),
             fx_zero_alpha_discard: false,
             skin_layout,

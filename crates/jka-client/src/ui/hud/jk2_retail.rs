@@ -64,12 +64,19 @@ const JK2_ITEM_NAMES: [&str; 7] = [
     "Binoculars", "Sentry Gun",
 ];
 
+// Bucky MVSDK cg_draw.c: the enhanced flag status uses these exact media.
+const JK2_FLAG_ICONS: [&str; 3] = [
+    "gfx/hud/mpi_rflag", "gfx/hud/mpi_bflag", "icons/iconf_neutral1",
+];
+const JK2_FLAG_TAKEN: [&str; 3] = [
+    "gfx/hud/mpi_rflag_x", "gfx/hud/mpi_bflag_x", "icons/iconf_neutral1_x",
+];
 const WHITE: [f32; 4] = [1.0; 4];
 const GREEN: [f32; 4] = [0.0, 0.613, 0.097, 1.0];
 const RED: [f32; 4] = [0.835, 0.015, 0.015, 1.0];
 const ORANGE: [f32; 4] = [1.0, 0.658, 0.062, 1.0];
 const LEFT_INNER: &str = "gfx/hud/hudleft_innerframe";
-const LEFT_FRAME: &str = "gfx/hud/static_test";
+const LEFT_FRAME: &str = "gfx/hud/hudleft";
 const RIGHT_INNER: &str = "gfx/hud/hudright_innerframe";
 const RIGHT_FRAME: &str = "gfx/hud/hudrightframe";
 const ARMOR_OUTER: &str = "gfx/hud/armor1";
@@ -144,6 +151,17 @@ const AMMO_TICS: [Piece; 14] = [
 
 /// Appends only the assets for the active game; extension image slots retain their order.
 /// As with the JKA native HUD, loading/decoding stays on the existing image worker.
+pub(crate) fn append_jk2_ctf_images(images: &mut Vec<String>) {
+    for name in JK2_FLAG_ICONS.into_iter().chain(JK2_FLAG_TAKEN)
+        .chain(JK2_ITEM_ICONS.into_iter().filter(|name| !name.is_empty()))
+        .chain([JK2_WEAPON_ICONS[12]])
+    {
+        if !images.iter().any(|present| present == name) {
+            images.push(name.to_owned());
+        }
+    }
+}
+
 pub(crate) fn append_jk2_hud_images(images: &mut Vec<String>, style: u8) {
     if style != 1 { return; }
     let names = [
@@ -283,7 +301,7 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: 
         let health_fraction = hud.health.min(hud.max_health) as f32 / hud.max_health.max(1) as f32;
         painter.frame(HEALTH, dim(RED, health_fraction));
         if health_fraction > 0.2 || flashing {
-            painter.frame(HEALTH_TIC, RED);
+            painter.frame(HEALTH_TIC, if hud.jk2_has_bacta { [0.1, 0.3, 1.0, 1.0] } else { RED });
         }
         painter.number(hud.armor, 32.0, 54.0, GREEN);
         painter.number(hud.health, 16.0, 40.0, RED);
@@ -319,11 +337,91 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: 
 }
 
 
+/// Bucky MVSDK `cg_enhancedFlagStatus`: carried flags show the carrier,
+/// dropped flags show *only* the flag icon. This overlay is native JK2 and
+/// independent of the selectable DinurdoJK vs retail status-panel style.
+pub(in crate::ui) fn build_enhanced_flag_status(
+    out: &mut Vec<UiVertex>, ui: &UiSnapshot,
+    font: Option<&crate::ui::ProportionalFont>, w: u32, h: u32,
+) {
+    if ui.video.jk2_enhanced_flag_status == 0 || ui.jk2_flags.is_empty() { return; }
+    let scale = h as f32 / 480.0;
+    for (row, flag) in ui.jk2_flags.iter().enumerate() {
+        let index = match flag.team { 1 => 0, 2 => 1, 0 => 2, _ => continue };
+        let y = 66.0 + 38.0 * row as f32;
+        let icon = if flag.status == 1 { JK2_FLAG_TAKEN[index] }
+            else { JK2_FLAG_ICONS[index] };
+        {
+            let mut painter = Painter {
+                out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags,
+                uvs: &ui.extension_image_uvs, screen: [w, h], origin: [0.0, 0.0], unit: scale,
+            };
+            painter.image(icon, 3.0, y, 32.0, 32.0, WHITE);
+        }
+        // The mod's team colors are red, blue and yellow (TEAM_FREE).
+        let color = match flag.team {
+            1 => [1.0, 0.25, 0.25, 1.0],
+            2 => [0.4, 0.6, 1.0, 1.0],
+            _ => [1.0, 0.85, 0.2, 1.0],
+        };
+        // Dropped means *no name*, even if a stale entity still carries
+        // the powerup bit for a single interpolation frame.
+        if flag.status != 1 { continue; }
+        let Some(carrier) = flag.carrier.as_ref() else { continue; };
+        // Avoid an arbitrarily long/colored client name taking over the HUD.
+        let name: String = carrier.chars().take(26).collect();
+        let mut line = name;
+        if let Some((hp, armor)) = flag.health_armor {
+            line.push_str(&format!("  {} / {}", hp.max(0), armor.max(0)));
+        }
+        if ui.video.jk2_enhanced_flag_status >= 2 && flag.held_ms > 0 {
+            let secs = flag.held_ms / 1000;
+            line.push_str(&format!("  {}:{:02}", secs / 60, secs % 60));
+        }
+        let x = 39.0 * scale;
+        let y = (y + 10.0) * scale;
+        if let Some(font) = font {
+            crate::ui::proportional_text_uniform(out, &line, font, x, y, 0.65,
+                color, true, w, h);
+        } else {
+            crate::ui::fixed_charset_text(out, &line, x, y,
+                7.0 * scale, 12.0 * scale, 7.0 * scale, color, true, w, h);
+        }
+    }
+}
+
+/// MVSDK `cg_drawInventory` is the persistent item stack, not the temporary
+/// inventory selection carousel. Does not require the retail JK2 HUD style.
+pub(in crate::ui) fn build_persistent_inventory(
+    out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32,
+) {
+    if !ui.video.jk2_draw_inventory { return; }
+    let Some(inventory) = ui.jk2_inventory else { return; };
+    let scale = h as f32 / 480.0;
+    let mut painter = Painter {
+        out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags,
+        uvs: &ui.extension_image_uvs, screen: [w, h],
+        origin: [w as f32 - 42.0 * scale, 0.0], unit: scale,
+    };
+    let mut y = 80.0;
+    for (tag, icon) in JK2_ITEM_ICONS.iter().enumerate().skip(1) {
+        if icon.is_empty() || inventory.owned_bits & (1_u32 << tag) == 0 {
+            continue;
+        }
+        painter.image(icon, 0.0, y, 32.0, 32.0, WHITE);
+        y += 35.0;
+    }
+    if inventory.trip_mines > 0 {
+        painter.image(JK2_WEAPON_ICONS[12], 0.0, y, 32.0, 32.0, WHITE);
+    }
+}
+
 /// Draw the original JK2 460x60 selection art with fixed-size endcaps.
 /// Only a narrow centre texel is extended across extra widescreen space;
 /// circular frames, icons, and animated prongs remain aspect-correct.
 fn select_background(
     painter: &mut Painter<'_>, name: &str, y: f32, height: f32, screen_width: f32,
+    tint: [f32; 4],
 ) {
     let unit = painter.unit;
     let left = 90.0 * unit;
@@ -333,62 +431,81 @@ fn select_background(
     let height = height * unit;
     if right <= left + half {
         // 4:3 and narrower: the authored image already fits at uniform scale.
-        painter.image_pixels(name, left, y, 460.0 * unit, height, [0.0, 1.0], WHITE);
+        painter.image_pixels(name, left, y, 460.0 * unit, height, [0.0, 1.0], tint);
     } else {
-        painter.image_pixels(name, left, y, half, height, [0.0, 0.5], WHITE);
+        painter.image_pixels(name, left, y, half, height, [0.0, 0.5], tint);
         painter.image_pixels(name, left + half, y, right - left - half, height,
-            [0.499, 0.501], WHITE);
-        painter.image_pixels(name, right, y, half, height, [0.5, 1.0], WHITE);
+            [0.499, 0.501], tint);
+        painter.image_pixels(name, right, y, half, height, [0.5, 1.0], tint);
     }
 }
 
-/// Replays JK2 single-player's expanding `CG_DrawIconBackground` artwork.
-/// Original 130 ms timing is unchanged; only widescreen placement differs.
-pub(in crate::ui) fn build_select_chrome(
-    out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32,
-) {
-    if ui.native_replaced(crate::extensions::NativeHud::Jk2Prongs) { return; }
-    if !ui.jk2_mode || ui.video.hud_style != 1 || !ui.video.draw_hud || w == 0 || h == 0 {
-        return;
+/// The authored selector advances in integer-pixel steps. Keep this key shared
+/// by the painter and the transient-update dirty check: animation only rebuilds
+/// the *stable* gameplay HUD when its visible chrome actually changes.
+/// Kind: 0 = idle, 1 = weapon, 2 = Force, 3 = inventory.
+pub(crate) fn chrome_key(ui: &UiSnapshot) -> Option<(u8, i32, i32, bool)> {
+    if ui.native_replaced(crate::extensions::NativeHud::Jk2Prongs)
+        || !ui.jk2_mode || ui.video.hud_style != 1 || !ui.video.draw_hud
+        || ui.hud.is_some_and(|hud| hud.spectating)
+    {
+        return None;
     }
-    // The status clusters are hidden for spectators; the idle prongs must be too.
-    if ui.hud.is_some_and(|hud| hud.spectating) { return; }
-    let selections = [
-        ui.weapon_select.map(|value| (value.remaining_ms, SELECT_BG_WEAPON, SELECT_PRONG_WEAPON)),
-        ui.force_select.map(|value| (value.remaining_ms, SELECT_BG_FORCE, SELECT_PRONG_FORCE)),
-        ui.inventory_select.map(|value| (value.remaining_ms, SELECT_BG_ITEM, SELECT_PRONG_ITEM)),
-    ];
-    // App clears older selection state whenever a new selector is activated.
-    let selected = selections.into_iter().flatten().find(|(ms, _, _)| *ms > 0);
-    let unit = super::layout::hud_art_scale(w, h);
-    let mut painter = Painter {
-        out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags, uvs: &ui.extension_image_uvs,
-        screen: [w, h], origin: [0.0, 0.0], unit,
-    };
-    // Prongs are tied to the left and right viewport edges, respectively.
-    // Neither X size nor Y size depends on screen aspect ratio.
-    let prongs = |painter: &mut Painter<'_>, name: &str, x_add: f32| {
-        painter.image_pixels(name, (67.0 + x_add) * unit, 400.0 * unit,
-            40.0 * unit, 80.0 * unit, [0.0, 1.0], WHITE);
-        painter.image_pixels(name, w as f32 - (66.0 + x_add) * unit, 400.0 * unit,
-            -40.0 * unit, 80.0 * unit, [0.0, 1.0], WHITE);
-    };
-    let Some((remaining, background, prong)) = selected else {
-        prongs(&mut painter, SELECT_PRONG_OFF, 0.0);
-        return;
-    };
+    let selection = [
+        ui.weapon_select.map(|value| (1, value.remaining_ms)),
+        ui.force_select.map(|value| (2, value.remaining_ms)),
+        ui.inventory_select.map(|value| (3, value.remaining_ms)),
+    ].into_iter().flatten().find(|(_, remaining)| *remaining > 0);
+    let Some((kind, remaining)) = selection else { return Some((0, 0, 0, false)); };
     let percent = if remaining > 1400 {
         ((1530 - remaining.min(1530)) as f32 / 130.0).clamp(0.0, 1.0)
     } else if remaining <= 130 {
         (remaining as f32 / 130.0).clamp(0.0, 1.0)
     } else { 1.0 };
-    let x_add = (8.0 * percent) as i32 as f32;
-    let span = (60.0 * percent) as i32 as f32;
-    if span > 0.0 {
-        select_background(&mut painter, background, 440.0, -span, w as f32);
-        select_background(&mut painter, background, 438.0, span, w as f32);
+    Some((kind, (8.0 * percent) as i32, (60.0 * percent) as i32, remaining <= 130))
+}
+
+/// Replays JK2 single-player's expanding `CG_DrawIconBackground` artwork.
+/// This is part of the stable HUD batch, *before* the left and right clusters,
+/// so the prongs are correctly behind their frames instead of drawn over them
+/// by the later, transient selector-icon batch. The quantized animation key
+/// triggers only the necessary stable rebuilds while selection is moving.
+pub(in crate::ui) fn build_select_chrome(
+    out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: u32,
+) {
+    if w == 0 || h == 0 { return; }
+    let Some((kind, x_add, span, closing)) = chrome_key(ui) else { return; };
+    // Only the idle prongs follow cg_tintHud/team. During selection, use
+    // the authored colors of the on-prongs and holographic background; their
+    // colored textures must not be multiplied by the team's status-HUD tint.
+    let idle_tint = ui.hud.as_ref().map_or(WHITE, |hud|
+        super::draw::native_hud_tint(hud, ui.video.tint_hud));
+    let tint = if kind == 0 { idle_tint } else { WHITE };
+    let unit = super::layout::hud_art_scale(w, h);
+    let mut painter = Painter {
+        out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags,
+        uvs: &ui.extension_image_uvs, screen: [w, h], origin: [0.0, 0.0], unit,
+    };
+    let prongs = |painter: &mut Painter<'_>, name: &str, x_add: f32| {
+        painter.image_pixels(name, (67.0 + x_add) * unit, 400.0 * unit,
+            40.0 * unit, 80.0 * unit, [0.0, 1.0], tint);
+        painter.image_pixels(name, w as f32 - (66.0 + x_add) * unit, 400.0 * unit,
+            -40.0 * unit, 80.0 * unit, [0.0, 1.0], tint);
+    };
+    if kind == 0 {
+        prongs(&mut painter, SELECT_PRONG_OFF, 0.0);
+        return;
     }
-    prongs(&mut painter, if remaining <= 130 { SELECT_PRONG_OFF } else { prong }, x_add);
+    let (background, prong) = match kind {
+        1 => (SELECT_BG_WEAPON, SELECT_PRONG_WEAPON),
+        2 => (SELECT_BG_FORCE, SELECT_PRONG_FORCE),
+        _ => (SELECT_BG_ITEM, SELECT_PRONG_ITEM),
+    };
+    if span > 0 {
+        select_background(&mut painter, background, 440.0, -(span as f32), w as f32, tint);
+        select_background(&mut painter, background, 438.0, span as f32, w as f32, tint);
+    }
+    prongs(&mut painter, if closing { SELECT_PRONG_OFF } else { prong }, x_add as f32);
 }
 
 fn select_label(
@@ -521,6 +638,124 @@ mod tests {
         ui.force_select.as_mut().unwrap().remaining_ms = 65;
         build_select_chrome(&mut out, &ui, 1280, 720);
         assert_eq!(out.len(), 48); // six background slices + two off prongs
+    }
+
+    #[test]
+    fn jk2_selector_chrome_uses_authored_colors_when_active() {
+        let mut ui = UiSnapshot::default();
+        ui.jk2_mode = true;
+        ui.video.hud_style = 1;
+        ui.video.draw_hud = true;
+        ui.video.tint_hud = true;
+        append_jk2_hud_images(&mut ui.extension_images, 1);
+        ui.hud = Some(crate::ui::HudState {
+            gametype: crate::cgame::GT_TEAM,
+            team: crate::cgame::TEAM_RED,
+            ..Default::default()
+        });
+        let mut vertices = Vec::new();
+        // Both idle/off prongs are team tinted.
+        build_select_chrome(&mut vertices, &ui, 1280, 720);
+        assert_eq!(vertices.len(), 12);
+        assert!(vertices.iter().all(|v| v.color == [255, 128, 128, 255]));
+
+        // Opening prongs AND the stretched holographic backing must keep
+        // their original colors, even in red/blue team games.
+        ui.weapon_select = Some(crate::ui::UiWeaponSelect {
+            selected: 2, owned_bits: 1 << 2, selectable_bits: 1 << 2,
+            ammo_available_bits: 1 << 2, saber_style: 0, remaining_ms: 1465,
+        });
+        vertices.clear();
+        build_select_chrome(&mut vertices, &ui, 1280, 720);
+        assert_eq!(vertices.len(), 48);
+        assert!(vertices.iter().all(|v| v.color == [255; 4]));
+
+        ui.hud.as_mut().unwrap().team = crate::cgame::TEAM_BLUE;
+        vertices.clear();
+        build_select_chrome(&mut vertices, &ui, 1280, 720);
+        assert!(vertices.iter().all(|v| v.color == [255; 4]));
+
+        // Closing still has a visible background and uses the off-prong
+        // image, but stays untinted until the selection is fully idle.
+        ui.weapon_select.as_mut().unwrap().remaining_ms = 65;
+        vertices.clear();
+        build_select_chrome(&mut vertices, &ui, 1280, 720);
+        assert_eq!(vertices.len(), 48);
+        assert!(vertices.iter().all(|v| v.color == [255; 4]));
+
+        // Once idle, team-tinted off prongs return; cg_tintHud off and
+        // non-team gametypes keep the original white modulation.
+        ui.weapon_select = None;
+        vertices.clear();
+        build_select_chrome(&mut vertices, &ui, 1280, 720);
+        assert!(vertices.iter().all(|v| v.color == [128, 128, 255, 255]));
+        ui.video.tint_hud = false;
+        vertices.clear();
+        build_select_chrome(&mut vertices, &ui, 1280, 720);
+        assert!(vertices.iter().all(|v| v.color == [255; 4]));
+        ui.video.tint_hud = true;
+        ui.hud.as_mut().unwrap().gametype = crate::cgame::GT_FFA;
+        vertices.clear();
+        build_select_chrome(&mut vertices, &ui, 1280, 720);
+        assert!(vertices.iter().all(|v| v.color == [255; 4]));
+    }
+
+    #[test]
+    fn jk2_left_frame_uses_the_existing_hudleft_artwork() {
+        // gfx/hud/hudleft.tga is loaded by the implicit-image qpath below.
+        // Do not register the unrelated static_test instead.
+        assert_eq!(LEFT_FRAME, "gfx/hud/hudleft");
+        let mut images = Vec::new();
+        append_jk2_hud_images(&mut images, 1);
+        assert!(images.iter().any(|name| name == "gfx/hud/hudleft"));
+        assert!(!images.iter().any(|name| name == "gfx/hud/static_test"));
+    }
+
+    #[test]
+    fn jk2_chrome_key_tracks_visible_animation_steps_only() {
+        let mut ui = UiSnapshot::default();
+        ui.jk2_mode = true;
+        ui.video.hud_style = 1;
+        ui.video.draw_hud = true;
+        assert_eq!(chrome_key(&ui), Some((0, 0, 0, false)));
+        ui.force_select = Some(crate::ui::UiForceSelect {
+            selected: 3, known_bits: 1 << 3, remaining_ms: 1530,
+        });
+        assert_eq!(chrome_key(&ui), Some((2, 0, 0, false)));
+        ui.force_select.as_mut().unwrap().remaining_ms = 1529;
+        assert_eq!(chrome_key(&ui), Some((2, 0, 0, false)));
+        ui.force_select.as_mut().unwrap().remaining_ms = 1400;
+        assert_eq!(chrome_key(&ui), Some((2, 8, 60, false)));
+        ui.force_select.as_mut().unwrap().remaining_ms = 130;
+        assert_eq!(chrome_key(&ui), Some((2, 8, 60, true)));
+        ui.force_select.as_mut().unwrap().remaining_ms = 0;
+        assert_eq!(chrome_key(&ui), Some((0, 0, 0, false)));
+    }
+
+    #[test]
+    fn jk2_status_frames_are_drawn_after_the_prongs_in_the_same_batch() {
+        let mut ui = UiSnapshot::default();
+        ui.jk2_mode = true;
+        ui.video.hud_style = 1;
+        ui.video.draw_hud = true;
+        ui.video.draw_2d = true;
+        ui.hud = Some(crate::ui::HudState {
+            health: 100, max_health: 100, armor: 50,
+            weapon: 2, saber_style: 2, force_power: Some(75),
+            ..Default::default()
+        });
+        append_jk2_hud_images(&mut ui.extension_images, 1);
+        let mut chrome = Vec::new();
+        let mut status = Vec::new();
+        let mut combined = Vec::new();
+        build_select_chrome(&mut chrome, &ui, 1280, 720);
+        build(&mut status, &ui, 1280, 720);
+        crate::ui::compose::build_dynamic_static_vertices(&mut combined, &ui, 1280, 720);
+        assert_eq!(chrome.len(), 12);
+        assert!(!status.is_empty());
+        assert_eq!(combined.len(), chrome.len() + status.len());
+        assert_eq!(combined[0].position, chrome[0].position);
+        assert_eq!(combined[chrome.len()].position, status[0].position);
     }
 
     #[test]

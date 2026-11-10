@@ -21,13 +21,6 @@ const DEPENDENCY_RELEASE_FILES: &[&str] = &[
     "msvcp140.dll", "msvcp140_atomic_wait.dll",
     "vcruntime140.dll", "vcruntime140_1.dll",
 ];
-// The packager installs attribution/license files at the EXE root,
-// not under DinurdoJK/dependencies. These must be accepted at that exact path.
-const ROOT_NOTICE_FILES: &[&str] = &[
-    "OpenAL-Soft-LGPL-2.0.txt", "EalMan-LGPL-2.1.txt",
-    "NVIDIA-DLSS-SDK-LICENSE.txt", "Bevy-Solari-MIT.txt",
-    "DXC-LICENSE.txt", "DXC-ThirdPartyNotices.txt",
-];
 
 const MANIFEST_NAME: &str = "release-manifest.json";
 const SIGNATURE_NAME: &str = "release-manifest.sig";
@@ -171,14 +164,15 @@ fn parse_signed_manifest_with_key(raw: &[u8], signature: &[u8], key: &VerifyingK
     if manifest.format != 2 || stable_version(&manifest.tag).is_none() {
         return Err("unsupported signed per-file release manifest format or tag".into());
     }
-    if !manifest.files.contains_key("DinurdoJK.exe") || manifest.files.len() > 18 {
+    if !manifest.files.contains_key("DinurdoJK.exe") || manifest.files.len() > DEPENDENCY_RELEASE_FILES.len() + 2 {
         return Err("signed file allowlist must contain DinurdoJK.exe".into());
     }
     let mut total = 0u64;
     for (name, info) in &manifest.files {
+        // The updater is intentionally runtime-only. License and attribution
+        // notices belong to the manual full ZIP, never signed install targets.
         let allowed_root = matches!(name.as_str(), "DinurdoJK.exe"
-            | "DinurdoJK/shared/dinurdo-assets.pk4")
-            || ROOT_NOTICE_FILES.contains(&name.as_str());
+            | "DinurdoJK/shared/dinurdo-assets.pk4");
         let allowed_dependency = name.strip_prefix("DinurdoJK/dependencies/")
             .is_some_and(|file| DEPENDENCY_RELEASE_FILES.contains(&file));
         if !allowed_root && !allowed_dependency {
@@ -1170,16 +1164,13 @@ mod security_tests {
     }
 
     #[test]
-    fn signed_eal_runtime_and_license_are_accepted_without_widening_install_paths() {
+    fn signed_runtime_dependencies_are_accepted_without_widening_install_paths() {
         let signing = SigningKey::from_bytes(&[41; 32]);
         let (raw, _, key) = signed_fixture();
         let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         for name in DEPENDENCY_RELEASE_FILES {
             value["files"][format!("DinurdoJK/dependencies/{name}")] =
                 serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
-        }
-        for name in ROOT_NOTICE_FILES {
-            value["files"][*name] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
         }
         let raw = serde_json::to_vec(&value).unwrap();
         assert!(parse_signed_manifest_with_key(&raw, &signing.sign(&raw).to_bytes(), &key).is_ok());
@@ -1197,15 +1188,13 @@ mod security_tests {
         for name in ["dxcompiler.dll", "dxil.dll"] {
             value["files"][format!("DinurdoJK/dependencies/{name}")] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
         }
-        for name in ["DXC-LICENSE.txt", "DXC-ThirdPartyNotices.txt"] {
-            value["files"][name] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
-        }
         let valid = serde_json::to_vec(&value).unwrap();
         assert!(parse_signed_manifest_with_key(&valid, &signing.sign(&valid).to_bytes(), &key).is_ok());
         assert_eq!(stage_filename("DinurdoJK/dependencies/dxcompiler.dll"), "deps__dxcompiler.dll");
         assert_eq!(signed_name_from_stage("deps__dxcompiler.dll"), "DinurdoJK/dependencies/dxcompiler.dll");
         assert_eq!(release_asset_name("DinurdoJK/dependencies/dxcompiler.dll"), "dxcompiler.dll");
-        for bad in ["dxcompiler.dll", "bin/dxcompiler.dll", "DinurdoJK/dependencies/../phonon.dll"] {
+        for bad in ["dxcompiler.dll", "bin/dxcompiler.dll", "DinurdoJK/dependencies/../phonon.dll",
+                    "DXC-LICENSE.txt", "DXC-ThirdPartyNotices.txt"] {
             let mut rejected = value.clone();
             rejected["files"][bad] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
             let invalid = serde_json::to_vec(&rejected).unwrap();
@@ -1222,18 +1211,18 @@ mod security_tests {
             manifest["files"][format!("DinurdoJK/dependencies/{name}")] =
                 serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
         }
-        for name in ROOT_NOTICE_FILES {
-            manifest["files"][*name] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
-        }
         manifest["files"]["DinurdoJK/shared/dinurdo-assets.pk4"] =
             serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
         let encoded = serde_json::to_vec(&manifest).unwrap();
         assert!(parse_signed_manifest_with_key(&encoded, &signing.sign(&encoded).to_bytes(), &key).is_ok());
-        for bad in ["DXC-LICENSE.txt/evil", "DinurdoJK/dependencies/DXC-LICENSE.txt",
+        for bad in ["DXC-LICENSE.txt", "OpenAL-Soft-LGPL-2.0.txt", "NVIDIA-DLSS-SDK-LICENSE.txt",
+            "EalMan-LGPL-2.1.txt", "Bevy-Solari-MIT.txt", "DXC-ThirdPartyNotices.txt",
+            "FFmpeg-GPL-3.0.txt", "FFmpeg-SOURCE-NOTICE.txt", "licenses/DXC-LICENSE.txt",
+            "DXC-LICENSE.txt/evil", "DinurdoJK/dependencies/DXC-LICENSE.txt",
             "dxcompiler.dll", "vcruntime140.dll", "DinurdoJK/shared/../evil.pk4"] {
             let mut invalid = manifest.clone();
             // Keep the same file count so rejection checks the path, not the limit.
-            invalid["files"].as_object_mut().unwrap().remove("DXC-LICENSE.txt");
+            invalid["files"].as_object_mut().unwrap().remove("DinurdoJK/dependencies/phonon.dll");
             invalid["files"][bad] = serde_json::json!({"size": 3, "sha256": "b".repeat(64)});
             let data = serde_json::to_vec(&invalid).unwrap();
             assert!(parse_signed_manifest_with_key(&data, &signing.sign(&data).to_bytes(), &key).is_err());

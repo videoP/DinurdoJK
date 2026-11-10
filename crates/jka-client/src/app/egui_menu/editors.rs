@@ -1173,6 +1173,9 @@ impl App {
                 let mut images = self.extensions.hud_images.clone();
                 crate::ui::append_native_hud_images(&mut images, self.video.hud_style,
                     self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2());
+                if self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2() {
+                    ui::append_jk2_ctf_images(&mut images);
+                }
                 ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
                 images
             }, self.extensions.hud_shaders.clone(),

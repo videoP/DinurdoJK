@@ -173,6 +173,29 @@ pub type OceanWind = AtmosphericWind;
 pub const CS_OCEANS: u16 = 1660;
 pub const CS_WEATHER: u16 = CS_OCEANS + 8;
 
+/// `sailingdebug` is on (the renderer then publishes `SAILING_DEBUG_DRAWN`).
+pub static SAILING_DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Camera position (JKA) and the rendered water height there (probe), or None
+/// when the camera is not over a Hybrid-classified pool.
+pub static SAILING_DEBUG_DRAWN: std::sync::Mutex<Option<([f32; 3], Option<f32>)>> = std::sync::Mutex::new(None);
+/// Blue Water's per-tile significant heights (m: big, medium, small) and the
+/// Hybrid FFT blend they are drawn at, from the shared ocean.
+pub static SAILING_DEBUG_TILES: std::sync::Mutex<Option<([f32; 3], f32)>> = std::sync::Mutex::new(None);
+
+/// `SAILING_OCEAN_SPEED_AUTO`: authored speed that derives from the wavelength.
+pub const OCEAN_SPEED_AUTO: f32 = -1.0;
+/// `SAILING_WAVE_GRAVITY`: 9.81 m/s² at 40 map units per metre.
+pub const OCEAN_WAVE_GRAVITY: f32 = 392.4;
+
+/// `BG_SailingResolveOceanSpeed`: the phase speed an authored speed means.
+pub fn resolve_ocean_speed(speed_authored: f32, wavelength: f32) -> f32 {
+    if speed_authored == OCEAN_SPEED_AUTO {
+        (OCEAN_WAVE_GRAVITY * wavelength.clamp(64.0, 32768.0) / std::f32::consts::TAU).sqrt()
+    } else {
+        speed_authored.clamp(-4096.0, 4096.0)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AuthoredOcean {
     pub index: usize,
@@ -180,11 +203,16 @@ pub struct AuthoredOcean {
     pub maxs: [f32; 3],
     pub height: f32,
     pub current_scale: f32,
+    /// `waves.speed` is resolved; this is what was authored (-1 = auto).
+    pub speed_authored: f32,
     pub waves: OceanAuthoring,
+    /// Always 0: jaPRO's map wind is `misc_dynamic_weather` 0 (`CS_WEATHER`).
     pub weather: usize,
     pub wind: AtmosphericWind,
+    /// `wind` is the map's (server `CS_WEATHER` or BSP `misc_dynamic_weather`),
+    /// not a placeholder for the local atmospheric wind.
+    pub server_wind: bool,
     pub rain: f32,
-    pub wave_model: u32,
     pub wave_count: u32,
     pub horizontal_scale: f32,
 }
@@ -209,62 +237,134 @@ impl AuthoredOcean {
             let origin = vector(e, "origin");
             let mins = std::array::from_fn(|i| model.mins[i] + origin[i]);
             let maxs = std::array::from_fn(|i| model.maxs[i] + origin[i]);
-            let weather_index = number(e,"weather",0.0).clamp(0.0,1.0) as usize;
+            // -1 follows the wavelength (`resolve_ocean_speed`).
+            let speed_authored = number(e, "speed", 180.0).clamp(-4096.0, 4096.0);
+            let wavelength = number(e, "wavelength", 1400.0).clamp(64.0, 32768.0);
             let mut ocean = Self {
                 index: result.len(), mins, maxs, height: number(e,"waterHeight",maxs[2]),
-                current_scale:number(e,"currentScale",0.25), weather:weather_index,
-                wind:AtmosphericWind::default(), rain:0.0, wave_model:number(e,"waveModel",1.0) as u32,
+                current_scale:number(e,"currentScale",0.25).clamp(-2.0,2.0), speed_authored, weather:0,
+                wind:AtmosphericWind::default(), server_wind:false, rain:number(e,"rainIntensity",0.0).clamp(0.0,1.0),
                 wave_count:number(e,"gerstnerWaveCount",8.0) as u32, horizontal_scale:number(e,"gerstnerHorizontalScale",1.0),
                 waves: OceanAuthoring {
-                    amplitude:number(e,"amplitude",128.0), wavelength:number(e,"wavelength",1400.0),
-                    speed:number(e,"speed",180.0), direction:number(e,"waveAngle",0.0),
+                    amplitude:number(e,"amplitude",128.0), wavelength,
+                    speed:resolve_ocean_speed(speed_authored, wavelength), direction:number(e,"waveAngle",0.0),
                     steepness:number(e,"steepness",0.65), slosh:number(e,"slosh",0.0),
                     seed:e.get(b"waveSeed").and_then(|s| std::str::from_utf8(s).ok()).and_then(|s| s.parse().ok()).unwrap_or(85619173),
                     wind_chop:number(e,"windChop",1.0),foam:number(e,"foamAmount",1.0),
                     foam_lifetime:number(e,"foamLifetime",2.0),spray:number(e,"sprayAmount",1.0),
                 }.sanitize(),
             };
-            if let Some(w) = weather.get(weather_index) {
+            if let Some(w) = weather.first() {
                 ocean.wind = AtmosphericWind {speed:number(w,"windSpeed",180.0), direction:number(w,"windAngle",0.0),
                     gust:number(w,"windGust",0.2),shift:number(w,"windShift",0.0)}.sanitize();
-                ocean.rain=number(w,"rainIntensity",0.0).clamp(0.0,1.0);
+                ocean.server_wind = true;
             }
             result.push(ocean);
         }
         result
     }
 
-    /// One development format; incomplete, non-finite and old strings are rejected.
+    /// jaPRO `BG_SailingBuildOceanWeatherString`: mins[3] maxs[3] baseHeight
+    /// amplitude wavelength speedAuthored steepness slosh waveDirection[2]
+    /// currentScale rainIntensity waveSeed gerstnerWaveCount
+    /// horizontalDisplacementScale. Any other count or a non-finite value is
+    /// rejected. Wind is not here: it is `CS_WEATHER` (`apply_weather`).
     pub fn parse(index: usize, bytes: &[u8]) -> Option<Self> {
         let text = std::str::from_utf8(bytes).ok()?;
         let words: Vec<_> = text.split_whitespace().collect();
-        if words.len() != 24 { return None; }
-        let v: Vec<f32> = words.iter().map(|v| v.parse::<f32>()).collect::<Result<_, _>>().ok()?;
-        if v.iter().any(|v| !v.is_finite()) { return None; }
-        let weather = words[19].parse::<usize>().ok()?;
-        if weather >= 2 || (0..3).any(|i| v[i] >= v[i+3]) { return None; }
+        if words.len() != 19 { return None; }
+        let float = |i: usize| words[i].parse::<f32>().ok().filter(|v| v.is_finite());
+        let v: Vec<f32> = (0..16).map(float).collect::<Option<_>>()?;
+        let horizontal_scale = float(18)?;
+        let (mins, maxs) = ([v[0], v[1], v[2]], [v[3], v[4], v[5]]);
+        if mins[0] >= maxs[0] || mins[1] >= maxs[1] || mins[2] > maxs[2] { return None; }
+        let wavelength = v[8].clamp(64.0, 32768.0);
+        let speed_authored = v[9].clamp(-4096.0, 4096.0);
+        let amplitude = v[7];
+        // The wire has no foam/spray/chop controls; derive them from the sea
+        // state as the linked UI controls do (identical to defaults at 128u).
+        let derived = derive_from_amplitude(amplitude);
+        let seed = words[16].parse::<u32>().ok()?;
         Some(Self {
-            index, mins: [v[0],v[1],v[2]], maxs: [v[3],v[4],v[5]], height: v[6],
-            current_scale: v[7].clamp(-2.0,2.0),
+            index, mins, maxs, height: v[6],
+            current_scale: v[14].clamp(-2.0, 2.0),
+            speed_authored,
             waves: OceanAuthoring {
-                amplitude: v[8], steepness: v[9], wavelength: v[10], slosh: v[11], speed: v[12],
-                direction: v[14].atan2(v[13]).to_degrees(), seed: words[15].parse().ok()?,
-                wind_chop: v[20], foam: v[21], foam_lifetime: v[22], spray: v[23],
+                amplitude, wavelength, speed: resolve_ocean_speed(speed_authored, wavelength),
+                direction: v[13].atan2(v[12]).to_degrees(), steepness: v[10], slosh: v[11],
+                seed: if seed == 0 { 85619173 } else { seed },
+                wind_chop: derived.wind_chop, foam: derived.foam, foam_lifetime: 2.0, spray: derived.spray,
             }.sanitize(),
-            wave_count: words[16].parse::<u32>().ok()?.clamp(2, 12),
-            horizontal_scale: v[17].clamp(0.0,1.0), wave_model: words[18].parse().ok()?,
-            weather, wind: AtmosphericWind::default(), rain: 0.0,
+            wave_count: words[17].parse::<i32>().ok()?.clamp(2, 12) as u32,
+            horizontal_scale: horizontal_scale.clamp(0.0, 1.0),
+            weather: 0, wind: AtmosphericWind::default(), server_wind: false, rain: v[15].clamp(0.0, 1.0),
         })
     }
 
+    /// Drive Hybrid (`r_oceanType 3`) from this map ocean without changing how
+    /// Hybrid draws waves: its analytic swell is the map's primary Gerstner wave,
+    /// `slosh` is the analytic/FFT blend (jaPRO: 0 one coherent swell, 1 the
+    /// full directional spectrum), and the Blue Water FFT carries the full-
+    /// spectrum height, peak wavelength, heading, chop and the map's wind.
+    ///
+    /// Every value comes from `sea` (jaPRO `BG_SailingSea`, the same code the
+    /// server and prediction float in); the FFT's two long tiles are replaced
+    /// by `sea.waves` (`RenderCommand::SetSailingSea`), so the drawn long and
+    /// medium waves are the physics waves.
+    pub fn apply_to_hybrid(&self, sea: &jka_movement::SailingSea, settings: &mut super::OceanSettings) {
+        settings.hybrid_swell = OceanAuthoring {
+            amplitude: sea.swell_amplitude,
+            wavelength: sea.swell_wavelength,
+            speed: sea.swell_speed,
+            steepness: sea.swell_steepness,
+            ..self.waves
+        };
+        settings.hybrid_swell_absolute = true;
+        settings.hybrid_fft_blend = sea.fft_blend;
+        settings.blue_water_waves = super::BlueWaterWaves {
+            height: sea.significant_height,
+            direction: sea.direction_degrees,
+            wavelength: sea.peak_wavelength,
+            choppiness: sea.choppiness,
+            wind_speed: sea.wind_speed,
+        };
+    }
+
+    /// jaPRO `BG_DynamicWeatherBuildString`: windDirection[2] windSpeed
+    /// windGust windShift cloudCoverage cloudType cloudDensity cloudSpeedScale
+    /// cloudBottom cloudTop. Only the wind is ocean state.
     pub fn apply_weather(&mut self, bytes: &[u8]) -> Option<()> {
-        let v: Vec<f32> = std::str::from_utf8(bytes).ok()?.split_whitespace()
-            .map(str::parse).collect::<Result<_,_>>().ok()?;
-        if v.len() != 12 || v.iter().any(|v| !v.is_finite()) { return None; }
-        self.wind = AtmosphericWind { direction: v[1].atan2(v[0]).to_degrees(), speed: v[2], gust: v[3], shift: v[4] }.sanitize();
-        self.rain = v[11].clamp(0.0,1.0);
+        self.wind = parse_weather_wind(bytes)?;
+        self.server_wind = true;
         Some(())
     }
+}
+
+/// jaPRO sailing markers for the prediction backend, in entity-lump order (the
+/// jaPRO cgame's `CG_ParseEntitiesFromString` order). Brush bounds are the
+/// inline model's, as the cgame's `R_ModelBounds` returns them.
+pub fn sailing_spawns(bsp: &jka_assets::bsp::Bsp) -> Vec<jka_movement::SailingSpawn> {
+    bsp.entities.iter().filter_map(|e| {
+        let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+        let spawn = jka_movement::SailingSpawn {
+            pairs: e.properties.iter().map(|(k, v)| (text(k), text(v))).collect(),
+            model_bounds: e.get(b"model").and_then(|s| std::str::from_utf8(s).ok())
+                .and_then(|s| s.strip_prefix('*')).and_then(|s| s.parse::<usize>().ok())
+                .and_then(|i| bsp.models.get(i)).map(|m| (m.mins, m.maxs)),
+        };
+        spawn.is_sailing_marker().then_some(spawn)
+    }).collect()
+}
+
+/// The wind of a jaPRO `CS_WEATHER` string (11 fields), or `None`.
+pub fn parse_weather_wind(bytes: &[u8]) -> Option<AtmosphericWind> {
+    let v: Vec<f32> = std::str::from_utf8(bytes).ok()?.split_whitespace()
+        .map(str::parse).collect::<Result<_, _>>().ok()?;
+    if v.len() != 11 || v.iter().any(|v| !v.is_finite()) { return None; }
+    Some(AtmosphericWind { direction: v[1].atan2(v[0]).to_degrees(), speed: v[2], gust: v[3], shift: v[4] }.sanitize())
+}
+
+impl AuthoredOcean {
 
     pub fn contains_render_point(&self, p: [f32;3]) -> bool {
         p[0] >= self.mins[0] && p[0] <= self.maxs[0]
@@ -286,14 +386,25 @@ mod tests {
     }
     #[test]
     fn ocean_wire_is_strict_and_wind_does_not_change_swell() {
-        let wire = b"-100 -200 -50 100 200 0 0 0.25 128 0.65 1400 1 180 1 0 4294967295 8 1 1 0 1 1 2 1";
+        // As jaPRO's BG_SailingBuildOceanWeatherString writes it (%.9g).
+        let wire = b"-100 -200 -50 100 200 0 0 128 1400 -1 0.649999976 1 0.939692616 0.342020154 0.25 0.349999994 4294967295 8 1";
         let mut ocean = AuthoredOcean::parse(0, wire).unwrap();
         assert_eq!(ocean.waves.seed, u32::MAX);
+        assert_eq!((ocean.mins, ocean.maxs, ocean.height), ([-100.0, -200.0, -50.0], [100.0, 200.0, 0.0], 0.0));
+        assert_eq!(ocean.speed_authored, OCEAN_SPEED_AUTO);
+        // Auto speed is the deep-water phase speed of 1400u at 40 u/m.
+        assert!((ocean.waves.speed - (392.4f32 * 1400.0 / std::f32::consts::TAU).sqrt()).abs() < 1e-3);
+        assert!((ocean.waves.direction - 20.0).abs() < 1e-4);
+        assert!((ocean.rain - 0.35).abs() < 1e-6);
         let waves = ocean.waves;
-        ocean.apply_weather(b"0 1 800 0.4 15 0.5 0.5 1 2 6000 14000 0.7").unwrap();
+        ocean.apply_weather(b"0 1 800 0.4 15 0.5 0.5 1 2 6000 14000").unwrap();
         assert_eq!(ocean.waves, waves);
         assert_eq!(ocean.wind.direction, 90.0);
-        assert!(AuthoredOcean::parse(0, b"1 0 180 0.2 0 0.25 128 0.65 1400 0 180 0 1 0").is_none());
-        assert!(ocean.apply_weather(b"1 0 NaN 0 0 0 0 0 0 0 0 0").is_none());
+        assert_eq!(ocean.wind.speed, 800.0);
+        assert!(AuthoredOcean::parse(0, &wire[..wire.len() - 2]).is_none());
+        assert!(ocean.apply_weather(b"1 0 NaN 0 0 0 0 0 0 0 0").is_none());
+        // A literal speed stays literal.
+        let fixed = AuthoredOcean::parse(0, b"0 0 0 1 1 0 0 96 1200 220 0.7 0.7 1 0 0.1 0 1 8 1").unwrap();
+        assert_eq!(fixed.waves.speed, 220.0);
     }
 }

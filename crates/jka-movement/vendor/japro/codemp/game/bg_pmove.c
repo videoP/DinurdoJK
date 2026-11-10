@@ -27,6 +27,9 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include "qcommon/q_shared.h"
 #include "bg_public.h"
 #include "bg_local.h"
+/* DinurdoJK: jaPRO sailing (local D:/Code/jaPRO `sailing` fork). Swimmer-side
+ * hunks only, verbatim; boats/paddles are not ported. See MOD_SUPPORT.md. */
+#include "bg_sailing.h"
 #include "ghoul2/G2.h"
 
 #ifdef _GAME
@@ -60,6 +63,19 @@ pml_t		pml;
 
 bgEntity_t *pm_entSelf = NULL;
 bgEntity_t *pm_entVeh = NULL;
+
+/* DinurdoJK: jaPRO sailing begin */
+/* Pmove queries water level twice and swimming once per predicted command.
+ * Keep the analytic ocean sample local to that command rather than repeating
+ * the spectral trigonometry at the same timestamp. */
+static qboolean pmSailingPlayerSampleValid = qfalse;
+static const sailingOcean_t *pmSailingPlayerSampleOcean = NULL;
+static float pmSailingPlayerSampleHeight = 0.0f;
+static vec3_t pmSailingPlayerSampleVelocity;
+static qboolean pmSailingRiverSampleValid = qfalse;
+static qboolean pmSailingRiverSampleAvailable = qfalse;
+static sailingRiverSample_t pmSailingRiverSample;
+/* DinurdoJK: jaPRO sailing end */
 
 qboolean gPMDoSlowFall = qfalse;
 
@@ -4687,6 +4703,223 @@ static void PM_WaterJumpMove( void ) {
 	}
 }
 
+/* DinurdoJK: jaPRO sailing begin */
+/* Who swims in the analytic media.  NPCs are ordinary swimmers and use the
+ * same float spring as players; only vehicles are excluded, because a boat
+ * hull already solves its own support against this wave surface and a swimmer
+ * spring layered on top would fight it. */
+static qboolean PM_SailingSwimmer( void ) {
+	if ( pm->ps->m_iVehicleNum ) {
+		/* Riding a vehicle, or a vehicle carrying a pilot. */
+		return qfalse;
+	}
+	if ( pm_entSelf && pm_entSelf->s.NPC_class == CLASS_VEHICLE ) {
+		/* Riderless vehicle: still hull physics, not a swimmer. */
+		return qfalse;
+	}
+	return qtrue;
+}
+
+/* Return the shared analytic ocean only for an unmounted swimmer whose authored
+ * volume still contains real BSP water.  That last check prevents a sailing
+ * marker from changing movement if it is accidentally used without water. */
+static const sailingOcean_t *PM_SailingPlayerOcean( float *surfaceHeight,
+	vec3_t waterVelocity ) {
+	const sailingOcean_t *ocean;
+	vec3_t contentsPoint;
+
+	if ( pmSailingPlayerSampleValid ) {
+		if ( surfaceHeight ) {
+			*surfaceHeight = pmSailingPlayerSampleHeight;
+		}
+		if ( waterVelocity ) {
+			VectorCopy( pmSailingPlayerSampleVelocity, waterVelocity );
+		}
+		return pmSailingPlayerSampleOcean;
+	}
+
+	pmSailingPlayerSampleValid = qtrue;
+	pmSailingPlayerSampleOcean = NULL;
+	pmSailingPlayerSampleHeight = 0.0f;
+	VectorClear( pmSailingPlayerSampleVelocity );
+
+	if ( !PM_SailingSwimmer() ) {
+		return NULL;
+	}
+
+	ocean = BG_SailingOceanForPoint( pm->ps->origin[0], pm->ps->origin[1] );
+	if ( !ocean ) {
+		return NULL;
+	}
+
+	VectorSet( contentsPoint, pm->ps->origin[0], pm->ps->origin[1],
+		ocean->baseHeight - 8.0f );
+	if ( !( pm->pointcontents( contentsPoint, pm->ps->clientNum ) & CONTENTS_WATER ) ) {
+		return NULL;
+	}
+
+	BG_SailingEvaluateWave( ocean, pm->ps->origin[0], pm->ps->origin[1],
+		pm->cmd.serverTime, &pmSailingPlayerSampleHeight, NULL,
+		pmSailingPlayerSampleVelocity );
+	pmSailingPlayerSampleOcean = ocean;
+	if ( surfaceHeight ) {
+		*surfaceHeight = pmSailingPlayerSampleHeight;
+	}
+	if ( waterVelocity ) {
+		VectorCopy( pmSailingPlayerSampleVelocity, waterVelocity );
+	}
+	return ocean;
+}
+
+/* Return the runtime shallow-water sample for the player's XY.  A true return
+ * also covers inactive cells inside the river domain, because those cells must
+ * suppress the vanilla fallback brush's water contents. */
+static qboolean PM_SailingPlayerRiver( sailingRiverSample_t *sample ) {
+	if ( !pmSailingRiverSampleValid ) {
+		pmSailingRiverSampleValid = qtrue;
+		pmSailingRiverSampleAvailable = qfalse;
+		memset( &pmSailingRiverSample, 0,
+			sizeof( pmSailingRiverSample ) );
+		if ( PM_SailingSwimmer() ) {
+			pmSailingRiverSampleAvailable = BG_SailingRuntimeRiverSample(
+				pm->ps->origin[0], pm->ps->origin[1],
+				&pmSailingRiverSample );
+		}
+	}
+	if ( sample ) {
+		*sample = pmSailingRiverSample;
+	}
+	return pmSailingRiverSampleAvailable;
+}
+
+static qboolean PM_SailingShallowRiverCurrent( vec3_t current ) {
+	sailingRiverSample_t sample;
+	float footHeight;
+	float immersion;
+	float immersionScale;
+
+	VectorClear( current );
+	if ( !PM_SailingPlayerRiver( &sample )
+		|| !( sample.flags & SAILING_RIVER_CELL_ACTIVE )
+		|| sample.depth <= 0.001f ) {
+		return qfalse;
+	}
+	footHeight = pm->ps->origin[2] + pm->mins[2];
+	immersion = sample.surfaceHeight - footHeight;
+	if ( immersion <= 0.0f ) {
+		return qfalse;
+	}
+	/* The stock swimming path begins at waterlevel 2. Below that threshold,
+	 * move relative to a depth-scaled current so ankle water has a small effect
+	 * and roughly knee-deep water reaches the full solved horizontal velocity. */
+	immersionScale = Com_Clamp( 0.0f, 1.0f, immersion / 24.0f );
+	current[0] = sample.velocity[0] * immersionScale;
+	current[1] = sample.velocity[1] * immersionScale;
+	return VectorLengthSquared2( current ) > 0.0001f;
+}
+
+/* Descent speed at which a swimmer counts as a full ballistic plunge rather
+ * than someone paddling downward.  Drag relief ramps in across this range. */
+#define SAILING_PLUNGE_SPEED 250.0f
+
+/* How much of the ocean's drag resists a fast descent. Water drag is authored
+ * for a swimmer presenting their full frontal area; a dive is a far cleaner
+ * profile, and letting entry momentum survive is what decides plunge depth. */
+/* Takes diveDrag rather than the ocean, so rivers get the same plunge
+ * behaviour without duplicating the curve. */
+static float PM_SailingDiveDragScale( qboolean active, float diveDrag,
+	float relativeVerticalSpeed ) {
+	float plungeFrac;
+
+	if ( !active || relativeVerticalSpeed >= 0.0f ) {
+		return 1.0f;
+	}
+
+	plungeFrac = Com_Clamp( 0.0f, 1.0f,
+		-relativeVerticalSpeed / SAILING_PLUNGE_SPEED );
+	return 1.0f + plungeFrac * ( diveDrag - 1.0f );
+}
+
+/* Float spring, shared by oceans and rivers. The medium supplies its own
+ * three constants; everything else about how a swimmer floats is identical,
+ * so this deliberately does not know which one it is serving. */
+static void PM_SailingPlayerBuoyancy( qboolean active, float buoyancy,
+	float buoyancyDamping, float buoyancyDepth,
+	float surfaceHeight, const vec3_t waterVelocity, float diveDragScale ) {
+	float targetHeight;
+	float heightError;
+	float relativeVerticalSpeed;
+	float floatScale;
+	float immersionDepth;
+
+	if ( !active || pml.frametime <= 0.0f ) {
+		return;
+	}
+
+	/* Rest neck-deep for stable immersion. Holding jump raises the target to
+	 * chest depth rather than adding unrestricted upward swim acceleration. */
+	immersionDepth = ( pm->cmd.upmove > 10 ) ? 12.0f : 22.0f;
+	targetHeight = surfaceHeight - immersionDepth;
+	heightError = targetHeight - pm->ps->origin[2];
+	relativeVerticalSpeed = pm->ps->velocity[2] - waterVelocity[2];
+	/* Archimedes: the displaced volume stops growing once the body is under, so
+	 * lift saturates instead of scaling with depth. Without this a deep plunge
+	 * is flung back to the surface harder the deeper it went. */
+	if ( heightError > buoyancyDepth ) {
+		heightError = buoyancyDepth;
+	}
+	/* Downward input progressively releases the float spring so the player can
+	 * still dive. Positive input keeps full damping while changing the target. */
+	floatScale = 1.0f - Com_Clamp( 0.0f, 1.0f,
+		-(float)pm->cmd.upmove / 80.0f );
+	pm->ps->velocity[2] += ( heightError * buoyancy
+		- relativeVerticalSpeed * buoyancyDamping * diveDragScale )
+		* pml.frametime * floatScale;
+	/* Asymmetric: a dive may carry its entry speed, but nothing the float
+	 * spring does should launch the player upward out of the water. */
+	pm->ps->velocity[2] = Com_Clamp( -900.0f, 450.0f, pm->ps->velocity[2] );
+
+}
+
+static void PM_ApplyWaterspoutWind( void )
+{
+	vec3_t localWind;
+	vec3_t relativeWind;
+	float influence;
+	float response;
+
+	if ( !pm || !pm->ps || pm->ps->clientNum < 0
+		|| pm->ps->clientNum >= MAX_CLIENTS
+		|| pm->ps->m_iVehicleNum
+		|| pm->ps->persistant[PERS_TEAM] == TEAM_SPECTATOR
+		|| pm->ps->pm_type == PM_NOCLIP
+		|| pm->ps->pm_type == PM_INTERMISSION
+		|| pm->ps->stats[STAT_HEALTH] <= 0 ) {
+		return;
+	}
+	influence = BG_SailingWaterspoutWindAt( pm->ps->origin,
+		pm->cmd.serverTime, localWind );
+	if ( influence <= 0.0f ) {
+		return;
+	}
+
+	VectorSubtract( localWind, pm->ps->velocity, relativeWind );
+	response = pm->ps->groundEntityNum == ENTITYNUM_NONE ? 1.15f : 0.32f;
+	VectorMA( pm->ps->velocity, response * pml.frametime,
+		relativeWind, pm->ps->velocity );
+	if ( localWind[2] > 180.0f ) {
+		pm->ps->velocity[2] +=
+			( localWind[2] - pm->ps->velocity[2] )
+			* Com_Clamp( 0.0f, 1.0f, 1.8f * pml.frametime );
+		if ( pm->ps->velocity[2] > 40.0f ) {
+			pm->ps->groundEntityNum = ENTITYNUM_NONE;
+			pml.walking = qfalse;
+			pml.groundPlane = qfalse;
+		}
+	}
+}
+/* DinurdoJK: jaPRO sailing end */
+
 /*
 ===================
 PM_WaterMove
@@ -4696,11 +4929,48 @@ PM_WaterMove
 static void PM_WaterMove( void ) {
 	int		i;
 	vec3_t	wishvel;
+	/* DinurdoJK: jaPRO sailing begin */
+	vec3_t	sailingWaterVelocity;
+	vec3_t	sailingCurrentVelocity;
+	/* DinurdoJK: jaPRO sailing end */
 	float	wishspeed;
 	vec3_t	wishdir;
 	float	scale;
 	float	vel;
+	/* DinurdoJK: jaPRO sailing begin */
+	float	sailingSurfaceHeight = 0.0f;
+	float	sailingDiveDragScale = 1.0f;
+	float	preFrictionVertical;
+	const sailingOcean_t *sailingOcean;
+	const sailingRiver_t *sailingRiverMedium = NULL;
+	sailingRiverSample_t sailingRiverSample;
+	qboolean sailingRiver;
+	qboolean sailingRiverFloats = qfalse;
+	/* DinurdoJK: jaPRO sailing end */
 	float realspeed = pm->ps->speed;
+
+	/* DinurdoJK: jaPRO sailing begin */
+	VectorClear( sailingWaterVelocity );
+	VectorClear( sailingCurrentVelocity );
+	sailingRiver = PM_SailingPlayerRiver( &sailingRiverSample );
+	if ( sailingRiver ) {
+		sailingOcean = NULL;
+		/* Only float where there is solved water; an inactive cell inside the
+		 * domain exists to suppress the fallback brush, not to swim in. */
+		if ( ( sailingRiverSample.flags & SAILING_RIVER_CELL_ACTIVE )
+			&& sailingRiverSample.depth > 0.001f ) {
+			sailingRiverMedium = BG_SailingRuntimeRiver();
+			if ( sailingRiverMedium ) {
+				sailingRiverFloats = qtrue;
+				sailingSurfaceHeight = sailingRiverSample.surfaceHeight;
+			}
+		}
+	}
+	else {
+		sailingOcean = PM_SailingPlayerOcean( &sailingSurfaceHeight,
+			sailingWaterVelocity );
+	}
+	/* DinurdoJK: jaPRO sailing end */
 
 	if ( PM_CheckWaterJump() ) {
 		PM_WaterJumpMove();
@@ -4720,7 +4990,48 @@ static void PM_WaterMove( void ) {
 		}
 	}
 #endif
+	/* DinurdoJK: jaPRO sailing begin */
+	if ( sailingOcean ) {
+		/* Swim relative to the complete moving medium: the authored prevailing
+		 * current plus the local horizontal orbital velocity of the swell. Boats
+		 * consume this same wave velocity, so a crest pushes both consistently. */
+		BG_SailingCurrentVelocityAt( sailingOcean, pm->ps->origin[0],
+			pm->ps->origin[1], pm->cmd.serverTime, sailingCurrentVelocity );
+		sailingCurrentVelocity[0] += sailingWaterVelocity[0];
+		sailingCurrentVelocity[1] += sailingWaterVelocity[1];
+		VectorSubtract( pm->ps->velocity, sailingCurrentVelocity,
+			pm->ps->velocity );
+		realspeed *= sailingOcean->swimControlScale;
+		sailingDiveDragScale = PM_SailingDiveDragScale( qtrue,
+			sailingOcean->diveDrag,
+			pm->ps->velocity[2] - sailingWaterVelocity[2] );
+	}
+	else if ( sailingRiver
+		&& ( sailingRiverSample.flags & SAILING_RIVER_CELL_ACTIVE )
+		&& sailingRiverSample.depth > 0.001f ) {
+		/* Swim relative to the solved horizontal current, just as ocean
+		 * swimming is relative to its current and orbital velocity. */
+		sailingCurrentVelocity[0] = sailingRiverSample.velocity[0];
+		sailingCurrentVelocity[1] = sailingRiverSample.velocity[1];
+		VectorSubtract( pm->ps->velocity, sailingCurrentVelocity,
+			pm->ps->velocity );
+		if ( sailingRiverFloats ) {
+			sailingDiveDragScale = PM_SailingDiveDragScale( qtrue,
+				sailingRiverMedium->diveDrag, pm->ps->velocity[2] );
+		}
+	}
+	preFrictionVertical = pm->ps->velocity[2];
+	/* DinurdoJK: jaPRO sailing end */
 	PM_Friction ();
+	/* DinurdoJK: jaPRO sailing begin */
+	/* PM_Friction scales all three axes by one factor, so it bleeds a dive
+	 * exactly as hard as it bleeds sideways paddling. Give the vertical axis
+	 * back the share of that drag a plunge should not have paid. */
+	if ( sailingDiveDragScale < 1.0f ) {
+		pm->ps->velocity[2] += ( preFrictionVertical - pm->ps->velocity[2] )
+			* ( 1.0f - sailingDiveDragScale );
+	}
+	/* DinurdoJK: jaPRO sailing end */
 
 	scale = PM_CmdScale( &pm->cmd );
 	//
@@ -4737,13 +5048,21 @@ static void PM_WaterMove( void ) {
 				wishvel[2] = 60;		// float towards top
 		}
 		else {
-			wishvel[2] = -60;		// sink towards bottom;
+			/* DinurdoJK: jaPRO sailing. Anything with a float spring holds its
+			 * own depth; only stock water still sinks the player. */
+			wishvel[2] = ( sailingOcean || sailingRiverFloats )
+				? 0.0f : -60.0f;
 		}
 	} else {
 		for (i=0 ; i<3 ; i++)
 			wishvel[i] = scale * pml.forward[i]*pm->cmd.forwardmove + scale * pml.right[i]*pm->cmd.rightmove;
 
-		wishvel[2] += scale * pm->cmd.upmove;
+		/* DinurdoJK: jaPRO sailing. In a sailing ocean, jump selects the
+		 * shallower chest-depth float target instead of continuously
+		 * accelerating the player out of the water. */
+		if ( !sailingOcean || pm->cmd.upmove <= 0 ) {
+			wishvel[2] += scale * pm->cmd.upmove;
+		}
 	}
 
 	VectorCopy (wishvel, wishdir);
@@ -4756,7 +5075,27 @@ static void PM_WaterMove( void ) {
 	if (IsJaPRO() && pm->ps->stats[STAT_MOVEMENTSTYLE] == MV_TRIBES)
 		wishspeed *= 2;
 
-	PM_Accelerate (wishdir, wishspeed, pm_wateraccelerate);
+	/* DinurdoJK: jaPRO sailing begin */
+	PM_Accelerate( wishdir, wishspeed, pm_wateraccelerate
+		* ( sailingOcean ? sailingOcean->swimControlScale : 1.0f ) );
+	if ( sailingOcean || sailingRiver ) {
+		VectorAdd( pm->ps->velocity, sailingCurrentVelocity,
+			pm->ps->velocity );
+	}
+	if ( sailingRiverFloats ) {
+		PM_SailingPlayerBuoyancy( qtrue, sailingRiverMedium->buoyancy,
+			sailingRiverMedium->buoyancyDamping,
+			sailingRiverMedium->buoyancyDepth, sailingSurfaceHeight,
+			sailingWaterVelocity, sailingDiveDragScale );
+	}
+	else {
+		PM_SailingPlayerBuoyancy( sailingOcean ? qtrue : qfalse,
+			sailingOcean ? sailingOcean->buoyancy : 0.0f,
+			sailingOcean ? sailingOcean->buoyancyDamping : 0.0f,
+			sailingOcean ? sailingOcean->buoyancyDepth : 0.0f,
+			sailingSurfaceHeight, sailingWaterVelocity, sailingDiveDragScale );
+	}
+	/* DinurdoJK: jaPRO sailing end */
 
 	// make sure we can go up slopes easily under water
 	if ( pml.groundPlane && DotProduct( pm->ps->velocity, pml.groundTrace.plane.normal ) < 0 ) {
@@ -7104,8 +7443,52 @@ static void PM_GroundTrace( void ) {
 PM_SetWaterLevel
 =============
 */
+/* DinurdoJK: jaPRO sailing begin */
+static int PM_SailingAdjustWaterContents( const sailingOcean_t *ocean,
+	float surfaceHeight, float sampleZ, int contents ) {
+	qboolean insideBspWater;
+
+	if ( !ocean ) {
+		return contents;
+	}
+
+	insideBspWater = (qboolean)( ( contents & CONTENTS_WATER ) != 0 );
+	contents &= ~CONTENTS_WATER;
+	/*
+	 * Below the calm surface, the BSP water brush owns the lower boundary.
+	 * Above it, an analytical crest may legitimately extend the medium beyond
+	 * the brush's flat top. The surface-height test also removes BSP water
+	 * exposed by an analytical trough.
+	 */
+	if ( sampleZ <= surfaceHeight
+		&& ( insideBspWater || sampleZ >= ocean->baseHeight ) ) {
+		contents |= CONTENTS_WATER;
+	}
+	return contents;
+}
+
+static int PM_SailingAdjustRiverWaterContents(
+	const sailingRiverSample_t *sample, float sampleZ, int contents ) {
+	contents &= ~CONTENTS_WATER;
+	if ( sample && ( sample->flags & SAILING_RIVER_CELL_ACTIVE )
+		&& sample->depth > 0.001f
+		&& sampleZ >= sample->bedHeight - 2.0f
+		&& sampleZ <= sample->surfaceHeight ) {
+		contents |= CONTENTS_WATER;
+	}
+	return contents;
+}
+/* DinurdoJK: jaPRO sailing end */
+
 static void PM_SetWaterLevel( void ) {
 	vec3_t		point;
+	/* DinurdoJK: jaPRO sailing begin */
+	vec3_t		sailingWaterVelocity;
+	const sailingOcean_t *sailingOcean;
+	sailingRiverSample_t sailingRiverSample;
+	qboolean sailingRiver;
+	float		sailingSurfaceHeight = 0.0f;
+	/* DinurdoJK: jaPRO sailing end */
 	int			cont;
 	int			sample1;
 	int			sample2;
@@ -7116,10 +7499,33 @@ static void PM_SetWaterLevel( void ) {
 	pm->waterlevel = 0;
 	pm->watertype = 0;
 
+	/* DinurdoJK: jaPRO sailing begin. The boat-rider exemption that precedes
+	 * this in jaPRO needs BG_BoatPhysics, which is not ported. */
+	VectorClear( sailingWaterVelocity );
+	sailingRiver = PM_SailingPlayerRiver( &sailingRiverSample );
+	if ( sailingRiver ) {
+		sailingOcean = NULL;
+	}
+	else {
+		sailingOcean = PM_SailingPlayerOcean( &sailingSurfaceHeight,
+			sailingWaterVelocity );
+	}
+	/* DinurdoJK: jaPRO sailing end */
+
 	point[0] = pm->ps->origin[0];
 	point[1] = pm->ps->origin[1];
 	point[2] = pm->ps->origin[2] + MINS_Z + 1;
 	cont = pm->pointcontents( point, pm->ps->clientNum );
+	/* DinurdoJK: jaPRO sailing begin */
+	if ( sailingRiver ) {
+		cont = PM_SailingAdjustRiverWaterContents( &sailingRiverSample,
+			point[2], cont );
+	}
+	else if ( sailingOcean ) {
+		cont = PM_SailingAdjustWaterContents( sailingOcean,
+			sailingSurfaceHeight, point[2], cont );
+	}
+	/* DinurdoJK: jaPRO sailing end */
 
 	if ( cont & MASK_WATER ) {
 		sample2 = pm->ps->viewheight - MINS_Z;
@@ -7129,10 +7535,30 @@ static void PM_SetWaterLevel( void ) {
 		pm->waterlevel = 1;
 		point[2] = pm->ps->origin[2] + MINS_Z + sample1;
 		cont = pm->pointcontents (point, pm->ps->clientNum );
+		/* DinurdoJK: jaPRO sailing begin */
+		if ( sailingRiver ) {
+			cont = PM_SailingAdjustRiverWaterContents( &sailingRiverSample,
+				point[2], cont );
+		}
+		else if ( sailingOcean ) {
+			cont = PM_SailingAdjustWaterContents( sailingOcean,
+				sailingSurfaceHeight, point[2], cont );
+		}
+		/* DinurdoJK: jaPRO sailing end */
 		if ( cont & MASK_WATER ) {
 			pm->waterlevel = 2;
 			point[2] = pm->ps->origin[2] + MINS_Z + sample2;
 			cont = pm->pointcontents (point, pm->ps->clientNum );
+			/* DinurdoJK: jaPRO sailing begin */
+			if ( sailingRiver ) {
+				cont = PM_SailingAdjustRiverWaterContents(
+					&sailingRiverSample, point[2], cont );
+			}
+			else if ( sailingOcean ) {
+				cont = PM_SailingAdjustWaterContents( sailingOcean,
+					sailingSurfaceHeight, point[2], cont );
+			}
+			/* DinurdoJK: jaPRO sailing end */
 			if ( cont & MASK_WATER ){
 				pm->waterlevel = 3;
 			}
@@ -14013,6 +14439,9 @@ void PmoveSingle (pmove_t *pmove) {
 	int savedGravity = 0;
 
 	pm = pmove;
+	/* DinurdoJK: jaPRO sailing */
+	pmSailingPlayerSampleValid = qfalse;
+	pmSailingRiverSampleValid = qfalse;
 	jka_pmove_begin_view_tracking(pmove->ps);
 
 #ifdef _CGAME
@@ -15434,12 +15863,30 @@ void PmoveSingle (pmove_t *pmove) {
 			} else if ( pm->waterlevel > 1 ) {
 				// swimming
 				PM_WaterMove();
-			} else if ( pml.walking ) {
-				// walking on ground
-				PM_WalkMove();
 			} else {
-				// airborne
-				PM_AirMove();
+				/* DinurdoJK: jaPRO sailing begin */
+				vec3_t shallowRiverCurrent;
+				qboolean shallowRiver = PM_SailingShallowRiverCurrent(
+					shallowRiverCurrent );
+
+				if ( shallowRiver ) {
+					VectorSubtract( pm->ps->velocity, shallowRiverCurrent,
+						pm->ps->velocity );
+				}
+				/* DinurdoJK: jaPRO sailing end */
+				if ( pml.walking ) {
+					// walking on ground
+					PM_WalkMove();
+				} else {
+					// airborne
+					PM_AirMove();
+				}
+				/* DinurdoJK: jaPRO sailing begin */
+				if ( shallowRiver ) {
+					VectorAdd( pm->ps->velocity, shallowRiverCurrent,
+						pm->ps->velocity );
+				}
+				/* DinurdoJK: jaPRO sailing end */
 			}
 		}
 	}
@@ -15456,6 +15903,7 @@ void PmoveSingle (pmove_t *pmove) {
 		PM_HoverTrace();
 	}
 	PM_SetWaterLevel();
+	PM_ApplyWaterspoutWind(); /* DinurdoJK: jaPRO sailing */
 	if (pm->cmd.forcesel != (byte)-1 && (pm->ps->fd.forcePowersKnown & (1 << pm->cmd.forcesel)))
 	{
 #if _GAME

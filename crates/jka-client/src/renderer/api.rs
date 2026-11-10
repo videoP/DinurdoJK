@@ -76,6 +76,8 @@ pub enum DynamicModelAlphaMode {
     Modulate2x,
     /// GL_ZERO GL_ONE_MINUS_SRC_COLOR.
     Darken,
+    /// GL_ONE GL_ONE_MINUS_SRC_COLOR: original OpenJK screen composite.
+    Screen,
     /// Promoted `q3map_material Glass`, sampled from the opaque scene capture.
     Glass,
     /// TaystJK RF_NODEPTH for Force Seeing level 2+. An additive overlay
@@ -84,7 +86,7 @@ pub enum DynamicModelAlphaMode {
 }
 
 impl DynamicModelAlphaMode {
-    pub(in crate::renderer) const COUNT: usize = 15;
+    pub(in crate::renderer) const COUNT: usize = 16;
 
     /// Dense index for per-alpha-mode pipeline tables and draw bitmasks.
     pub(crate) const fn index(self) -> usize {
@@ -104,11 +106,12 @@ impl DynamicModelAlphaMode {
             Self::BlendUnlitDepthWrite => 12,
             Self::Glass => 13,
             Self::SightShellNoDepth => 14,
+            Self::Screen => 15,
         }
     }
 }
 
-pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 15] = [
+pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 16] = [
     DynamicModelAlphaMode::Opaque,
     DynamicModelAlphaMode::Mask,
     DynamicModelAlphaMode::BlendDepthWrite,
@@ -118,6 +121,7 @@ pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode;
     DynamicModelAlphaMode::DstColorAdd,
     DynamicModelAlphaMode::Modulate2x,
     DynamicModelAlphaMode::Darken,
+    DynamicModelAlphaMode::Screen,
     DynamicModelAlphaMode::Blend,
     DynamicModelAlphaMode::Glass,
     DynamicModelAlphaMode::BlendUnlit,
@@ -1033,9 +1037,13 @@ pub const PBR_PROFILE_POM_ADAPTIVE_STEPS: bool = false;
 
 pub const PBR_PROFILE_COMPANION_SAMPLER_TRILINEAR: bool = false;
 // MATCH BASE
-pub const PBR_PROFILE_COMPANION_COMPRESSION: bool = true;
+// Generic BC3 RGB encoding couples the normal's X/Y channels and damages
+// highlights along diagonal trim. Rend2 packs normals before compression;
+// keep our authored companion data uncompressed until a matching encoder is
+// available, including when r_ext_compress_textures is disabled.
+pub const PBR_PROFILE_COMPANION_COMPRESSION: bool = false;
 
-pub const PBR_PROFILE_VERTEX_LIGHTGRID: bool = false;
+pub const PBR_PROFILE_VERTEX_LIGHTGRID: bool = true;
 // FRAGMENT
 
 pub struct EguiRenderData {
@@ -1271,6 +1279,9 @@ pub enum RenderCommand {
     /// Phase-1 render-only clipmap continuation at qualifying BSP sky walls.
     SetOceanSkyExtend(u8),
     SetOceanSettings(crate::ocean::OceanSettings),
+    /// The map ocean's physics waves (jaPRO `BG_SailingSea`) that replace the
+    /// Blue Water FFT's two long tiles; None restores Blue Water's own.
+    SetSailingSea(Option<std::sync::Arc<jka_movement::SailingSea>>),
     /// Blue Water ship wake input (hulls, strikes, demo ships); ignored unless `r_oceanWake` is on.
     OceanWake(crate::ocean::WakeCommand),
     /// Developer river patch: source spec plus the map's collision triangles.
@@ -1341,6 +1352,7 @@ pub enum RenderCommand {
     SetEntityShadowLight(EntityShadowLight),
     SetPbrSettings {
         enabled: bool,
+        cubemaps: bool,
         deluxe_mapping: bool,
         deluxe_specular: f32,
     },
@@ -1393,6 +1405,8 @@ pub enum RenderCommand {
     SetExtensionHud(Vec<crate::extensions::PlacedHudWidget>, crate::extensions::NativeHudMask,
         Vec<String>, Vec<(String, String)>),
     SetTransientUi {
+        falling_death_fade: f32,
+        falling_death_active: bool,
         chat_lines: Vec<ui::UiChatLine>,
         console_notify_lines: Vec<ui::UiConsoleNotifyLine>,
         center_print: Option<ui::UiCenterPrint>,
@@ -1402,6 +1416,8 @@ pub enum RenderCommand {
         force_select: Option<ui::UiForceSelect>,
         weapon_select: Option<ui::UiWeaponSelect>,
         inventory_select: Option<ui::UiInventorySelect>,
+        jk2_flags: Vec<ui::Jk2FlagUi>,
+        jk2_inventory: Option<ui::Jk2InventoryUi>,
         follow_name: Option<String>,
         game_timer: Option<String>,
         mini_scores: Option<ui::UiMiniScores>,
@@ -1417,6 +1433,7 @@ pub enum RenderCommand {
         speedometer: Option<crate::speedometer::Ui>,
         lagometer: Option<crate::lagometer::Ui>,
         team_overlay: Option<ui::TeamOverlayUi>,
+        spectator_broadcast: Option<ui::SpectatorBroadcastUi>,
     },
     SetUiTelemetry {
         perf: ui::PerfStats,

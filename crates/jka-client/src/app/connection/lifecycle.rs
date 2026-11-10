@@ -60,8 +60,9 @@ impl App {
         self.baked_sun_auto_status = crate::renderer::BakedSunAutoStatus::Calibrating;
         self.prepared_map_cache = None;
         self.cross_game_map_seed = None;
+        self.spectator_broadcast = Default::default();
         self.game_session = None;
-        self.select_demo_asset_game(None);
+        self.select_demo_asset_game(None); // also unmount server-scoped dl_ archives
         self.weapon_select_until = None;
         self.inventory_select_until = None;
         self.force_select_until = None;
@@ -107,6 +108,7 @@ impl App {
         self.map_physics_collision = PhysicsMapMesh::default();
         self.map_movement = None;
         self.third_person_camera.reset();
+        self.reset_falling_death();
         self.solo_dynamic_models = Arc::new(Vec::new());
         self.spawns.clear();
         self.spawn_index = 0;
@@ -117,6 +119,9 @@ impl App {
         self.map_authored_oceans.clear();
         self.authored_oceans.clear();
         self.authored_ocean_preview = false;
+        jka_movement::sailing_reset();
+        self.sailing_ocean_states = Default::default();
+        self.sailing_weather_states = Default::default();
         self.render_command(RenderCommand::SetAuthoredOceans(Vec::new()));
         self.forget_trace();
         self.keys.clear();
@@ -161,7 +166,11 @@ impl App {
         self.sun_bake_progress = None;
         self.baked_sun_auto_status = crate::renderer::BakedSunAutoStatus::Calibrating;
         self.prepared_map_cache = None;
+        self.spectator_broadcast = Default::default();
         self.game_session = None;
+        // A demo can carry a different referenced-PK3 set from the live server.
+        // Do not expose the previous server's downloads during demo probing.
+        jka_assets::pk3::set_server_referenced_paks(&[]);
         self.weapon_select_until = None;
         self.inventory_select_until = None;
         self.force_select_until = None;
@@ -206,6 +215,7 @@ impl App {
         self.map_physics_collision = PhysicsMapMesh::default();
         self.map_movement = None;
         self.third_person_camera.reset();
+        self.reset_falling_death();
         self.solo_dynamic_models = Arc::new(Vec::new());
         self.spawns.clear();
         self.spawn_index = 0;
@@ -215,6 +225,9 @@ impl App {
         self.map_authored_oceans.clear();
         self.authored_oceans.clear();
         self.authored_ocean_preview = false;
+        jka_movement::sailing_reset();
+        self.sailing_ocean_states = Default::default();
+        self.sailing_weather_states = Default::default();
         self.forget_trace();
         self.keys.clear();
         self.movement_keys.clear();

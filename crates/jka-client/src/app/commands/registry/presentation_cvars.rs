@@ -42,6 +42,32 @@ app_cvars! {
         implementations: []
     }
 
+    APP_CG_DRAWINVENTORY {
+        runtime: super::hud::APP_JK2_DRAW_INVENTORY.copy(),
+        config: CvarBinding {
+            load_video: Some(|settings, _, value, _| {
+                settings.jk2_draw_inventory = parse_bool(value).unwrap_or(settings.jk2_draw_inventory);
+            }),
+            archive: Some((457, |state| format!("{}", u8::from(state.video.jk2_draw_inventory)))),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CG_ENHANCEDFLAGSTATUS {
+        runtime: super::hud::APP_JK2_ENHANCED_FLAGS.copy(),
+        config: CvarBinding {
+            load_video: Some(|settings, _, value, _| {
+                if let Ok(value) = value.trim().parse::<u8>() {
+                    settings.jk2_enhanced_flag_status = value.min(2);
+                }
+            }),
+            archive: Some((458, |state| state.video.jk2_enhanced_flag_status.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
     APP_CG_HUDSTYLE {
         runtime: super::hud::APP_HUD_STYLE.copy(),
         config: CvarBinding {

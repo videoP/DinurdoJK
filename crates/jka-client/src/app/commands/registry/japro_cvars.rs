@@ -2,6 +2,42 @@
 use super::cvar_prelude::*;
 
 settings_cvars! { JaproCgame;
+    APP_CG_AUTOKILLWHENFALLING {
+        runtime: CvarDef::new(
+            "cg_autoKillWhenFalling", "0", "0|1",
+            "TaystJK: send kill and a two-usercmd attack pulse to try to skip the pit-death wait; client only, default off.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(u8::from(app.japro_cg.auto_kill_when_falling).to_string()),
+            |app, value| {
+                let enabled = App::parse_cvar_bool("cg_autoKillWhenFalling", &value.to_string())?;
+                app.japro_cg.auto_kill_when_falling = enabled;
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Ok(value) = value.trim().parse::<u8>() {
+                    if value <= 1 { settings.japro.auto_kill_when_falling = value == 1; }
+                }
+            }),
+            archive: Some((35919, |state| u8::from(state.presentation.japro.auto_kill_when_falling).to_string())),
+            ..CvarBinding::NONE
+        },
+        settings: SETTINGS_CG_AUTOKILLWHENFALLING = APP_CG_AUTOKILLWHENFALLING
+            .bind(
+                |state: &JaproCgame| CvarValue::String(u8::from(state.auto_kill_when_falling).to_string()),
+                |state, value| {
+                    let value = value.to_string();
+                    match value.trim() {
+                        "0" => { state.auto_kill_when_falling = false; Ok(()) },
+                        "1" => { state.auto_kill_when_falling = true; Ok(()) },
+                        _ => Err("cg_autoKillWhenFalling expects 0 or 1".to_owned()),
+                    }
+                },
+            ),
+        implementations: []
+    }
     APP_CG_LEADINDICATOR {
         runtime: CvarDef::new(
             "cg_leadIndicator", "0", "0 off | 1 ping | 2..2000 manual ms",
@@ -1025,8 +1061,8 @@ settings_cvars! { JaproCgame;
         runtime: CvarDef::new(
                 "cg_specHud",
                 "",
-                "0|1",
-                "While spectating or watching a demo, outline other living players through walls.",
+                "0|1|2|3|4",
+                "0 off; 1 outlines; 2 outlines + CS-style team HUD; 3 mode 2 + score refresh; 4 mode 2 + follow-cycle telemetry (vitals, ammo, scores; virtual free camera).",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -1046,13 +1082,13 @@ settings_cvars! { JaproCgame;
                 }),
                 archive: Some((419, |state| {
                     let presentation = state.presentation;
-                    format!("{}", u8::from(presentation.japro.spec_hud))
+                    format!("{}", presentation.japro.spec_hud)
                 })),
                 ..CvarBinding::NONE
             },
         settings: SETTINGS_CG_SPECHUD = APP_CG_SPECHUD
                 .bind(
-                    |state: &JaproCgame| CvarValue::String(u8::from(state.spec_hud).to_string()),
+                    |state: &JaproCgame| CvarValue::String(state.spec_hud.to_string()),
                     |state, value| {
                         JaproCgame::cvar_set_cg_spechud(
                             state,
@@ -1066,8 +1102,9 @@ settings_cvars! { JaproCgame;
             impl JaproCgame {
                 fn cvar_set_cg_spechud(&mut self, name: &str, value: &str) -> Result<(), String> {
                     japro_integer(name, value)
-                        .map(|number| number != 0)
-                        .map(|v| self.spec_hud = v)
+                        .and_then(|number| u8::try_from(number).ok().filter(|mode| *mode <= 4)
+                            .ok_or_else(|| format!("{name}: expected a mode from 0 to 4")))
+                        .map(|mode| self.spec_hud = mode)
                 }
             }
             impl App {
@@ -1087,6 +1124,70 @@ settings_cvars! { JaproCgame;
                     }
                     self.mark_config_dirty();
                     self.publish_snapshot();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_CG_SPECHUDMAP {
+        runtime: CvarDef::new(
+                "cg_specHudMap",
+                "",
+                "0|1|2",
+                "cg_specHud 2-4 radar, top-left: 0 off; 1 whole map; 2 follows the observed player.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app| CvarValue::String(App::cvar_get_cg_spechudmap(app)),
+                |app, value| {
+                    App::cvar_set_cg_spechudmap(
+                        app,
+                        APP_CG_SPECHUDMAP.entry.name,
+                        &value.to_string(),
+                    )
+                },
+            )
+            .with_text_setter(App::cvar_set_cg_spechudmap, None),
+        config: CvarBinding {
+                load_presentation: Some(|settings, name, value| {
+                    let _ = settings.japro.set_cvar(name, value);
+                }),
+                archive: Some((419, |state| {
+                    let presentation = state.presentation;
+                    format!("{}", presentation.japro.spec_hud_map)
+                })),
+                ..CvarBinding::NONE
+            },
+        settings: SETTINGS_CG_SPECHUDMAP = APP_CG_SPECHUDMAP
+                .bind(
+                    |state: &JaproCgame| CvarValue::String(state.spec_hud_map.to_string()),
+                    |state, value| {
+                        JaproCgame::cvar_set_cg_spechudmap(
+                            state,
+                            APP_CG_SPECHUDMAP.entry.name,
+                            &value.to_string(),
+                        )
+                    },
+                )
+                .with_text_setter(JaproCgame::cvar_set_cg_spechudmap, None),
+        implementations: [
+            impl JaproCgame {
+                fn cvar_set_cg_spechudmap(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    japro_integer(name, value)
+                        .and_then(|number| u8::try_from(number).ok().filter(|mode| *mode <= 2)
+                            .ok_or_else(|| format!("{name}: expected a mode from 0 to 2")))
+                        .map(|mode| self.spec_hud_map = mode)
+                }
+            }
+            impl App {
+                fn cvar_get_cg_spechudmap(&self) -> String {
+                    (SETTINGS_CG_SPECHUDMAP.get)(&self.japro_cg).to_string()
+                }
+                fn cvar_set_cg_spechudmap(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    (SETTINGS_CG_SPECHUDMAP.set_text.unwrap())(&mut self.japro_cg, name, value)?;
+                    self.mark_config_dirty();
                     self.publish_ui();
                     Ok(())
                 }

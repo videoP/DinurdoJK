@@ -1580,7 +1580,9 @@ pub(in crate::scene) fn prepare_internal(
         None
     };
 
-    let reflection_probes = load_reflection_probes(&bsp, &mut assets, name, &mut warnings)?;
+    let reflection_probes = if options.pbr_materials {
+        load_reflection_probes(&bsp, &mut assets, name, &mut warnings)?
+    } else { Vec::new() };
     assign_reflection_probes(&mut batches, &vertices, &reflection_probes);
     assign_reflection_probes(&mut pvs_batches, &vertices, &reflection_probes);
     assign_reflection_probes(&mut inline_batches, &inline_vertices, &reflection_probes);
@@ -2093,6 +2095,7 @@ pub(in crate::scene) fn prepare_internal(
         sub_bsp_names: Vec::new(),
         debug_volumes,
         authored_oceans,
+        sailing_spawns: crate::ocean::authoring::sailing_spawns(&bsp),
         water_brush_bounds: crate::ocean::volume::from_bsp(&bsp),
         thermal_liquids: bsp.models.first().map_or_else(Vec::new, |world| {
             world.brushes.clone().filter_map(|id| {

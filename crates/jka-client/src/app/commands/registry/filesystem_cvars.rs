@@ -74,10 +74,21 @@ app_cvars! {
         config: CvarBinding::NONE,
         implementations: []
     }
+    APP_FS_JK2FORCEGAME {
+        runtime: CvarDef::new(
+            "fs_jk2forcegame", "", "JK2 asset override folder",
+            "Optional highest-priority JK2 asset layer fs_jk2basepath/<name>/, above DinurdoJK/shared and fs_game. Never mounted by JKA. Does not change write paths. Restart required.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app| CvarValue::String(app.fs_roots.jk2forcegame.clone().unwrap_or_default()),
+            |app, value| App::set_fs_jk2forcegame(app, &value.to_string())
+        ).with_text_setter(|app, _, value| App::set_fs_jk2forcegame(app, value), None),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
     APP_FS_FORCEGAME {
         runtime: CvarDef::new(
-            "fs_forcegame", "", "client-owned override folder",
-            "Optional highest-priority asset layer DinurdoJK/<name>/, above DinurdoJK/shared. Does not change game directories or write paths. Restart required.",
+            "fs_forcegame", "", "JKA asset override folder",
+            "Optional highest-priority JKA asset layer fs_basepath/<name>/, above DinurdoJK/shared and fs_game. Does not change game directories or write paths. Restart required.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(app.fs_roots.forcegame.clone().unwrap_or_default()),
             |app, value| App::set_fs_forcegame(app, &value.to_string())
@@ -149,6 +160,12 @@ impl App {
     fn set_fs_forcegame(&mut self, value: &str) -> Result<(), String> {
         let mut proposed = self.fs_roots.clone();
         proposed.forcegame = crate::filesystem_paths::validate_game_name(value)?;
+        self.store_fs_roots(proposed)
+    }
+
+    fn set_fs_jk2forcegame(&mut self, value: &str) -> Result<(), String> {
+        let mut proposed = self.fs_roots.clone();
+        proposed.jk2forcegame = crate::filesystem_paths::validate_game_name(value)?;
         self.store_fs_roots(proposed)
     }
 }

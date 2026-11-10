@@ -1399,6 +1399,16 @@ pub struct SaberClashFlare {
     pub color: [f32; 4],
 }
 
+/// MVSDK cg_players.c uses trace.endpos, entity -1, CHAN_WEAPON.
+/// Authored .efx sounds retain the unchanged CHAN_AUTO route.
+fn saber_wall_contact_sound(origin: [f32; 3], variant: i32) -> FxSound {
+    let mut sound = FxSound::auto(origin, format!("sound/weapons/saber/saberhitwall{variant}.wav"));
+    if jka_assets::pk3::active_jk2().is_some() {
+        sound.channel = 2; // CHAN_WEAPON; -1 is ENTITYNUM_NONE.
+    }
+    sound
+}
+
 pub struct WeaponFx {
     saber_definitions: SaberDefinitions,
     vehicle_definitions: VehicleDefinitions,
@@ -3220,10 +3230,7 @@ impl WeaponFx {
                     && self.time.saturating_sub(previous.last_sound_time) >= 100
                 {
                     let variant = self.runner_rng.irand(1, 3);
-                    self.immediate_sounds.push(FxSound {
-                        origin: hit.end,
-                        qpath: format!("sound/weapons/saber/saberhitwall{variant}.wav"),
-                    });
+                    self.immediate_sounds.push(saber_wall_contact_sound(hit.end, variant));
                     next.last_sound_time = self.time;
                 }
             }
@@ -3259,10 +3266,7 @@ impl WeaponFx {
                     // wall-hit sound every 100 ms while continuous contact lasts.
                     if self.time.saturating_sub(previous.last_sound_time) >= 100 {
                         let variant = self.runner_rng.irand(1, 3);
-                        self.immediate_sounds.push(FxSound {
-                            origin: hit.end,
-                            qpath: format!("sound/weapons/saber/saberhitwall{variant}.wav"),
-                        });
+                        self.immediate_sounds.push(saber_wall_contact_sound(hit.end, variant));
                         next.last_sound_time = self.time;
                     }
                 }
@@ -3289,10 +3293,7 @@ impl WeaponFx {
                     );
                     if previous.have_old_pos && self.time.saturating_sub(previous.last_sound_time) >= 100 {
                         let variant = self.runner_rng.irand(1, 3);
-                        self.immediate_sounds.push(FxSound {
-                            origin: hit.end,
-                            qpath: format!("sound/weapons/saber/saberhitwall{variant}.wav"),
-                        });
+                        self.immediate_sounds.push(saber_wall_contact_sound(hit.end, variant));
                         next.last_sound_time = self.time;
                     }
                     let flicker = 0.94 + (self.time as f32 * 0.029).sin() * 0.06;
@@ -5285,9 +5286,7 @@ mod tests {
             start: [0.0; 3], end: [1.0, 2.0, 3.0], width: 1.0,
             rgba: [255; 4], shader: "gfx/test".into(),
         });
-        fx.cached_fx_tick.sounds.push(FxSound {
-            origin: [0.0; 3], qpath: "sound/test.wav".to_owned(),
-        });
+        fx.cached_fx_tick.sounds.push(FxSound::auto([0.0; 3], "sound/test.wav".to_owned()));
         let first = fx.end_async_fx_tick();
         assert_eq!(first.shared_draws.as_ref().unwrap().len(), 1);
         assert_eq!(first.sounds.len(), 1);

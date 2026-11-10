@@ -48,6 +48,13 @@ pub(in crate::ui) fn build_hud(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32,
     let Some(hud) = ui.hud else {
         return;
     };
+    // OpenJK CG_Draw2D: a free spectator (PM_SPECTATOR/intermission) never
+    // gets the status HUD; a follow view carries the followed player's
+    // pm_type and keeps it. Same rule as the retail styles. HUD Edit keeps
+    // the elements so they can still be placed while spectating.
+    if hud.spectating && ui.mode != crate::ui::OverlayMode::HudEdit {
+        return;
+    }
 
     if ui.video.hud_style == 1 {
         if ui.jk2_mode {

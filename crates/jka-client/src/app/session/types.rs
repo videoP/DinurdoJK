@@ -192,6 +192,9 @@ pub(in crate::app) struct GameSession {
     /// Current Studio observer, supplied before camera-dependent presentation.
     /// Unlike gameplay's previous-frame camera hint, this survives teleports.
     pub(in crate::app) studio_presentation_view: Option<crate::cgame::player_presenter::Ghoul2PresentationView>,
+    /// cg_specHud 4 free camera: the App camera (passed as the Ghoul2 view
+    /// hint) owns culling/LOD, never the presented playerState's eye.
+    pub(in crate::app) app_camera_view: bool,
     pub(in crate::app) race_ghost_alpha: f32,
     /// Exact predicted/followed sample used to compare the live racer against
     /// the synchronized ghost labels on this frame.

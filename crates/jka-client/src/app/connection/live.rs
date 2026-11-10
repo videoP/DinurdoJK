@@ -468,7 +468,10 @@ impl App {
                         any_key,
                         talking,
                     };
-                    let cmd = self.live_input.create_cmd(&buttons);
+                    let mut cmd = self.live_input.create_cmd(&buttons);
+                    // cg_specHud 4 walks the follow cycle with +attack edges (and keeps a
+                    // virtual free camera's server-side spectator motionless).
+                    self.shape_spectator_broadcast_cmd(&mut cmd);
                     if crate::emotes::cancel_world_taunt(emote_anims.0, emote_anims.1, cmd.buttons, cmd.up_move) {
                         self.live_input.queue_emote_stop();
                     }
@@ -496,7 +499,10 @@ impl App {
                         any_key,
                         talking,
                     };
-                    let cmd = self.live_input.create_cmd(&buttons);
+                    let mut cmd = self.live_input.create_cmd(&buttons);
+                    // cg_specHud 4 walks the follow cycle with +attack edges (and keeps a
+                    // virtual free camera's server-side spectator motionless).
+                    self.shape_spectator_broadcast_cmd(&mut cmd);
                     if crate::emotes::cancel_world_taunt(emote_anims.0, emote_anims.1, cmd.buttons, cmd.up_move) {
                         self.live_input.queue_emote_stop();
                     }
@@ -696,6 +702,14 @@ impl App {
                 }
             }
             SessionEvent::Snapshot(snapshot) => {
+                // cg_specHud 4: while a telemetry sweep has the server following
+                // someone else, present the original view instead. Only this
+                // presentation copy changes; decoder delta baselines do not.
+                let snapshot = if self.game_session.as_ref().is_some_and(|session| session.live) {
+                    self.filter_spectator_broadcast_snapshot(snapshot)
+                } else {
+                    snapshot
+                };
                 if self.game_session.as_ref().is_some_and(|session| session.live) {
                     if self.emote_net_rx.needs_reset(&snapshot) {
                         crate::emotes::network::reset();
@@ -801,6 +815,9 @@ impl App {
         self.map_authored_oceans.clear();
         self.authored_oceans.clear();
         self.authored_ocean_preview = false;
+        jka_movement::sailing_reset();
+        self.sailing_ocean_states = Default::default();
+        self.sailing_weather_states = Default::default();
         self.render_command(RenderCommand::SetAuthoredOceans(Vec::new()));
         self.forget_trace();
         self.front_end = false;
@@ -890,6 +907,20 @@ impl App {
                 return;
             }
         };
+        // FS_PureServerSetReferencedPaks applies to *both* games and to
+        // non-pure servers. Do this before checking the BSP or accepting any
+        // speculative CGame/map assets prepared without server references.
+        let refs = crate::download::server_referenced_checksums(
+            configstrings.get(&jka_protocol::session::CS_SYSTEMINFO)
+                .map(Vec::as_slice).unwrap_or_default(),
+        );
+        let references_changed = jka_assets::pk3::set_server_referenced_paks(&refs);
+        if references_changed {
+            self.stringed = None;
+            self.pk3_manager_loaded = false;
+            self.reset_asset_catalogs_for_game_change();
+            self.invalidate_studio_sources();
+        }
         let pure_changed = if jk2 {
             match self.apply_jk2_pure_assets(&configstrings, checksum_feed, &map_name) {
                 Ok(changed) => changed,
@@ -900,13 +931,58 @@ impl App {
                 }
             }
         } else { false };
-        if game_changed || pure_changed { self.start_live_cgame_prep(); }
+        if references_changed && !game_changed && !pure_changed {
+            // The mod and JK2 pure mode can stay identical across a map change,
+            // while the referenced downloads change. Old BSP/CGame caches must
+            // not retain providers from the last server gamestate.
+            self.cancel_vote_map_prewarm();
+            self.cancel_live_cgame_prep();
+            self.game_session = None;
+            self.prepare_worldless_session(&map_name);
+            self.map_loader_latest_requested.store(
+                self.latest_request_id, std::sync::atomic::Ordering::Release,
+            );
+            self.local_player_presenter = None;
+        }
+        if game_changed || pure_changed || references_changed { self.start_live_cgame_prep(); }
         if let Err(error) = scene::server_bsp_names(&configstrings) {
             self.push_console_line(format!("^1Rejected server BSP instances: {error}"));
             self.disconnect_to_main_menu();
             return;
         }
         self.update_chat_log_live_metadata(&map_name);
+
+        // JK2MV CL_InitDownloads runs FS_ComparePaks on *every* gamestate,
+        // not only when the BSP is absent. A server can reference missing
+        // model/sound/mod PK3s while its map is already locally installed.
+        // Keep the existing explicit download consent UI for both games.
+        let systeminfo = configstrings.get(&jka_protocol::session::CS_SYSTEMINFO)
+            .map(Vec::as_slice).unwrap_or_default();
+        let missing_paks = match crate::download::referenced_downloads(
+            &self.base, self.game.as_deref(), systeminfo,
+        ) {
+            Ok(missing) => missing,
+            Err(error) => {
+                self.push_console_line(format!("^1Could not compare server PK3s: {error}"));
+                self.disconnect_to_main_menu();
+                return;
+            }
+        };
+        if self.live_auto_download_requested && !missing_paks.is_empty() {
+            self.begin_live_autodownload(&map_name, &configstrings);
+            return;
+        }
+        if !missing_paks.is_empty() && !self.live_missing_map_authorized {
+            let names = missing_paks.iter().take(6)
+                .map(|spec| spec.remote_name.as_str())
+                .collect::<Vec<_>>().join(", ");
+            let tail = if missing_paks.len() > 6 { " ..." } else { "" };
+            self.show_missing_map_prompt(&map_name, format!(
+                "Missing server-referenced PK3{} ({}): {names}{tail}",
+                if missing_paks.len() == 1 { "" } else { "s" }, missing_paks.len(),
+            ));
+            return;
+        }
 
         let source = scene::MapSource::Bsp(map_name.clone());
         if let Err(error) =

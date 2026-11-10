@@ -278,6 +278,17 @@ impl App {
                 });
             };
         }
+        theme::row(
+            ui,
+            "Confine cursor to window",
+            "in_confineCursor. Keep the visible mouse pointer inside the focused game window while using menus, console or other cursor-based UI. Turning this off never changes the locked mouse-look during gameplay.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(enabled) = theme::switch(ui, self.in_confine_cursor) {
+                    let _ = self.set_console_cvar("in_confineCursor", if enabled { "1" } else { "0" });
+                }
+            },
+        );
         mouse_number!(
             "Sensitivity",
             "sensitivity. TaystJK mouse sensitivity multiplier; stock default is 5. Raw input does not bypass this scaling.",
@@ -309,6 +320,49 @@ impl App {
             "cl_mouseAccel",
             0.01,
             4
+        );
+        // These settings belong to the held MOUSE4/MOUSE5 bind-repeat path,
+        // not relative gameplay mouse capture or visible-cursor confinement.
+        let mut repeat_mode = None;
+        theme::row(
+            ui,
+            "Mouse button repeat",
+            "in_mouserepeat. 0: Off; 1: repeat held MOUSE4 and MOUSE5; 2: repeat held MOUSE4 only. Uses the existing real-time repeat cadence, independent of render FPS.",
+            theme::Reset::None,
+            |ui| {
+                for (mode, label) in [(0, "Off"), (1, "MOUSE4 + MOUSE5"), (2, "MOUSE4 only")] {
+                    if theme::chip(ui, label, mode == self.in_mouserepeat).clicked()
+                        && mode != self.in_mouserepeat
+                    {
+                        repeat_mode = Some(mode);
+                    }
+                    ui.add_space(3.0);
+                }
+            },
+        );
+        if let Some(mode) = repeat_mode {
+            let _ = self.set_console_cvar("in_mouserepeat", &mode.to_string());
+        }
+        theme::row(
+            ui,
+            "Repeat start delay",
+            "in_mouserepeatDelay. Additional delay in milliseconds before a held MOUSE4/MOUSE5 starts repeating. 0 (default) adds no delay; subsequent repeats are approximately 16 ms apart.",
+            theme::Reset::None,
+            |ui| {
+                let mut delay = self.in_mouserepeat_delay;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut delay)
+                            .range(0..=2000)
+                            .speed(1.0)
+                            .suffix(" ms")
+                            .update_while_editing(false),
+                    )
+                    .changed()
+                {
+                    let _ = self.set_console_cvar("in_mouserepeatDelay", &delay.to_string());
+                }
+            },
         );
         theme::row(
             ui,

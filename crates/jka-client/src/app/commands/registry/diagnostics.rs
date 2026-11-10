@@ -591,7 +591,24 @@ commands! {
         }
     }
 
-    cmd_menuent ["menuent", ] ("menuent [overwrite]", "In a menudevmap session: load the menu props from mapmods/mp/duel9.ent as editable Map Mods placements (writing it from the built-in layout first if it does not exist; `menuent overwrite` rewrites it from the built-in layout). Edit them with the placement tool, then Map Mods > EXPORT to mapmods/mp/duel9.ent: the main menu reads that file.", CommandScope::Always) |self, command| {
+    cmd_sailingdebug ["sailingdebug", ] ("sailingdebug [0|1]", "jaPRO sailing: draw a line from your head to the predicted (server-physics) water surface below you. Yellow cross = physics surface at your command time; magenta cross = Hybrid's drawn analytic swell at the ocean render time; cyan = the same analytic swell at your command time. Replaces the r_drawEntities overlay while on.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        let enabled = match words.as_slice() {
+            [_verb] => !self.sailing_debug,
+            [_verb, arg] => *arg != "0",
+            _ => return CommandResult::Unhandled,
+        };
+        self.sailing_debug = enabled;
+        crate::ocean::authoring::SAILING_DEBUG.store(enabled, std::sync::atomic::Ordering::Relaxed);
+        if !enabled {
+            self.render_command(RenderCommand::SetEntityMarkers(None));
+            self.entity_marker_cache = None;
+        }
+        self.console_status = format!("SAILINGDEBUG {}", if enabled { "ON" } else { "OFF" });
+        CommandResult::Handled
+    }
+
+    cmd_menuent ["menuent", ]("menuent [overwrite]", "In a menudevmap session: load the menu props from mapmods/mp/duel9.ent as editable Map Mods placements (writing it from the built-in layout first if it does not exist; `menuent overwrite` rewrites it from the built-in layout). Edit them with the placement tool, then Map Mods > EXPORT to mapmods/mp/duel9.ent: the main menu reads that file.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         let overwrite = match words.as_slice() {
             [_verb] => false,

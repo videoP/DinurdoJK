@@ -93,22 +93,10 @@ impl Jk2PurePolicy {
                     p.is_file() && p.extension().is_some_and(|s| s.eq_ignore_ascii_case("pk3"))
                 })
                 .filter(|p| !disabled.contains(p) || retail(p))
-                .filter(|p| {
-                    version != 2
-                        || !p.file_name().is_some_and(|n| {
-                            n.eq_ignore_ascii_case("assets2.pk3")
-                                || n.eq_ignore_ascii_case("assets5.pk3")
-                        })
-                })
                 .collect::<Vec<_>>();
-            paths.sort_by_key(|p| {
-                std::cmp::Reverse(
-                    p.file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .to_ascii_lowercase(),
-                )
-            });
+            // Keep the pure-package inventory in the same provider order as
+            // the VFS: checksum-authorized dl_ PK3s before ordinary archives.
+            paths.sort_by(|a, b| pk3::compare_package_mount_priority(a, b));
             for path in paths {
                 let (checksum, pure_checksum) = pak_checksum::pk3_checksums(&path, feed)
                     .map_err(|e| format!("JK2 pure checksum {}: {e}", path.display()))?;

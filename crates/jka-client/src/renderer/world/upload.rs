@@ -4,10 +4,8 @@ use crate::renderer::{
     collect_static_ao_lightmap_triangles, collect_static_ao_render_triangles,
     collect_static_ao_vertex_receivers, create_cull_debug_bind_group, create_fast_world_bind_group,
     build_world_animation, WorldAnimationFrame,
-    create_legacy_dlight_pass_pipelines, create_legacy_fog_pass_pipelines,
-    create_local_shadow_resources, create_reflection_fog_pass_pipelines,
-    create_reflection_pipelines, create_snow_shell_gpu, create_world_bind_group,
-    create_specialized_world_pipelines, create_world_pipelines, detail_texture_for_source,
+    create_local_shadow_resources, create_snow_shell_gpu, create_world_bind_group,
+    create_world_pipeline_variant_from_plan, detail_texture_for_source,
     material_specialization_eligible, material_specialization_jobs, world_base_fragment_entry,
     MaterialFragmentKey, gpu_point_lights, inspector_texture_meta,
     instantiate_portal_draw_plans, is_upward_water_face, legacy_dlight_runs_for_batch, packed_face_plane, authored_face_runs,
@@ -21,7 +19,8 @@ use crate::renderer::{
     Instant, MaterialUniform, PreparedMap, PreparedPortalPlanBatchRef, RtAlphaMaskSource,
     RuntimeOceanClipmap, OceanPromotionDecision,
     StaticAoBaseLightmap, StaticAoWorldSource, SurfaceSpriteEffectGpu, SurfaceSpriteEffectRenderer,
-    texture_compression, TextureData, UniformArena, UniformSlot, WorldBatch, WorldGpu, WorldPipelineVariant, WorldShaderVariantKey,
+    texture_compression, TextureData, UniformArena, UniformSlot, WorldBatch, WorldGpu,
+    WorldPipelineCompilePlan, WorldPipelineReuseCatalog, WorldShaderVariantKey,
     WorldUploadTimings, AUTO4_COLLAPSE_CACHE_BYTES, AUTO_DETAIL_ENABLED_BIT, CLUSTER_COUNT,
     LOCAL_SHADOW_CACHE_SLOTS, MAX_CLUSTER_LIGHTS, MAX_DYNAMIC_LIGHTS, MAX_LOCAL_SHADOW_LIGHTS,
     MAX_OCEAN_SURFACES, PLANAR_REFLECTION_SLOTS,
@@ -172,6 +171,7 @@ pub(in crate::renderer) fn build_world(
     texture_compression: u8,
     mutable_images: &[usize],
     prepare_bsp_model_lod: bool,
+    pipeline_catalog: &WorldPipelineReuseCatalog,
     map: PreparedMap,
     reuse_world: Option<&WorldGpu>,
     requested_base_texture_count: usize,
@@ -188,6 +188,10 @@ pub(in crate::renderer) fn build_world(
         map.textures.len()
     };
     let source_map = map.map_file_stats.is_some();
+    let pbr_legacy_baked_color = !source_map
+        && !map.lightmaps.iter().any(|image| image.label.to_ascii_lowercase().ends_with(".hdr"));
+    let pbr_baked_color_flags = u32::from(pbr_legacy_baked_color)
+        | (u32::from(pbr_legacy_baked_color && map.lightmaps.iter().any(|image| image.rgba16f.is_some())) << 1);
     let sky_portal = map.sky_portal;
     let PreparedMap {
         vertices,
@@ -2240,7 +2244,8 @@ pub(in crate::renderer) fn build_world(
         .and_then(|old| old.pipeline_variants.get(&shader_variant).map(|psos| (old, psos)))
         .filter(|(_, psos)| {
             let keys = coarse_batches.iter().map(|b| b.source.pipeline).collect::<BTreeSet<_>>();
-            keys.iter().all(|key| psos.pipelines.contains_key(key))
+            keys.iter().all(|key| psos.pipelines.contains_key(key)
+                || (shader_variant.material_specialization && material_specialization_eligible(key)))
                 && (!shader_variant.legacy_dlights || coarse_batches.iter()
                     .filter(|b| crate::renderer::legacy_dlight_receives(&b.source))
                     .all(|b| psos.legacy_dlight_pipelines.contains_key(&b.source.pipeline)))
@@ -2266,107 +2271,33 @@ pub(in crate::renderer) fn build_world(
         };
         (variants, fast)
     } else {
-        let pipelines = create_world_pipelines(
-            device,
-            pipeline_layout,
-            shader,
-            surface_format,
-            msaa_samples,
-            &coarse_batches,
-            legacy_fog,
-            Some(shader_variant),
-        );
-        let legacy_dlight_pipelines = if shader_variant.legacy_dlights {
-            create_legacy_dlight_pass_pipelines(
-                device,
-                pipeline_layout,
-                shader,
-                surface_format,
-                msaa_samples,
-                &coarse_batches,
-                shader_variant,
-            )
-        } else {
-            BTreeMap::new()
-        };
-        let fog_pass_pipelines = if legacy_fog {
-            create_legacy_fog_pass_pipelines(
-                device,
-                pipeline_layout,
-                shader,
-                surface_format,
-                msaa_samples,
-                &coarse_batches,
-                Some(shader_variant),
-            )
-        } else {
-            BTreeMap::new()
-        };
-        // Companion-camera pipelines compile only when that view is requested.
-        let fast_pipelines = BTreeMap::new();
-        let reflection_pipelines = if planar_reflectors.is_empty() || !shader_variant.planar_reflections
-        {
-            BTreeMap::new()
-        } else {
-            create_reflection_pipelines(
-                device,
-                pipeline_layout,
-                shader,
-                surface_format,
-                &coarse_batches,
-                legacy_fog,
-                shader_variant,
-            )
-        };
-        let reflection_fog_pass_pipelines =
-            if legacy_fog && !planar_reflectors.is_empty() && shader_variant.planar_reflections {
-                create_reflection_fog_pass_pipelines(
-                    device,
-                    pipeline_layout,
-                    shader,
-                    surface_format,
-                    &coarse_batches,
-                    shader_variant,
-                )
-            } else {
-                BTreeMap::new()
-            };
         if let Some(path) = std::env::var_os("JKA_DUMP_WORLD_BATCHES") {
             dump_world_batches(&path, &coarse_batches, &full_batches, shader_variant, legacy_fog,
                 &material_debug);
         }
-        let specialized_pipelines = create_specialized_world_pipelines(
-            device,
-            pipeline_layout,
-            shader,
-            lean_shader,
-            surface_format,
-            msaa_samples,
-            &material_specialization_jobs(coarse_batches.iter().chain(&full_batches)),
-            shader_variant,
-        );
+        // Use the same PSO identity/cancellation-aware compiler as runtime
+        // variants. This lets map reloads reuse PSOs without retaining old BSP
+        // geometry, textures or bind groups. The one-shot load token is never
+        // cancelled; the previous world's background job was cancelled first.
+        let plan = WorldPipelineCompilePlan {
+            base_keys: coarse_batches.iter().map(|b| b.source.pipeline)
+                .collect::<BTreeSet<_>>().into_iter().collect(),
+            legacy_dlight_keys: coarse_batches.iter()
+                .filter(|b| crate::renderer::legacy_dlight_receives(&b.source))
+                .map(|b| b.source.pipeline).collect::<BTreeSet<_>>()
+                .into_iter().collect(),
+            fog_jobs: crate::renderer::legacy_fog_pass_jobs(&coarse_batches),
+            material_jobs: material_specialization_jobs(coarse_batches.iter().chain(&full_batches)),
+            has_planar_reflectors: !planar_reflectors.is_empty(),
+        };
+        let never_cancel = std::sync::atomic::AtomicBool::new(false);
+        let compiled = create_world_pipeline_variant_from_plan(
+            device, pipeline_layout, shader, lean_shader, surface_format,
+            msaa_samples, shader_variant, &plan, pipeline_catalog, &never_cancel,
+        ).expect("uncancelled BSP map upload must create a complete variant");
         let mut pipeline_variants = BTreeMap::new();
-        pipeline_variants.insert(
-            shader_variant,
-            WorldPipelineVariant {
-                encoded_fog_pipelines: super::legacy_blend::fog_pipelines(
-                    device, pipeline_layout, shader, surface_format, msaa_samples,
-                    coarse_batches.iter().map(|b| b.source.pipeline), shader_variant),
-                encoded_world_pipelines: super::legacy_blend::pipelines(
-                    device, pipeline_layout, shader, surface_format, msaa_samples,
-                    coarse_batches.iter().map(|b| b.source.pipeline), shader_variant),
-                ocean_far_pipeline: None,
-                ocean_native_mesh_pipeline: None,
-                ocean_native_mesh_wireframe_pipeline: None,
-                pipelines,
-                legacy_dlight_pipelines,
-                fog_pass_pipelines,
-                reflection_pipelines,
-                reflection_fog_pass_pipelines,
-                specialized_pipelines,
-                slot_pipelines: Vec::new(),
-            },
-        );
+        pipeline_variants.insert(shader_variant, compiled);
+        let fast_pipelines = BTreeMap::new();
         (pipeline_variants, fast_pipelines)
     };
     upload_timings.pipeline_create_ms = pipeline_started.elapsed().as_secs_f64() * 1000.0;
@@ -2594,6 +2525,7 @@ pub(in crate::renderer) fn build_world(
 
     (
         WorldGpu {
+            pbr_baked_color_flags,
             weather_anchor,
             collision_mesh: None,
             native_flat_draw: None,

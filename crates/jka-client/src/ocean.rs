@@ -1577,6 +1577,22 @@ pub struct OceanSettings {
     /// Separate authored swell for Hybrid; never changes Godot map-authored
     /// waves, their amplitude links, or Blue Water's simulation parameters.
     pub hybrid_swell: OceanAuthoring,
+    /// Map-authored (jaPRO) ocean: `hybrid_swell.amplitude` is absolute, not
+    /// relative to the Blue Water height slider (the map already sets that
+    /// height from the same amplitude, which would count it twice).
+    pub hybrid_swell_absolute: bool,
+    /// `r_oceanLongWaves`: rebuild the Blue Water FFT's largest tile (its long
+    /// waves) from this many stronger waves with the same total energy and
+    /// spread, instead of thousands of weak ones. 0 = original spectrum.
+    pub long_waves: u32,
+    /// `r_oceanMediumWaves`: the same for the FFT's medium tile. 0 = original.
+    pub medium_waves: u32,
+    /// `r_oceanSmallWaveDetail`: height gain on the FFT's fine-chop tile
+    /// (visual only; physics never sums it). 1 = Blue Water's own spectrum.
+    pub small_wave_detail: f32,
+    /// `r_oceanMediumWaveDetail`: height gain on the FFT's medium tile. These
+    /// waves are physics waves, so the server must use the same gain.
+    pub medium_wave_detail: f32,
     /// `r_oceanType 5` (backend 2 + this): Hybrid with godot-water-shader's
     /// waves, surface colour and persistent foam (vendor/godot-water-shader)
     /// in place of the FFT displacement, water body and foam. Blue Water lights it.
@@ -1736,6 +1752,11 @@ impl Default for OceanSettings {
             hybrid_fft_blend: 1.0,
             hybrid_breaker: 0,
             hybrid_swell: OceanAuthoring::default(),
+            hybrid_swell_absolute: false,
+            long_waves: 0,
+            medium_waves: 0,
+            small_wave_detail: 1.0,
+            medium_wave_detail: 1.0,
             blue_water_optics: BlueWaterOptics::default(),
             blue_water_refraction: 0.1,
             blue_water_refraction_mode: 2,
@@ -2674,6 +2695,11 @@ impl OceanGpu {
 
     pub fn map_size(&self) -> u32 { self.settings.map_size }
     pub fn backend(&self) -> u8 { self.settings.backend }
+    /// The map ocean's physics waves for the shared Blue Water/Hybrid FFT.
+    pub(crate) fn set_sailing_sea(&mut self, sea: Option<&jka_movement::SailingSea>) {
+        if let Some(blue) = self.blue_water.as_mut() { blue.set_sailing_sea(sea); }
+    }
+
     pub(crate) fn set_blue_water_shore(&mut self,device:&wgpu::Device,queue:&wgpu::Queue,maps:Option<std::sync::Arc<upstream_coast::Maps>>) {
         if let Some(blue)=self.blue_water.as_mut() {blue.set_shore(device,queue,maps,self.settings.blue_water_coast_shelter);}
     }
@@ -3309,6 +3335,15 @@ impl OceanGpu {
 
     /// Latest rasterized-surface height above pool `slot`'s flat plane at the eye, in
     /// JKA units, a few frames old.
+    /// Blue Water's significant height 4σ (m) per FFT tile (big, medium, small)
+    /// of the spectrum currently built, or None without Blue Water.
+    pub fn blue_tile_heights(&self) -> Option<[f32; 3]> {
+        self.blue_water.as_ref().map(|blue| {
+            let h = blue.field.surface_stats().heights();
+            [h[0], h[1], h[2]]
+        })
+    }
+
     pub fn eye_wave_sample(&self, slot: usize) -> Option<eye_wave::EyeWaveSample> {
         self.eye_wave.as_ref()?.latest(slot)
     }
@@ -3323,7 +3358,9 @@ impl OceanGpu {
             blue.adapter_enabled = self.settings.blue_water_adapter;
             blue.encode(queue, encoder, delta, self.settings.updates_per_second, self.settings.blue_water_waves,
                 hybrid_swell_uniform(&self.settings,self.elapsed+delta.max(0.0)),
-                if self.settings.backend == 2 { self.settings.hybrid_breaker } else { 0 });
+                if self.settings.backend == 2 { self.settings.hybrid_breaker } else { 0 },
+                [self.settings.long_waves, self.settings.medium_waves],
+                [self.settings.medium_wave_detail, self.settings.small_wave_detail]);
             self.elapsed += delta.max(0.0);
             self.write_render_uniform(queue);
             return;
@@ -3564,7 +3601,9 @@ pub(super) fn hybrid_swell_uniform(settings: &OceanSettings, seconds: f32) -> [[
     static REFERENCE_WAVE_HEIGHT: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     let reference_height = *REFERENCE_WAVE_HEIGHT
         .get_or_init(|| BlueWaterWaves::default().height.max(0.001));
-    let wave_height_scale = settings.blue_water_waves.height.max(0.0) / reference_height;
+    let wave_height_scale = if settings.hybrid_swell_absolute { 1.0 } else {
+        settings.blue_water_waves.height.max(0.0) / reference_height
+    };
     let amplitude = if gerstner { 0.0 } else {
         authored.amplitude / OCEAN_UNITS_PER_METER * (1.0 - mix) * wave_height_scale
     };

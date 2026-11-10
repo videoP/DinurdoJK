@@ -204,6 +204,7 @@ impl GameSession {
             studio_external_player_entities: Vec::new(),
             studio_visible_players: None,
             studio_presentation_view: None,
+            app_camera_view: false,
             race_ghost_alpha: 0.35,
             race_ghost_live_sample: None,
             lagometer: crate::lagometer::Lagometer::default(),

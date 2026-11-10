@@ -109,6 +109,26 @@ video_scalar_cvars! { SCALAR_DEFINITIONS, commit_ocean_settings;
         range: "0..1", description: "Hybrid ocean: 1 pure Blue Water FFT; 0 authored Gerstner; intermediate values mix FFT and analytical displacement. Native and Godot unaffected.",
         kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.hybrid_fft_blend, archive: 25189
     }
+    APP_R_OCEANLONGWAVES {
+        name: "r_oceanLongWaves", default: "0",
+        range: "0..4096", description: "Blue Water / Hybrid: rebuild the FFT's long waves (its largest tile) from this many stronger waves with the same total height, wavelength and direction spread, instead of thousands of weak ones. 0 = original spectrum. Shorter waves are unchanged. Look test for a wave count the server could sum.",
+        kind: CvarType::Int { min: 0, max: 4096 }, field: ocean_settings.long_waves, archive: 27390
+    }
+    APP_R_OCEANMEDIUMWAVES {
+        name: "r_oceanMediumWaves", default: "0",
+        range: "0..4096", description: "Blue Water / Hybrid: rebuild the FFT's medium waves (its second tile) from this many stronger waves with the same total height and spread. 0 = original spectrum. Pair with r_oceanLongWaves.",
+        kind: CvarType::Int { min: 0, max: 4096 }, field: ocean_settings.medium_waves, archive: 27391
+    }
+    APP_R_OCEANSMALLWAVEDETAIL {
+        name: "r_oceanSmallWaveDetail", default: "1",
+        range: "0..16", description: "Blue Water / Hybrid: height multiplier for the FFT's fine chop (its smallest tile). Raise it for more small surface variation. Visual only: physics never sums these waves. 1 = Blue Water's own spectrum.",
+        kind: CvarType::Float { min: 0.0, max: 16.0 }, field: ocean_settings.small_wave_detail, archive: 27392
+    }
+    APP_R_OCEANMEDIUMWAVEDETAIL {
+        name: "r_oceanMediumWaveDetail", default: "1",
+        range: "0..16", description: "Blue Water / Hybrid: height multiplier for the FFT's medium waves (its second tile, a few metres to ~20 m). Raise it for more mid-size surface variation. 1 = Blue Water's own spectrum.",
+        kind: CvarType::Float { min: 0.0, max: 16.0 }, field: ocean_settings.medium_wave_detail, archive: 27393
+    }
     APP_R_HYBRIDBREAKER {
         name: "r_hybridBreaker", default: "0",
         range: "0..2", description: "Hybrid crest A/B: 0 original; 1 conservative horizontal compression limit; 2 bounded crest folds, signed normals and spilling foam. Preserves vertical wave height. Applies live.",

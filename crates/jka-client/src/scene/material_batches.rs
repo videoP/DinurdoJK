@@ -924,6 +924,12 @@ pub(in crate::scene) fn build_material_debug_entry(
         ));
     }
 
+    if material.stages.len() == 2 && !material.water && !material.planar_reflection
+        && can_fold_pbr_cutout_lightmap_pair(&material.stages[0], &material.stages[1])
+    {
+        lines.push("effective render: enhanced cutout + lightmap folds to ONE masked base*lightmap batch; PBR maps and authored alpha test retained (requires BSP lightmap)".into());
+    }
+
     if material.stages.len() >= 2
         && can_fold_openjk_reverse_lightmap_modulate_pair(&material.stages[0], &material.stages[1])
     {
@@ -975,8 +981,7 @@ pub(in crate::scene) fn build_material_debug_entry(
         let stage_enhanced = has_stage_enhancements(stage);
         enhanced |= stage_enhanced;
         let pbr_eligible = matches!(stage.texture, StageTexture::Image(_))
-            && stage.blend.is_none()
-            && stage.alpha_cutoff == 0.0
+            && (stage.blend.is_none() || stage_is_opaque_replacement(stage))
             && matches!(stage.tc_gen, TcGen::Base);
         lines.push(format!(
             "resolved stage {index}: base={base} blend={:?} alpha_cutoff={:.3} color={:.3},{:.3},{:.3},{:.3} tcGen={:?} rgbGen={:?} alphaGen={:?} pbr_eligible={} normal={} roughness={} metallic={} specular={} emissive={} height={} height_from_alpha={} rmo_packed={} rmos_alpha={} normalScale={:.3},{:.3} roughnessOverride={} specularReflectance={} parallaxDepth={:.4}",
@@ -1105,6 +1110,36 @@ pub(in crate::scene) fn can_fold_jka_lightmap_pair(
         && matches!(material_stage.tc_gen, TcGen::Base)
         && !material_stage.depth_equal
         && !material_stage.depth_test_disabled
+}
+
+/// Rend2 evaluates an enhanced cutout and its following lightmap in the same
+/// lighting pass. Keeping the lightmap as a later framebuffer multiply would
+/// also multiply the specular highlight, and leave static PBR without a baked
+/// lighting input. Preserve the original cutoff (including LT128), depth and UVs.
+fn can_fold_pbr_cutout_lightmap_pair(base: &MaterialStage, lightmap: &MaterialStage) -> bool {
+    matches!(base.texture, StageTexture::Image(_))
+        && has_stage_enhancements(base)
+        && stage_class(base) == DrawClass::Mask
+        && base.depth_write
+        && !base.depth_equal && !base.depth_test_disabled
+        && base.opacity == 1.0 && base.color == [1.0; 3]
+        && matches!(base.rgb_gen, RgbGen::Identity)
+        && matches!(base.alpha_gen, AlphaGen::Identity)
+        && matches!(base.tc_gen, TcGen::Base)
+        && !base.glow
+        && matches!(lightmap.texture, StageTexture::Lightmap)
+        && matches!(lightmap.blend,
+            Some(materials::BlendFunc { src: BlendFactor::DstColor, dst: BlendFactor::Zero })
+            | Some(materials::BlendFunc { src: BlendFactor::Zero, dst: BlendFactor::SrcColor }))
+        && lightmap.alpha_cutoff == 0.0
+        && lightmap.opacity == 1.0 && lightmap.color == [1.0; 3]
+        && matches!(lightmap.rgb_gen, RgbGen::Identity)
+        && matches!(lightmap.alpha_gen, AlphaGen::Identity)
+        && matches!(lightmap.tc_gen, TcGen::Lightmap)
+        && lightmap.tc_mods.is_empty()
+        && lightmap.animation.is_none()
+        && !lightmap.depth_test_disabled && !lightmap.depth_write
+        && !lightmap.glow && !has_stage_enhancements(lightmap)
 }
 
 /// OpenJK `CollapseMultitexture` explicitly permits the companion modulation
@@ -1324,7 +1359,13 @@ fn additive_same_tcgen(a: &DrawBatch, b: &DrawBatch) -> bool {
 }
 
 fn additive_candidate(b: &DrawBatch) -> bool {
-    b.pipeline.blend == BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::One)
+    // GL_ONE/GL_ONE and GL_SRC_ALPHA/GL_ONE both add independently to the
+    // destination. Unlike alpha compositing, the contributions may be summed
+    // before a single ONE/ONE hardware blend. Preserve each stage's OWN source
+    // factor in its material uniform; mixed chains are legal as well.
+    matches!(b.pipeline.blend,
+        BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::One)
+        | BlendMode::Custom(BlendFactor::One, BlendFactor::One))
         && b.pipeline.class == DrawClass::Transparent
         && !b.pipeline.depth_write && !b.pipeline.offset && !(b.pipeline.auto_sprite || b.pipeline.auto_sprite2)
         // The move entry emits VertexOut; fused additive shaders require their
@@ -1353,7 +1394,7 @@ fn additive_candidate(b: &DrawBatch) -> bool {
 /// split an eligible run. Keep this in one place to avoid misleading diagnostics.
 pub(crate) fn additive_fusion_rejection_reason(a: &DrawBatch, b: &DrawBatch) -> Option<&'static str> {
     if !additive_candidate(a) || !additive_candidate(b) {
-        return Some("non-additive blend, depth/alpha state, texture animation, fog, PBR or non-affine tcMod");
+        return Some("non-additive (requires ONE/ONE or SRC_ALPHA/ONE), depth/alpha state, texture animation, fog, PBR or non-affine tcMod");
     }
     if a.authored_glow != b.authored_glow {
         return Some("authored glow boundary (glow-only framebuffer replay)");
@@ -1532,8 +1573,9 @@ pub(in crate::scene) fn append_material_batches(
         fog,
         fog_is_global,
     );
-    // Fold only strictly equivalent adjacent SRC_ALPHA/ONE passes: no depth writes,
-    // no alpha discard, identical depth/glow/fog and affine texture generators.
+    // Fold adjacent ONE/ONE and SRC_ALPHA/ONE passes (including mixed runs):
+    // no depth writes, no alpha discard, identical depth/glow/fog and affine
+    // texture generators. Every original source factor remains stage-local.
     // This is material-agnostic: ocean, fish caustics and terrain overlays all
     // use the same eligibility test. The world fragment shader evaluates every
     // member in original order in one draw, preserving independent tcMods.
@@ -1618,6 +1660,18 @@ pub(in crate::scene) fn append_material_batches_unflagged(
     let lightmap_stage = lightmap.and_then(|_| stages.iter().position(|s| {
         matches!(s.texture, StageTexture::Lightmap)
     }));
+
+    if !vertex_lit && lightmap.is_some() && stages.len() == 2
+        && !material.water && !material.planar_reflection
+        && can_fold_pbr_cutout_lightmap_pair(&stages[0], &stages[1])
+    {
+        let mut batch = stage_batch(material, &stages[0], true, vertex_lit,
+            range, Some(bsp_shader_index), material_debug_index, lightmap,
+            pvs_signature, area_signature, fog, fog_is_global);
+        batch.modulate_lightmap = true;
+        out.push(batch);
+        return;
+    }
 
 
     // Keep the overwhelmingly common implicit BSP material in one draw call.
@@ -2070,6 +2124,84 @@ mod cloud_composite_order_tests {
         assert_eq!(draws.len(), 2);
         assert!(!draws[0].pipeline.depth_test_disabled);
         assert!(draws[1].pipeline.depth_test_disabled);
+    }
+
+    #[test]
+    fn one_one_additive_pair_fuses_without_losing_source_alpha_semantics() {
+        // GL_ONE GL_ONE must add raw source RGB and alpha. GL_SRC_ALPHA GL_ONE
+        // must weight both by source alpha. These two modes can share the same
+        // fixed ONE/ONE destination blend, with per-stage source weighting.
+        let mut first = base_stage();
+        first.texture = StageTexture::Image(41);
+        first.blend = Some(materials::BlendFunc {
+            src: BlendFactor::One, dst: BlendFactor::One,
+        });
+        let mut second = first.clone();
+        second.texture = StageTexture::Image(42);
+        second.tc_mods = vec![TcMod::Scroll(0.2, -0.1)];
+        let material = SurfaceMaterial {
+            explicit: true, stages: vec![first, second], ..Default::default()
+        };
+        let mut draws = Vec::new();
+        append_material_batches(&mut draws, &material, 10, None, false,
+            0..6, None, &[], [0; 4], [0.0; 4], false);
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].pipeline.additive_fusion_count, 2);
+        assert_eq!(draws[0].additive_companions.len(), 1);
+        assert_eq!(draws[0].pipeline.blend, BlendMode::Custom(BlendFactor::One, BlendFactor::One));
+        assert_eq!(draws[0].additive_companions[0].pipeline.blend, BlendMode::Custom(BlendFactor::One, BlendFactor::One));
+    }
+
+    #[test]
+    fn mixed_one_one_src_alpha_additive_chain_fuses_and_restores() {
+        let mut stages = (0..3).map(|i| {
+            let mut stage = base_stage();
+            stage.texture = StageTexture::Image(51 + i);
+            stage.blend = Some(materials::BlendFunc {
+                src: if i == 1 { BlendFactor::SrcAlpha } else { BlendFactor::One },
+                dst: BlendFactor::One,
+            });
+            stage
+        }).collect::<Vec<_>>();
+        stages[1].alpha_gen = AlphaGen::Vertex;
+        stages[2].tc_mods = vec![TcMod::Rotate(1.5)];
+        let material = SurfaceMaterial {
+            explicit: true, stages, ..Default::default()
+        };
+        let mut draws = Vec::new();
+        append_material_batches(&mut draws, &material, 10, None, false,
+            0..6, None, &[], [0; 4], [0.0; 4], false);
+        assert_eq!(draws.len(), 1);
+        assert_eq!(draws[0].pipeline.additive_fusion_count, 3);
+        assert_eq!(draws[0].additive_companions.len(), 2);
+        let restored = super::super::shader_remap::expand_additive_batches(&draws);
+        assert_eq!(restored.len(), 3);
+        assert_eq!(restored[0].pipeline.blend, BlendMode::Custom(BlendFactor::One, BlendFactor::One));
+        assert_eq!(restored[1].pipeline.blend, BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::One));
+        assert_eq!(restored[2].pipeline.blend, BlendMode::Custom(BlendFactor::One, BlendFactor::One));
+    }
+
+    #[test]
+    fn additive_mixed_pair_does_not_cross_glow_boundary() {
+        let mut first = base_stage();
+        first.texture = StageTexture::Image(51);
+        first.blend = Some(materials::BlendFunc {
+            src: BlendFactor::One, dst: BlendFactor::One,
+        });
+        let mut second = first.clone();
+        second.blend = Some(materials::BlendFunc {
+            src: BlendFactor::SrcAlpha, dst: BlendFactor::One,
+        });
+        second.glow = true;
+        let material = SurfaceMaterial {
+            explicit: true, stages: vec![first, second], ..Default::default()
+        };
+        let mut draws = Vec::new();
+        append_material_batches(&mut draws, &material, 10, None, false,
+            0..6, None, &[], [0; 4], [0.0; 4], false);
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].pipeline.additive_fusion_count, 0);
+        assert_eq!(draws[1].pipeline.additive_fusion_count, 0);
     }
 
     #[test]

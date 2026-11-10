@@ -345,6 +345,21 @@ impl Renderer {
         self.refresh_ocean_extension_gate(camera.position.to_array(), render_ocean);
         let topology_started=render_ocean.then(Instant::now);
         self.refresh_eye_wave_offset(camera.position);
+        if crate::ocean::authoring::SAILING_DEBUG.load(std::sync::atomic::Ordering::Relaxed) {
+            // `sailingdebug`: the rendered surface height at the camera XY
+            // (probe, a few frames old) for the app's console readout.
+            let drawn = self.eye_wave_slot
+                .filter(|_| self.camera_water_surface > crate::renderer::NO_WATER_SURFACE * 0.5)
+                .map(|_| self.camera_water_surface + self.eye_wave_offset);
+            let jka = crate::scene::jka_position(camera.position.to_array());
+            if let Ok(mut slot) = crate::ocean::authoring::SAILING_DEBUG_DRAWN.lock() {
+                *slot = Some((jka, drawn));
+            }
+            let tiles = self.ocean.as_ref().and_then(|ocean| ocean.blue_tile_heights());
+            if let Ok(mut slot) = crate::ocean::authoring::SAILING_DEBUG_TILES.lock() {
+                *slot = tiles.map(|heights| (heights, self.ocean_settings.hybrid_fft_blend));
+            }
+        }
         // BSP water volumes are valid even with the promoted ocean renderer
         // disabled. DOF underwater-only still needs to recognize stock water.
         if render_ocean || (self.dof_mode == DofMode::UnderwaterOnly
@@ -2849,6 +2864,8 @@ impl Renderer {
                 }
             }
         }
+
+        self.encode_generated_cubemaps(&mut encoder, camera_pos_time[3]);
 
         // Render up to four distinct visible planar views at half resolution.
         // Coplanar surfaces share one texture-array layer. Each reflection pass
@@ -8995,13 +9012,15 @@ impl Renderer {
         }
         let egui_had_pixels = self.egui_active
             && (!self.egui_paint_jobs.is_empty() || self.neon_chrome_wanted());
-        // The native map/join screen paints an opaque fullscreen background.
-        // Draw it BEFORE egui's interactive join/password/missing-map dialogs,
-        // otherwise the late native HUD completely hides those dialogs while
-        // the network preflight waits for the user to choose an option. Keep
-        // the normal HUD/egui ordering unchanged outside loading screens.
-        let loading_egui_on_top = self.ui_state.loading.is_some() && self.egui_active;
-        if !loading_egui_on_top {
+        // Loading dialogs and the floating HL2 console are interactive egui
+        // overlays. Draw the native UI first so its late HUD/scoreboard passes
+        // cannot cover either of them. In particular, the HL2 console must be
+        // above the gameplay HUD even when SMAA, HDR, streaming or CRT defers
+        // the native UI. Keep the existing order for all other egui pages and
+        // for the classic (native WGPU) console.
+        let egui_over_native_ui = self.egui_active && (self.ui_state.loading.is_some()
+            || (self.ui_state.mode == ui::OverlayMode::Console && self.ui_state.console_hl2));
+        if !egui_over_native_ui {
             if legacy_hdr_ui {
                 let perf_ui_call_started = perf_timing.then(Instant::now);
                 self.submit_egui_deferred_hdr(ui_composite_target);
@@ -9036,7 +9055,7 @@ impl Renderer {
                 info.perf_followup_native_ui_ms += started.elapsed().as_secs_f64() * 1000.0;
             }
         }
-        if loading_egui_on_top {
+        if egui_over_native_ui {
             if legacy_hdr_ui {
                 if native_ui_main_drawn || native_ui_late_drawn {
                     let perf_ui_call_started = perf_timing.then(Instant::now);

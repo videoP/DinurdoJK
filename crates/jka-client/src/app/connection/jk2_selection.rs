@@ -120,7 +120,7 @@ impl App {
         let name = words.first().copied().unwrap_or_default();
         match action {
             GameCommand::ToggleFireMode => return false,
-            GameCommand::WeaponLast | GameCommand::WeaponClean | GameCommand::InventoryFree => {
+            GameCommand::WeaponClean | GameCommand::InventoryFree => {
                 self.push_console_line(format!("^3{name}: not a JK2 CGame command"));
                 return true;
             }
@@ -136,6 +136,7 @@ impl App {
                 let slot = words.get(1).map_or(0, |slot| jka_protocol::commands::atoi(slot.as_bytes()));
                 self.live_input.jk2_weapon_slot(&frame, slot)
             }
+            GameCommand::WeaponLast => self.live_input.jk2_last_weapon(&frame),
             GameCommand::ForceNext | GameCommand::ForcePrev => {
                 self.live_input.jk2_cycle_force(&frame, matches!(action, GameCommand::ForceNext))
             }

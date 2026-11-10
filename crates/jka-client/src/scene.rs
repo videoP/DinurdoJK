@@ -244,6 +244,16 @@ pub struct PipelineKey {
 }
 
 impl DrawBatch {
+    /// Cutouts replace covered pixels just like opaque surfaces. Their alpha
+    /// test must not disable authored normal/material maps at uniform upload.
+    pub(crate) fn pbr_eligible(&self) -> bool {
+        !self.texture_is_lightmap
+            && !self.texture_is_white
+            && matches!(self.pipeline.class, DrawClass::Opaque | DrawClass::Mask)
+            && self.pipeline.blend == BlendMode::Opaque
+            && matches!(self.tc_gen, TcGen::Base)
+    }
+
     /// A non-lightmapped *world* additive stage which consumes a fixed or
     /// animated RGB generator instead of BSP vertex RGB. For baked sky lighting
     /// it may use the cached sky gain without changing its authored rgbGen,
@@ -1656,6 +1666,9 @@ pub struct PreparedMap {
     /// Server CS_BSP_MODELS assets, in the order used for collision/render handles.
     pub sub_bsp_names: Vec<String>,
     pub authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
+    /// jaPRO sailing markers (ocean/shore/current) in entity-lump order, loaded
+    /// into the jaPRO prediction backend when this map is installed.
+    pub sailing_spawns: Vec<jka_movement::SailingSpawn>,
     /// Real water brush bounds in renderer coordinates, independent of visible faces.
     pub water_brush_bounds: Vec<crate::ocean::WaterVolume>,
     pub thermal_liquids: Vec<ThermalLiquidVolume>,

@@ -117,9 +117,10 @@ pub fn validate_game_name(value: &str) -> Result<Option<String>, String> {
     let name = value.trim();
     if name.is_empty() { return Ok(None); }
     if name.len() > 63 || name == "." || name == ".."
+        || name.eq_ignore_ascii_case(jka_assets::pk3::DINURDOJK_DIRECTORY)
         || name.bytes().any(|c| c < 0x20 || c == 0x7f || matches!(c, b'/' | b'\\' | b':' | b';' | b'"'))
     {
-        return Err("expected one game directory name (not a path, or 'base')".into());
+        return Err("expected one game directory name (not a path or the DinurdoJK client folder)".into());
     }
     Ok(Some(name.into()))
 }
@@ -154,6 +155,7 @@ pub fn load(base: &Path) -> FilesystemRoots {
             "fs_jk2homepath" => parse_root(base, value).map(|v| { roots.jk2homepath = v; }),
             "fs_jk2cdpath" => parse_root(base, value).map(|v| { roots.jk2cdpath = v; }),
             "fs_forcegame" => validate_game_name(value).map(|v| { roots.forcegame = v; }),
+            "fs_jk2forcegame" => validate_game_name(value).map(|v| { roots.jk2forcegame = v; }),
             _ => continue,
         };
         if let Err(error) = result { eprintln!("Ignoring invalid {key} in {FILE}: {error}"); }
@@ -176,10 +178,10 @@ pub fn save(_base: &Path, roots: &FilesystemRoots) -> Result<(), String> {
         }
     });
     let contents = format!(
-        "# Game roots contain base/ and mod folders. Relative paths use the executable directory.\n# Blank fs_basepath = the executable directory; blank fs_jk2basepath = JK2 disabled. fs_homepath/fs_jk2homepath are optional per-game writable roots (they must differ).\n# fs_forcegame mounts DinurdoJK/<name>/ above shared/ without changing write locations.\nfs_basepath={}\nfs_homepath={}\nfs_cdpath={}\nfs_jk2basepath={}\nfs_jk2homepath={}\nfs_jk2cdpath={}\nfs_forcegame={}\n",
+        "# Game roots contain base/ and mod folders. Relative paths use the executable directory.\n# Blank fs_basepath = the executable directory; blank fs_jk2basepath = JK2 disabled. fs_homepath/fs_jk2homepath are optional per-game writable roots (they must differ).\n# fs_forcegame mounts fs_basepath/<name>/ for JKA; fs_jk2forcegame mounts fs_jk2basepath/<name>/ for JK2. Neither changes game-owned writes.\nfs_basepath={}\nfs_homepath={}\nfs_cdpath={}\nfs_jk2basepath={}\nfs_jk2homepath={}\nfs_jk2cdpath={}\nfs_forcegame={}\nfs_jk2forcegame={}\n",
         show(&roots.basepath), show(&roots.homepath), show(&roots.cdpath),
         show(&roots.jk2basepath), show(&roots.jk2homepath), show(&roots.jk2cdpath),
-        roots.forcegame.as_deref().unwrap_or(""),
+        roots.forcegame.as_deref().unwrap_or(""), roots.jk2forcegame.as_deref().unwrap_or(""),
     );
     std::fs::write(&file, contents).map_err(|error| format!("{}: {error}", file.display()))
 }
@@ -205,6 +207,7 @@ pub fn apply_startup_commands(
             "fs_jk2homepath" => roots.jk2homepath = parse_root(base, value)?,
             "fs_jk2cdpath" => roots.jk2cdpath = parse_root(base, value)?,
             "fs_forcegame" => roots.forcegame = validate_game_name(value)?,
+            "fs_jk2forcegame" => roots.jk2forcegame = validate_game_name(value)?,
             _ => {}
         }
     }
@@ -217,11 +220,24 @@ mod tests {
     #[test]
     fn roots_are_inclusive_game_roots_and_names_reject_traversal() {
         assert!(validate_game_name("../escape").is_err());
+        assert!(validate_game_name("DinurdoJK").is_err());
         assert!(validate_game_name("C:\\folder").is_err());
         let base = Path::new("/client/base");
         let mut roots = FilesystemRoots::default();
         apply_startup_commands(base, &mut roots, &["set fs_jk2basepath /outcast".into()]).unwrap();
         assert_eq!(jka_assets::pk3::jk2_base_directory(base, &roots), Some(PathBuf::from("/outcast/base")));
+    }
+
+    #[test]
+    fn startup_forcegame_values_remain_independent() {
+        let base = Path::new("/client/base");
+        let mut roots = FilesystemRoots::default();
+        apply_startup_commands(base, &mut roots, &[
+            "set fs_forcegame Eternal".into(),
+            "set fs_jk2forcegame jk2-custom".into(),
+        ]).unwrap();
+        assert_eq!(roots.forcegame.as_deref(), Some("Eternal"));
+        assert_eq!(roots.jk2forcegame.as_deref(), Some("jk2-custom"));
     }
 
     fn layout(jk2: Option<PathBuf>, home: Option<PathBuf>, jk2_home: Option<PathBuf>) -> FilesystemRoots {

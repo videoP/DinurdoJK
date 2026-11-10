@@ -84,6 +84,7 @@ pub const TEAM_RED: i32 = 1;
 pub const TEAM_BLUE: i32 = 2;
 pub const SABER_RED: i32 = 0;
 pub const SABER_BLUE: i32 = 4;
+pub const SABER_YELLOW: i32 = 2;
 pub const SABER_PURPLE: i32 = 5;
 const MAX_QPATH: usize = 64;
 
@@ -120,6 +121,8 @@ pub struct ClientInfo {
     pub gametype: i32,
     /// TaystJK serverinfo exception: team skin/saber forcing is disabled in Jedi-vs-Merc mode.
     pub jedi_v_merc: bool,
+    /// Bucky MVSDK CT(F)3: TEAM_FREE is an actual yellow CTF side.
+    pub jk2_ctf3: bool,
     /// BG_ValidateSkinForTeam's RGB/Jedi-model fallback tint. Zero/None means use customRGBA.
     pub team_color_override: Option<[u8; 3]>,
     /// CG_NewClientInfo's `ds` gender hint selects the missing-model fallback.
@@ -164,6 +167,7 @@ impl ClientInfo {
             team: 0,
             gametype: 0,
             jedi_v_merc: false,
+            jk2_ctf3: false,
             team_color_override: None,
             female: false,
             model_name: "kyle".to_owned(),
@@ -245,7 +249,7 @@ impl ClientInfo {
 const MAX_GENTITIES: usize = 1024;
 const MAX_CLIENTS: usize = 32;
 const EF_TELEPORT_BIT: i32 = 1 << 3;
-const SNAPFLAG_SERVERCOUNT: u8 = 1 << 2;
+pub(crate) const SNAPFLAG_SERVERCOUNT: u8 = 1 << 2;
 const DEFAULT_GRAVITY: f32 = 800.0;
 const CLASS_VEHICLE: i32 = 53;
 const GIB_HEALTH: i32 = -40;
@@ -670,7 +674,8 @@ struct ConfigStringState {
     duelists: [i32; 3],
     duelist_healths: [i32; 3],
     intermission: bool,
-    flag_status: [i32; 2],
+    flag_status: [i32; 3],
+    flag_taken_since: [i32; 3],
     siege_state: Vec<u8>,
     siege_objectives: Vec<u8>,
     siege_time_override: i32,
@@ -690,7 +695,8 @@ impl Default for ConfigStringState {
             duelists: [-1; 3],
             duelist_healths: [-1; 3],
             intermission: false,
-            flag_status: [-1; 2],
+            flag_status: [-1; 3],
+            flag_taken_since: [0; 3],
             siege_state: Vec::new(),
             siege_objectives: Vec::new(),
             siege_time_override: 0,
@@ -893,6 +899,15 @@ impl PrivateDuelState {
     }
 }
 
+/// A snapshot-side G_AddEvent transition waiting for the next player-state
+/// event dispatch. Prediction can consume several snapshots before rendering
+/// a frame, or replay no movement command at all. Retain each transition,
+/// including zeros (which reset the raw external-event uniqueness baseline).
+struct PendingExternalPlayerEvent {
+    player_state: PlayerState,
+    server_time: i32,
+}
+
 pub struct ClientGameState {
     private_duel: PrivateDuelState,
     entities: Vec<CEntity>,
@@ -927,6 +942,12 @@ pub struct ClientGameState {
     /// against duplicates across successive replays and snapshot corrections.
     /// See the predictable-event parity audit before changing this gate.
     predicted_event_high: Option<i32>,
+    /// Snapshot external events are collected for the normal predicted-state
+    /// transition, rather than being dispatched from CG_TransitionSnapshot.
+    pending_external_player_events: VecDeque<PendingExternalPlayerEvent>,
+    /// Last raw external event observed by the shared player-state dispatcher.
+    /// Includes the EV_EVENT_BITS uniqueness tag and zero transitions.
+    last_external_player_event: Option<(i32, i32)>,
     /// `cg_correctPredictedEvents`. Off by default, matching every JKA fork.
     correct_predicted_events: bool,
     /// Last authoritative/predicted playerState reward counters seen. This
@@ -946,6 +967,9 @@ pub struct ClientGameState {
     pending_server_actions: VecDeque<CgameServerAction>,
     pending_audio_actions: VecDeque<CgameServerAction>,
     team_info: Vec<TeamInfoEntry>,
+    /// Count of parsed `tinfo` commands, so consumers can tell a fresh
+    /// message with unchanged values from no message at all.
+    team_info_sequence: u32,
     cosmetic_unlocks: Vec<CosmeticUnlock>,
     force_rank_change: Option<(i32, bool, i32)>,
     config_state: ConfigStringState,
@@ -980,6 +1004,8 @@ impl Default for ClientGameState {
             predicted_event_sequence: 0,
             predictable_events: [0; MAX_PREDICTED_EVENTS],
             predicted_event_high: None,
+            pending_external_player_events: VecDeque::new(),
+            last_external_player_event: None,
             correct_predicted_events: false,
             reward_baseline: None,
             presentation_events: PresentationEventQueue::default(),
@@ -990,6 +1016,7 @@ impl Default for ClientGameState {
             pending_server_actions: VecDeque::new(),
             pending_audio_actions: VecDeque::new(),
             team_info: Vec::new(),
+            team_info_sequence: 0,
             cosmetic_unlocks: Vec::new(),
             force_rank_change: None,
             config_state: ConfigStringState::default(),
@@ -1061,6 +1088,8 @@ impl ClientGameState {
         self.predicted_event_sequence = 0;
         self.predictable_events = [0; MAX_PREDICTED_EVENTS];
         self.predicted_event_high = None;
+        self.pending_external_player_events.clear();
+        self.last_external_player_event = None;
         self.reward_baseline = None;
         self.presentation_events.clear();
         self.pending_event_traces.clear();
@@ -1144,6 +1173,10 @@ impl ClientGameState {
         &self.team_info
     }
 
+    pub fn team_info_sequence(&self) -> u32 {
+        self.team_info_sequence
+    }
+
     pub fn cosmetic_unlocks(&self) -> &[CosmeticUnlock] {
         &self.cosmetic_unlocks
     }
@@ -1164,7 +1197,29 @@ impl ClientGameState {
     pub fn duelist_healths(&self) -> [i32; 3] { self.config_state.duelist_healths }
     pub fn jedi_master(&self) -> i32 { self.config_state.jedi_master }
     pub fn duel_winner(&self) -> i32 { self.config_state.duel_winner }
-    pub fn flag_status(&self) -> [i32; 2] { self.config_state.flag_status }
+    pub fn flag_status(&self) -> [i32; 2] {
+        [self.config_state.flag_status[0], self.config_state.flag_status[1]]
+    }
+
+    /// Bucky MVSDK's three-team CTF is a server opt-in, never a reinterpretation
+    /// of TEAM_FREE on ordinary JK2 servers. See cg_servercmds.c CG_ParseServerinfo.
+    pub fn jk2_ctf3_active(&self) -> bool {
+        let name = self.serverinfo_value(b"gamename").unwrap_or_default();
+        let name = name.trim().to_ascii_lowercase();
+        (name.starts_with("< vvv >") || name.starts_with("cpt ][ mod"))
+            && self.serverinfo_value(b"g_allowFreeTeam")
+                .and_then(|value| value.trim().parse::<i32>().ok())
+                .is_some_and(|value| value != 0)
+    }
+
+    /// Wire state: red, blue, and optional yellow/TEAM_FREE. 0=base, 1=taken,
+    /// 4=dropped (the stock JK2/JKA flagStatus_t presentation value).
+    pub fn jk2_ctf_flags(&self) -> [(i32, i32); 3] {
+        std::array::from_fn(|i| {
+            if i == 2 && !self.jk2_ctf3_active() { (-1, 0) }
+            else { (self.config_state.flag_status[i], self.config_state.flag_taken_since[i]) }
+        })
+    }
     pub fn intermission_started(&self) -> bool { self.config_state.intermission }
     pub fn siege_state(&self) -> &[u8] { &self.config_state.siege_state }
     pub fn siege_round_state(&self, now: i32) -> siege::SiegeRoundState { siege::parse_round_state(&self.config_state.siege_state, now) }
@@ -1279,7 +1334,18 @@ impl ClientGameState {
                     Some(b'2') => 4,
                     _ => -1,
                 };
-                self.config_state.flag_status = [decode(value.first()), decode(value.get(1))];
+                let next = [decode(value.first()), decode(value.get(1)), decode(value.get(2))];
+                // MVSDK resets each time counter when a flag returns/drops and
+                // restarts it when a new carrier takes the flag. The initial
+                // gamestate can precede the first snapshot, hence timestamp 0.
+                let now = self.current_snapshot.as_ref().map_or(0, |snap| snap.server_time);
+                for (i, &status) in next.iter().enumerate() {
+                    if status != self.config_state.flag_status[i] {
+                        self.config_state.flag_taken_since[i] =
+                            if status == 1 { now } else { 0 };
+                    }
+                }
+                self.config_state.flag_status = next;
             }
             CS_SHADERSTATE => {
                 self.config_state.shader_remaps.clear();
@@ -1369,14 +1435,37 @@ impl ClientGameState {
         ops: &PlayerState,
         server_time: i32,
     ) -> Result<(), String> {
+        self.transition_player_state_events(ps, ops, server_time, false)
+    }
+
+    /// CG_TransitionSnapshot calls the very same dispatcher when prediction
+    /// does not own player-state events (demo, follow, no-predict, local map).
+    pub fn transition_snapshot_player_state(
+        &mut self,
+        ps: &PlayerState,
+        ops: &PlayerState,
+        server_time: i32,
+    ) -> Result<(), String> {
+        self.transition_player_state_events(ps, ops, server_time, true)
+    }
+
+    fn transition_player_state_events(
+        &mut self,
+        ps: &PlayerState,
+        ops: &PlayerState,
+        server_time: i32,
+        snapshot_owned: bool,
+    ) -> Result<(), String> {
         if ps.field_i32("clientNum") != ops.field_i32("clientNum") {
+            self.pending_external_player_events.clear();
+            self.last_external_player_event = None;
             // CG_TransitionPlayerState sets ops = ps when the followed client
             // changes, preventing old-player events from leaking across.
             return Ok(());
         }
 
         self.check_reward_notices(ps);
-        self.check_playerstate_events(ps, ops, server_time)?;
+        self.check_playerstate_events(ps, ops, server_time, snapshot_owned)?;
         // Correction gate, `cg_correctPredictedEvents`. Every JKA lineage
         // (Raven/OpenJK, EternalJK, jaMME, jaPRO, TaystJK, and JKA single
         // player) ships the equivalent call commented out in
@@ -1444,17 +1533,79 @@ impl ClientGameState {
         }
     }
 
-    /// OpenJK `CG_CheckPlayerstateEvents`.
+    /// CG_TransitionSnapshot retains `externalEvent` changes for the same
+    /// `CG_CheckPlayerstateEvents` path used by normal prediction. This is
+    /// necessary because multiple server snapshots may arrive between two
+    /// predicted frames and their G_AddEvent values are not pmove events.
+    pub fn queue_snapshot_playerstate_external_event(
+        &mut self,
+        ps: &PlayerState,
+        ops: &PlayerState,
+        server_time: i32,
+        server_restarted: bool,
+    ) {
+        if server_restarted || ps.field_i32("clientNum") != ops.field_i32("clientNum") {
+            self.pending_external_player_events.clear();
+            self.last_external_player_event = None;
+            return;
+        }
+        if ps.field_i32("externalEvent") != ops.field_i32("externalEvent") {
+            self.pending_external_player_events.push_back(PendingExternalPlayerEvent {
+                player_state: ps.clone(),
+                server_time,
+            });
+        }
+    }
+
+    /// One dispatcher for authoritative and predicted player-state events.
+    /// The raw uniqueness bits are included in the comparison, as in OpenJK.
+    fn observe_external_player_event(
+        &mut self,
+        ps: &PlayerState,
+        server_time: i32,
+    ) -> Result<(), String> {
+        let client = ps.field_i32("clientNum").unwrap_or(-1);
+        let raw = ps.field_i32("externalEvent").unwrap_or(0);
+        if self.last_external_player_event == Some((client, raw)) {
+            return Ok(());
+        }
+        self.last_external_player_event = Some((client, raw));
+        if raw != 0 {
+            self.push_predicted_player_event(
+                ps, raw, ps.field_i32("externalEventParm").unwrap_or(0), server_time,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Deliver any authoritative transitions skipped by command replay.
+    /// Also used when movement prediction returned no state this frame.
+    pub fn flush_snapshot_playerstate_external_events(&mut self) -> Result<(), String> {
+        while let Some(event) = self.pending_external_player_events.pop_front() {
+            self.observe_external_player_event(&event.player_state, event.server_time)?;
+        }
+        Ok(())
+    }
+
+    /// OpenJK/TaystJK `CG_CheckPlayerstateEvents`: external events and the
+    /// predictable ring are processed together. Snapshot transitions only
+    /// stage missing external events; they do not independently play sounds.
     fn check_playerstate_events(
         &mut self,
         ps: &PlayerState,
         ops: &PlayerState,
         server_time: i32,
+        snapshot_owned: bool,
     ) -> Result<(), String> {
-        let external = ps.field_i32("externalEvent").unwrap_or(0);
-        if external != 0 && external != ops.field_i32("externalEvent").unwrap_or(0) {
-            let parm = ps.field_i32("externalEventParm").unwrap_or(0);
-            self.push_predicted_player_event(ps, external, parm, server_time)?;
+        self.flush_snapshot_playerstate_external_events()?;
+        let raw = ps.field_i32("externalEvent").unwrap_or(0);
+        if raw != ops.field_i32("externalEvent").unwrap_or(0)
+            && (raw != 0 || snapshot_owned)
+        {
+            // A speculative prediction's temporary zero must not re-arm a
+            // voice/event already played from nextSnap. Only an authoritative
+            // snapshot zero clears that baseline during live prediction.
+            self.observe_external_player_event(ps, server_time)?;
         }
 
         let sequence = ps.field_i32("eventSequence").unwrap_or(0);
@@ -1946,6 +2097,10 @@ impl ClientGameState {
             .map(bytes_to_lossless_ascii)
             .unwrap_or_default();
         let (mut model_name, mut skin_name) = split_model_skin(&model_value);
+        if team == 0 && self.jk2_ctf3_active() {
+            // MVSDK three-team CTF uses default skins for the yellow side.
+            skin_name = "default".to_owned();
+        }
         let siege_class = info_value(configstring, b"siegeclass")
             .map(bytes_to_lossless_ascii)
             .unwrap_or_default();
@@ -2005,6 +2160,7 @@ impl ClientGameState {
             team,
             gametype: self.gametype(),
             jedi_v_merc: self.jedi_v_merc(),
+            jk2_ctf3: self.jk2_ctf3_active(),
             team_color_override: None,
             female: info_value(configstring, b"sex")
                 .or_else(|| info_value(configstring, b"ds"))
@@ -2109,6 +2265,7 @@ impl ClientGameState {
                 team: 0, // TEAM_FREE
                 gametype: self.gametype(),
                 jedi_v_merc: self.jedi_v_merc(),
+                jk2_ctf3: self.jk2_ctf3_active(),
                 team_color_override: None,
                 female: false,
                 model_name,
@@ -2133,6 +2290,8 @@ impl ClientGameState {
     /// OpenJK `CG_SetInitialSnapshot`, limited to the snapshot/entity responsibilities that exist
     /// in this Rust client today. Rendering/Ghoul2 side effects are deliberately not fabricated.
     pub fn set_initial_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), String> {
+        self.pending_external_player_events.clear();
+        self.last_external_player_event = None;
         self.private_duel.observe_snapshot(snapshot, None);
         self.reward_baseline = Some(RewardBaseline::from_player_state(&snapshot.player_state));
         self.current_snapshot = Some(snapshot.clone());
@@ -2464,6 +2623,7 @@ impl ClientGameState {
                 });
             }
             self.team_info = entries;
+            self.team_info_sequence = self.team_info_sequence.wrapping_add(1);
             return Ok(());
         }
         if name.eq_ignore_ascii_case(b"cosmetics") {
@@ -2898,6 +3058,7 @@ pub fn team_saber_color(info: &ClientInfo, color: i32, saber_team_colors: bool) 
         return color;
     }
     match info.team {
+        0 if info.jk2_ctf3 => SABER_YELLOW,
         TEAM_RED if saber_team_colors || color == SABER_BLUE || color > SABER_PURPLE => SABER_RED,
         TEAM_BLUE if saber_team_colors || color == SABER_RED || color > SABER_PURPLE => SABER_BLUE,
         _ => color,
@@ -3970,6 +4131,25 @@ mod tests {
     }
 
     #[test]
+    fn mvsdk_ctf3_requires_mod_identity_and_explicit_server_opt_in() {
+        let mut game = ClientGameState::new();
+        game.set_configstring(CS_FLAGSTATUS, b"120".to_vec());
+        assert_eq!(game.flag_status(), [1, 4]);
+        assert_eq!(game.jk2_ctf_flags()[2], (-1, 0));
+        game.set_configstring(CS_SERVERINFO,
+            br"\gamename\< VvV >\g_allowFreeTeam\0\g_gametype\8".to_vec());
+        assert!(!game.jk2_ctf3_active());
+        game.set_configstring(CS_SERVERINFO,
+            br"\gamename\< VvV >\g_allowFreeTeam\1\g_gametype\8".to_vec());
+        assert!(game.jk2_ctf3_active());
+        assert_eq!(game.jk2_ctf_flags()[2], (0, 0));
+        let yellow = ClientInfo { team: 0, gametype: 8, jk2_ctf3: true, ..ClientInfo::solo_kyle() };
+        assert_eq!(team_saber_color(&yellow, SABER_BLUE, false), SABER_YELLOW);
+        let regular_ffa = ClientInfo { jk2_ctf3: false, ..yellow };
+        assert_eq!(team_saber_color(&regular_ffa, SABER_BLUE, false), SABER_BLUE);
+    }
+
+    #[test]
     fn show_player_id_uses_active_configstring_slots_and_tayst_bot_skill() {
         let mut game = ClientGameState::new();
         game.configstrings.insert(CS_PLAYERS, br"\n\^1Red\t\1\skill\5".to_vec());
@@ -4407,6 +4587,109 @@ mod tests {
         assert_eq!((first.receive_sequence, first.event, first.parm), (1, EntityEvent::EV_JUMP, 7));
         assert_eq!((second.receive_sequence, second.event, second.parm), (2, EntityEvent::EV_ROLL, 9));
         assert!(game.pop_presentation_event().is_none());
+    }
+
+    #[test]
+    fn snapshot_death_event_is_delivered_by_normal_prediction_transition() {
+        let mut game = ClientGameState::new();
+        let old = predicted_ps(3, 0, 0, 0, 0, 0);
+        let mut death = old.clone();
+        let raw_death = 0x100 | EntityEvent::EV_DEATH2.as_i32();
+        assert!(death.set_field_bits("externalEvent", raw_death as u32));
+        game.queue_snapshot_playerstate_external_event(&death, &old, 1_000, false);
+        // No sound is dispatched from the snapshot transition itself.
+        assert!(game.drain_presentation_events().is_empty());
+        // A later prediction can be based on a snapshot where externalEvent
+        // has already cleared. The queued event still reaches CHAN_VOICE.
+        game.transition_predicted_player_state(&old, &old, 1_016).unwrap();
+        let received = game.drain_presentation_events();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].event, EntityEvent::EV_DEATH2);
+        assert_eq!(received[0].raw_event, raw_death);
+        assert_eq!(received[0].server_time, 1_000);
+        game.transition_predicted_player_state(&old, &old, 1_024).unwrap();
+        assert!(game.drain_presentation_events().is_empty());
+    }
+
+    #[test]
+    fn multiple_snapshot_external_events_survive_one_prediction_frame() {
+        let mut game = ClientGameState::new();
+        let base = predicted_ps(3, 0, 0, 0, 0, 0);
+        let mut first = base.clone();
+        first.set_field_bits("externalEvent", (0x100 | EntityEvent::EV_DEATH1.as_i32()) as u32);
+        let mut clear = first.clone();
+        clear.set_field_bits("externalEvent", 0);
+        let mut second = clear.clone();
+        second.set_field_bits("externalEvent", (0x200 | EntityEvent::EV_DEATH3.as_i32()) as u32);
+        game.queue_snapshot_playerstate_external_event(&first, &base, 1_000, false);
+        game.queue_snapshot_playerstate_external_event(&clear, &first, 1_008, false);
+        game.queue_snapshot_playerstate_external_event(&second, &clear, 1_016, false);
+        // Predictable movement and both death voices are resolved by one path.
+        let jump = predicted_ps(3, 1, EntityEvent::EV_JUMP.as_i32(), 0, 0, 0);
+        game.transition_predicted_player_state(&jump, &base, 1_024).unwrap();
+        let received = game.drain_presentation_events();
+        assert_eq!(received.len(), 3);
+        assert_eq!(received.iter().map(|ev| ev.event).collect::<Vec<_>>(), vec![
+            EntityEvent::EV_DEATH1, EntityEvent::EV_DEATH3, EntityEvent::EV_JUMP,
+        ]);
+        assert_eq!((received[0].server_time, received[1].server_time), (1_000, 1_016));
+    }
+
+    #[test]
+    fn early_predicted_external_event_is_not_replayed_when_snapshot_arrives() {
+        let mut game = ClientGameState::new();
+        let old = predicted_ps(3, 0, 0, 0, 0, 0);
+        let mut death = old.clone();
+        death.set_field_bits("externalEvent", (0x100 | EntityEvent::EV_DEATH2.as_i32()) as u32);
+        // OpenJK prediction may run from nextSnap before it is committed.
+        game.transition_predicted_player_state(&death, &old, 1_000).unwrap();
+        assert_eq!(game.drain_presentation_events().len(), 1);
+        game.queue_snapshot_playerstate_external_event(&death, &old, 1_008, false);
+        game.transition_predicted_player_state(&death, &old, 1_016).unwrap();
+        assert!(game.drain_presentation_events().is_empty());
+        let mut clear = death.clone();
+        clear.set_field_bits("externalEvent", 0);
+        game.queue_snapshot_playerstate_external_event(&clear, &death, 1_024, false);
+        // Repeating the same raw event after an authoritative zero is new.
+        game.queue_snapshot_playerstate_external_event(&death, &clear, 1_032, false);
+        game.flush_snapshot_playerstate_external_events().unwrap();
+        assert_eq!(game.drain_presentation_events().len(), 1);
+    }
+
+    #[test]
+    fn predicted_external_event_jitter_does_not_repeat_death_voice() {
+        let mut game = ClientGameState::new();
+        let old = predicted_ps(3, 0, 0, 0, 0, 0);
+        let mut death = old.clone();
+        death.set_field_bits("externalEvent", (0x100 | EntityEvent::EV_DEATH1.as_i32()) as u32);
+        game.transition_predicted_player_state(&death, &old, 1_000).unwrap();
+        assert_eq!(game.drain_presentation_events().len(), 1);
+        // Re-prediction may temporarily revert to the earlier snapshot;
+        // only a snapshot-owned zero can allow the voice again.
+        game.transition_predicted_player_state(&old, &death, 1_008).unwrap();
+        game.transition_predicted_player_state(&death, &old, 1_016).unwrap();
+        assert!(game.drain_presentation_events().is_empty());
+        game.transition_snapshot_player_state(&old, &death, 1_024).unwrap();
+        game.transition_predicted_player_state(&death, &old, 1_032).unwrap();
+        assert_eq!(game.drain_presentation_events().len(), 1);
+    }
+
+    #[test]
+    fn missing_prediction_frame_still_flushes_authoritative_death() {
+        let mut game = ClientGameState::new();
+        let old = predicted_ps(3, 0, 0, 0, 0, 0);
+        let mut death = old.clone();
+        death.set_field_bits("externalEvent", (0x200 | EntityEvent::EV_DEATH1.as_i32()) as u32);
+        game.queue_snapshot_playerstate_external_event(&death, &old, 1_000, false);
+        game.flush_snapshot_playerstate_external_events().unwrap();
+        assert_eq!(game.drain_presentation_events().len(), 1);
+        game.transition_predicted_player_state(&death, &old, 1_008).unwrap();
+        assert!(game.drain_presentation_events().is_empty());
+        // Follow-client and server restart boundaries must not retain queued audio.
+        game.queue_snapshot_playerstate_external_event(&death, &old, 1_016, false);
+        game.queue_snapshot_playerstate_external_event(&old, &death, 1_024, true);
+        game.flush_snapshot_playerstate_external_events().unwrap();
+        assert!(game.drain_presentation_events().is_empty());
     }
 
     #[test]

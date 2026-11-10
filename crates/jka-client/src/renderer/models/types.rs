@@ -526,6 +526,7 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) fx_sprite_dst_color_add_pipeline: Option<wgpu::RenderPipeline>,
     pub(in crate::renderer) fx_sprite_modulate2x_pipeline: Option<wgpu::RenderPipeline>,
     pub(in crate::renderer) fx_sprite_darken_pipeline: Option<wgpu::RenderPipeline>,
+    pub(in crate::renderer) fx_sprite_screen_pipeline: Option<wgpu::RenderPipeline>,
     pub(in crate::renderer) fx_sprite_glow_pipelines:
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     pub(in crate::renderer) fx_zero_alpha_discard: bool,

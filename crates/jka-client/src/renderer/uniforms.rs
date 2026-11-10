@@ -570,7 +570,7 @@ pub(in crate::renderer) fn transient_light_samples(
 pub(in crate::renderer) struct LightingSettings {
     pub(in crate::renderer) values: [u32; 4], // enabled, light count, viewport width, viewport height
     pub(in crate::renderer) local_shadows: [u32; 4], // enabled, shadowed count, cubemap size, transient-light start
-    pub(in crate::renderer) feature_flags: [u32; 4], // area lights, voxel/probe GI, point-light mode (0/1/2), reflection quality
+    pub(in crate::renderer) feature_flags: [u32; 4], // area lights, voxel/probe GI, point-light mode; w: reflection tier in low byte, authored PBR probes in bit 8
     pub(in crate::renderer) map_ambient: [f32; 4], // xyz q3map2 ambient RGB; w RT sample count (1, 2, 4)
     pub(in crate::renderer) map_minlight: [f32; 4], // source-.map q3map2 minlight RGB, normalized; w runtime-dlight falloff mode (0 stock, 1 physical)
     pub(in crate::renderer) baked_sun_direction_strength: [f32; 4], // xyz toward authored sun, w 0..1 extraction strength

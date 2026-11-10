@@ -226,6 +226,16 @@ impl BlueWaterOcean {
         }
     }
 
+    /// A map ocean's physics waves (jaPRO `BG_SailingSea`) replace the FFT's
+    /// two long tiles, so the drawn long and medium waves are the ones physics
+    /// floats in; None restores Blue Water's own spectrum.
+    pub fn set_sailing_sea(&mut self, sea: Option<&jka_movement::SailingSea>) {
+        let lattice = sea.map(|sea| std::sync::Arc::new(sea.waves.iter().map(|w| blue_water_gpu::LatticeWave {
+            cascade: w.cascade, nx: w.nx, nz: w.nz, re: w.re, im: w.im, m: w.m,
+        }).collect::<Vec<_>>()));
+        self.field.set_authored_lattice(lattice);
+    }
+
     pub fn set_time(&mut self, time: f32) {
         self.time = time as f64;
         self.next_update = self.time;
@@ -241,8 +251,14 @@ impl BlueWaterOcean {
         waves: super::BlueWaterWaves,
         swell: [[f32;4];2],
         breaker_mode: u8,
+        wave_counts: [u32; 2],
+        detail_gains: [f32; 2],
     ) {
         self.updated_this_frame = false;
+        // r_oceanLongWaves / r_oceanMediumWaves and r_oceanMediumWaveDetail /
+        // r_oceanSmallWaveDetail; each rebuilds the spectrum on change.
+        self.field.set_long_waves(wave_counts[0], wave_counts[1]);
+        self.field.set_wave_detail_gains(detail_gains[0], detail_gains[1]);
         if self.breaker_mode != breaker_mode {
             self.breaker_mode = breaker_mode;
             self.field.request_update();

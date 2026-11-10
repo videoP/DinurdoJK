@@ -1068,6 +1068,7 @@ pub const VIDEO_ROW_BAKED_AO_CURRENT_CELL: usize = 46;
 pub const VIDEO_ROW_VID_RESTART: usize = 47;
 
 pub const VIDEO_ROW_PBR: usize = 48;
+pub const VIDEO_ROW_PBR_CUBEMAPS: usize = 119;
 
 pub const VIDEO_ROW_QUALITY_PRESET: usize = 49;
 
@@ -1076,6 +1077,9 @@ pub const VIDEO_ROW_AUTO_EXPOSURE: usize = 50;
 pub const VIDEO_ROW_FLOAT_LIGHTMAP: usize = 51;
 
 pub const VIDEO_ROW_GEN_NORMAL_MAPS: usize = 52;
+
+/// Session-only PBR parallax occlusion; keep IDs appended, never renumber rows.
+pub const VIDEO_ROW_POM: usize = 120;
 
 pub const VIDEO_ROW_DELUXE_MAPPING: usize = 53;
 
@@ -1212,7 +1216,7 @@ pub const SUN_INTENSITY_MAX: f32 = 4000.0;
 pub enum ReflectionQuality {
     /// No enhanced reflections and no authored tcGen environment stages.
     Off,
-    /// Vanilla/authored tcGen environment stages and JKA portal mirrors only;
+    /// Authored tcGen environment stages, PBR probes and JKA portal mirrors;
     /// no promoted environment-planar reflection path.
     Legacy,
     Low,
@@ -1289,6 +1293,11 @@ impl ReflectionQuality {
         self >= Self::Medium
     }
 
+    /// Authored PBR environment lighting is independent of SSR and planar promotion.
+    pub fn pbr_probes_enabled(self) -> bool {
+        self != Self::Off
+    }
+
     pub fn planar_slot_budget(self) -> usize {
         match self {
             Self::Off => 0,
@@ -1302,6 +1311,23 @@ impl ReflectionQuality {
 
     pub fn promotes_environment_planars(self) -> bool {
         matches!(self, Self::High | Self::Ultra)
+    }
+}
+
+#[cfg(test)]
+mod pbr_probe_policy_tests {
+    use super::ReflectionQuality as Q;
+
+    #[test]
+    fn pbr_regression_legacy_keeps_authored_probes_without_ssr() {
+        assert!(Q::Legacy.pbr_probes_enabled());
+        assert!(!Q::Legacy.ssr_enabled());
+        assert!(!Q::Legacy.promotes_environment_planars());
+        assert_eq!(Q::Legacy.shader_value(), 0);
+        assert!(!Q::Off.pbr_probes_enabled());
+        for quality in [Q::Low, Q::Medium, Q::High, Q::Ultra] {
+            assert!(quality.pbr_probes_enabled());
+        }
     }
 }
 

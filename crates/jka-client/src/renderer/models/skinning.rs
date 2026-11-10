@@ -354,6 +354,7 @@ impl DynamicModelRenderer {
                         | DynamicModelAlphaMode::DstColorAdd
                         | DynamicModelAlphaMode::Modulate2x
                         | DynamicModelAlphaMode::Darken
+                        | DynamicModelAlphaMode::Screen
                 ) {
                 match (surface.lighting_origin, classic_grid) {
                     (Some(origin), Some(grid)) => light_memo.light(

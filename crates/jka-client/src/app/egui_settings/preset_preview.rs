@@ -39,6 +39,7 @@ fn row_for_preset_cvar(name: &str) -> Option<theme::Reset> {
         "r_localLightShadows" => Reset::Video(ui::VIDEO_ROW_LOCAL_LIGHT_SHADOWS),
         "r_dynamicShadows" => Reset::Video(ui::VIDEO_ROW_DYNAMIC_SHADOWS),
         "r_pbr" => Reset::Video(ui::VIDEO_ROW_PBR),
+        "r_cubeMapping" => Reset::Video(ui::VIDEO_ROW_PBR_CUBEMAPS),
         "r_genNormalMaps" => Reset::Video(ui::VIDEO_ROW_GEN_NORMAL_MAPS),
         "r_deluxeMapping" => Reset::Video(ui::VIDEO_ROW_DELUXE_MAPPING),
         "r_deluxeSpecular" => Reset::Video(ui::VIDEO_ROW_DELUXE_SPECULAR),
@@ -93,7 +94,7 @@ pub(in crate::app) fn preset_cvar_section(name: &str) -> Option<VideoSection> {
         | "r_entityAmbientLighting" | "r_dynamicLights" | "r_promoteFxLights"
         | "r_voxelProbeGI"
         | "r_contactShadows" | "r_localLightShadows" | "r_dynamicShadows" => S::Lighting,
-        "r_pbr" | "r_genNormalMaps" | "r_deluxeMapping" | "r_deluxeSpecular" => S::Materials,
+        "r_pbr" | "r_cubeMapping" | "r_genNormalMaps" | "r_deluxeMapping" | "r_deluxeSpecular" => S::Materials,
         "fx_physics" | "r_reflectionQuality" => S::Effects,
         "r_hdr" | "r_floatLightmap" | "r_tonemap" | "r_autoExposure"
         | "r_colorLut" | "r_colorLutStrength" => S::Color,
@@ -157,6 +158,7 @@ fn preview_target_label_for_row(preset: QualityPreset, reset: theme::Reset) -> O
         | Reset::Video(ui::VIDEO_ROW_VOXEL_PROBE_GI)
         | Reset::Video(ui::VIDEO_ROW_LOCAL_LIGHT_SHADOWS)
         | Reset::Video(ui::VIDEO_ROW_PBR)
+        | Reset::Video(ui::VIDEO_ROW_PBR_CUBEMAPS)
         | Reset::Video(ui::VIDEO_ROW_GEN_NORMAL_MAPS)
         | Reset::Video(ui::VIDEO_ROW_DELUXE_MAPPING)
         | Reset::Video(ui::VIDEO_ROW_PATCH_STITCHING)
@@ -179,6 +181,7 @@ fn preview_target_label_for_row(preset: QualityPreset, reset: theme::Reset) -> O
                 Reset::Video(ui::VIDEO_ROW_VOXEL_PROBE_GI) => "r_voxelProbeGI",
                 Reset::Video(ui::VIDEO_ROW_LOCAL_LIGHT_SHADOWS) => "r_localLightShadows",
                 Reset::Video(ui::VIDEO_ROW_PBR) => "r_pbr",
+                Reset::Video(ui::VIDEO_ROW_PBR_CUBEMAPS) => "r_cubeMapping",
                 Reset::Video(ui::VIDEO_ROW_GEN_NORMAL_MAPS) => "r_genNormalMaps",
                 Reset::Video(ui::VIDEO_ROW_DELUXE_MAPPING) => "r_deluxeMapping",
                 Reset::Video(ui::VIDEO_ROW_PATCH_STITCHING) => "r_patchStitching",

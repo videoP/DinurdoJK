@@ -20,6 +20,8 @@ pub(crate) struct Jk2Selection {
     pub weapon: i32,
     pub force: i32,
     pub item: i32,
+    /// JKA /weaplast history, stored as raw JK2 weapon IDs.
+    last_weapon_select: [i32; 2],
     weapon_time: i32,
     force_time: i32,
     item_time: i32,
@@ -33,6 +35,7 @@ impl Default for Jk2Selection {
             weapon: WP_BRYAR_PISTOL,
             force: -1,
             item: -1,
+            last_weapon_select: [0; 2],
             weapon_time: 0,
             force_time: 0,
             item_time: 0,
@@ -78,6 +81,7 @@ impl LiveInput {
         if selection.spawn_count != Some(ps.persistant[4]) {
             selection.spawn_count = Some(ps.persistant[4]);
             selection.weapon = field(ps, "weapon");
+            selection.last_weapon_select = [0; 2];
             selection.weapon_time = frame.time;
         }
         // Non-spectator, alive status branch: only the most recent selector
@@ -142,6 +146,52 @@ impl LiveInput {
     pub(crate) fn jk2_weapon_slot(&mut self, frame: &Jk2Frame, slot: i32) -> Result<Outcome, String> {
         self.jk2_command(frame, |s| {
             select::weapon_slot(frame.gameplay, &frame.snap, &frame.predicted, &mut s.weapon, slot)
+        }, |s| &mut s.weapon_time)
+    }
+
+    /// TaystJK /weaplast semantics for JK2, using native JK2 weapon IDs and
+    /// the pinned MVSDK CG_WeaponSelectable rather than JKA's weapon table.
+    pub(crate) fn jk2_last_weapon(&mut self, frame: &Jk2Frame) -> Result<Outcome, String> {
+        self.jk2_command(frame, |s| {
+            // Match the JKA extension's follow, spectator, and emplacement
+            // guards. JK2 PM_SPECTATOR is 3 (JKA uses 4).
+            if field(&frame.snap, "pm_flags") & 4096 != 0
+                || field(&frame.snap, "pm_type") == 3
+                || frame.snap.persistant[3] == 3
+                || field(&frame.snap, "emplacedIndex") != 0
+            {
+                return Ok(Outcome::Ignored);
+            }
+
+            // Like JKA's CG_LastWeapon_f, the first invocation starts from
+            // the server-equipped weapon, not a possibly pending usercmd.
+            let equipped = field(&frame.snap, "weapon");
+            if s.last_weapon_select[0] == 0 {
+                s.last_weapon_select[0] = equipped;
+            }
+            if s.last_weapon_select[1] == 0 {
+                s.last_weapon_select[1] = equipped;
+            }
+            if s.last_weapon_select[0] == s.last_weapon_select[1] {
+                for candidate in (1..WP_NUM_WEAPONS).rev() {
+                    if candidate != s.weapon
+                        && select::weapon_selectable(frame.gameplay, &frame.predicted, candidate)?
+                    {
+                        s.last_weapon_select[1] = candidate;
+                        break;
+                    }
+                }
+            }
+            if s.last_weapon_select[0] != s.weapon {
+                s.last_weapon_select[1] = s.last_weapon_select[0];
+                s.last_weapon_select[0] = s.weapon;
+            }
+            let previous = s.last_weapon_select[1];
+            if !select::weapon_selectable(frame.gameplay, &frame.predicted, previous)? {
+                return Ok(Outcome::Unchanged);
+            }
+            s.weapon = previous;
+            Ok(Outcome::Selected)
         }, |s| &mut s.weapon_time)
     }
 

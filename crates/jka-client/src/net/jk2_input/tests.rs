@@ -43,8 +43,16 @@ fn jk2_usercmds_carry_native_selection_and_engine_rules() {
     assert_eq!(input.create_cmd(&buttons(&active)).generic_command, 20);
     input.queue_generic_command(4); // GENCMD_FORCE_SPEED is shared
     assert_eq!(input.create_cmd(&buttons(&active)).generic_command, 4);
-    input.queue_generic_command(27); // JKA-only taunt
+    input.queue_generic_command(27); // JKA-only taunt must not go onto the wire
     assert_eq!(input.create_cmd(&buttons(&active)).generic_command, 0);
+    // JK2 /taunt instead pulses BUTTON_GESTURE through the normal button
+    // latch; it must not send genericCommand 27 or stay held indefinitely.
+    input.note_pressed("+button3");
+    let taunt = input.create_cmd(&buttons(&active));
+    assert_ne!(taunt.buttons & (1 << 3), 0);
+    assert_eq!(taunt.generic_command, 0);
+    let next = input.create_cmd(&buttons(&active));
+    assert_eq!(next.buttons & (1 << 3), 0);
     assert!(!input.queue_emote_taunt(1), "JK2 never repurposes cmd angles for emotes");
     // JKA keeps its own rules.
     let mut jka = LiveInput::default();
@@ -115,4 +123,69 @@ fn jk2_out_of_ammo_and_pickup_follow_cgame_events() {
     input.jk2_pickup(&frame(1300, blaster), 8, 2);
     assert_eq!(input.jk2_selection().unwrap().weapon, 7);
     assert_eq!(input.weapon_select, 8);
+}
+
+#[test]
+fn jk2_weaplast_toggles_native_weapons_and_uses_server_equipped_on_first_use() {
+    let mut input = LiveInput::default();
+    input.set_jk2(true);
+    input.sync_jk2(&frame(1000, |_| {}));
+    let f = frame(1100, |_| {});
+
+    // First use with a pending selection returns to the server-equipped saber,
+    // as in JKA's CG_LastWeapon_f, not an arbitrary high-numbered weapon.
+    assert_eq!(input.jk2_weapon_slot(&f, 3), Ok(Outcome::Selected));
+    assert_eq!(input.jk2_selection().unwrap().weapon, 4); // JK2 blaster
+    assert_eq!(input.jk2_last_weapon(&f), Ok(Outcome::Selected));
+    assert_eq!(input.jk2_selection().unwrap().weapon, 2); // JK2 saber
+    assert_eq!(input.preview_cmd(&buttons(&HashSet::new())).weapon, 2);
+    assert_eq!(input.weapon_select, 3, "HUD mirrors JK2 saber as JKA weapon 3");
+    assert_eq!(input.jk2_last_weapon(&f), Ok(Outcome::Selected));
+    assert_eq!(input.jk2_selection().unwrap().weapon, 4);
+    assert_eq!(input.preview_cmd(&buttons(&HashSet::new())).weapon, 4);
+}
+
+#[test]
+fn jk2_weaplast_first_use_fallback_and_respawn_history() {
+    let mut input = LiveInput::default();
+    input.set_jk2(true);
+    input.sync_jk2(&frame(1000, |_| {}));
+    let f = frame(1100, |_| {});
+    assert_eq!(input.jk2_last_weapon(&f), Ok(Outcome::Selected));
+    assert_eq!(input.jk2_selection().unwrap().weapon, 4, "highest owned selectable weapon");
+    assert_eq!(input.jk2_last_weapon(&f), Ok(Outcome::Selected));
+    assert_eq!(input.jk2_selection().unwrap().weapon, 2);
+
+    // A fresh spawn must not retain the previous spawn's toggle history.
+    let respawn = frame(1500, |s| {
+        s.persistant[4] = 2;
+        s.set_field_bits("weapon", 3).unwrap();
+    });
+    input.sync_jk2(&respawn);
+    assert_eq!(input.jk2_last_weapon(&respawn), Ok(Outcome::Selected));
+    assert_eq!(input.jk2_selection().unwrap().weapon, 4);
+}
+
+#[test]
+fn jk2_weaplast_respects_native_selectability_and_spectator_guards() {
+    let mut input = LiveInput::default();
+    input.set_jk2(true);
+    input.sync_jk2(&frame(1000, |_| {}));
+    let only_saber = frame(1100, |s| s.stats[4] = 1 << 2);
+    assert_eq!(input.jk2_last_weapon(&only_saber), Ok(Outcome::Selected));
+    assert_eq!(input.jk2_selection().unwrap().weapon, 2);
+
+    for guarded in ["pm_flags", "pm_type", "emplacedIndex"] {
+        let f = frame(1200, |s| {
+            s.set_field_bits(guarded, match guarded {
+                "pm_flags" => 4096, // PMF_FOLLOW
+                "pm_type" => 3, // JK2 PM_SPECTATOR
+                _ => 1,
+            }).unwrap();
+        });
+        assert_eq!(input.jk2_last_weapon(&f), Ok(Outcome::Ignored), "{guarded}");
+        assert_eq!(input.jk2_selection().unwrap().weapon, 2);
+    }
+    let spectator = frame(1300, |s| s.persistant[3] = 3);
+    assert_eq!(input.jk2_last_weapon(&spectator), Ok(Outcome::Ignored));
 }

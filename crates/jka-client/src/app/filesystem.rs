@@ -5,7 +5,17 @@ impl App {
     /// Change game assets only while replacing a session, before creating any
     /// new CGame/map readers. Existing VFS owners keep their immutable indexes.
     pub(in crate::app) fn select_demo_asset_game(&mut self, jk2: Option<u8>) {
-        if self.fs_roots.active_jk2 == jk2 && self.fs_roots.jk2_pure.is_none() { return; }
+        // A server's `dl_` mounts cannot survive a live/demo/game transition,
+        // even if the next session uses the same game version and fs_game.
+        let references_cleared = jka_assets::pk3::set_server_referenced_paks(&[]);
+        if self.fs_roots.active_jk2 == jk2 && self.fs_roots.jk2_pure.is_none() {
+            if references_cleared {
+                self.pk3_manager_loaded = false;
+                self.reset_asset_catalogs_for_game_change();
+                self.invalidate_studio_sources();
+            }
+            return;
+        }
         self.latest_request_id = self.latest_request_id.wrapping_add(1);
         self.map_loader_latest_requested.store(self.latest_request_id, std::sync::atomic::Ordering::Release);
         self.cancel_vote_map_prewarm();

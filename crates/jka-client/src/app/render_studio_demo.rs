@@ -1751,7 +1751,7 @@ impl App {
         let hud_keys=self.movement_keys_hud;
         let hud_speedometer=self.japro_cg.speedometer;
         let hud_video=self.video;
-        let hud_spec_hud=self.japro_cg.spec_hud;
+        let hud_spec_hud=self.japro_cg.spec_hud != 0;
         let mut frames = Vec::new();
         let wallrun_camera_mode = self.wallrun_camera_mode;
         for index in active {
@@ -2324,6 +2324,7 @@ fn studio_hud_for_source(
                 rage_recovery_until_ms:ps.field_i32("fd.forceRageRecoveryTime").unwrap_or(0),
                 time_ms:session.cgame_time,
                 force_icons_hidden:ps.field_i32("zoomMode").unwrap_or(0)!=0 || ps.persistant[3]==3,
+                jk2_has_bacta:false,
             });
         }
         if flags.enabled("speedometer") {

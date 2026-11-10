@@ -100,6 +100,156 @@ pub struct WaveField {
     last_phase: f32,
     spectrum_fresh: bool,
     crest_limits: crest_limits::CrestLimits,
+    /// `r_oceanLongWaves`: the first cascade rebuilt from this many waves
+    /// (`sparse_long_waves`); 0 keeps upstream's spectrum.
+    long_waves: u32,
+    /// `r_oceanMediumWaves`: the same for the second cascade.
+    medium_waves: u32,
+    /// `r_oceanSmallWaveDetail`: height gain on the third cascade (fine chop).
+    small_gain: f32,
+    /// `r_oceanMediumWaveDetail`: height gain on the second cascade.
+    medium_gain: f32,
+    /// A map ocean's physics waves (jaPRO `BG_SailingSea`): when set, the
+    /// first two cascades hold exactly these instead of Blue Water's draw.
+    authored: Option<std::sync::Arc<Vec<LatticeWave>>>,
+}
+
+/// One wave of an authored lattice: the texel at signed index (`nx`, `nz`) of
+/// `cascade` holds (`re`, `im`, `m`), its twin at (-`nx`, -`nz`) the conjugate
+/// and -`m` (`spectrum::build_spectrum`'s layout).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LatticeWave {
+    pub cascade: u32,
+    pub nx: i32,
+    pub nz: i32,
+    pub re: f32,
+    pub im: f32,
+    pub m: f32,
+}
+
+/// Replace the cascades the authored lattice covers (0 and 1) with its waves
+/// and recompute their statistics and the field's bounds.
+fn apply_authored_lattice(wave: &mut spectrum::WaveSpectrum, lattice: &[LatticeWave], choppiness: f64) {
+    for cascade in wave.cascades.iter_mut().take(2) {
+        cascade.amplitudes.fill(0.0);
+    }
+    for entry in lattice {
+        let Some(cascade) = wave.cascades.get_mut(entry.cascade as usize) else { continue };
+        let n = cascade.resolution as i32;
+        let half = n / 2;
+        if entry.nx.abs() >= half || entry.nz.abs() >= half {
+            continue;
+        }
+        let texel = |x: i32, z: i32| (z.rem_euclid(n) * n + x.rem_euclid(n)) as usize * 4;
+        let (here, twin) = (texel(entry.nx, entry.nz), texel(-entry.nx, -entry.nz));
+        cascade.amplitudes[here..here + 3].copy_from_slice(&[entry.re, entry.im, entry.m]);
+        cascade.amplitudes[twin..twin + 3].copy_from_slice(&[entry.re, -entry.im, -entry.m]);
+    }
+    for index in 0..wave.cascades.len().min(2) {
+        recompute_cascade_stats(&mut wave.cascades[index]);
+    }
+    refresh_bounds(wave, choppiness);
+}
+
+/// `build_spectrum`'s per-cascade statistics from its stored amplitudes.
+fn recompute_cascade_stats(cascade: &mut spectrum::CascadeSpectrum) {
+    let n = cascade.resolution as usize;
+    let signed = |i: usize| if i < n / 2 { i as i64 } else { i as i64 - n as i64 };
+    let dk = 2.0 * std::f64::consts::PI / cascade.size;
+    let (mut variance, mut slope_variance, mut reach) = (0.0, 0.0, 0.0);
+    for (texel, a) in cascade.amplitudes.as_chunks::<4>().0.iter().enumerate() {
+        if a[2] == 0.0 {
+            continue;
+        }
+        let (fx, fz) = (signed(texel % n) as f64, signed(texel / n) as f64);
+        let energy = f64::from(a[0]).powi(2) + f64::from(a[1]).powi(2);
+        let k2 = (fx * fx + fz * fz) * dk * dk;
+        variance += energy;
+        slope_variance += energy * k2;
+        reach += energy * k2.sqrt();
+    }
+    cascade.variance = variance;
+    cascade.slope_variance = slope_variance;
+    cascade.slope_length = if slope_variance > 0.0 { 2.0 * reach / slope_variance } else { 0.0 };
+}
+
+/// The field's height and horizontal-displacement bounds from every cascade.
+fn refresh_bounds(wave: &mut spectrum::WaveSpectrum, choppiness: f64) {
+    wave.max_height = wave.cascades.iter().flat_map(|c| c.amplitudes.as_chunks::<4>().0.iter())
+        .filter(|a| a[2] != 0.0)
+        .map(|a| (f64::from(a[0]).powi(2) + f64::from(a[1]).powi(2)).sqrt())
+        .sum();
+    wave.max_horizontal_displacement = choppiness.max(0.0) * wave.max_height;
+}
+
+/// `r_oceanLongWaves`: rebuild the first cascade (the long waves) from `count`
+/// waves instead of the thousands of weak lattice modes `build_spectrum` draws.
+/// Systematic importance sampling over the modes' energy: `count` evenly spaced
+/// picks through the cumulative energy (a seeded start), each pick worth an
+/// equal share of the cascade's energy, merged where a strong mode is picked
+/// more than once. The kept modes keep their phase, direction and wavelength,
+/// the rest are zeroed, and the cascade's total energy is unchanged, so height
+/// and the spectrum's shape and spread hold while the wave count drops. The
+/// GPU still evolves and transforms the same lattice; only its contents change.
+fn sparse_long_waves(wave: &mut spectrum::WaveSpectrum, cascade_index: usize, count: u32, seed: f64, choppiness: f64) {
+    let Some(cascade) = wave.cascades.get_mut(cascade_index) else { return };
+    let n = cascade.resolution as usize;
+    let signed = |i: usize| if i < n / 2 { i as i64 } else { i as i64 - n as i64 };
+    // One canonical member per +/- pair (as build_spectrum draws them), with its energy.
+    let mut modes: Vec<(usize, f64)> = Vec::new();
+    for z in 0..n {
+        for x in 0..n {
+            let (nx, nz) = (signed(x), signed(z));
+            if nz < 0 || (nz == 0 && nx <= 0) {
+                continue;
+            }
+            let a = &cascade.amplitudes[(z * n + x) * 4..(z * n + x) * 4 + 4];
+            let energy = f64::from(a[0]).powi(2) + f64::from(a[1]).powi(2);
+            if a[2] != 0.0 && energy > 0.0 {
+                modes.push((z * n + x, energy));
+            }
+        }
+    }
+    let total: f64 = modes.iter().map(|(_, e)| e).sum();
+    if total <= 0.0 || count as usize >= modes.len() {
+        return;
+    }
+    let step = total / f64::from(count);
+    let mut next = (seed * 0.618_033_988_749_895 + 0.5 + cascade_index as f64 * 0.754_877_666_246_693)
+        .rem_euclid(1.0) * step;
+    let mut cumulative = 0.0;
+    for &(texel, energy) in &modes {
+        cumulative += energy;
+        let mut picks = 0u32;
+        while next < cumulative {
+            picks += 1;
+            next += step;
+        }
+        let scale = if picks > 0 { (f64::from(picks) * step / energy).sqrt() } else { 0.0 };
+        let (x, z) = (texel % n, texel / n);
+        let twin = ((n - z) % n) * n + (n - x) % n;
+        for t in [texel, twin] {
+            cascade.amplitudes[t * 4] = (f64::from(cascade.amplitudes[t * 4]) * scale) as f32;
+            cascade.amplitudes[t * 4 + 1] = (f64::from(cascade.amplitudes[t * 4 + 1]) * scale) as f32;
+        }
+    }
+    // build_spectrum's statistics, recomputed from the rewritten amplitudes.
+    recompute_cascade_stats(cascade);
+    refresh_bounds(wave, choppiness);
+}
+
+/// `r_oceanSmallWaveDetail`: multiply one cascade's wave heights by `gain`
+/// (its statistics and the field's height bound follow).
+fn scale_cascade(wave: &mut spectrum::WaveSpectrum, cascade_index: usize, gain: f32, choppiness: f64) {
+    let Some(cascade) = wave.cascades.get_mut(cascade_index) else { return };
+    for a in cascade.amplitudes.as_chunks_mut::<4>().0 {
+        a[0] *= gain;
+        a[1] *= gain;
+    }
+    let g2 = f64::from(gain) * f64::from(gain);
+    cascade.variance *= g2;
+    cascade.slope_variance *= g2;
+    refresh_bounds(wave, choppiness);
 }
 
 fn uniform(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -452,6 +602,11 @@ impl WaveField {
         let crest_limits = crest_limits::CrestLimits::new(device, &sets, &field_params, n, count);
         Self {
             crest_limits,
+            long_waves: 0,
+            medium_waves: 0,
+            small_gain: 1.0,
+            medium_gain: 1.0,
+            authored: None,
             tier: tier.clone(),
             cascades: tier,
             n,
@@ -498,6 +653,42 @@ impl WaveField {
     pub fn resolution(&self) -> u32 {
         self.n
     }
+    /// `r_oceanLongWaves` / `r_oceanMediumWaves`; a change rebuilds the
+    /// spectrum at the next update.
+    pub fn set_long_waves(&mut self, long: u32, medium: u32) {
+        if (self.long_waves, self.medium_waves) != (long, medium) {
+            self.long_waves = long;
+            self.medium_waves = medium;
+            self.built_for = None;
+        }
+    }
+
+    /// A map ocean's physics waves for the first two cascades, or None for
+    /// Blue Water's own; a change rebuilds the spectrum.
+    pub fn set_authored_lattice(&mut self, lattice: Option<std::sync::Arc<Vec<LatticeWave>>>) {
+        let same = match (&self.authored, &lattice) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b) || a == b,
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.authored = lattice;
+            self.built_for = None;
+        }
+    }
+
+    /// `r_oceanMediumWaveDetail` / `r_oceanSmallWaveDetail`: height gains on the
+    /// medium and fine-chop cascades; a change rebuilds the spectrum.
+    pub fn set_wave_detail_gains(&mut self, medium: f32, small: f32) {
+        let clean = |g: f32| if g.is_finite() { g.clamp(0.0, 16.0) } else { 1.0 };
+        let (medium, small) = (clean(medium), clean(small));
+        if (self.medium_gain, self.small_gain) != (medium, small) {
+            self.medium_gain = medium;
+            self.small_gain = small;
+            self.built_for = None;
+        }
+    }
+
     pub fn cascades(&self) -> &[CascadeInfo] {
         &self.cascades
     }
@@ -539,7 +730,23 @@ impl WaveField {
         // Explicit wavelengths also need room in the FFT tiles. The upstream
         // growth rule does not require its automatic height/wind sea-state policy.
         self.cascades = sea_state::sea_state_cascades(&self.tier, self.sea.peak_wavelength);
-        let wave = spectrum::build_spectrum(&self.cascades, &self.sea);
+        let mut wave = spectrum::build_spectrum(&self.cascades, &self.sea);
+        if let Some(lattice) = &self.authored {
+            // The physics waves exactly: no thinning or gain of their own.
+            apply_authored_lattice(&mut wave, lattice, self.sea.choppiness);
+        } else {
+            for (cascade, count) in [self.long_waves, self.medium_waves].into_iter().enumerate() {
+                if count > 0 {
+                    sparse_long_waves(&mut wave, cascade, count, self.sea.seed, self.sea.choppiness);
+                }
+            }
+            if (self.medium_gain - 1.0).abs() > 1e-6 {
+                scale_cascade(&mut wave, 1, self.medium_gain, self.sea.choppiness);
+            }
+        }
+        if (self.small_gain - 1.0).abs() > 1e-6 {
+            scale_cascade(&mut wave, 2, self.small_gain, self.sea.choppiness);
+        }
         self.surface_stats = surface_waves::SpectrumStats::from_spectrum(&wave);
         self.surface_stats.set_shore_tables(&wave, self.sea.wind_speed);
         let n = self.n as usize;

@@ -19,6 +19,10 @@ fn frontend_scene_camera(mut camera: crate::camera::Camera) -> crate::camera::Ca
 
 impl App {
     pub(in crate::app) fn subframe_input_view_rotation(&self) -> Option<[f32; 2]> {
+        // cg_specHud 4 virtual free camera: mouse drives the camera directly.
+        if self.spectator_broadcast.free_active() {
+            return None;
+        }
         if !self.live_remote_view_forced() {
             if let Some(angles) = self.live_view_angles() {
                 return Some([angles[1].to_radians(), -angles[0].to_radians()]);
@@ -163,7 +167,8 @@ impl App {
             self.subframe_input_view_rotation()
         };
         let spectator_highlights = if !isolated_preview
-            && self.japro_cg.spec_hud
+            // Through-wall outlines in every cg_specHud mode (1-4).
+            && self.japro_cg.spec_hud != 0
             && (self.demo_playback_active() || self.live_spec_hud_eligible())
         {
             // Restriction bits come from live (or recorded demo) CS_SERVERINFO.
@@ -299,7 +304,9 @@ impl App {
                     // Render space is Y-up: landing dip and stair smoothing move a
                     // player-owned eye vertically. Demo freecam has no player owner;
                     // its stored camera position is already the exact render position.
-                    if playback.live || playback.local || self.demo_view_mode != DemoViewMode::Free {
+                    if (playback.live || playback.local || self.demo_view_mode != DemoViewMode::Free)
+                        && !self.spectator_broadcast.free_active()
+                    {
                         camera.position.y += playback.view_offset_z;
                     }
                 }
@@ -674,6 +681,7 @@ impl App {
         let mut vote_line = self.vote_hud_line();
         let mut speedometer = self.speedometer_ui.clone();
         let team_overlay = self.team_overlay_ui();
+        let spectator_broadcast = self.spectator_broadcast_ui();
         let scoreboard = self.visible_scoreboard();
         let scoreboard_focus_client = self.scoreboard_focus_client();
         let killfeed = if self.overlay == OverlayMode::HudEdit {
@@ -699,6 +707,8 @@ impl App {
             crate::streamer::redact_stream_transients(&mut chat_lines, &mut console_notify_lines, self.streamer);
         }
         self.render_command(RenderCommand::SetTransientUi {
+            falling_death_fade: self.falling_death_alpha(),
+            falling_death_active: self.falling_death.is_some(),
             chat_lines,
             console_notify_lines,
             center_print,
@@ -708,6 +718,8 @@ impl App {
             force_select,
             weapon_select,
             inventory_select,
+            jk2_flags: self.jk2_flags_ui(),
+            jk2_inventory: self.jk2_persistent_inventory_ui(),
             follow_name,
             game_timer: self.game_timer_text(),
             mini_scores: self.mini_scores_ui(),
@@ -723,6 +735,7 @@ impl App {
             speedometer,
             lagometer: self.current_lagometer_ui(),
             team_overlay,
+            spectator_broadcast,
         });
     }
 

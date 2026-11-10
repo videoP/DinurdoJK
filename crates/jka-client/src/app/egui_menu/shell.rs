@@ -170,28 +170,15 @@ impl App {
             // Only the chat translation popup, while open, takes pointer input.
             return self.route_console_chat_menu_event(event);
         }
-        // Keep the legacy console text editor (completion, history, search,
-        // clipboard and bindings) authoritative. Only pointer events are sent
-        // to egui's floating frame, and consumed there instead of selecting
-        // text in the old dropdown geometry.
+        // Both consoles use the same editor, selection, clipboard and search
+        // handlers. HL2 routes pointer gestures to its own log geometry only.
+        // In particular Ctrl+C MUST reach handle_console_key, not egui, since
+        // egui has no knowledge of the shared console selection.
         if !confirmation && self.overlay == OverlayMode::Console && self.console_hl2
             && !connection_choice
         {
             if let WindowEvent::CursorMoved { position, .. } = event {
                 self.cursor_position = (position.x, position.y);
-            }
-            // Keep egui's selectable log text copyable with Ctrl+C, while
-            // all command editing keys continue through the raw console path.
-            if self.modifiers.control_key() && matches!(event,
-                WindowEvent::KeyboardInput {
-                    event: KeyEvent { physical_key: PhysicalKey::Code(KeyCode::KeyC), .. }, ..
-                })
-            {
-                if let (Some(window), Some(state)) = (self.window.as_ref(), self.egui_state.as_mut()) {
-                    let response = state.on_window_event(window, event);
-                    self.egui_repaint_requested |= response.repaint;
-                }
-                return true;
             }
             if matches!(event, WindowEvent::KeyboardInput { .. }
                 | WindowEvent::Ime(..) | WindowEvent::ModifiersChanged(..)) {

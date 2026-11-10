@@ -64,6 +64,9 @@ fn main() {
         "codemp/game/bg_saber.c",
         "codemp/game/bg_misc.c",
         "codemp/game/bg_weapons.c",
+        // jaPRO sailing (local fork): analytic ocean the swimmer Pmove reads.
+        "codemp/game/bg_sailing.c",
+        "codemp/game/bg_weather.c",
         "shared/qcommon/q_math.c",
         "codemp/qcommon/q_shared.c",
         "shared/qcommon/q_string.c",
@@ -75,7 +78,10 @@ fn main() {
     } else {
         japro.flag("-include").flag("native/japro_namespace.h");
     }
-    japro.file("native/japro_movement.c").compile("jka_japro_pmove");
+    japro
+        .file("native/japro_movement.c")
+        .file("native/japro_sailing.c")
+        .compile("jka_japro_pmove");
     // Separate JK2 native layouts and symbols. Never add this to JKA's backend
     // switch or feed normalized presentation state to its snapshot importer.
     let mut jk2 = cc::Build::new();

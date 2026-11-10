@@ -55,6 +55,7 @@ pub(in crate::ui) fn build_crosshair_name(
     w: u32,
     h: u32,
 ) {
+    if ui.falling_death_active { return; }
     let Some(name) = &ui.crosshair_target.name else {
         return;
     };
@@ -239,7 +240,7 @@ pub fn build_crosshair_vertices(
     w: u32,
     h: u32,
 ) {
-    if !gameplay_hud_visible(ui, w, h) {
+    if ui.falling_death_active || !gameplay_hud_visible(ui, w, h) {
         return;
     }
     // TaystJK CG_DrawCrosshair: no ordinary crosshair over zoomMode 1 or 2,

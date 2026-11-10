@@ -1,8 +1,8 @@
-//! Jedi Academy package autodownload support.
+//! Shared JKA/JK2 package autodownload support.
 //!
 //! The server advertises referenced PK3 checksums/names in systeminfo.  We
 //! download missing packages rather than a bare BSP so the map arrives with its
-//! shaders, textures and other referenced assets, matching OpenJK/TaystJK's
+//! shaders, textures and other referenced assets, matching OpenJK/JK2MV's
 //! CL_InitDownloads / FS_ComparePaks model.
 
 use std::{
@@ -39,32 +39,40 @@ pub enum HttpEvent {
     Finished(Result<(), String>),
 }
 
+/// Match OpenJK FS_PureServerSetReferencedPaks: pairs of checksum and name
+/// delimit the authoritative list. Ignore excess checksums without a name;
+/// use signed 32-bit values because the wire protocol prints them as integers.
+/// This same list drives JKA/JK2 mount gating (also when sv_pure is off).
+fn server_referenced_packages(systeminfo: &[u8]) -> Vec<(i32, String)> {
+    let checksums = info_value(systeminfo, b"sv_referencedPaks").unwrap_or_default();
+    let names = info_value(systeminfo, b"sv_referencedPakNames").unwrap_or_default();
+    std::str::from_utf8(checksums).unwrap_or_default().split_whitespace()
+        .zip(std::str::from_utf8(names).unwrap_or_default().split_whitespace())
+        .filter_map(|(checksum, name)| checksum.parse::<i32>().ok()
+            .map(|checksum| (checksum, name.to_owned())))
+        .collect()
+}
+
+pub fn server_referenced_checksums(systeminfo: &[u8]) -> Vec<i32> {
+    server_referenced_packages(systeminfo).into_iter().map(|(checksum, _)| checksum).collect()
+}
+
 pub fn referenced_downloads(
     base_dir: &Path,
     active_game_dir: Option<&Path>,
     systeminfo: &[u8],
 ) -> Result<Vec<DownloadSpec>, String> {
-    let checksums = info_value(systeminfo, b"sv_referencedPaks").unwrap_or_default();
-    let names = info_value(systeminfo, b"sv_referencedPakNames").unwrap_or_default();
-    let checksums = String::from_utf8_lossy(checksums)
-        .split_whitespace()
-        .filter_map(|word| word.parse::<i32>().ok())
-        .collect::<Vec<_>>();
-    let names = String::from_utf8_lossy(names)
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if checksums.is_empty() || names.is_empty() {
+    let referenced_packages = server_referenced_packages(systeminfo);
+    if referenced_packages.is_empty() {
         return Ok(Vec::new());
     }
 
-    let game_data = base_dir
-        .parent()
-        .ok_or_else(|| format!("base directory has no GameData parent: {}", base_dir.display()))?;
-    // PK3 autodownloads follow the writable root, but remain in their server
-    // game directory (NOT fs_forcegame). No download ever lands in fs_cdpath.
+    // PK3 downloads follow the *active game's* writable root. JK2 must never
+    // fall through to JKA's GameData/base or fs_homepath; both games share the
+    // downloader, not their asset namespace. This also respects fs_jk2homepath
+    // (and fs_homepath for JKA), but never writes into CD or fs_forcegame.
     let roots = jka_assets::pk3::configured_filesystem_roots(base_dir);
-    let download_root = jka_assets::pk3::game_home_root(&roots, false).unwrap_or_else(|| game_data.to_path_buf());
+    let download_root = download_root_for(base_dir, &roots);
     // The server's mod name is its literal directory name (no prefixes).
     let active_name = jka_assets::pk3::fs_game_name(active_game_dir);
     let active_name = active_name.as_str();
@@ -72,13 +80,13 @@ pub fn referenced_downloads(
     let local_checksums = local_pk3_checksums(base_dir, active_game_dir)?;
 
     let mut result = Vec::new();
-    for (checksum, referenced) in checksums.into_iter().zip(names) {
+    for (checksum, referenced) in referenced_packages {
         let Some((game, pak)) = validate_referenced_name(&referenced) else {
             continue;
         };
-        // Never autodownload Raven's stock assets. OpenJK applies the same
-        // policy to base/assets0..assets3.
-        if game.eq_ignore_ascii_case("base") && is_stock_assets(pak) {
+        // Never fetch stock engine assets. JKA and JK2 have different
+        // asset packs; JK2MV additionally protects assets5 and assetsmv.
+        if game.eq_ignore_ascii_case("base") && is_stock_assets(pak, roots.active_jk2.is_some()) {
             continue;
         }
         // A remote server may only write into base or its active fs_game. This
@@ -114,8 +122,8 @@ pub fn referenced_downloads(
 
 
 fn local_pk3_checksums(base_dir: &Path, active_game_dir: Option<&Path>) -> Result<HashSet<i32>, String> {
-    // All currently mounted PK3s, including shared stock archives, count as
-    // locally available; avoid re-downloading packages already in fs_cdpath.
+    // All installed, eligible PK3s count as locally available, including
+    // unmounted `dl_` archives. Avoid re-downloading from fs_cdpath/other roots.
     let roots = jka_assets::pk3::configured_filesystem_roots(base_dir);
     let dirs = jka_assets::pk3::filesystem_search_dirs(base_dir, active_game_dir, &roots);
 
@@ -129,7 +137,7 @@ fn local_pk3_checksums(base_dir: &Path, active_game_dir: Option<&Path>) -> Resul
         for entry in entries.flatten() {
             let path = entry.path();
             if !entry.file_type().is_ok_and(|kind| kind.is_file())
-                || !jka_assets::pk3::package_enabled(&path)
+                || !jka_assets::pk3::package_available_for_download(&path)
                 || !path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pk3"))
             {
                 continue;
@@ -176,8 +184,32 @@ fn validate_referenced_name(name: &str) -> Option<(&str, &str)> {
     Some((game, pak))
 }
 
-fn is_stock_assets(name: &str) -> bool {
-    matches!(name.to_ascii_lowercase().as_str(), "assets0" | "assets1" | "assets2" | "assets3")
+fn is_stock_assets(name: &str, jk2: bool) -> bool {
+    let name = name.to_ascii_lowercase();
+    if jk2 {
+        // JK2MV FS_idPakPath: never fetch stock JK2 assets or assetsmv.
+        matches!(name.as_str(), "assets0" | "assets1" | "assets2" | "assets5" | "assetsmv")
+    } else {
+        matches!(name.as_str(), "assets0" | "assets1" | "assets2" | "assets3")
+    }
+}
+
+fn download_root_for(base_dir: &Path, roots: &jka_assets::pk3::FilesystemRoots) -> PathBuf {
+    // filesystem_write_directory owns the JKA/JK2 root, including optional
+    // game-specific homepath. Asking for base avoids deriving an install root
+    // from self.game (which may point at a physically different mod layer).
+    let base_write = jka_assets::pk3::filesystem_write_directory(base_dir, None, roots);
+    base_write.parent().unwrap_or(base_write.as_path()).to_path_buf()
+}
+
+/// JK2MV reads sv_allowDownload from CS_SERVERINFO and requires a nonzero
+/// value. OpenJK/JKA's historical fallback is preserved for servers which
+/// omit the key. HTTP is advertised separately by getinfo's mvhttp keys.
+pub fn server_allows_udp(serverinfo: &[u8], jk2: bool) -> bool {
+    match info_value(serverinfo, b"sv_allowDownload") {
+        Some(value) => jka_protocol::commands::atoi(value) != 0,
+        None => !jk2,
+    }
 }
 
 /// TaystJK advertises its usable HTTP endpoint in the connectionless
@@ -427,6 +459,20 @@ pub fn temp_path_for(final_path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn referenced_packages_match_checksum_to_name_and_clamp_missing_names() {
+        let info = br"\sv_referencedPaks\1 -2 3 4\sv_referencedPakNames\base/a base/b";
+        assert_eq!(server_referenced_checksums(info), vec![1, -2]);
+        assert_eq!(server_referenced_packages(info), vec![
+            (1, "base/a".to_owned()), (-2, "base/b".to_owned()),
+        ]);
+        let malformed = br"\sv_referencedPaks\1 bad 3\sv_referencedPakNames\base/a base/b base/c";
+        assert_eq!(server_referenced_packages(malformed), vec![
+            (1, "base/a".to_owned()), (3, "base/c".to_owned()),
+        ]);
+        assert!(server_referenced_checksums(b"").is_empty());
+    }
+
     fn server_info(fields: &str) -> jka_protocol::ServerInfo {
         let mut packet = b"\xff\xff\xff\xffinfoResponse\n".to_vec();
         packet.extend_from_slice(format!("\\challenge\\dltest\\protocol\\26{fields}").as_bytes());
@@ -468,6 +514,39 @@ mod tests {
             advertised_http_base(&info, server).as_deref(),
             Some("http://203.0.113.7:18200")
         );
+    }
+
+    #[test]
+    fn jk2_downloads_use_the_jk2_write_root_and_never_jka_or_cd() {
+        let base = Path::new("/game/jka/base");
+        let roots = jka_assets::pk3::FilesystemRoots {
+            jk2basepath: Some("/games/jk2".into()),
+            jk2cdpath: Some("/disc/jk2".into()),
+            active_jk2: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(download_root_for(base, &roots), PathBuf::from("/games/jk2"));
+        let roots = jka_assets::pk3::FilesystemRoots {
+            jk2homepath: Some("/user/jk2".into()), ..roots
+        };
+        assert_eq!(download_root_for(base, &roots), PathBuf::from("/user/jk2"));
+        let roots = jka_assets::pk3::FilesystemRoots {
+            active_jk2: None, homepath: Some("/user/jka".into()), ..roots
+        };
+        assert_eq!(download_root_for(base, &roots), PathBuf::from("/user/jka"));
+    }
+
+    #[test]
+    fn stock_packages_and_udp_policy_follow_each_game() {
+        assert!(is_stock_assets("assets5", true));
+        assert!(is_stock_assets("assetsmv", true));
+        assert!(!is_stock_assets("assets3", true));
+        assert!(is_stock_assets("assets3", false));
+        assert!(!is_stock_assets("assets5", false));
+        assert!(!server_allows_udp(b"", true));
+        assert!(server_allows_udp(b"", false));
+        assert!(server_allows_udp(br"\sv_allowDownload\1", true));
+        assert!(!server_allows_udp(br"\sv_allowDownload\0", false));
     }
 
     #[test]

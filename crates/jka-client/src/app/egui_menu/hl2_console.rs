@@ -3,6 +3,9 @@
 //! The underlying command editor/history, execution, log records and search
 //! stay in App. This is exclusively an opt-in presentation; the original
 //! WGPU console and its mouse hit-testing are bypassed only while con_hl2=1.
+//! The HL2 renderer must NOT create an independent egui text selection; it
+//! uses the same ConsolePoint and clipboard handler as the classic console.
+use crate::app::console_state::ConsolePoint;
 use crate::app::egui_menu::App;
 use crate::logging::ConsoleLineKind;
 
@@ -144,6 +147,33 @@ fn console_line_job(line: &str, kind: ConsoleLineKind) -> egui::text::LayoutJob 
     job.wrap.break_anywhere = true;
     job
 }
+
+/// Selection coordinates are character offsets into logical records, not
+/// virtualized widget positions. One normalized range works for both views.
+fn selected_columns(
+    bounds: Option<(ConsolePoint, ConsolePoint)>, row: usize, length: usize,
+) -> Option<(usize, usize)> {
+    let (start, end) = bounds?;
+    if row < start.line || row > end.line { return None; }
+    let left = if row == start.line { start.col.min(length) } else { 0 };
+    let right = if row == end.line { end.col.min(length) } else { length };
+    (left < right).then_some((left, right))
+}
+
+/// Map a displayed galley hit to shared (line, character) coordinates. Using
+/// the actual laid-out glyph positions avoids inaccurate x / fixed-width
+/// guesses on DPI scaling and Unicode text.
+fn galley_point(
+    line: usize, galley: &egui::Galley, origin: egui::Pos2, pointer: egui::Pos2,
+) -> ConsolePoint {
+    ConsolePoint {
+        line,
+        col: galley.cursor_from_pos(pointer - origin).index.0,
+    }
+}
+
+/// Row data is kept only for visible (virtualized) rows, never the whole log.
+type VisibleLogRow = (usize, egui::Rect, std::sync::Arc<egui::Galley>, egui::Pos2);
 
 /// Keep the complete floating console on the current egui viewport, including
 /// when a stored rectangle is restored after changing resolution or DPI scale.
@@ -290,6 +320,8 @@ impl App {
             egui::pos2(x, y), egui::vec2(width, height),
         );
         let mut prompt_rect = None;
+        let scroll_to = self.console_hl2_scroll_to.take();
+        let page_delta = std::mem::take(&mut self.console_hl2_page_delta);
         egui::Window::new("Console")
             .id(egui::Id::new("dinurdo_hl2_console"))
             .title_bar(false)
@@ -348,10 +380,21 @@ impl App {
                 if self.console_search_open {
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("FIND:").monospace().color(DIM));
+                        // Keyboard focus intentionally stays with the shared
+                        // console search editor, not a second egui TextEdit.
                         ui.label(egui::RichText::new(format!("{}|", self.console_search_input))
                             .monospace().color(LABEL));
                         ui.label(egui::RichText::new(format!("{} matches", self.console_search_matches.len()))
                             .color(DIM).small());
+                        if ui.small_button("Prev").clicked() {
+                            self.step_console_search(true);
+                        }
+                        if ui.small_button("Next").clicked() {
+                            self.step_console_search(false);
+                        }
+                        if ui.small_button("×").on_hover_text("Close search").clicked() {
+                            self.console_search_open = false;
+                        }
                     });
                 }
                 // The log always fills the same space regardless of whether
@@ -359,55 +402,177 @@ impl App {
                 let log_height = (ui.available_height() - 45.0).max(65.0);
                 let mut reveal_path = None;
                 let mut chat_action = None;
-                egui::Frame::new()
+                // Egui is only the painter/window layout here. The classic
+                // ConsolePoint selection and Ctrl+C path own all text state.
+                // Individual selectable labels cannot select across virtual
+                // rows and steal Ctrl+C, so draw rows and hit-test ourselves.
+                let mut visible_rows: Vec<VisibleLogRow> = Vec::new();
+                let selection = self.console_selection_bounds();
+                let log_result = egui::Frame::new()
                     .fill(LOG_BG)
                     .stroke(egui::Stroke::new(1.0, EDGE))
                     .inner_margin(egui::Margin::symmetric(6, 5))
                     .show(ui, |ui| {
-                        // Do not derive a *minimum* width from the available
-                        // width inside this padded frame: the margins would
-                        // otherwise create a growth feedback loop per frame.
-                        egui::ScrollArea::vertical()
+                        // show_rows adds the *parent* item spacing to its
+                        // virtual row pitch. Set it before constructing the
+                        // scroll area so 16px is truly 16px everywhere.
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        let mut scroll = egui::ScrollArea::vertical()
                             .id_salt("hl2_console_log")
                             .max_height(log_height)
                             .min_scrolled_height(log_height)
                             .auto_shrink([false, false])
-                            .stick_to_bottom(true)
-                            .show_rows(ui, 16.0, self.console_lines.len(), |ui, range| {
-                                for index in range {
-                                    let Some(line) = self.console_lines.get(index) else { continue; };
-                                    let kind = self.console_line_kinds.get(index).copied().unwrap_or_default();
-                                    // Chat rows carry their message id; a translated
-                                    // message is shown through it, never re-parsed.
-                                    let chat_id = self.console_chat_ids.get(index).copied().flatten()
-                                        .filter(|&id| self.chat_translation.has_message(id));
-                                    let translated = chat_id.and_then(|id| self.console_chat_translation_line(line, id));
-                                    let job = console_line_job(translated.as_deref().unwrap_or(line), kind);
-                                    let response = ui.add(egui::Label::new(job).selectable(true).truncate());
-                                    let path_target = self.console_path_links.get(index)
-                                        .and_then(|links| links.first()).map(|link| link.target.clone());
-                                    if chat_id.is_some() || path_target.is_some() {
-                                        response.context_menu(|ui| {
-                                            if let Some(id) = chat_id {
-                                                if let Some(action) = self.chat_translation_menu(ui, id) {
-                                                    chat_action = Some(action);
-                                                    ui.close();
-                                                }
-                                            }
-                                            if let Some(target) = &path_target {
-                                                if chat_id.is_some() {
-                                                    ui.separator();
-                                                }
-                                                if ui.button("Reveal linked file").clicked() {
-                                                    reveal_path = Some(target.clone());
-                                                    ui.close();
-                                                }
-                                            }
-                                        });
+                            .stick_to_bottom(true);
+                        if let Some(line) = scroll_to {
+                            // This offset is only set on a search navigation
+                            // request; otherwise preserve egui's user scroll.
+                            let visible = (log_height / 16.0) as usize;
+                            scroll = scroll.vertical_scroll_offset(
+                                line.saturating_sub(visible / 2) as f32 * 16.0,
+                            );
+                        }
+                        scroll.show_rows(ui, 16.0, self.console_lines.len(), |ui, range| {
+                            if page_delta != 0 {
+                                ui.scroll_with_delta(egui::vec2(0.0, page_delta as f32 * 16.0));
+                            }
+                            let primary_down = ui.input(|i| i.pointer.primary_down());
+                            let pointer = ui.input(|i| i.pointer.interact_pos());
+                            if self.console_selecting && primary_down {
+                                // Continue dragging across the top/bottom of
+                                // the virtual list, including offscreen rows.
+                                if let Some(pointer) = pointer {
+                                    let clip = ui.clip_rect();
+                                    if pointer.y <= clip.top() + 8.0 {
+                                        ui.scroll_with_delta(egui::vec2(0.0, 16.0));
+                                        ui.ctx().request_repaint();
+                                    } else if pointer.y >= clip.bottom() - 8.0 {
+                                        ui.scroll_with_delta(egui::vec2(0.0, -16.0));
+                                        ui.ctx().request_repaint();
                                     }
                                 }
-                            });
+                            }
+                            for index in range {
+                                let Some(line) = self.console_lines.get(index) else { continue; };
+                                let kind = self.console_line_kinds.get(index).copied().unwrap_or_default();
+                                let chat_id = self.console_chat_ids.get(index).copied().flatten()
+                                    .filter(|&id| self.chat_translation.has_message(id));
+                                let translated = chat_id.and_then(|id| self.console_chat_translation_line(line, id));
+                                let display = translated.as_deref().unwrap_or(line);
+                                let job = console_line_job(display, kind);
+                                let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width().max(1.0), 16.0),
+                                    egui::Sense::hover(),
+                                );
+                                // Explicit per-record id: otherwise the widget
+                                // identity changes as the virtualized range moves.
+                                let response = ui.interact(
+                                    rect, ui.id().with(("hl2_log_row", index)),
+                                    egui::Sense::click_and_drag(),
+                                ).on_hover_cursor(egui::CursorIcon::Text);
+                                let origin = egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5);
+                                let clip = ui.clip_rect().intersect(rect);
+                                let painter = ui.painter().with_clip_rect(clip);
+                                // Show current search hit(s) underneath the
+                                // shared selection; navigation moves this list.
+                                let hits = &self.console_search_matches;
+                                let first = hits.partition_point(|hit| hit.line < index);
+                                for hit in hits[first..].iter().take_while(|hit| hit.line == index) {
+                                    let max_col = galley.text().chars().count();
+                                    let left = galley.pos_from_cursor(egui::text::CCursor::new(hit.start_col.min(max_col))).left();
+                                    let right = galley.pos_from_cursor(egui::text::CCursor::new(hit.end_col.min(max_col))).left();
+                                    if right > left {
+                                        painter.rect_filled(egui::Rect::from_min_max(
+                                            egui::pos2(origin.x + left, rect.top()),
+                                            egui::pos2(origin.x + right, rect.bottom()),
+                                        ), 0.0, egui::Color32::from_rgb(99, 84, 46));
+                                    }
+                                }
+                                if let Some((left, right)) = selected_columns(
+                                    selection, index, galley.text().chars().count(),
+                                ) {
+                                    let start = galley.pos_from_cursor(egui::text::CCursor::new(left)).left();
+                                    let end = galley.pos_from_cursor(egui::text::CCursor::new(right)).left();
+                                    painter.rect_filled(egui::Rect::from_min_max(
+                                        egui::pos2(origin.x + start, rect.top()),
+                                        egui::pos2(origin.x + end, rect.bottom()),
+                                    ), 0.0, egui::Color32::from_rgb(68, 107, 146));
+                                }
+                                painter.galley(origin, galley.clone(), LABEL);
+                                if response.clicked() {
+                                    if let Some(pointer) = response.interact_pointer_pos() {
+                                        let point = galley_point(index, &galley, origin, pointer);
+                                        self.begin_console_selection(point);
+                                        self.finish_console_selection();
+                                    }
+                                } else if response.drag_started() {
+                                    // Anchor at mouse-down, not at the delayed
+                                    // drag threshold position.
+                                    if let Some(pointer) = ui.input(|i| i.pointer.press_origin()) {
+                                        self.begin_console_selection(galley_point(index, &galley, origin, pointer));
+                                    }
+                                }
+                                let path_target = self.console_path_links.get(index)
+                                    .and_then(|links| links.first()).map(|link| link.target.clone());
+                                response.context_menu(|ui| {
+                                    if ui.add_enabled(self.selected_console_text().is_some(),
+                                        egui::Button::new("Copy selected text"))
+                                        .clicked()
+                                    {
+                                        self.copy_console_selection();
+                                        ui.close();
+                                    }
+                                    if ui.button("Select all").clicked() {
+                                        self.select_all_console();
+                                        ui.close();
+                                    }
+                                    if chat_id.is_some() || path_target.is_some() {
+                                        ui.separator();
+                                    }
+                                    if let Some(id) = chat_id {
+                                        if let Some(action) = self.chat_translation_menu(ui, id) {
+                                            chat_action = Some(action);
+                                            ui.close();
+                                        }
+                                    }
+                                    if let Some(target) = &path_target {
+                                        if chat_id.is_some() { ui.separator(); }
+                                        if ui.button("Reveal linked file").clicked() {
+                                            reveal_path = Some(target.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                                visible_rows.push((index, rect, galley, origin));
+                            }
+                        });
                     });
+                // The active drag can travel across rows that are different
+                // widgets or past the clipped viewport. Choose the nearest
+                // visible record, then let the next scroll frame extend it.
+                if self.console_selecting {
+                    if ctx.input(|i| i.pointer.primary_down()) {
+                        if let Some(pointer) = ctx.input(|i| i.pointer.interact_pos()) {
+                            if !visible_rows.is_empty() {
+                                let candidate = visible_rows.iter().min_by(|a, b| {
+                                    let distance = |row: &VisibleLogRow| {
+                                        if pointer.y < row.1.top() { row.1.top() - pointer.y }
+                                        else { (pointer.y - row.1.bottom()).max(0.0) }
+                                    };
+                                    distance(a).total_cmp(&distance(b))
+                                });
+                                if let Some((line, _, galley, origin)) = candidate {
+                                    self.console_selection_focus = Some(galley_point(*line, galley, *origin, pointer));
+                                }
+                            }
+                        }
+                    } else {
+                        self.finish_console_selection();
+                    }
+                }
+                // Keep the scrollframe a fixed-height element, even when rows
+                // are empty, so its content never resizes the floating panel.
+                let _ = log_result;
                 if let Some(target) = reveal_path {
                     let _ = self.reveal_console_path(&target);
                 }
@@ -424,9 +589,9 @@ impl App {
                         .stroke(egui::Stroke::new(1.0, EDGE))
                         .inner_margin(egui::Margin::symmetric(5, 3))
                         .show(ui, |ui| {
-                            let (text_rect, _) = ui.allocate_exact_size(
+                            let (text_rect, response) = ui.allocate_exact_size(
                                 egui::vec2((field_width - 10.0).max(1.0), 17.0),
-                                egui::Sense::hover(),
+                                egui::Sense::click(),
                             );
                             let font = egui::FontId::monospace(12.5);
                             let color = egui::Color32::BLACK;
@@ -447,7 +612,15 @@ impl App {
                             let scroll = (caret_offset - visible_width + 3.0).max(0.0);
                             let painter = ui.painter().with_clip_rect(text_rect);
                             let text_y = text_rect.center().y - text_galley.size().y * 0.5;
-                            painter.galley(egui::pos2(text_rect.left() - scroll, text_y), text_galley, color);
+                            let input_origin = egui::pos2(text_rect.left() - scroll, text_y);
+                            if response.clicked() {
+                                if let Some(pointer) = response.interact_pointer_pos() {
+                                    let index = text_galley.cursor_from_pos(pointer - input_origin).index.0;
+                                    self.console_cursor = self.console_input.char_indices()
+                                        .nth(index).map_or(self.console_input.len(), |(byte, _)| byte);
+                                }
+                            }
+                            painter.galley(input_origin, text_galley, color);
                             let caret_x = (text_rect.left() + caret_offset - scroll)
                                 .clamp(text_rect.left(), text_rect.right());
                             painter.line_segment(
@@ -568,6 +741,19 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hl2_selection_uses_shared_character_positions_across_virtual_rows() {
+        let bounds = Some((ConsolePoint { line: 2, col: 3 },
+                           ConsolePoint { line: 4, col: 2 }));
+        assert_eq!(selected_columns(bounds, 1, 10), None);
+        assert_eq!(selected_columns(bounds, 2, 9), Some((3, 9)));
+        assert_eq!(selected_columns(bounds, 3, 9), Some((0, 9)));
+        assert_eq!(selected_columns(bounds, 4, 9), Some((0, 2)));
+        assert_eq!(selected_columns(bounds, 5, 9), None);
+        assert_eq!(selected_columns(bounds, 2, 2), None);
+        assert_eq!(selected_columns(None, 3, 9), None);
+    }
 
     #[test]
     fn console_geometry_changes_only_on_explicit_resize() {

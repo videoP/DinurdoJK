@@ -120,9 +120,10 @@ impl FolderPicker {
 }
 
 pub(super) struct AssetMappingState {
-    cdpath:String, jk2cdpath:String, basepath:String, jk2basepath:String, forcegame:String,
+    cdpath:String, jk2cdpath:String, basepath:String, jk2basepath:String,
+    forcegame:String, jk2forcegame:String,
     picker:Option<FolderPicker>, feedback:Option<String>, allow_close:bool,
-    /// 0..4 input fields, 5 is the folder picker address.
+    /// 0..5 input fields, 6 is the folder picker address.
     focus:Option<usize>, caret:usize, selection_anchor:Option<usize>, drag_text:bool, text_start:usize, scroll:f32,
 }
 impl AssetMappingState {
@@ -135,6 +136,7 @@ impl AssetMappingState {
             basepath:show_path(roots.basepath.as_deref()),
             jk2basepath:show_path(roots.jk2basepath.as_deref()),
             forcegame:roots.forcegame.clone().unwrap_or_default(),
+            jk2forcegame:roots.jk2forcegame.clone().unwrap_or_default(),
             picker:None,feedback:None,allow_close:false,focus:None,caret:0,selection_anchor:None,drag_text:false,text_start:0,scroll:0.0,
         }
     }
@@ -159,17 +161,19 @@ impl AssetMappingState {
         roots.basepath=crate::filesystem_paths::parse_root(base,&self.basepath)?;
         roots.jk2basepath=crate::filesystem_paths::parse_root(base,&self.jk2basepath)?;
         roots.forcegame=crate::filesystem_paths::validate_game_name(&self.forcegame)?;
+        roots.jk2forcegame=crate::filesystem_paths::validate_game_name(&self.jk2forcegame)?;
         Ok(roots)
     }
-    fn values(&self)->[String;5] {
+    fn values(&self)->[String;6] {
         [self.basepath.clone(),self.cdpath.clone(),self.jk2basepath.clone(),
-            self.jk2cdpath.clone(),self.forcegame.clone()]
+            self.jk2cdpath.clone(),self.forcegame.clone(),self.jk2forcegame.clone()]
     }
     fn edit(&mut self,index:usize)->Option<&mut String> {
         match index {
             0=>Some(&mut self.basepath),1=>Some(&mut self.cdpath),
             2=>Some(&mut self.jk2basepath),3=>Some(&mut self.jk2cdpath),
-            4=>Some(&mut self.forcegame),5=>self.picker.as_mut().map(|p|&mut p.address),
+            4=>Some(&mut self.forcegame),5=>Some(&mut self.jk2forcegame),
+            6=>self.picker.as_mut().map(|p|&mut p.address),
             _=>None,
         }
     }
@@ -304,13 +308,22 @@ impl AssetMappingState {
                 Err(_)=>Some(false),
             };
         }
-        match crate::filesystem_paths::validate_game_name(&self.forcegame) {
-            Ok(Some(name)) => {
-                result.force_status=Some(jka_assets::pk3::dinurdojk_directory_for(base,roots)
-                    .join(name).is_dir());
+        // Resolve previews against the *edited* game roots, not the old
+        // mounted roots. JK2 has no implicit fallback to the JKA directory.
+        let jka_root = crate::filesystem_paths::parse_root(base, &self.basepath).ok().map(|root| {
+            root.unwrap_or_else(|| crate::filesystem_paths::default_base_directory()
+                .unwrap_or_else(|_| base.to_path_buf())
+                .parent().unwrap_or(base).to_path_buf())
+        });
+        let jk2_root = crate::filesystem_paths::parse_root(base, &self.jk2basepath).ok().flatten();
+        for (i, (value, root)) in [(&self.forcegame, jka_root), (&self.jk2forcegame, jk2_root)]
+            .into_iter().enumerate()
+        {
+            match crate::filesystem_paths::validate_game_name(value) {
+                Ok(Some(name)) => result.force_status[i] = root.map(|dir| dir.join(name).is_dir()),
+                Err(_) => result.force_invalid[i] = true,
+                Ok(None) => {}
             }
-            Err(_) => result.force_invalid=true,
-            Ok(None) => {}
         }
         if let Ok(proposed)=self.proposed(base,roots) {
             let dirs=jka_base_layers(&restart_jka_base(&proposed,base),&proposed);
@@ -353,7 +366,7 @@ fn relaunch_arguments() -> Vec<std::ffi::OsString> {
             && args.get(i + 1).is_some_and(|name| {
                 matches!(name.to_string_lossy().to_ascii_lowercase().as_str(),
                     "fs_basepath" | "fs_jk2basepath" | "fs_cdpath" |
-                    "fs_jk2cdpath" | "fs_forcegame")
+                    "fs_jk2cdpath" | "fs_forcegame" | "fs_jk2forcegame")
             })
         {
             i += (args.len() - i).min(3);
@@ -402,7 +415,7 @@ impl App {
                 if self.asset_mapping.as_ref().unwrap().drag_text {
                     if let Some(layout)=geometry.as_ref() {
                         let state=self.asset_mapping.as_mut().unwrap();
-                        let bounds=if state.focus==Some(5) {layout.picker.map(|p|p.address)}
+                        let bounds=if state.focus==Some(6) {layout.picker.map(|p|p.address)}
                             else {state.focus.map(|i|layout.fields[i].edit)};
                         if let (Some(bounds),Some(index))=(bounds,state.focus) {
                             if let Some(text)=state.edit(index).map(|s|s.clone()) {
@@ -462,17 +475,17 @@ impl App {
                         let state=self.asset_mapping.as_mut().unwrap();
                         let value=state.values()[i].clone();
                         state.picker=Some(FolderPicker::new(i,&value,&self.base));
-                        state.focus(5);
+                        state.focus(6);
                     }
                     Some(Hit::Address)=>{
                         let state=self.asset_mapping.as_mut().unwrap();
                         let bounds=geometry.as_ref().unwrap().picker.unwrap().address;
                         let text=state.picker.as_ref().unwrap().address.clone();
                         let cap=crate::ui::asset_mapping::edit_capacity(bounds[2],geometry.as_ref().unwrap().scale);
-                        let start=if state.focus==Some(5) { state.text_start }
+                        let start=if state.focus==Some(6) { state.text_start }
                             else { text.chars().count().saturating_sub(cap) };
                         let caret=crate::ui::asset_mapping::caret_from_x(&text,start,bounds,geometry.as_ref().unwrap().scale,point[0]);
-                        if state.focus!=Some(5) { state.focus(5);state.text_start=start; }
+                        if state.focus!=Some(6) { state.focus(6);state.text_start=start; }
                         state.set_caret(caret,self.modifiers.shift_key());
                         state.drag_text=true;
                     }
@@ -481,12 +494,12 @@ impl App {
                         if let Some(p)=state.picker.as_mut() {
                             if let Some(parent)=p.current.parent() {p.navigate(parent.to_path_buf());}
                         }
-                        state.focus(5);
+                        state.focus(6);
                     }
                     Some(Hit::Refresh)=>{
                         let state=self.asset_mapping.as_mut().unwrap();
                         if let Some(p)=state.picker.as_mut() {p.refresh();}
-                        state.focus(5);
+                        state.focus(6);
                     }
                     Some(Hit::Entry(i))=>{
                         let state=self.asset_mapping.as_mut().unwrap();
@@ -498,7 +511,7 @@ impl App {
                                 navigated=true;
                             }
                         }
-                        if navigated {state.focus(5);}
+                        if navigated {state.focus(6);}
                     }
                     Some(Hit::Choose)=>{
                         let state=self.asset_mapping.as_mut().unwrap();
@@ -516,7 +529,7 @@ impl App {
                     None=>{if self.asset_mapping.as_ref().unwrap().picker.is_none(){let state=self.asset_mapping.as_mut().unwrap();state.focus=None;state.drag_text=false;}}
                 }
                 if let (Some(layout),Some(state))=(geometry.as_ref(),self.asset_mapping.as_mut()) {
-                    let bounds=if state.focus==Some(5) {layout.picker.map(|p|p.address)}
+                    let bounds=if state.focus==Some(6) {layout.picker.map(|p|p.address)}
                         else {state.focus.map(|i|layout.fields[i].edit)};
                     if let Some(bounds)=bounds {state.keep_caret_visible(bounds[2],layout.scale);}
                 }
@@ -526,7 +539,7 @@ impl App {
                 if let Some(state)=self.asset_mapping.as_mut(){
                     state.replace_selection(value);
                     if let Some(layout)=geometry.as_ref() {
-                        let bounds=if state.focus==Some(5) {layout.picker.map(|p|p.address)}
+                        let bounds=if state.focus==Some(6) {layout.picker.map(|p|p.address)}
                             else {state.focus.map(|i|layout.fields[i].edit)};
                         if let Some(bounds)=bounds {state.keep_caret_visible(bounds[2],layout.scale);}
                     }
@@ -545,13 +558,13 @@ impl App {
                     } else {self.close_asset_mapping();}
                 } else if code==KeyCode::Tab && !key.repeat && self.asset_mapping.as_ref().unwrap().picker.is_none() {
                     let state=self.asset_mapping.as_mut().unwrap();
-                    let next=state.focus.map_or(0,|i|(i+1)%5);
+                    let next=state.focus.map_or(0,|i|(i+1)%6);
                     state.focus(next);
                 } else if code==KeyCode::Enter && !key.repeat && self.asset_mapping.as_ref().unwrap().picker.is_some() {
                     let state=self.asset_mapping.as_mut().unwrap();
-                    if state.focus==Some(5) {
+                    if state.focus==Some(6) {
                         if let Some(p)=state.picker.as_mut(){p.navigate(PathBuf::from(p.address.clone()));}
-                        state.focus(5);
+                        state.focus(6);
                     }
                 } else {
                     let control=self.modifiers.control_key();
@@ -561,7 +574,7 @@ impl App {
                     }
                 }
                 if let (Some(layout),Some(state))=(geometry.as_ref(),self.asset_mapping.as_mut()) {
-                    let bounds=if state.focus==Some(5) {layout.picker.map(|p|p.address)}
+                    let bounds=if state.focus==Some(6) {layout.picker.map(|p|p.address)}
                         else {state.focus.map(|i|layout.fields[i].edit)};
                     if let Some(bounds)=bounds {state.keep_caret_visible(bounds[2],layout.scale);}
                 }
@@ -581,16 +594,19 @@ impl App {
     fn save_asset_mapping(&mut self,restart:bool) {
         let Some(state)=self.asset_mapping.as_ref() else {return;};
         let result=state.proposed(&self.base,&self.fs_roots).and_then(|proposed| {
-            // Creating the explicitly selected client override is not a game
-            // asset migration. It stays client-owned and is never a write root
-            // for configs, demos, screenshots, or downloaded game files.
-            if let Some(name)=proposed.forcegame.as_deref() {
-                let directory=jka_assets::pk3::dinurdojk_directory_for(&self.base,&proposed).join(name);
-                std::fs::create_dir_all(&directory).map_err(|error|
-                    format!("Cannot create client override {}: {error}",directory.display()))?;
+            // These are game-root asset overrides, not fs_game selections or
+            // write roots. Never create a JK2 override under JKA's root when
+            // fs_jk2basepath is unset; it remains dormant until configured.
+            let jka_base=restart_jka_base(&proposed,&self.base);
+            for jk2 in [false,true] {
+                if let Some(directory)=jka_assets::pk3::filesystem_forcegame_directory(&jka_base,&proposed,jk2) {
+                    std::fs::create_dir_all(&directory).map_err(|error|
+                        format!("Cannot create {} override {}: {error}",
+                            if jk2 {"JK2"} else {"JKA"},directory.display()))?;
+                }
             }
-            // Existing INI store and no live VFS remount. Root paths are never
-            // redirected into base/ and forcegame never becomes a write root.
+            // Existing INI store and no live VFS remount. forcegame never
+            // changes where configs, demos, screenshots or downloads are written.
             crate::filesystem_paths::save(&self.base,&proposed)?;
             Ok(proposed)
         });
@@ -635,6 +651,25 @@ mod tests {
         let proposed = state.proposed(&base, &roots).unwrap();
         assert!(proposed.basepath.is_none());
         assert!(proposed.jk2basepath.is_none());
+        assert!(proposed.forcegame.is_none());
+        assert!(proposed.jk2forcegame.is_none());
+    }
+
+    #[test]
+    fn mapping_preserves_independent_jka_and_jk2_override_names() {
+        let base=Path::new("/client/base");
+        let mut roots=jka_assets::pk3::FilesystemRoots::default();
+        roots.jk2basepath=Some("/outcast".into());
+        roots.forcegame=Some("Eternal".into());
+        roots.jk2forcegame=Some("jk2-custom".into());
+        let mut state=AssetMappingState::new(&roots,base);
+        assert_eq!(state.values()[4],"Eternal");
+        assert_eq!(state.values()[5],"jk2-custom");
+        *state.edit(5).unwrap()="new-jk2".into();
+        let proposed=state.proposed(base,&roots).unwrap();
+        assert_eq!(proposed.forcegame.as_deref(),Some("Eternal"));
+        assert_eq!(proposed.jk2forcegame.as_deref(),Some("new-jk2"));
+        assert!(state.edit(6).is_none()); // Picker address is a separate field.
     }
 
     #[test]

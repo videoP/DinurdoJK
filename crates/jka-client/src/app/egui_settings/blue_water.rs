@@ -121,6 +121,26 @@ impl App {
             super::ocean_slider_d(ui, "Peak wavelength (m)", "Dominant crest spacing in metres. Controls wave speed through the native dispersion relation.", &mut ocean.blue_water_waves.wavelength, d.blue_water_waves.wavelength, 2.0..=512.0, &mut changed);
             super::ocean_slider_d(ui, "Choppiness", "Horizontal displacement strength. Zero keeps only vertical waves.", &mut ocean.blue_water_waves.choppiness, d.blue_water_waves.choppiness, 0.0..=4.0, &mut changed);
             super::ocean_slider_d(ui, "Spectrum wind speed", "Reference wind speed in metres per second. Changes the native spectral shape and fine surface roughness; independent of weather wind.", &mut ocean.blue_water_waves.wind_speed, d.blue_water_waves.wind_speed, 0.1..=40.0, &mut changed);
+            {
+                // r_oceanLongWaves: the FFT's long waves from N stronger waves.
+                let mut count = ocean.long_waves as f32;
+                super::ocean_slider_d(ui, "Long-wave count (0 = off)",
+                    "Builds the big waves from this many wave pieces instead of thousands, keeping the same height, wavelength and direction spread. Short waves, chop and foam are unchanged. Find the lowest count that still looks like the original: that is how many waves the server would add up at your position.",
+                    &mut count, d.long_waves as f32, 0.0..=1024.0, &mut changed);
+                ocean.long_waves = count.round().max(0.0) as u32;
+                // r_oceanMediumWaves: the same for the medium waves.
+                let mut medium = ocean.medium_waves as f32;
+                super::ocean_slider_d(ui, "Medium-wave count (0 = off)",
+                    "Builds the medium waves (shorter than the big ones, longer than the fine chop) from this many wave pieces instead of thousands, keeping the same height and spread. Find the lowest count that still looks like the original.",
+                    &mut medium, d.medium_waves as f32, 0.0..=1024.0, &mut changed);
+                ocean.medium_waves = medium.round().max(0.0) as u32;
+            }
+            super::ocean_slider_d(ui, "Medium-wave detail",
+                "Strength of the medium waves (a few metres up to about 20 m). Raise it for more mid-size surface variation. 1 = Blue Water's own spectrum.",
+                &mut ocean.medium_wave_detail, d.medium_wave_detail, 0.0..=16.0, &mut changed);
+            super::ocean_slider_d(ui, "Small-wave detail",
+                "Strength of the fine chop (the smallest waves). Raise it for more small surface variation. Visual only: the server never adds these up, so it costs nothing there. 1 = Blue Water's own spectrum.",
+                &mut ocean.small_wave_detail, d.small_wave_detail, 0.0..=16.0, &mut changed);
             if hybrid {
                 theme::row(ui, "Crest breaking (A/B)", "Original preserves the current waves. Limit is a conservative comparison. Spilling keeps more crest chop, bounds deep folds and uses two-sided crest lighting and whitewater. Experimental; vertical wave height is preserved.", theme::Reset::None, |ui| {
                     for (mode, label) in [(0, "Original"), (1, "Limit"), (2, "Spilling")] {

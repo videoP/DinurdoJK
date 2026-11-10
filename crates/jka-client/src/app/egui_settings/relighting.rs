@@ -46,16 +46,45 @@ impl App {
         }
         ui.add_enabled_ui(self.video.sun_override, |ui| {
             theme::section(ui, "TIME OF DAY", "Artistic 24-hour cycle; sunrise 6 AM, noon 12 PM, sunset 6 PM. Sun and moon positions update together; lunar phase and original map lighting stay independently adjustable.");
-            theme::row(ui, "Time", "3 AM to the following 3 AM. Moves the sun and moon along opposite arcs. Your selected Sky mode and shadow method are not changed.", theme::Reset::None, |ui| {
-                let mut time = self.video.relight_time;
-                let minutes = (((time % 24.0) * 60.0) / 15.0).round() as u32 * 15;
-                let hours = (minutes / 60) % 24;
+            theme::row(ui, "Time", "3 AM to the following 3 AM. Match system time uses the PC's local clock; Realtime follows it, Baked captures it at map load. Manual slider and shadow/sky selection are otherwise unchanged.", theme::Reset::None, |ui| {
+                let matching = self.video.relight_match_system_time;
+                let mut time = if matching {
+                    self.relight_clock_effective.unwrap_or(self.video.relight_time)
+                } else {
+                    self.video.relight_time
+                };
+                let minutes = ((time.rem_euclid(24.0) * 60.0).round() as u32) % (24 * 60);
+                let hours = minutes / 60;
                 let hh = hours % 12;
                 let readout = format!("{}:{:02} {}", if hh == 0 { 12 } else { hh }, minutes % 60, if hours < 12 { "AM" } else { "PM" });
-                if theme::slider_default(ui, &mut time, 3.0..=27.0, &readout, 15.0) {
-                    self.set_relighting_time((time * 4.0).round() * 0.25);
-                }
+                ui.horizontal(|ui| {
+                    // Reserve room for the adjacent toggle: the theme's slider
+                    // uses its available width to size the Taffy track.
+                    let slider_width = (ui.available_width() - 150.0).max(210.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(slider_width, 24.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add_enabled_ui(!matching, |ui| {
+                                if theme::slider_default(ui, &mut time, 3.0..=27.0, &readout, 15.0) {
+                                    self.set_relighting_time((time * 4.0).round() * 0.25);
+                                }
+                            });
+                        },
+                    );
+                    if theme::chip(ui, "MATCH SYSTEM TIME", matching).clicked() {
+                        self.set_relighting_match_system_time(!matching);
+                    }
+                });
             });
+            if self.video.relight_match_system_time && self.video.active_relighting_mode() == 1 {
+                let hint = if self.relight_clock_effective.is_some() {
+                    "Baked: system time was captured at map load and stays fixed until the next map load."
+                } else {
+                    "Baked: the system clock will first be sampled at the next map load. The displayed time is your saved manual value."
+                };
+                theme::hint(ui, hint, theme::TEXT_DIM());
+            }
             if self.video.sky_backend != 1 || self.video.fast_sky != 0 {
                 theme::hint(ui, "Blue Water Sky gives the clock a matching sunrise, sunset and night sky; other sky modes retain their own appearance.", theme::TEXT_DIM());
             }
@@ -385,6 +414,9 @@ impl App {
         self.video.baked_indirect_highlight_preserve = d.baked_indirect_highlight_preserve;
         self.video.sun_lighting = d.sun_lighting;
         self.video.relight_time = d.relight_time;
+        self.video.relight_match_system_time = d.relight_match_system_time;
+        self.relight_clock_effective = None;
+        self.apply_relighting_celestial_time(d.relight_time);
         self.video.static_world_csm = d.static_world_csm;
         self.video.promote_shader_glow = d.promote_shader_glow;
         self.video.promote_shader_additive = d.promote_shader_additive;

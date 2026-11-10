@@ -194,12 +194,7 @@ impl App {
                     return;
                 }
                 KeyCode::KeyC => {
-                    if let Some(text) = self.selected_console_text() {
-                        if let Err(error) = crate::clipboard::set_text(&text) {
-                            self.console_status = format!("CLIPBOARD ERROR: {error}");
-                            self.push_console_line(format!("^1{}", self.console_status));
-                        }
-                    }
+                    self.copy_console_selection();
                     self.publish_ui();
                     return;
                 }
@@ -278,11 +273,19 @@ impl App {
                 self.publish_ui();
             }
             KeyCode::PageUp => {
-                self.scroll_console(8);
+                if self.console_hl2 {
+                    self.console_hl2_page_delta += 8;
+                } else {
+                    self.scroll_console(8);
+                }
                 self.publish_ui();
             }
             KeyCode::PageDown => {
-                self.console_scroll = self.console_scroll.saturating_sub(8);
+                if self.console_hl2 {
+                    self.console_hl2_page_delta -= 8;
+                } else {
+                    self.console_scroll = self.console_scroll.saturating_sub(8);
+                }
                 self.publish_ui();
             }
             KeyCode::Backspace => {

@@ -252,12 +252,41 @@ impl App {
                 );
                 theme::row(
                     ui,
-                    "Player outlines",
-                    "cg_specHud. Outline other living players through walls while spectating or watching demos. Team players are red/blue; neutral/FFA players are yellow.",
+                    "Spectator HUD",
+                    "cg_specHud: 0 Off; 1 through-wall outlines; 2 outlines plus broadcast team panels; 3 mode 2 plus automatic scoreboard updates; 4 mode 2 plus follow-cycle telemetry (health, armor, ammo, Force, score); free spectating uses a client-side camera.",
                     theme::Reset::None,
                     |ui| {
-                        if let Some(on) = theme::switch(ui, self.japro_cg.spec_hud) {
-                            let _ = self.set_console_cvar("cg_specHud", if on { "1" } else { "0" });
+                        let labels = ["Off", "Legacy outlines", "Broadcast UI", "Broadcast + scores", "Broadcast + telemetry"];
+                        let mut selected = self.japro_cg.spec_hud;
+                        egui::ComboBox::from_id_salt("cg_specHud_mode")
+                            .selected_text(labels[usize::from(selected.min(4))])
+                            .show_ui(ui, |ui| {
+                                for (value, label) in labels.iter().enumerate() {
+                                    ui.selectable_value(&mut selected, value as u8, *label);
+                                }
+                            });
+                        if selected != self.japro_cg.spec_hud {
+                            let _ = self.set_console_cvar("cg_specHud", &selected.to_string());
+                        }
+                    },
+                );
+                theme::row(
+                    ui,
+                    "Broadcast radar",
+                    "cg_specHudMap: top-down map with every player's position and view direction, top-left of the broadcast UI (cg_specHud 2-4). Whole map, or a close view that follows the player you watch.",
+                    theme::Reset::None,
+                    |ui| {
+                        let labels = ["Off", "Whole map", "Follow view"];
+                        let mut selected = self.japro_cg.spec_hud_map;
+                        egui::ComboBox::from_id_salt("cg_specHudMap_mode")
+                            .selected_text(labels[usize::from(selected.min(2))])
+                            .show_ui(ui, |ui| {
+                                for (value, label) in labels.iter().enumerate() {
+                                    ui.selectable_value(&mut selected, value as u8, *label);
+                                }
+                            });
+                        if selected != self.japro_cg.spec_hud_map {
+                            let _ = self.set_console_cvar("cg_specHudMap", &selected.to_string());
                         }
                     },
                 );

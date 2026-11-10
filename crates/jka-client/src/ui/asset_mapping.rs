@@ -23,11 +23,12 @@ pub struct FolderUi {
 pub struct PickerEntryUi { pub name: String, pub is_dir: bool }
 #[derive(Clone, Debug, Default)]
 pub struct AssetMappingUi {
-    /// 0 JKA base; 1 JKA CD; 2 JK2 base; 3 JK2 CD; 4 forced client override.
-    pub values: [String; 5],
+    /// 0 JKA base; 1 JKA CD; 2 JK2 base; 3 JK2 CD;
+    /// 4 JKA forcegame; 5 JK2 forcegame.
+    pub values: [String; 6],
     pub valid: [Option<bool>; 4],
-    pub force_status: Option<bool>,
-    pub force_invalid: bool,
+    pub force_status: [Option<bool>; 2],
+    pub force_invalid: [bool; 2],
     pub retail: [bool; 4],
     pub jk2_status: [String; 2],
     pub feedback: Option<String>,
@@ -49,7 +50,7 @@ pub struct Layout {
     pub viewport: Bounds, pub jka: Bounds, pub jk2: Bounds, pub override_panel: Bounds,
     pub jka_title: Bounds, pub jk2_title: Bounds, pub force_title: Bounds,
     pub retail: Bounds, pub jk2_status: Bounds, pub feedback: Bounds,
-    pub fields: [FieldLayout; 5],
+    pub fields: [FieldLayout; 6],
     pub footer: Bounds, pub save: Bounds, pub restart: Bounds, pub back: Bounds,
     pub scroll_max: f32, pub scroll: f32, pub scale: f32,
     pub picker: Option<PickerLayout>,
@@ -85,7 +86,7 @@ fn panel_row(f: &mut Flex, width: f32, s: f32, browse: bool) -> (NodeId, [NodeId
     (row, [label,edit,button,status])
 }
 fn section(f: &mut Flex, width: f32, s: f32, title_h: f32, index_a: usize, index_b: usize,
-    field_nodes: &mut [[Option<NodeId>;4];5]) -> (NodeId,NodeId,NodeId) {
+    field_nodes: &mut [[Option<NodeId>;4];6]) -> (NodeId,NodeId,NodeId) {
     let inner = (width-36.0*s).max(1.0);
     let title = f.band(title_h*s);
     let (row_a,nodes_a) = panel_row(f,inner,s,true);
@@ -114,7 +115,7 @@ pub fn layout(width: u32, height: u32, ui: &AssetMappingUi) -> Layout {
     let header_h=99.0*s;
     let footer_h=110.0*s;
     let section_h=364.0*s;
-    let override_h=170.0*s;
+    let override_h=286.0*s;
     let feedback_h=54.0*s;
     let content_h=if wide { section_h+gap+override_h+gap+feedback_h }
         else { section_h*2.0+gap*3.0+override_h+feedback_h };
@@ -125,7 +126,7 @@ pub fn layout(width: u32, height: u32, ui: &AssetMappingUi) -> Layout {
     let title=f.band(50.0*s);
     let subtitle=f.band(33.0*s);
     let header=f.node(Container::column().width(mw).height(header_h).gap(1.0*s).pad(0.0,6.0*s),&[title,subtitle]);
-    let mut field_nodes=[[None;4];5];
+    let mut field_nodes=[[None;4];6];
     let (jka,jka_title,retail)=section(&mut f,col_w,s,39.0,0,1,&mut field_nodes);
     let (jk2,jk2_title,jk2_status)=section(&mut f,col_w,s,39.0,2,3,&mut field_nodes);
     let both = if wide {
@@ -134,10 +135,12 @@ pub fn layout(width: u32, height: u32, ui: &AssetMappingUi) -> Layout {
         f.node(Container::column().width(mw).height(section_h*2.0+gap).gap(gap), &[jka,jk2])
     };
     let force_title=f.band(28.0*s);
-    let (force_row, force_parts)=panel_row(&mut f,(mw-36.0*s).max(1.0),s,false);
-    field_nodes[4]=force_parts.map(Some);
+    let (jka_force_row,jka_parts)=panel_row(&mut f,(mw-36.0*s).max(1.0),s,false);
+    let (jk2_force_row,jk2_parts)=panel_row(&mut f,(mw-36.0*s).max(1.0),s,false);
+    field_nodes[4]=jka_parts.map(Some);
+    field_nodes[5]=jk2_parts.map(Some);
     let override_panel=f.node(Container::column().width(mw).height(override_h).gap(10.0*s).pad(18.0*s,12.0*s),
-        &[force_title,force_row]);
+        &[force_title,jka_force_row,jk2_force_row]);
     let feedback=f.band(feedback_h);
     let content=f.node(Container::column().width(mw).height(content_h).gap(gap), &[both,override_panel,feedback]);
     let scroller=f.node(Container::column().width(mw).height(view_h), &[content]);
@@ -419,7 +422,7 @@ pub(crate) fn build(out:&mut Vec<UiVertex>,ui:&UiSnapshot,w:u32,h:u32) {
         else {"JEDI ACADEMY RETAIL ASSETS NOT DETECTED  -  LOCATE YOUR GAME ROOT"},18.0*s,CYAN);
     for (panel,heading,name) in [(l.jka,l.jka_title,"JEDI ACADEMY  /  REQUIRED"),
         (l.jk2,l.jk2_title,"JEDI OUTCAST  /  OPTIONAL"),
-        (l.override_panel,l.force_title,"CLIENT ASSET OVERRIDE  /  OPTIONAL")] {
+        (l.override_panel,l.force_title,"GAME ASSET OVERRIDES  /  OPTIONAL")] {
         // The scroll viewport clips each panel; do not paint beyond the footer.
         let top=panel[1].max(l.viewport[1]);
         let bottom=(panel[1]+panel[3]).min(l.viewport[1]+l.viewport[3]);
@@ -434,10 +437,12 @@ pub(crate) fn build(out:&mut Vec<UiVertex>,ui:&UiSnapshot,w:u32,h:u32) {
             }
         }
     }
-    let names=["fs_basepath", "fs_cdpath", "fs_jk2basepath", "fs_jk2cdpath", "fs_forcegame"];
+    let names=["fs_basepath", "fs_cdpath", "fs_jk2basepath", "fs_jk2cdpath",
+        "fs_forcegame", "fs_jk2forcegame"];
     let descriptions=["JKA game root (contains base/)","Optional retail JKA root (read-only)",
         "JK2 game root (contains base/)","Optional retail JK2 root (read-only)",
-        "Override folder name under DinurdoJK/ (not fs_game)"];
+        "JKA override name under fs_basepath/ (not fs_game)",
+        "JK2 override name under fs_jk2basepath/ (not fs_game)"];
     for (i,row) in l.fields.iter().enumerate() {
         if !visible(row.label,l.viewport) || !visible(row.edit,l.viewport) {continue;}
         let label=format!("{}   /   {}",names[i],descriptions[i]);
@@ -450,7 +455,7 @@ pub(crate) fn build(out:&mut Vec<UiVertex>,ui:&UiSnapshot,w:u32,h:u32) {
             line(out,&font,[row.edit[0]+10.0*s,row.edit[1],row.edit[2]-20.0*s,row.edit[3]],match i {
                 0=>"Default / EXE directory",
                 2=>"Not set / JK2 disabled",
-                4=>"Empty = disabled",
+                4|5=>"Empty = disabled",
                 _=>"Not configured",
             },18.0*s,DIM);
         } else {
@@ -471,12 +476,15 @@ pub(crate) fn build(out:&mut Vec<UiVertex>,ui:&UiSnapshot,w:u32,h:u32) {
                 status_line(out,&font,row.status,status,color,w,h,s);
             }
         } else if visible(row.status,l.viewport) {
-            let (status,color)=if state.force_invalid {
+            let idx=i-4;
+            let (status,color)=if state.force_invalid[idx] {
                 ("INVALID NAME  /  use one folder name",RED)
-            } else if state.values[4].trim().is_empty() {
-                ("DISABLED  /  no forced client asset override",DIM)
-            } else if state.force_status==Some(true) {
-                ("FOUND  /  DinurdoJK override directory exists",GREEN)
+            } else if state.values[i].trim().is_empty() {
+                ("DISABLED  /  no forced asset override",DIM)
+            } else if i==5 && state.values[2].trim().is_empty() {
+                ("INACTIVE  /  configure fs_jk2basepath first",AMBER)
+            } else if state.force_status[idx]==Some(true) {
+                ("FOUND  /  game-root override directory exists",GREEN)
             } else {
                 ("NEW  /  override folder will be created on save",AMBER)
             };
@@ -559,10 +567,10 @@ pub(crate) fn build(out:&mut Vec<UiVertex>,ui:&UiSnapshot,w:u32,h:u32) {
         }
         fill(out,p.address,[0.035,0.082,0.12,1.0],w,h);
         rect_outline(out,p.address[0],p.address[1],p.address[2],p.address[3],1.0,
-            if state.focus==Some(5){CYAN}else{DIM},w,h);
+            if state.focus==Some(6){CYAN}else{DIM},w,h);
         let mono=UiText::legacy_only(None,w,h);
-        edit_contents(out,&mono,p.address,&data.address,state.focus==Some(5),state.caret,
-            if state.focus==Some(5){state.selection_anchor}else{None},state.text_start,w,h,s);
+        edit_contents(out,&mono,p.address,&data.address,state.focus==Some(6),state.caret,
+            if state.focus==Some(6){state.selection_anchor}else{None},state.text_start,w,h,s);
         for (bounds,hit,name) in [(p.choose,Hit::Choose,"SELECT FOLDER"),(p.cancel,Hit::Cancel,"CANCEL")] {
             button(out,&font,bounds,name,l.hit(state.pointer,state)==Some(hit),hit==Hit::Choose,w,h,s);
         }
@@ -620,6 +628,14 @@ mod tests {
             assert_eq!(l.hit(mid(l.restart),&ui),Some(Hit::Restart));
             assert_eq!(l.hit(mid(l.back),&ui),Some(Hit::Back));
             assert!(l.scroll_max>=0.0);
+            assert!(l.fields[5].edit[1]>l.fields[4].edit[1]);
+            let mut at_bottom=ui.clone();
+            at_bottom.scroll=l.scroll_max;
+            let bottom_layout=layout(w,h,&at_bottom);
+            let target=bottom_layout.fields[5].edit;
+            if visible(target,bottom_layout.viewport) {
+                assert_eq!(bottom_layout.hit(mid(target),&at_bottom),Some(Hit::Edit(5)));
+            }
         }
     }
 }

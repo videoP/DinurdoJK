@@ -828,6 +828,9 @@ impl Renderer {
                 world.pipeline_variants.insert(key, variant);
                 world.active_pipeline_variant = key;
                 world.refresh_pso_slots();
+                self.world_pipeline_catalog.extend_from_variants(
+                    &world.pipeline_variants, scene_format, samples,
+                );
                 self.world_variant_pending = None;
                 rverbose!(1, "World lighting shaders active (compiled): {}", key.short_label());
                 rverbose!(
@@ -853,11 +856,16 @@ impl Renderer {
         // pipeline state, render-target format and MSAA configuration.
         // Compile-only catalog: complete, exact pass/PSO identities captured
         // once from prior variants. Nothing is cloned during steady-state frames.
-        let reusable_pipelines = self.world.as_ref().map(|world| {
-            WorldPipelineReuseCatalog::from_variants(
+        let mut reusable_pipelines = WorldPipelineReuseCatalog::default();
+        // Keep the resident catalog bounded: merge the current world's PSOs
+        // last so they have priority over older map entries on eviction.
+        // The global catalog is only read on a cold pipeline request.
+        reusable_pipelines.extend_from_catalog(&self.world_pipeline_catalog);
+        if let Some(world) = self.world.as_ref() {
+            reusable_pipelines.extend_from_variants(
                 &world.pipeline_variants, scene_format, samples,
-            )
-        }).unwrap_or_default();
+            );
+        }
         let device = self.device.clone();
         let lean_shader = self.world_shader_lean.clone();
         let queued =

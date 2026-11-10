@@ -299,6 +299,28 @@ impl WorldShaderVariantKey {
     /// The base material BSP pass has ENABLE_LEGACY_DLIGHTS=0 even while the
     /// selected dynamic-light mode is Legacy. Treat its compiled PSOs as the
     /// *same program* across otherwise-identical variants (no runtime flags).
+    /// Temporary upload/format-rebuild fallback while expensive PBR PSOs are
+    /// built by the world worker. The shader itself sees matching disabled
+    /// constants; it never selects a PBR specialization accidentally.
+    pub(in crate::renderer) fn initial_upload_fallback(mut self) -> Self {
+        self.pbr = false;
+        self.pom = false;
+        self.pbr_shared_material_eval = false;
+        self.pbr_shared_tangent_frame = false;
+        self.pom_mip_aware = false;
+        self.pom_adaptive_steps = false;
+        self.pbr_companion_sampler = false;
+        self.pbr_vertex_lightgrid = false;
+        self.deluxe = false;
+        self.deluxe_specular = false;
+        // No per-material PSOs are needed for the initial raster fallback.
+        // Fully specialized mode 5 remains the requested background variant.
+        self.material_specialization = false;
+        self.minimal_entries = false;
+        self.program_mode = super::programs::WorldProgramMode::Specialized;
+        self
+    }
+
     pub(in crate::renderer) fn base_pass_key(mut self) -> Self {
         self.legacy_dlights = false;
         self
@@ -584,5 +606,29 @@ mod baked_sky_flag_tests {
         let wind = MaterialFragmentKey::from_material([0, 0, 0, foliage], 0.0);
         assert_eq!(wind.flags_w & foliage, foliage);
         assert_eq!(wind.flags_w & overlay, 0);
+    }
+}
+
+#[cfg(test)]
+mod upload_fallback_tests {
+    use super::{WorldShaderVariantKey, WorldProgramMode};
+
+    #[test]
+    fn pbr_upload_fallback_keeps_non_pbr_lighting_features() {
+        let requested = WorldShaderVariantKey {
+            pbr: true, pom: true, pbr_shared_material_eval: true,
+            pom_mip_aware: true, pbr_vertex_lightgrid: true,
+            deluxe: true, deluxe_specular: true,
+            cascaded_shadows: true, local_shadows: true,
+            material_specialization: true, program_mode: WorldProgramMode::Hybrid,
+            ..Default::default()
+        };
+        let fallback = requested.initial_upload_fallback();
+        assert!(!fallback.pbr && !fallback.pom && !fallback.deluxe);
+        assert!(!fallback.pbr_shared_material_eval && !fallback.pom_mip_aware);
+        assert!(!fallback.pbr_vertex_lightgrid && !fallback.deluxe_specular);
+        assert!(!fallback.material_specialization);
+        assert_eq!(fallback.program_mode, WorldProgramMode::Specialized);
+        assert!(fallback.cascaded_shadows && fallback.local_shadows);
     }
 }

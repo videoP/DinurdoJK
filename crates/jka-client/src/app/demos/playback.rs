@@ -715,6 +715,14 @@ impl App {
             return false;
         }
 
+        // Demo gamestate references are authoritative for this playback's
+        // downloads too. Apply before the BSP and presenter VFS are opened.
+        if jka_assets::pk3::set_server_referenced_paks(&probe.referenced_paks) {
+            self.pk3_manager_loaded = false;
+            self.reset_asset_catalogs_for_game_change();
+            self.invalidate_studio_sources();
+        }
+
         // Establish CA_LOADING-equivalent presentation before the expensive CGame
         // asset build. `unknownmap_mp` is resident on the renderer, so the next
         // present is intentional even if presenter/VFS setup takes a while.
@@ -963,6 +971,7 @@ impl App {
             self.spectator_camera_state.reset();
             self.third_person_camera.reset();
         }
+        self.update_falling_death(&sample);
         let spectator_mode = spectator_view.then_some(self.spectator_camera.mode);
         let render_third_person = match spectator_mode {
             Some(SpectatorCameraMode::FirstPerson) => false,
@@ -1059,7 +1068,11 @@ impl App {
                     third_person,
                     &mut self.third_person_camera,
                     ThirdPersonViewInput {
-                        origin: sample.native_origin,
+                        // TaystJK CG_OffsetThirdPersonView freezes the target
+                        // focus at gCGFallVector when the player starts falling.
+                        // The post-view override below then aims at the moving
+                        // player and places the eye at that same frozen origin.
+                        origin: self.falling_death.map_or(sample.native_origin, |fall| fall.anchor),
                         view_angles: camera_angles,
                         velocity: sample.velocity,
                         view_height: sample.view_height,
@@ -1085,6 +1098,7 @@ impl App {
                         self.render_view_latch = ViewLatchMode::ThirdPerson(latch);
                     }
                 }
+                self.apply_falling_death_camera(&sample);
                 return;
             }
         }
@@ -1104,6 +1118,7 @@ impl App {
         if latch_input_available {
             self.render_view_latch = ViewLatchMode::Direct;
         }
+        self.apply_falling_death_camera(&sample);
     }
 
     pub(in crate::app) fn apply_demo_fake_camera(
@@ -1111,6 +1126,7 @@ impl App {
         sample: DemoCameraSample,
         mut fake: DemoFakeView,
     ) {
+        self.reset_falling_death();
         fake.view_angles[1] = self.wallrun_camera_yaw.apply(
             fake.view_angles[1], fake.legs_anim, fake.client_num,
             sample.presentation_time_ms, sample.teleported, self.wallrun_camera_mode,
@@ -1485,8 +1501,13 @@ impl App {
         // capturing the Ghoul2 presentation view so player frustum culling/LOD
         // and spectator outlines are prepared from the same camera that will be
         // rendered this frame, rather than from the previous free-camera frame.
+        // cg_specHud 4 virtual free camera reuses the demo free camera as is.
         if self.demo_playback_active() && self.demo_view_mode == DemoViewMode::Free {
             self.update_demo_free_camera(dt);
+        } else if self.spectator_broadcast.free_active() {
+            // Live spectator free camera flies like PM_SPECTATOR (friction,
+            // acceleration, +altattack turbo) and collides with the world.
+            self.update_spectator_free_flight(dt);
         }
         // Player presentation happens inside GameSession::advance, before the
         // final camera is applied for this frame. Pass the current rendered view
@@ -1500,6 +1521,7 @@ impl App {
             .as_ref()
             .map(|server| (server.presentation_time(), server.subframe_view_angles()));
         let demo_view_mode = self.demo_view_mode;
+        let free_camera = self.spectator_broadcast.free_active();
         // The network-owned slot remains "us" even when snapshot presentation is
         // following another player. VGS needs both identities: presentation for
         // spatial/listener behavior, connection ownership for our own radio copy.
@@ -1523,6 +1545,7 @@ impl App {
                         DemoViewMode::Free => PresentationViewer::None,
                     }
                 });
+            playback.app_camera_view = free_camera;
             let effective_spectator=self.spectator_camera.mode;
             playback.demo_spectator_camera_mode =
                 if playback.live || self.demo_view_mode == DemoViewMode::Free {
@@ -1911,7 +1934,11 @@ impl App {
             .as_ref()
             .is_some_and(|session| session.live)
         {
-            self.apply_demo_camera(sample);
+            // The virtual free camera owns the view exactly like demo free
+            // camera: no snapshot/prediction sample ever touches it.
+            if !self.spectator_broadcast.free_active() {
+                self.apply_demo_camera(sample);
+            }
             sample.client_num
         } else {
             self.apply_demo_view(sample)

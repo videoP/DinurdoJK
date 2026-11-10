@@ -13,10 +13,7 @@
 //! (`FS_FOpenFileRead`) or when the pak lives outside `base`. Everything with
 //! higher priority than assets3 (custom/downloaded PK3s) is never reported.
 
-use std::{
-    cmp::Reverse,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 // FS_ReferencedPakPureChecksums: `lastPack = -1342311474; //assets3.pk3`.
 const ASSETS3_CHECKSUM: i32 = -1_342_311_474;
@@ -143,6 +140,6 @@ fn pk3_search_order(dir: &Path) -> Vec<PathBuf> {
             path.is_file() && jka_assets::pk3::package_enabled(path) && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pk3"))
         })
         .collect();
-    paks.sort_by_key(|path| Reverse(path.file_name().map(|name| name.to_string_lossy().to_ascii_lowercase())));
+    paks.sort_by(|a, b| jka_assets::pk3::compare_package_mount_priority(a, b));
     paks
 }

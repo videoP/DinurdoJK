@@ -29,10 +29,6 @@ impl App {
         map_name: &str,
         configstrings: &BTreeMap<u16, Vec<u8>>,
     ) {
-        if self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
-            self.fail_live_autodownload(map_name, "JK2 autodownload is not implemented; install the map in the separate JK2 asset namespace.".into());
-            return;
-        }
         if self.live_download.is_some() {
             return;
         }
@@ -60,10 +56,12 @@ impl App {
             return;
         }
 
-        let server_allows_legacy =
-            jka_protocol::commands::info_value(serverinfo, b"sv_allowDownload")
-                .is_none_or(|value| jka_protocol::commands::atoi(value) != 0);
-        let server_allows_http =
+        let jk2 = self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some());
+        // JK2MV requires sv_allowDownload != 0, advertised in CS_SERVERINFO.
+        // Its HTTP availability comes from mvhttp/mvhttpurl in getinfo and is
+        // independent of the JKA-only sv_httpDownloads serverinfo cvar.
+        let server_allows_legacy = crate::download::server_allows_udp(serverinfo, jk2);
+        let server_allows_http = jk2 ||
             jka_protocol::commands::info_value(serverinfo, b"sv_httpDownloads")
                 .is_none_or(|value| jka_protocol::commands::atoi(value) != 0);
         let http_base = if self.network.allow_http_downloads && server_allows_http {
@@ -205,10 +203,15 @@ impl App {
                 return;
             }
         };
+        let protocol = if self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
+            "JK2 UDP"
+        } else {
+            "JKA UDP"
+        };
         if let Some(state) = self.live_download.as_mut() {
             state.received = 0;
             state.total = None;
-            state.status = format!("Legacy JKA: {}", spec.remote_name);
+            state.status = format!("{protocol}: {}", spec.remote_name);
             state.transfer = LiveDownloadTransfer::Legacy {
                 file,
                 temp_path,
@@ -283,7 +286,7 @@ impl App {
                             state.status = format!("HTTP failed; falling back to legacy: {error}");
                         }
                         self.push_console_line(format!(
-                            "^3HTTP download failed:^7 {error}; trying legacy JKA download."
+                            "^3HTTP download failed:^7 {error}; trying legacy UDP download."
                         ));
                         if let Some(spec) = spec {
                             self.start_live_legacy_download(spec);
@@ -451,6 +454,23 @@ impl App {
             return;
         };
         let map_name = state.map_name;
+        // Unlike the startup filesystem scan, a download has installed new
+        // archives *after* the session's VFS and JK2 pure package inventory
+        // were created. Refresh both before checking the BSP and before the
+        // server's `donedl` response requests another gamestate.
+        self.cancel_vote_map_prewarm();
+        self.cancel_live_cgame_prep();
+        jka_assets::pk3::invalidate_installed_package_index();
+        if self.fs_roots.jk2_pure.take().is_some() {
+            // JK2's cached pure policy captures the package list at resolve
+            // time. Leaving it intact would pass `matches` on the next
+            // gamestate but omit the PK3 we just downloaded from the `cp`.
+            jka_assets::pk3::configure_filesystem_roots(&self.base, self.fs_roots.clone());
+        }
+        self.pk3_manager_loaded = false;
+        self.reset_asset_catalogs_for_game_change();
+        self.invalidate_studio_sources();
+        self.stringed = None;
         let source = scene::MapSource::Bsp(map_name.clone());
         if let Err(error) =
             scene::verify_map_source_exists(&self.base, self.game.as_deref(), &source)
@@ -474,11 +494,9 @@ impl App {
             join_ui.detail =
                 "Refreshing downloaded assets and requesting a fresh gamestate...".into();
         }
-        self.cancel_live_cgame_prep();
-        // A downloaded PK3 can contribute strings as well as map/render assets.
-        // Force the post-download prep to rebuild from the refreshed search path.
-        self.stringed = None;
-        self.start_live_cgame_prep();
+        // As in JK2MV CL_DownloadsComplete, wait for the fresh gamestate
+        // before loading CGame. That will rebuild JK2 pure checksums using
+        // the just-installed packages (and uses the same path for JKA).
         self.console_status = format!("DOWNLOAD COMPLETE: {map_name}; REFRESHING GAMESTATE...");
         self.push_console_line(format!(
             "^2DOWNLOAD COMPLETE:^7 {map_name}; requesting fresh gamestate."

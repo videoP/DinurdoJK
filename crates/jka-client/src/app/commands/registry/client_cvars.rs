@@ -182,6 +182,37 @@ app_cvars! {
         },
         implementations: []
     }
+    APP_IN_CONFINECURSOR {
+        runtime: CvarDef::new(
+            "in_confineCursor", "1", "0|1",
+            "Confine the visible cursor to the game window while focused (menus, console, UI). Does not change gameplay mouse locking or Render Studio mouse-look.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(u8::from(app.in_confine_cursor).to_string()),
+            |app, value| {
+                let confined = match value.to_string().trim() {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err("in_confineCursor expects 0 or 1".to_owned()),
+                };
+                app.in_confine_cursor = confined;
+                // Apply immediately even if we are already in a visible-cursor UI.
+                // The helper is a no-op while gameplay/Studio owns a locked mouse.
+                app.sync_visible_cursor_grab();
+                app.mark_config_dirty();
+                Ok(())
+            },
+        ),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| match value {
+                "0" => settings.confine_cursor = false,
+                "1" => settings.confine_cursor = true,
+                _ => (),
+            }),
+            archive: Some((36352, |state| u8::from(state.presentation.confine_cursor).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
     APP_IN_MOUSEREPEAT {
         runtime: CvarDef::new(
             "in_mouserepeat", "0", "0|1|2",

@@ -207,6 +207,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetOceanEnabled(..) => "SetOceanEnabled",
         RenderCommand::SetOceanSkyExtend(..) => "SetOceanSkyExtend",
         RenderCommand::SetOceanSettings(..) => "SetOceanSettings",
+        RenderCommand::SetSailingSea(..) => "SetSailingSea",
         RenderCommand::RiverMaterial(..) => "RiverMaterial",
         RenderCommand::RiverSource(..) => "RiverSource",
         RenderCommand::RiverRemove(..) => "RiverRemove",
@@ -871,6 +872,7 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
     renderer.set_entity_shadow_light(video.entity_shadow_light);
     renderer.set_pbr_settings(
         video.pbr,
+        video.pbr_cubemaps,
         video.deluxe_mapping,
         video.deluxe_specular,
     );
@@ -1666,6 +1668,9 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetOceanSettings(settings)) => {
                         renderer.set_ocean_settings(settings)
                     }
+                    Ok(RenderCommand::SetSailingSea(sea)) => {
+                        renderer.set_sailing_sea(sea)
+                    }
                     Ok(RenderCommand::OceanWake(command)) => {
                         if let Some(ocean) = &mut renderer.ocean {
                             ocean.blue_wake_command(command);
@@ -1881,10 +1886,11 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetPbrSettings {
                         enabled,
+                        cubemaps,
                         deluxe_mapping,
                         deluxe_specular,
                     }) => {
-                        renderer.set_pbr_settings(enabled, deluxe_mapping, deluxe_specular);
+                        renderer.set_pbr_settings(enabled, cubemaps, deluxe_mapping, deluxe_specular);
                     }
                     Ok(RenderCommand::SetCascadedShadows(mode)) => {
                         renderer.set_cascaded_shadows(mode);
@@ -2019,6 +2025,8 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetExtensionHud(widgets, hidden, images, shaders)) =>
                         renderer.set_extension_hud(widgets, hidden, images, shaders),
                     Ok(RenderCommand::SetTransientUi {
+                        falling_death_fade,
+                        falling_death_active,
                         chat_lines,
                         console_notify_lines,
                         center_print,
@@ -2028,6 +2036,8 @@ pub(in crate::renderer) fn render_thread_main(
                         force_select,
                         weapon_select,
                         inventory_select,
+                        jk2_flags,
+                        jk2_inventory,
                         follow_name,
                         game_timer,
                         mini_scores,
@@ -2043,8 +2053,11 @@ pub(in crate::renderer) fn render_thread_main(
                         speedometer,
                         lagometer,
                         team_overlay,
+                        spectator_broadcast,
                     }) => {
                         renderer.set_transient_ui(
+                            falling_death_fade,
+                            falling_death_active,
                             chat_lines,
                             console_notify_lines,
                             center_print,
@@ -2054,11 +2067,13 @@ pub(in crate::renderer) fn render_thread_main(
                             force_select,
                             weapon_select,
                             inventory_select,
+                            jk2_flags,
+                            jk2_inventory,
                             follow_name,
                             game_timer,
                             mini_scores,
-                        hud_score,
-                        enemy_info,
+                            hud_score,
+                            enemy_info,
                             race_timer,
                             vote_line,
                             siege_hud,
@@ -2069,6 +2084,7 @@ pub(in crate::renderer) fn render_thread_main(
                             speedometer,
                             lagometer,
                             team_overlay,
+                            spectator_broadcast,
                         );
                     }
                     Ok(RenderCommand::SetUiTelemetry { perf, threads }) => {

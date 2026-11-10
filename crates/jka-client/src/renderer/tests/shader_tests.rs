@@ -1286,6 +1286,17 @@ fn skybox_average_falls_back_without_faces() {
 }
 
 #[test]
+fn openjk_screen_blend_is_not_source_alpha_blending() {
+    let state = super::models::pipelines::fx_sprite_blend(DynamicModelAlphaMode::Screen)
+        .expect("screen-blend mode must provide WGPU fixed-function blend state");
+    assert_eq!(state.color.src_factor, wgpu::BlendFactor::One);
+    assert_eq!(state.color.dst_factor, wgpu::BlendFactor::OneMinusSrc);
+    assert_eq!(state.alpha.src_factor, wgpu::BlendFactor::One);
+    assert_eq!(state.alpha.dst_factor, wgpu::BlendFactor::OneMinusSrcAlpha);
+    assert!(!dynamic_model_writes_depth(DynamicModelAlphaMode::Screen));
+}
+
+#[test]
 fn dynamic_model_depth_phase_places_saber_fx_after_gpu_skinned_opaque_geometry() {
     // Saber glow/core are transient CPU additive surfaces while the default
     // player path is GPU Ghoul2. The player must establish depth first so

@@ -85,6 +85,9 @@ impl App {
             self.render_command(RenderCommand::SetExtensionHud(self.extensions.placed_widgets(), self.extensions.native_hidden, { let mut images = self.extensions.hud_images.clone();
                 ui::append_native_hud_images(&mut images, self.video.hud_style,
                     self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2());
+                if self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2() {
+                    ui::append_jk2_ctf_images(&mut images);
+                }
                 ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
                 images }, self.extensions.hud_shaders.clone()));
             if self.overlay == OverlayMode::HudEdit {
@@ -164,6 +167,10 @@ impl App {
             (u64::from(previous_us) * 7 + u64::from(sample_us)).div_ceil(8) as u32
         };
         self.vote_map_frame_us.store(filtered_us, std::sync::atomic::Ordering::Relaxed);
+
+        // Zero clock work in the default/manual and Baked paths. Only the
+        // Realtime opt-in samples the OS clock, and never at render FPS.
+        self.sync_relighting_system_clock(false, false);
 
         if self.sun_ray_sent {
             self.sync_sun_ray();
@@ -312,6 +319,9 @@ impl App {
                     self.publish_ui();
                 }
             }
+            if self.tick_spectator_broadcast(now) {
+                self.publish_transient_ui();
+            }
             // Non-Siege jaPRO votes with >=5s execution delay send the same
             // EV_SIEGESPEC deadline as the Siege respawn timer. That event is
             // authoritative even when the pass `print` is localized. The
@@ -394,6 +404,7 @@ impl App {
 
         self.tick_water_wetness(now);
         self.refresh_authored_oceans();
+        self.update_sailing_debug();
         if !session_is_playing {
             self.tick_frontend_cinematic(now);
             self.update_solo_player_view_and_presentation();
@@ -511,6 +522,11 @@ impl App {
         let vote_line = self.vote_hud_line();
         let siege_hud = self.siege_hud_ui();
         let team_overlay = self.team_overlay_ui();
+        // Flag carrier/status transitions and inventory pickups can change
+        // without changing any other transient HUD widget. Test the precise
+        // JK2 state instead of republishing the whole HUD every frame.
+        let jk2_flags = self.jk2_flags_ui();
+        let jk2_inventory = self.jk2_persistent_inventory_ui();
         self.update_speedometer(now);
         self.update_variometer();
         self.update_lagometer();
@@ -523,6 +539,8 @@ impl App {
             || vote_line != self.vote_line_shown
             || siege_hud != self.siege_hud_shown
             || team_overlay != self.team_overlay_shown
+            || jk2_flags != self.jk2_flags_shown
+            || jk2_inventory != self.jk2_inventory_shown
             || self.speedometer_ui != self.speedometer_shown
             || self.lagometer_ui != self.lagometer_shown
         {
@@ -535,8 +553,25 @@ impl App {
             self.vote_line_shown = vote_line;
             self.siege_hud_shown = siege_hud;
             self.team_overlay_shown = team_overlay;
+            self.jk2_flags_shown = jk2_flags;
+            self.jk2_inventory_shown = jk2_inventory;
             self.speedometer_shown = self.speedometer_ui.clone();
             self.lagometer_shown = self.lagometer_ui.clone();
+            self.publish_transient_ui();
+        }
+        // The falling-death fade changes at up to 255 small alpha steps in
+        // 1.5s. Rebuild only the transient UI on a changed alpha byte; the
+        // normal high-FPS gameplay path never pays for this when not falling.
+        if !self.game_session.as_ref().is_some_and(|session| session.phase == SessionPhase::Playing) {
+            self.reset_falling_death();
+        }
+        let fall_alpha = self.falling_death_alpha_byte();
+        let fall_active = self.falling_death.is_some();
+        if fall_alpha != self.falling_death_fade_shown
+            || fall_active != self.falling_death_active_shown
+        {
+            self.falling_death_fade_shown = fall_alpha;
+            self.falling_death_active_shown = fall_active;
             self.publish_transient_ui();
         }
         self.tick_follow_fastest(now);

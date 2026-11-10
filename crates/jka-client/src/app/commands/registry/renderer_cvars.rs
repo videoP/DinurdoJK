@@ -236,7 +236,7 @@ app_cvars! {
     APP_R_ADDITIVESTAGEFUSION {
         runtime: CvarDef::new(
             "r_additiveStageFusion", "", "0..1",
-            "A/B: fuse equivalent consecutive additive BSP shader stages into one draw. Default 1. Live toggle reuploads the cached render world (may briefly stall); no map reparse.",
+            "A/B: fuse equivalent consecutive additive BSP shader stages (GL_ONE/GL_ONE and GL_SRC_ALPHA/GL_ONE, mixed runs too) into one draw. Default 1. Live toggle reuploads the cached render world (may briefly stall); no map reparse.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(bool_value(app.video.additive_stage_fusion)),
             |app, value| App::cvar_set_r_additivestagefusion(app, APP_R_ADDITIVESTAGEFUSION.entry.name, &value.to_string()),
@@ -5333,6 +5333,34 @@ app_cvars! {
                         self.mark_config_dirty();
                         self.publish_ui();
                     }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CUBEMAPPING {
+        runtime: CvarDef::new(
+            "r_cubeMapping", "", "0..1",
+            "PBR local environment reflections. Load authored cubemaps or generate Rend2-style captures at map probe/spawn positions. Requires r_pbr and reflections not Off.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(bool_value(app.video.pbr_cubemaps)),
+            |app, value| App::cvar_set_r_cubemapping(app, APP_R_CUBEMAPPING.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_cubemapping, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.pbr_cubemaps = parse_bool(value).unwrap_or(settings.pbr_cubemaps);
+            }),
+            archive: Some((10446, |state| format!("{}", u8::from(state.video.pbr_cubemaps)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_cubemapping(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.pbr_cubemaps = Self::parse_cvar_bool(name, value)?;
+                    self.sync_pbr();
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }

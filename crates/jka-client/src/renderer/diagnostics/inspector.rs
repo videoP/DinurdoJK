@@ -1401,11 +1401,7 @@ impl Renderer {
                 continue;
             }
             enhanced_batches += 1;
-            let eligible = !source.texture_is_lightmap
-                && !source.texture_is_white
-                && source.pipeline.class == DrawClass::Opaque
-                && source.pipeline.blend == BlendMode::Opaque
-                && matches!(source.tc_gen, TcGen::Base);
+            let eligible = source.pbr_eligible();
             if eligible {
                 pbr_eligible_batches += 1;
                 if source.height_texture.is_some() {

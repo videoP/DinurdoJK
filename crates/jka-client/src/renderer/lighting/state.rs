@@ -470,7 +470,9 @@ impl Renderer {
                     | (if self.tinted_glass_debug == 1 { 0x400 } else { 0 })
                     | (if self.tinted_glass_debug == 2 { 0x800 } else { 0 })
                     | (promoted_start << 16),
-                self.reflection_quality.shader_value(),
+                self.reflection_quality.shader_value()
+                    | (u32::from(self.pbr_enabled && self.pbr_cubemaps
+                        && self.reflection_quality.pbr_probes_enabled()) << 8),
             ],
             map_ambient: [
                 source_map_lighting.ambient[0],

@@ -1,7 +1,7 @@
 //! Taffy owns the layout and hitboxes for the server join / map loading UI.
 //! The native HUD painter consumes these rectangles; no egui widgets or
 //! independently computed mouse targets are used for this screen.
-use super::{flex::{Bounds, Container, Flex}, MapLoadingUi};
+use super::{flex::{Bounds, Container, Flex}, MapLoadingPhase, MapLoadingUi};
 use taffy::prelude::{AlignItems, JustifyContent};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,15 +35,22 @@ pub(crate) struct DialogLayout {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct PhaseLayout {
+    pub heading: Bounds,
+    pub status: Bounds,
+    /// One real task rail per visible task in this phase, in original order.
+    pub bars: Vec<Bounds>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct LoadingLayout {
     pub panel: Bounds,
     pub kicker: Bounds,
     pub heading: Bounds,
     pub percentage: Bounds,
     pub overall_track: Bounds,
-    /// [label, rail, readout] for each visible enabled stage.
-    pub rows: Vec<[Bounds; 3]>,
-    pub status: Bounds,
+    /// Four fixed dependency columns. Individual tasks remain parallel.
+    pub phases: Vec<PhaseLayout>,
     pub cancel: Option<Bounds>,
     pub dialog: Option<DialogLayout>,
     /// All geometry and font sizes use physical pixels, not egui points.
@@ -82,34 +89,38 @@ impl LoadingLayout {
 
 pub(crate) fn layout(loading: &MapLoadingUi, width: u32, height: u32) -> LoadingLayout {
     let (w, h) = (width.max(1) as f32, height.max(1) as f32);
-    // Small but legible. Do not expand 6x8 bitmap glyphs with screen size:
-    // loading.rs uses the clean UI atlas and true pixel-height text metrics.
     let s = (h / 900.0).min(w / 1250.0).clamp(0.78, 1.15);
     let pad = 22.0 * s;
     let margin = (26.0 * s).min(w * 0.05).max(8.0);
-    // Main-menu footer is its own compositor surface, not part of Taffy.
-    // Not clamp(): a minimized window's 16% falls below 52 and would panic.
     let bottom_safe = (70.0 * s).max(52.0).min(h * 0.16);
     let panel_w = (830.0 * s).min(w - margin * 2.0).max(1.0);
     let inner = (panel_w - pad * 2.0).max(1.0);
-    let rows_count = loading.bars.iter().filter(|bar| !bar.skipped).count();
     let head_h = 76.0 * s;
-    let foot_h = if loading.status_line.is_some() { 46.0 * s } else { 8.0 * s };
     let gap = 11.0 * s;
-    let row_budget = (h - margin - bottom_safe - pad * 2.0 - head_h - foot_h - gap * 2.0).max(0.0);
-    let two_columns = rows_count > 8 && w >= 680.0
-        && row_budget / (rows_count as f32) < 26.0 * s;
-    let rows_per_column = if two_columns { rows_count.div_ceil(2) } else { rows_count };
-    let row_h = if rows_per_column == 0 { 0.0 } else {
-        (29.0 * s).min(row_budget / rows_per_column as f32).max(0.0)
-    };
-    let rows_h = row_h * rows_per_column as f32;
-    let panel_h = (pad * 2.0 + head_h + foot_h + rows_h + 2.0 * gap)
+    let phase_groups = MapLoadingPhase::ALL.map(|phase| loading.bars.iter()
+        .filter(|b| !b.skipped && b.phase == phase).collect::<Vec<_>>());
+    let max_bars = phase_groups.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    // Size rows for readable labels, not just thin progress ticks. All four
+    // columns share this height, so their unequal stacks stay centred.
+    let target_bar_h = 21.0 * s;
+    let target_bar_gap = 5.0 * s;
+    let label_h = 20.0 * s;
+    let state_h = 18.0 * s;
+    let available_stack_h = (h - margin - bottom_safe - pad * 2.0 - head_h
+        - gap - label_h - state_h).max(0.0);
+    let natural_stack_h = (145.0 * s).max(target_bar_h * max_bars as f32
+        + target_bar_gap * max_bars.saturating_sub(1) as f32);
+    let stack_h = natural_stack_h.min(available_stack_h);
+    let bar_gap = target_bar_gap.min(stack_h /
+        (max_bars as f32 * 3.0).max(1.0));
+    let bar_h = target_bar_h.min(((stack_h - bar_gap * (max_bars - 1) as f32)
+        / max_bars as f32).max(0.0));
+    let phases_h = stack_h + label_h + state_h;
+    // The active task is now named inside its own bar; no redundant footer.
+    let panel_h = (pad * 2.0 + head_h + phases_h + gap)
         .min((h - margin - bottom_safe).max(1.0));
 
     let mut f = Flex::new();
-    // The top-right cancel is a Taffy child of the header, not a manually
-    // positioned floating rectangle. Painting and hit testing share it.
     let kicker = f.leaf((inner * 0.54).max(1.0), 23.0 * s);
     let cancel_node = loading.joining_server.then(|| f.leaf(178.0 * s, 27.0 * s));
     let top = if let Some(cancel) = cancel_node {
@@ -118,39 +129,32 @@ pub(crate) fn layout(loading: &MapLoadingUi, width: u32, height: u32) -> Loading
     } else {
         f.node(Container::row().width(inner).height(27.0 * s), &[kicker])
     };
-    let title = f.leaf((inner - 100.0 * s).max(1.0), 34.0 * s);
-    let pct = f.leaf(92.0 * s, 34.0 * s);
+    let title = f.leaf((inner - 128.0 * s).max(1.0), 34.0 * s);
+    let pct = f.leaf(120.0 * s, 34.0 * s);
     let title_row = f.node(Container::row().width(inner).height(34.0 * s)
         .justify(JustifyContent::SPACE_BETWEEN), &[title, pct]);
     let track = f.leaf(inner, 6.0 * s);
     let header = f.node(Container::column().width(inner).height(head_h).gap(4.0 * s),
         &[top, title_row, track]);
 
-    let column_gap = if two_columns { 17.0 * s } else { 0.0 };
-    let column_w = if two_columns { (inner - column_gap) * 0.5 } else { inner };
-    let label_w = if two_columns { column_w * 0.34 } else { (inner * 0.31).min(230.0 * s) };
-    let value_w = if two_columns { 57.0 * s } else { 76.0 * s };
-    let rail_w = (column_w - label_w - value_w - 18.0 * s).max(1.0);
-    let mut row_nodes = Vec::with_capacity(rows_count);
-    let mut row_parts = Vec::with_capacity(rows_count);
-    for _ in 0..rows_count {
-        let label = f.leaf(label_w, row_h);
-        let rail = f.leaf(rail_w, row_h);
-        let value = f.leaf(value_w, row_h);
-        let row = f.node(Container::row().width(column_w).height(row_h)
-            .gap(9.0 * s).align(AlignItems::CENTER), &[label, rail, value]);
-        row_nodes.push(row);
-        row_parts.push([label, rail, value]);
+    let col_gap = 12.0 * s;
+    let col_w = ((inner - 3.0 * col_gap) / 4.0).max(1.0);
+    let mut column_nodes = Vec::with_capacity(4);
+    let mut part_nodes = Vec::with_capacity(4);
+    for group in &phase_groups {
+        let bar_nodes: Vec<_> = group.iter().map(|_| f.leaf((col_w - 4.0 * s).max(1.0), bar_h))
+            .collect();
+        let stack = f.node(Container::column().width(col_w).height(stack_h).gap(bar_gap)
+            .align(AlignItems::CENTER).justify(JustifyContent::CENTER), &bar_nodes);
+        let caption = f.leaf(col_w, label_h);
+        let state = f.leaf(col_w, state_h);
+        column_nodes.push(f.node(Container::column().width(col_w).height(phases_h),
+            &[stack, caption, state]));
+        part_nodes.push((bar_nodes, caption, state));
     }
-    let rows = if two_columns {
-        let first = f.node(Container::column().width(column_w).height(rows_h), &row_nodes[..rows_per_column]);
-        let second = f.node(Container::column().width(column_w).height(rows_h), &row_nodes[rows_per_column..]);
-        f.node(Container::row().width(inner).height(rows_h).gap(column_gap), &[first, second])
-    } else {
-        f.node(Container::column().width(inner).height(rows_h), &row_nodes)
-    };
-    let status = f.leaf(inner, foot_h);
-    let body = f.node(Container::column().width(inner).gap(gap), &[header, rows, status]);
+    let phase_row = f.node(Container::row().width(inner).height(phases_h).gap(col_gap),
+        &column_nodes);
+    let body = f.node(Container::column().width(inner).gap(gap), &[header, phase_row]);
     let panel = f.node(Container::column().width(panel_w).height(panel_h).pad(pad, pad), &[body]);
     let mut viewport = Container::column().width(w).height(h)
         .align(AlignItems::CENTER).justify(JustifyContent::FLEX_END);
@@ -161,8 +165,11 @@ pub(crate) fn layout(loading: &MapLoadingUi, width: u32, height: u32) -> Loading
     LoadingLayout {
         panel: f.bounds(panel), kicker: f.bounds(kicker), heading: f.bounds(title),
         percentage: f.bounds(pct), overall_track: f.bounds(track),
-        rows: row_parts.into_iter().map(|ids| [f.bounds(ids[0]), f.bounds(ids[1]), f.bounds(ids[2])]).collect(),
-        status: f.bounds(status), cancel: cancel_node.map(|id| f.bounds(id)), dialog,
+        phases: part_nodes.into_iter().map(|(bars, heading, state)| PhaseLayout {
+            heading: f.bounds(heading), status: f.bounds(state),
+            bars: bars.into_iter().map(|id| f.bounds(id)).collect(),
+        }).collect(),
+        cancel: cancel_node.map(|id| f.bounds(id)), dialog,
         text_scale: s,
     }
 }
@@ -218,7 +225,8 @@ mod tests {
     fn sample(rows: usize) -> MapLoadingUi {
         MapLoadingUi {
             map_name: "mp/ffa3".into(), active_game_dir: None, preparation_finished: false,
-            bars: (0..rows).map(|_| MapLoadingBar { label: "TEST", completed: 0, total: 1,
+            bars: (0..rows).map(|i| MapLoadingBar {
+                phase: MapLoadingPhase::ALL[i % 4], label: "TEST", completed: 0, total: 1,
                 skipped: false, no_work: false }).collect(),
             joining_server: true, status_line: Some("Downloading a very long map name".into()),
             download_file_name: None, download_overall_fraction: None,
@@ -227,19 +235,36 @@ mod tests {
     }
 
     #[test]
-    fn taffy_layout_reserves_footer_without_intersecting_rows() {
+    fn taffy_layout_centers_variable_parallel_bars_in_four_stage_columns() {
         let loading = sample(16);
         for (w,h) in [(1920,1080), (1280,720), (854,480)] {
-            let l = layout(&loading, w,h);
-            let last = l.rows.iter().map(|row| row[0])
-                .max_by(|a,b| (a[1]+a[3]).total_cmp(&(b[1]+b[3]))).unwrap();
-            assert!(last[1] + last[3] <= l.status[1] + 1.0, "{w}x{h}");
-            if h == 480 { assert!(l.rows[8][0][0] > l.rows[0][0][0]); }
-            assert!(l.status[1] + l.status[3] <= h as f32 - (70.0*l.text_scale).clamp(52.0,h as f32*0.16) + 1.0);
-            assert!(l.panel[0] >= 0.0 && l.panel[1] >= 0.0);
+            let l = layout(&loading,w,h);
+            assert_eq!(l.phases.len(), 4);
+            for stage in &l.phases {
+                assert_eq!(stage.bars.len(), 4);
+                assert!(stage.bars.iter().all(|bar|
+                    bar[1] >= l.panel[1] && bar[1] + bar[3] <= stage.heading[1] + 1.0));
+                assert!(stage.status[1] + stage.status[3] <= l.panel[1] + l.panel[3] + 1.0);
+                assert!(stage.bars.iter().all(|bar| bar[3] >= 16.0 * l.text_scale));
+            }
+            assert!(l.phases.windows(2).all(|adjacent|
+                adjacent[0].heading[0] < adjacent[1].heading[0]));
+            assert!(l.panel[1] + l.panel[3] <= h as f32 -
+                (70.0*l.text_scale).max(52.0).min(h as f32*0.16) + 1.0);
             let cancel = l.cancel.unwrap();
-            assert!(cancel[0] >= l.panel[0] && cancel[0] + cancel[2] <= l.panel[0] + l.panel[2]);
+            assert!(cancel[0] >= l.panel[0]
+                && cancel[0] + cancel[2] <= l.panel[0] + l.panel[2]);
         }
+    }
+
+    #[test]
+    fn skipped_tasks_remove_only_their_subbar_not_the_stage() {
+        let mut loading = sample(8);
+        loading.bars[0].skipped = true;
+        let l = layout(&loading, 1280, 720);
+        assert_eq!(l.phases.len(), 4);
+        assert_eq!(l.phases[0].bars.len(), 1);
+        assert!(l.phases.iter().skip(1).all(|p| p.bars.len()==2));
     }
 
     #[test]

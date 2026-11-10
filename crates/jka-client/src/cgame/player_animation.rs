@@ -47,6 +47,9 @@ pub struct LerpFrameState {
     pub last_forced_frame: i32,
     pub last_flip: bool,
     has_animation: bool,
+    /// MVSDK `lf->animation`: the installed animation, kept while forceFrame
+    /// zeroes `animationNumber`. Only the JK2 path uses it.
+    jk2_animation: Option<Animation>,
 }
 
 impl Default for LerpFrameState {
@@ -64,6 +67,7 @@ impl Default for LerpFrameState {
             last_forced_frame: -1,
             last_flip: false,
             has_animation: false,
+            jk2_animation: None,
         }
     }
 }
@@ -141,6 +145,7 @@ impl PlayerAnimationState {
     }
 
     /// Port of OpenJK `CG_PlayerAnimation` for the stock humanoid path.
+    /// `jk2` (`2` = 1.02, `4` = 1.04) selects the MVSDK cgame port instead.
     pub fn update(
         &mut self,
         entity: &EntityState,
@@ -151,7 +156,11 @@ impl PlayerAnimationState {
         current_time: i32,
         anim_blend: bool,
         humanoid: bool,
+        jk2: Option<u8>,
     ) -> Result<(), String> {
+        if let Some(version) = jk2.filter(|_| humanoid && !self.no_lumbar) {
+            return self.update_jk2(version, entity, animations, gla, current_time, anim_blend);
+        }
         let legs_anim = field_i32(entity, "legsAnim");
         let torso_anim = field_i32(entity, "torsoAnim");
         let force_active = field_i32(entity, "forcePowersActive");
@@ -223,14 +232,62 @@ impl PlayerAnimationState {
             &mut self.legs,
             &mut self.torso,
             self.no_lumbar,
+            "lower_lumbar",
             gla,
             current_time,
         )?;
+        self.finish_frame_step();
+        Ok(())
+    }
+
+    fn finish_frame_step(&mut self) {
         self.legs_step = (self.frames_seen && self.legs.frame != self.legs.old_frame).then_some(LegsFrameStep {
             old_frame: self.legs.old_frame,
             frame: self.legs.frame,
             anim: self.legs.animation_number,
         });
+        self.frames_seen = true;
+    }
+
+    /// MVSDK `CG_PlayerAnimation` (code/cgame/cg_players.c). Unlike OpenJK,
+    /// Force Rage/Speed scale *every* legs animation, and there is no
+    /// broken-limb or sabers.cfg speed input.
+    fn update_jk2(
+        &mut self,
+        version: u8,
+        entity: &EntityState,
+        animations: &AnimationSet,
+        gla: &GlaAnimation,
+        current_time: i32,
+        anim_blend: bool,
+    ) -> Result<(), String> {
+        let force_active = field_i32(entity, "forcePowersActive");
+        let legs_speed = if force_active & (1 << FP_RAGE) != 0 {
+            1.3
+        } else if force_active & (1 << FP_SPEED) != 0 {
+            1.7
+        } else {
+            1.0
+        };
+        let torso_speed = if force_active & (1 << FP_RAGE) != 0 { 1.7 } else { 1.0 };
+        let mut jk2 = Jk2Lerp {
+            version,
+            animator: &mut self.animator,
+            ci_legs_anim: &mut self.ci_legs_anim,
+            ci_torso_anim: &mut self.ci_torso_anim,
+            entity,
+            animations,
+            gla,
+            current_time,
+            anim_blend,
+        };
+        // CG_RunLerpFrame advances JK2's own frame counter (lf->frame), which
+        // CG_FirstAnimFrame, the 1.04 torso/legs sync and footsteps read.
+        self.legs_step = jk2.run(&mut self.legs, field_i32(entity, "legsAnim"),
+            field_i32(entity, "legsFlip") != 0, legs_speed, false, 0)?;
+        let legs_frame = self.legs.frame;
+        jk2.run(&mut self.torso, field_i32(entity, "torsoAnim"),
+            field_i32(entity, "torsoFlip") != 0, torso_speed, true, legs_frame)?;
         self.frames_seen = true;
         Ok(())
     }
@@ -619,6 +676,7 @@ fn refresh_lerp_frames_from_ghoul2(
     legs: &mut LerpFrameState,
     torso: &mut LerpFrameState,
     no_lumbar: bool,
+    torso_bone: &str,
     gla: &GlaAnimation,
     current_time: i32,
 ) -> Result<(), String> {
@@ -636,13 +694,289 @@ fn refresh_lerp_frames_from_ghoul2(
         torso.frame = legs.frame;
         return Ok(());
     }
-    if let Some(frame) = animator.bone_frame(gla, require_bone(gla, "lower_lumbar")?, current_time)? {
+    if let Some(frame) = animator.bone_frame(gla, require_bone(gla, torso_bone)?, current_time)? {
         let current = frame.floor() as i32;
         torso.old_frame = torso.frame;
         torso.frame = current;
         torso.backlerp = 1.0 - (frame - current as f32);
     }
     Ok(())
+}
+
+/// MVSDK installs torso-only animations on `upper_lumbar` for 1.02 clients
+/// and `lower_lumbar` for 1.03/1.04 (`ci->jk2gameplay == VERSION_1_02`).
+fn jk2_torso_bone(version: u8) -> &'static str {
+    if version == 2 { "upper_lumbar" } else { "lower_lumbar" }
+}
+
+/// JK2 `ANIM_TOGGLEBIT`; the presentation layer carries it as legs/torsoFlip.
+const JK2_ANIM_TOGGLEBIT: i32 = 2048;
+
+/// MVSDK `BG_FlippingAnim`/`BG_InDeathAnim` (the JKA lists are supersets).
+/// `anim` is a presentation ID; `toggle` re-adds the JK2 toggle bit, which
+/// 1.02 `BG_FlippingAnim` does not strip.
+fn jk2_anim_flags(version: u8, anim: i32, toggle: bool) -> (bool, bool) {
+    let Some(wire) = jka_protocol::jk2::presentation::wire_animation(anim) else {
+        return (false, false);
+    };
+    let raw = if toggle { wire | JK2_ANIM_TOGGLEBIT } else { wire };
+    jka_movement::jk2_animation_flags(version, raw)
+}
+
+/// MVSDK `CG_RunLerpFrame`/`CG_SetLerpFrameAnimation` for one player.
+struct Jk2Lerp<'a> {
+    version: u8,
+    animator: &'a mut Ghoul2Animator,
+    ci_legs_anim: &'a mut i32,
+    ci_torso_anim: &'a mut i32,
+    entity: &'a EntityState,
+    animations: &'a AnimationSet,
+    gla: &'a GlaAnimation,
+    current_time: i32,
+    anim_blend: bool,
+}
+
+impl Jk2Lerp<'_> {
+    fn torso_bone(&self) -> &'static str {
+        jk2_torso_bone(self.version)
+    }
+
+    /// `CG_RunLerpFrame`. The animation is (re)installed on a new number or
+    /// toggle, or by `CG_FirstAnimFrame`: a speed change only takes effect
+    /// once the current animation is back on its first frame. Returns the
+    /// legs frame pair `CG_FootStep` tests at this advance.
+    fn run(
+        &mut self,
+        lf: &mut LerpFrameState,
+        new_animation: i32,
+        flip: bool,
+        speed_scale: f32,
+        torso_only: bool,
+        legs_frame: i32,
+    ) -> Result<Option<LegsFrameStep>, String> {
+        let now = self.current_time;
+        if !lf.has_animation {
+            // CG_ResetPlayerEntity -> CG_ClearLerpFrame (speed 1).
+            lf.frame_time = now;
+            lf.old_frame_time = now;
+            lf.last_flip = flip;
+            self.set(lf, new_animation, 1.0, torso_only, legs_frame)?;
+            let first = lf.jk2_animation.map_or(0, |anim| i32::from(anim.first_frame));
+            lf.old_frame = first;
+            lf.frame = first;
+        }
+        let force_frame = field_i32(self.entity, "forceFrame");
+        if force_frame != 0 {
+            if lf.last_forced_frame != force_frame {
+                // MVSDK: BONE_ANIM_OVERRIDE_FREEZE only (no blend), 150 ms.
+                for bone in [self.torso_bone(), "model_root", "Motion"] {
+                    self.animator.set_bone_anim(
+                        self.gla, bone, force_frame, force_frame + 1,
+                        BONE_ANIM_OVERRIDE_FREEZE, 1.0, now, None, 150,
+                    )?;
+                }
+            }
+            lf.last_forced_frame = force_frame;
+            lf.animation_number = 0;
+        } else {
+            lf.last_forced_frame = -1;
+            // CG_FirstAnimFrame.
+            let first_anim_frame = {
+                let same_speed = if torso_only {
+                    lf.animation_torso_speed == speed_scale
+                } else {
+                    lf.animation_speed == speed_scale
+                };
+                !same_speed && lf.jk2_animation.is_some_and(|anim| {
+                    anim.num_frames < 2 || i32::from(anim.first_frame) == lf.frame
+                })
+            };
+            if new_animation != lf.animation_number
+                || lf.last_flip != flip
+                || lf.jk2_animation.is_none()
+                || first_anim_frame
+            {
+                self.set(lf, new_animation, speed_scale, torso_only, legs_frame)?;
+            }
+        }
+        lf.last_flip = flip;
+
+        let mut step = None;
+        if now >= lf.frame_time {
+            // CG_FootStep tests the pair from the *previous* advance.
+            if !torso_only && lf.old_frame != lf.frame {
+                step = Some(LegsFrameStep {
+                    old_frame: lf.old_frame,
+                    frame: lf.frame,
+                    anim: lf.animation_number,
+                });
+            }
+            lf.old_frame = lf.frame;
+            lf.old_frame_time = lf.frame_time;
+            let Some(anim) = lf.jk2_animation.filter(|anim| anim.frame_lerp != 0) else {
+                return Ok(step); // "shouldn't happen": MVSDK returns before the clamps
+            };
+            let frame_lerp = i32::from(anim.frame_lerp);
+            lf.frame_time = if now < lf.animation_time {
+                lf.animation_time // initial lerp
+            } else {
+                lf.old_frame_time + frame_lerp
+            };
+            // C int arithmetic: truncating division, then `f *= speedScale`.
+            let mut f = (lf.frame_time - lf.animation_time) / frame_lerp;
+            f = (f as f32 * speed_scale) as i32;
+            let num_frames = i32::from(anim.num_frames);
+            if f >= num_frames {
+                f -= num_frames;
+                if anim.loop_frames != -1 {
+                    let loop_frames = i32::from(anim.loop_frames);
+                    let span = if num_frames - loop_frames == 0 {
+                        num_frames
+                    } else {
+                        num_frames - loop_frames
+                    };
+                    f = f.checked_rem(span).unwrap_or(0) + loop_frames;
+                } else {
+                    f = num_frames - 1;
+                    // Stuck at the end: can transition immediately.
+                    lf.frame_time = now;
+                }
+            }
+            lf.frame = i32::from(anim.first_frame) + f;
+            if now > lf.frame_time {
+                lf.frame_time = now;
+            }
+        }
+        if lf.frame_time > now + 200 {
+            lf.frame_time = now;
+        }
+        if lf.old_frame_time > now {
+            lf.old_frame_time = now;
+        }
+        lf.backlerp = if lf.frame_time == lf.old_frame_time {
+            0.0
+        } else {
+            1.0 - (now - lf.old_frame_time) as f32 / (lf.frame_time - lf.old_frame_time) as f32
+        };
+        Ok(step)
+    }
+
+    /// `CG_SetLerpFrameAnimation` (non-ATST humanoid branch).
+    fn set(
+        &mut self,
+        lf: &mut LerpFrameState,
+        new_animation: i32,
+        anim_speed_mult: f32,
+        torso_only: bool,
+        legs_frame: i32,
+    ) -> Result<(), String> {
+        let version = self.version;
+        let old_anim = lf.animation_number;
+        // lf->animationNumber kept the toggle bit of the previous install.
+        let old_toggle = lf.last_flip;
+        lf.animation_number = new_animation;
+        let anim = *self.animations
+            .get(new_animation)
+            .ok_or_else(|| format!("Bad animation number: {new_animation}"))?;
+        lf.has_animation = true;
+        lf.jk2_animation = Some(anim);
+        // initialLerp = ceil(1000 / |fps|) = |frameLerp|.
+        lf.animation_time = lf.frame_time + i32::from(anim.frame_lerp).abs();
+        if anim.frame_lerp == 0 {
+            return Err(format!("animation {new_animation} has zero frameLerp"));
+        }
+
+        let mut anim_speed = 50.0 / f32::from(anim.frame_lerp);
+        let mut flags = if anim.loop_frames != -1 {
+            BONE_ANIM_OVERRIDE_LOOP
+        } else {
+            BONE_ANIM_OVERRIDE_FREEZE
+        };
+        if self.anim_blend {
+            flags |= BONE_ANIM_BLEND;
+        }
+        // newAnimation was masked before these tests; oldAnim was not.
+        let (new_flip, new_death) = jk2_anim_flags(version, new_animation, false);
+        let (old_flip, old_death) = if old_anim != -1 {
+            jk2_anim_flags(version, old_anim, old_toggle)
+        } else {
+            (false, false)
+        };
+        if new_death || old_death {
+            flags &= !BONE_ANIM_BLEND;
+        }
+        let blend_time = if flags & BONE_ANIM_BLEND != 0 && (new_flip || old_flip) { 200 } else { 150 };
+
+        anim_speed *= anim_speed_mult;
+        // 1.02 skips BG_SaberStartTransAnim.
+        if version != 2 && is_saber_transition_animation(new_animation) {
+            match field_i32(self.entity, "fireflag") {
+                1 => anim_speed *= 1.5,  // FORCE_LEVEL_1
+                3 => anim_speed *= 0.75, // FORCE_LEVEL_3
+                _ => {}
+            }
+        }
+        if torso_only {
+            lf.animation_torso_speed = anim_speed_mult;
+        } else {
+            lf.animation_speed = anim_speed_mult;
+        }
+
+        // MVSDK never swaps the range for a negative frameLerp (OpenJK does);
+        // JK2 Ghoul2 then holds a reversed FREEZE animation on endFrame + 1.
+        // Only keep that where the held frame exists in this GLA.
+        let first = i32::from(anim.first_frame);
+        let last = first + i32::from(anim.num_frames);
+        let (start, end) = if anim_speed < 0.0 && last + 1 >= self.gla.num_frames as i32 {
+            (last, first)
+        } else {
+            (first, last)
+        };
+
+        let torso_anim = field_i32(self.entity, "torsoAnim");
+        let mut begin_frame = start;
+        if torso_only {
+            // cent->pe.legs.frame: the legs lerp frame advanced just before.
+            let legs_frame = (version != 2
+                && torso_anim == field_i32(self.entity, "legsAnim")
+                && legs_frame >= first
+                && legs_frame <= last)
+                .then_some(legs_frame);
+            if let Some(legs_frame) = legs_frame {
+                self.animator.set_bone_anim(
+                    self.gla, "lower_lumbar", start, end, flags, anim_speed,
+                    self.current_time, Some(legs_frame as f32), blend_time,
+                )?;
+                begin_frame = legs_frame;
+            } else {
+                self.animator.set_bone_anim(
+                    self.gla, self.torso_bone(), start, end, flags, anim_speed,
+                    self.current_time, None, blend_time,
+                )?;
+            }
+            *self.ci_torso_anim = new_animation;
+        } else {
+            self.animator.set_bone_anim(
+                self.gla, "model_root", start, end, flags, anim_speed,
+                self.current_time, None, blend_time,
+            )?;
+            if version == 2 {
+                *self.ci_torso_anim = new_animation;
+            }
+            *self.ci_legs_anim = new_animation;
+        }
+
+        if torso_anim == new_animation {
+            // 1.02 always starts Motion at its first frame; 1.03/1.04 follow
+            // the legs-synchronised torso frame.
+            let set_frame = (version != 2 && begin_frame != start).then_some(begin_frame as f32);
+            self.animator.set_bone_anim(
+                self.gla, "Motion", start, end, flags, anim_speed,
+                self.current_time, set_frame, blend_time,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 fn require_bone(gla: &GlaAnimation, name: &str) -> Result<usize, String> {

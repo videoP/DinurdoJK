@@ -276,16 +276,8 @@ jobs:
           }
           Write-Host "Staged pinned ffmpeg.exe ($('{0:N1}' -f ((Get-Item $destination).Length / 1MB)) MiB) in $deps"
 
-          # Supplemental legal asset stays OUTSIDE the signed update payload:
-          # older clients reject unknown manifest paths, but accept ffmpeg.exe.
-          $noticeDir = 'dist/ffmpeg-notices'
-          New-Item -ItemType Directory -Force $noticeDir | Out-Null
-          $gpl = Join-Path $noticeDir 'FFmpeg-GPL-3.0.txt'
-          Copy-Item -LiteralPath 'release-licenses/FFmpeg-GPL-3.0.txt' -Destination $gpl -ErrorAction Stop
-          if ((Get-Item -LiteralPath $gpl).Length -lt 20000) {
-            throw 'Committed FFmpeg GPLv3 license is empty or truncated.'
-          }
-          Copy-Item -LiteralPath 'release-licenses/FFmpeg-SOURCE-NOTICE.txt' -Destination (Join-Path $noticeDir 'FFmpeg-SOURCE-NOTICE.txt') -ErrorAction Stop
+          # FFmpeg notices are committed in release-licenses/ and placed in
+          # the full ZIP by the packager, not downloaded by the auto-updater.
 
 
       # Restore the *archive*, not unpacked DLLs. Re-check its pinned SHA-256
@@ -420,6 +412,11 @@ jobs:
         run: |
           $licenseDir = 'target/release/licenses'
           New-Item -ItemType Directory -Force $licenseDir | Out-Null
+          foreach ($name in @('OpenAL-Soft-LGPL-2.0.txt', 'DXC-LICENSE.txt',
+                              'DXC-ThirdPartyNotices.txt', 'FFmpeg-GPL-3.0.txt',
+                              'FFmpeg-SOURCE-NOTICE.txt')) {
+            Copy-Item -LiteralPath (Join-Path 'release-licenses' $name) -Destination (Join-Path $licenseDir $name) -ErrorAction Stop
+          }
           Copy-Item (Join-Path $env:DLSS_SDK 'LICENSE.txt') (Join-Path $licenseDir 'NVIDIA-DLSS-SDK-LICENSE.txt') -ErrorAction Stop
           foreach ($name in @('dxcompiler.dll', 'dxil.dll')) {
             if (-not (Test-Path -LiteralPath (Join-Path 'target/release/DinurdoJK/dependencies' $name) -PathType Leaf)) {
@@ -437,11 +434,8 @@ jobs:
           # The full ZIP is for new/manual installations. Individual assets
           # are for the updater; the signed manifest binds their exact hashes.
           $archive = "dist/release/DinurdoJK-${{ steps.version.outputs.tag }}-full.zip"
-          python -c 'import sys, json, zipfile, pathlib, hashlib; p=pathlib.Path(sys.argv[1]); d=p.parent; z=zipfile.ZipFile(p); m=json.loads((d/"release-manifest.json").read_bytes()); assert m["format"]==2; assert set(z.namelist())==set(m["files"]); assert "DinurdoJK/shared/dinurdo-assets.pk4" in z.namelist(); assert "DinurdoJK.exe" in z.namelist(); assert "DinurdoJK/dependencies/dxcompiler.dll" in z.namelist() and "DinurdoJK/dependencies/dxil.dll" in z.namelist(); assert "DinurdoJK/dependencies/ffmpeg.exe" in z.namelist(); assert all(hashlib.sha256(z.read(n)).hexdigest()==f["sha256"] for n,f in m["files"].items()); print("Verified full ZIP and signed per-file hashes")' $archive
-          if ($LASTEXITCODE -ne 0) { throw 'Release layout and hashes failed verification.' }
-          # Add prepared FFmpeg notices only to the manual full ZIP, outside the signed updater manifest.
-          python -c 'import sys, pathlib, zipfile; z=pathlib.Path(sys.argv[1]); n=pathlib.Path("dist/ffmpeg-notices"); files={"FFmpeg-GPL-3.0.txt", "FFmpeg-SOURCE-NOTICE.txt"}; assert all((n/f).is_file() for f in files); f=zipfile.ZipFile(z,"a",compression=zipfile.ZIP_DEFLATED); [f.write(n/name, "licenses/"+name) for name in sorted(files)]; f.close(); x=zipfile.ZipFile(z); assert files=={p.removeprefix("licenses/") for p in x.namelist() if p.startswith("licenses/")}; print("Added FFmpeg license and source notice to manual full ZIP")' $archive
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to attach FFmpeg notices to manual ZIP.' }
+          python -c 'import sys, json, zipfile, pathlib, hashlib; p=pathlib.Path(sys.argv[1]); d=p.parent; z=zipfile.ZipFile(p); m=json.loads((d/"release-manifest.json").read_bytes()); files=set(m["files"]); names=set(z.namelist()); notices={n for n in names if n.startswith("licenses/")}; required={"licenses/FFmpeg-GPL-3.0.txt","licenses/FFmpeg-SOURCE-NOTICE.txt","licenses/OpenAL-Soft-LGPL-2.0.txt","licenses/DXC-LICENSE.txt","licenses/DXC-ThirdPartyNotices.txt","licenses/NVIDIA-DLSS-SDK-LICENSE.txt"}; assert m["format"]==2; assert names==files|notices; assert required<=notices; assert all(not n.lower().endswith(".txt") for n in files); assert {"DinurdoJK.exe","DinurdoJK/shared/dinurdo-assets.pk4","DinurdoJK/dependencies/dxcompiler.dll","DinurdoJK/dependencies/dxil.dll","DinurdoJK/dependencies/ffmpeg.exe"}<=files; assert all(hashlib.sha256(z.read(n)).hexdigest()==f["sha256"] for n,f in m["files"].items()); print("Verified runtime-only signed manifest and full ZIP license notices")' $archive
+          if ($LASTEXITCODE -ne 0) { throw 'Release layout, notices or hashes failed verification.' }
 
       - name: Upload signed updater artifact
         if: steps.version.outputs.publish == 'true'
@@ -457,16 +451,13 @@ jobs:
         shell: pwsh
         run: |
           $tag = '${{ steps.version.outputs.tag }}'
-          $updateAssets = @(Get-ChildItem 'dist/release' -File | Sort-Object Name | ForEach-Object { $_.FullName })
-          $noticeAssets = @(Get-ChildItem 'dist/ffmpeg-notices' -File | Sort-Object Name | ForEach-Object { $_.FullName })
-          if ($noticeAssets.Count -ne 2) { throw 'Expected FFmpeg GPLv3 and source notices.' }
-          $assets = @($updateAssets) + @($noticeAssets)
+          $assets = @(Get-ChildItem 'dist/release' -File | Sort-Object Name | ForEach-Object { $_.FullName })
           $manifest = Get-Content 'dist/release/release-manifest.json' -Raw | ConvertFrom-Json
-          $expectedCount = @($manifest.files.PSObject.Properties).Count + 3 + $noticeAssets.Count
+          $expectedCount = @($manifest.files.PSObject.Properties).Count + 3
           if ($assets.Count -ne $expectedCount) {
             throw "Expected $expectedCount assets (individual files + full ZIP + manifest + signature); found $($assets.Count)"
           }
-          gh release create $tag @assets --target $env:GITHUB_SHA --title "DinurdoJK $tag" --latest --notes "Windows x64 with Vulkan DLAA and FFmpeg for Render Studio exports. Download the full ZIP for a new install. Existing DinurdoJK clients with signed per-file update support download only changed files. FFmpeg is GPLv3; see the separate FFmpeg-GPL-3.0.txt and FFmpeg-SOURCE-NOTICE.txt assets and review source distribution obligations. Retail Jedi Academy assets are NOT included."
+          gh release create $tag @assets --target $env:GITHUB_SHA --title "DinurdoJK $tag" --latest --notes "Windows x64 with Vulkan DLAA and FFmpeg for Render Studio exports. Download the full ZIP for a new install; it includes third-party license notices under licenses/. Existing DinurdoJK clients with signed per-file update support download only changed runtime files. FFmpeg is GPLv3; review source distribution obligations. Retail Jedi Academy assets are NOT included."
           if ($LASTEXITCODE -ne 0) { throw 'Failed to create official GitHub Release.' }
           $release = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or $release.isDraft -or $release.isPrerelease) {

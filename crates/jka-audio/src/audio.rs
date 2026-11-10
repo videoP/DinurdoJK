@@ -1662,6 +1662,8 @@ pub struct AudioBackend {
     emote_music_volume: f32,
     voice_volume: f32,
     separation: f32,
+    /// JK2MV software-mixer behavior for JK2 sessions only. JKA remains unchanged.
+    jk2_mode: bool,
     rate: f32,
     output_channels: u16,
     output_sample_rate: u32,
@@ -1776,6 +1778,7 @@ impl AudioBackend {
             emote_music_volume: 0.5,
             voice_volume: 1.0,
             separation: 0.5,
+            jk2_mode: false,
             rate: 1.0,
             output_channels,
             output_sample_rate: output_sample_rate.get(),
@@ -1840,6 +1843,7 @@ impl AudioBackend {
             emote_music_volume: 0.5,
             voice_volume: 1.0,
             separation: 0.5,
+            jk2_mode: false,
             rate: 1.0,
             output_channels: 2,
             output_sample_rate: 48_000,
@@ -1896,6 +1900,7 @@ impl AudioBackend {
         backend.emote_music_volume = self.emote_music_volume;
         backend.voice_volume = self.voice_volume;
         backend.separation = self.separation;
+        backend.jk2_mode = self.jk2_mode;
         backend.music_level = self.music_level;
         backend.rate = 1.0;
         backend.set_underwater(self.underwater_mode, false);
@@ -2381,6 +2386,15 @@ impl AudioBackend {
         }
     }
 
+    /// Select the reference mix semantics explicitly; do not infer game
+    /// identity from a sound path, channel number, or the audio device.
+    pub fn set_jk2_mode(&mut self, jk2: bool) {
+        if self.jk2_mode != jk2 {
+            self.jk2_mode = jk2;
+            self.refresh_voice_gains();
+        }
+    }
+
     pub fn set_mix(&mut self, effects_volume: f32, voice_volume: f32, separation: f32) {
         self.effects_volume = effects_volume.clamp(0.0, 1.0);
         self.voice_volume = voice_volume.clamp(0.0, 1.0);
@@ -2398,9 +2412,10 @@ impl AudioBackend {
         let effects = self.effects_volume;
         let voice = self.voice_volume;
         let separation = self.separation;
+        let jk2 = self.jk2_mode;
         for item in &self.voices {
             let bus = if item.request.channel == 14 { self.emote_music_volume } else { effects };
-            let mut spatial = sound_spatialization(&item.request, listener, bus, voice, separation);
+            let mut spatial = sound_spatialization_mode(&item.request, listener, bus, voice, separation, jk2);
             spatial.stereo = spatial.stereo.map(|gain| gain * item.volume);
             spatial.mono *= item.volume;
             for (previous, next) in item.gains.get().into_iter().zip(spatial.stereo) {
@@ -2452,13 +2467,13 @@ impl AudioBackend {
                 SoundOrigin::Local => Spatialization {
                     // Preserve the old call to spatialize(listener.origin): at
                     // distance zero dot=0, so each ear gets s_separation.
-                    stereo: [self.separation; 2],
-                    mono: self.separation,
+                    stereo: [if self.jk2_mode { 0.5 } else { self.separation }; 2],
+                    mono: if self.jk2_mode { 0.5 } else { self.separation },
                     direction: [0.0, 0.0, -1.0],
                     hrtf_spatializable: false,
                 },
                 SoundOrigin::Entity(origin) | SoundOrigin::Fixed(origin) => {
-                    spatialize_detail(origin, self.listener, CHAN_AUTO, self.separation)
+                    spatialize_detail_mode(origin, self.listener, CHAN_AUTO, self.separation, self.jk2_mode)
                 }
             };
             if split {
@@ -2684,11 +2699,13 @@ impl AudioBackend {
     }
     fn play_with_loop(&mut self, mut request: SoundRequest, sound: Arc<RegisteredSound>, volume: f32, loop_start: Option<usize>) {
         self.reap_finished_voices();
-        if !matches!(request.channel, 0 | 10) { // CHAN_AUTO / CHAN_LESS_ATTEN auto-pick
+        // JK2MV: only CHAN_AUTO is exempt from same-channel replacement.
+        // Keep JKA's existing CHAN_LESS_ATTEN behavior unchanged.
+        if request.channel != CHAN_AUTO && (self.jk2_mode || request.channel != 10) {
             let (stomped, kept): (Vec<_>, Vec<_>) =
                 std::mem::take(&mut self.voices).into_iter().partition(|voice| {
                     voice.request.entity == request.entity
-                        && channels_stomp(voice.request.channel, request.channel)
+                        && channels_stomp_mode(voice.request.channel, request.channel, self.jk2_mode)
                 });
             self.voices = kept;
             for voice in stomped { self.retire(voice.player, voice.wet_player, &voice.gains); }
@@ -2713,12 +2730,13 @@ impl AudioBackend {
         if let SoundOrigin::Entity(ref mut origin) = request.origin {
             if let Some(current) = self.origins.get(&request.entity) { *origin = *current; }
         }
-        let mut spatial = sound_spatialization(
+        let mut spatial = sound_spatialization_mode(
             &request,
             self.listener,
             if request.channel == 14 { self.emote_music_volume } else { self.effects_volume },
             self.voice_volume,
             self.separation,
+            self.jk2_mode,
         );
         spatial.stereo = spatial.stereo.map(|gain| gain * volume);
         spatial.mono *= volume;
@@ -2840,9 +2858,14 @@ fn is_voice_channel(channel: i32) -> bool { matches!(channel, 3 | 4 | 12) }
 /// OpenJK S_CheckChannelStomp: the three voice channels mutually replace one
 /// another for the same entity, while all other non-auto channels only replace
 /// the identical channel.
-fn channels_stomp(a: i32, b: i32) -> bool {
-    a == b || (is_voice_channel(a) && is_voice_channel(b))
+fn channels_stomp_mode(a: i32, b: i32, jk2: bool) -> bool {
+    // JK2MV snd_dma.cpp S_CheckChannelStomp: software mixer only
+    // replaces the *same* numeric channel. JKA groups voice variants.
+    a == b || (!jk2 && is_voice_channel(a) && is_voice_channel(b))
 }
+
+#[cfg(test)]
+fn channels_stomp(a: i32, b: i32) -> bool { channels_stomp_mode(a, b, false) }
 
 #[derive(Clone, Copy, Debug)]
 struct Spatialization {
@@ -2864,19 +2887,19 @@ fn stereo_rms_gain(stereo: [f32; 2]) -> f32 {
 /// later in OpenJK's ChannelPaint; multiplying it here is algebraically the
 /// same for our normalized floating-point samples. HRTF keeps the legacy
 /// stereo RMS as its mono input level and replaces only the localization.
-fn sound_spatialization(
+fn sound_spatialization_mode(
     request: &SoundRequest,
     listener: Listener,
     effects_volume: f32,
     voice_volume: f32,
     separation: f32,
+    jk2: bool,
 ) -> Spatialization {
     let volume = if is_voice_channel(request.channel) { voice_volume } else { effects_volume };
     if matches!(request.origin, SoundOrigin::Local) || request.entity == listener.entity {
-        // S_StartSound scales listener-owned body/weapon/voice sounds to
-        // SOUND_FMAXVOL (0.75) for channels below CHAN_AMBIENT. These sounds
-        // are head-locked by JKA semantics and intentionally bypass HRTF.
-        let local_scale = if request.channel < 7 { 0.75 } else { 1.0 };
+        // JK2MV has the old 0.75 local sound reduction commented out.
+        // Preserve JKA's existing local-player gain for JKA sessions.
+        let local_scale = if !jk2 && request.channel < 7 { 0.75 } else { 1.0 };
         let gain = volume * local_scale;
         return Spatialization {
             stereo: [gain; 2],
@@ -2890,10 +2913,17 @@ fn sound_spatialization(
         SoundOrigin::Entity(p) | SoundOrigin::Fixed(p) => p,
         SoundOrigin::Local => unreachable!(),
     };
-    let mut spatial = spatialize_detail(origin, listener, request.channel, separation);
+    let mut spatial = spatialize_detail_mode(origin, listener, request.channel, separation, jk2);
     spatial.stereo = spatial.stereo.map(|gain| gain * volume);
     spatial.mono *= volume;
     spatial
+}
+
+#[cfg(test)]
+fn sound_spatialization(
+    request: &SoundRequest, listener: Listener, effects: f32, voice: f32, separation: f32,
+) -> Spatialization {
+    sound_spatialization_mode(request, listener, effects, voice, separation, false)
 }
 
 #[cfg(test)]
@@ -2911,7 +2941,7 @@ fn sound_gains(
 /// needed by Steam Audio. The legacy stereo result remains byte-for-byte the
 /// same formula as before. HRTF consumes the RMS-equivalent legacy level plus
 /// `direction`, avoiding the previous pre-pan gain boost for close sounds.
-fn spatialize_detail(origin: [f32; 3], listener: Listener, channel: i32, separation: f32) -> Spatialization {
+fn spatialize_detail_mode(origin: [f32; 3], listener: Listener, channel: i32, separation: f32, jk2: bool) -> Spatialization {
     let delta = std::array::from_fn::<_, 3, _>(|i| origin[i] - listener.origin[i]);
     let distance = delta.iter().map(|v| v * v).sum::<f32>().sqrt();
     let source_dir = if distance > 0.0001 {
@@ -2920,20 +2950,27 @@ fn spatialize_detail(origin: [f32; 3], listener: Listener, channel: i32, separat
         [0.0; 3]
     };
 
-    let (full_volume_distance, attenuation) = match channel {
+    // JK2MV's software S_SpatializeOrigin uses SOUND_FULLVOLUME=80
+    // and SOUND_ATTENUATE=0.0008 for *all* spatial channels. Its
+    // channel-specific 256/768 distances belong to optional OpenAL.
+    let (full_volume_distance, attenuation) = if jk2 {
+        (80.0, 0.0008)
+    } else { match channel {
         3 => (256.0 * 3.0, 0.0008),       // CHAN_VOICE
         4 => (256.0 * 1.35, 0.004),       // CHAN_VOICE_ATTEN
         10 => (256.0 * 8.0, 0.0008),      // CHAN_LESS_ATTEN
         12 => (f32::MAX, 0.0008),         // CHAN_VOICE_GLOBAL
         _ => (256.0, 0.0008),
-    };
+    } };
     let distance_loss = ((distance - full_volume_distance).max(0.0) * attenuation).max(0.0);
     let distance_gain = (1.0 - distance_loss).max(0.0);
 
     // OpenJK: dot = -DotProduct(listener_axis[1], source_vec). The App listener
     // stores that same left axis, and s_separation defaults to 0.5.
     let dot = -listener.left.iter().zip(source_dir).map(|(a, b)| a * b).sum::<f32>();
-    let separation = separation.clamp(0.0, 1.0);
+    // JK2MV software has the configurable separation expression commented
+    // out; hard-coded 0.5 is authoritative for the legacy mixer.
+    let separation = if jk2 { 0.5 } else { separation.clamp(0.0, 1.0) };
     let right_scale = (separation + (1.0 - separation) * dot).max(0.0);
     let left_scale = (separation - (1.0 - separation) * dot).max(0.0);
 
@@ -2957,6 +2994,11 @@ fn spatialize_detail(origin: [f32; 3], listener: Listener, channel: i32, separat
         direction,
         hrtf_spatializable: distance > 0.0001 && distance_gain > 0.0,
     }
+}
+
+#[cfg(test)]
+fn spatialize_detail(origin: [f32; 3], listener: Listener, channel: i32, separation: f32) -> Spatialization {
+    spatialize_detail_mode(origin, listener, channel, separation, false)
 }
 
 #[cfg(test)]
@@ -3318,6 +3360,27 @@ mod tests {
         assert!(channels_stomp(4, 12));
         assert!(channels_stomp(2, 2));
         assert!(!channels_stomp(2, 3));
+    }
+
+    #[test]
+    fn jk2mv_software_attenuation_local_gain_and_voice_slider() {
+        let listener = Listener { entity: 0, origin: [0.0; 3], ahead: [1.0, 0.0, 0.0], up: [0.0, 0.0, 1.0], left: [0.0, 1.0, 0.0] };
+        let mut weapon = request(2);
+        weapon.origin = SoundOrigin::Local;
+        assert_eq!(sound_spatialization_mode(&weapon, listener, 0.8, 0.4, 0.25, true).stereo, [0.8, 0.8]);
+        let mut voice = request(3);
+        voice.origin = SoundOrigin::Local;
+        assert_eq!(sound_spatialization_mode(&voice, listener, 0.8, 0.4, 0.25, true).stereo, [0.4, 0.4]);
+        // JK2MV software spatializes all positional channels alike.
+        for channel in [0, 2, 3, 4, 10, 12] {
+            let at_80 = spatialize_detail_mode([80.0, 0.0, 0.0], listener, channel, 0.8, true);
+            assert_eq!(at_80.stereo, [0.5, 0.5]);
+            let at_580 = spatialize_detail_mode([580.0, 0.0, 0.0], listener, channel, 0.8, true);
+            assert!((at_580.stereo[0] - 0.3).abs() < 1e-6);
+        }
+        assert!(channels_stomp_mode(3, 3, true));
+        assert!(!channels_stomp_mode(3, 4, true));
+        assert!(channels_stomp_mode(3, 4, false));
     }
 
     /// A mono 16-bit PCM WAV of a constant value, `frames` long at 8 kHz.

@@ -665,6 +665,52 @@ pub(in crate::renderer) fn planar_planes_equivalent(a: [f32; 4], b: [f32; 4]) ->
     alignment.abs() > 0.999 && plane_delta < 2.0
 }
 
+fn minimum_planar_screen_importance(
+    kind: PlanarReflectorKind,
+    lake_planar: Option<bool>,
+    quality: ReflectionQuality,
+) -> f32 {
+    if (lake_planar == Some(true) && kind == PlanarReflectorKind::Ocean)
+        || kind == PlanarReflectorKind::Authored
+    {
+        // These surfaces own their reflections. Dropping a small visible lake
+        // abruptly substitutes sky for the reflected room as the eye recedes.
+        // Visibility and the slot budget still bound the capture cost.
+        0.0
+    } else {
+        match quality {
+            ReflectionQuality::High => 0.015,
+            ReflectionQuality::Ultra => 0.002,
+            _ => 1.0,
+        }
+    }
+}
+
+#[test]
+fn lake_planar_reflection_survives_receding_screen_coverage() {
+    let projection = glam::camera::rh::proj::directx::perspective(
+        60.0_f32.to_radians(), 1.0, 0.1, 1000.0,
+    );
+    let mut previous_importance = f32::INFINITY;
+    for distance in [10.0, 30.0, 100.0, 300.0] {
+        let (_, importance) = projected_planar_importance(
+            [-1.0, -1.0, -distance], [1.0, 1.0, -distance],
+            [0.0, 0.0, 1.0, distance], projection,
+        ).expect("receding water remains visible");
+        assert!(importance > 0.0 && importance < previous_importance);
+        for quality in [ReflectionQuality::High, ReflectionQuality::Ultra] {
+            assert!(importance >= minimum_planar_screen_importance(
+                PlanarReflectorKind::Ocean, Some(true), quality,
+            ), "visible lake lost its reflection at {distance}");
+        }
+        previous_importance = importance;
+    }
+    // The distant fixture crosses the old cutoff; other oceans retain it.
+    assert!(previous_importance < minimum_planar_screen_importance(
+        PlanarReflectorKind::Ocean, None, ReflectionQuality::High,
+    ));
+}
+
 pub(in crate::renderer) fn select_planar_reflection_views(
     world: &WorldGpu,
     camera: &Camera,
@@ -742,21 +788,9 @@ pub(in crate::renderer) fn select_planar_reflection_views(
         };
         let (contains_centre, screen_importance) =
             planar_importance_from_ndc_rect(ndc_rect.0, ndc_rect.1);
-        let minimum_screen_importance =
-            if lake_planar == Some(true) && reflector.kind == PlanarReflectorKind::Ocean {
-                0.015
-            } else if reflector.kind == PlanarReflectorKind::Authored {
-                // Authored `portal` mirrors are baseline JKA content. If their plane
-                // is actually visible, keep them eligible regardless of enhanced
-                // reflection quality. The slot budget still limits total cost.
-                0.0
-            } else {
-                match reflection_quality {
-                    ReflectionQuality::High => 0.015,
-                    ReflectionQuality::Ultra => 0.002,
-                    _ => 1.0,
-                }
-            };
+        let minimum_screen_importance = minimum_planar_screen_importance(
+            reflector.kind, lake_planar, reflection_quality,
+        );
         if screen_importance < minimum_screen_importance {
             continue;
         }

@@ -121,8 +121,39 @@ fn saber_weapon_sound_paths(
 
 #[derive(Clone, Debug)]
 struct CustomSoundProfile {
-    sound_dir: String,
+    /// The explicit sounds.cfg first line, if supplied. No config means the
+    /// original engines both look under `chars/<model>/misc`.
+    sound_dir: Option<String>,
     female: bool,
+}
+
+/// Match the two original multiplayer `sounds.cfg` conventions:
+/// - JK2 (MVSDK CG_LoadClientInfo): the first line is a directory relative to
+///   `sound/`, e.g. `chars/jan/misc`.
+/// - JKA (OpenJK CG_LoadCISounds): the first line names a soundset under
+///   `sound/chars/<name>/misc/`, e.g. `jan`.
+/// When a config is absent, both games first try the player's model directory.
+/// A missing sound falls back to the gender-specific generic voice bank.
+fn player_custom_sound_candidates(
+    profile: &CustomSoundProfile,
+    model_name: &str,
+    stem: &str,
+    jk2: bool,
+) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(sound_dir) = profile.sound_dir.as_deref().filter(|dir| !dir.is_empty()) {
+        if jk2 {
+            candidates.push(format!("sound/{sound_dir}/{stem}"));
+        } else {
+            candidates.push(format!("sound/chars/{sound_dir}/misc/{stem}"));
+        }
+    } else if !model_name.is_empty() {
+        // Both MVSDK and OpenJK try this when no usable sounds.cfg path exists.
+        candidates.push(format!("sound/chars/{model_name}/misc/{stem}"));
+    }
+    let generic = if profile.female { "mp_generic_female" } else { "mp_generic_male" };
+    candidates.push(format!("sound/chars/{generic}/misc/{stem}"));
+    candidates
 }
 
 /// Immutable data event workers read while preparing sounds. It is loaded on
@@ -342,7 +373,8 @@ impl SoundPresenter {
             SaberDefinitions::default()
         });
         let backend = match AudioBackend::open(steam_audio_enabled, steam_audio_binaural_enabled, steam_audio_environmental_enabled) {
-            Ok(backend) => {
+            Ok(mut backend) => {
+                backend.set_jk2_mode(jka_assets::pk3::active_jk2().is_some());
                 let info = backend.info();
                 // Always logged: the first thing to check when a player hears nothing.
                 eprintln!(
@@ -556,10 +588,20 @@ impl SoundPresenter {
         let Some(effect) = previous.and_then(|previous| saber_weapon_transition(previous, current)) else {
             return;
         };
-        let Some(info) = game.client_info(usize::from(current.client), siege_classes) else {
-            return;
+        let paths = if jka_assets::pk3::active_jk2().is_some() {
+            // MVSDK cg_players.c: saber equip/unequip uses the original
+            // fixed samples, not JKA .sab soundOn/soundOff definitions.
+            vec![match effect {
+                SaberWeaponSound::On => "sound/weapons/saber/saberon.wav".to_owned(),
+                SaberWeaponSound::Off => "sound/weapons/saber/saberoffquick.wav".to_owned(),
+            }]
+        } else {
+            let Some(info) = game.client_info(usize::from(current.client), siege_classes) else {
+                return;
+            };
+            saber_weapon_sound_paths(&self.prep.saber_definitions, &info, effect)
         };
-        for qpath in saber_weapon_sound_paths(&self.prep.saber_definitions, &info, effect) {
+        for qpath in paths {
             match self.assets.register(&qpath) {
                 Ok(sound) => {
                     if let Some(backend) = &mut self.backend {
@@ -795,8 +837,9 @@ impl SoundPresenter {
         frame
     }
 
-    /// An FX `sound` primitive: S_StartSound(origin, ENTITYNUM_NONE, CHAN_AUTO).
-    pub fn play_fx_sound(&mut self, qpath: &str, origin: [f32; 3]) {
+    /// An authored FX `sound` primitive or a manually emitted blade/world
+    /// contact sound, retaining the call-site entity and channel semantics.
+    pub fn play_fx_sound(&mut self, qpath: &str, origin: [f32; 3], entity: u16, channel: i32) {
         if self.backend.is_none() {
             return;
         }
@@ -804,7 +847,7 @@ impl SoundPresenter {
             Ok(sound) => {
                 if let Some(backend) = &mut self.backend {
                     backend.play(
-                        SoundRequest { qpath: qpath.to_owned(), entity: 1023, channel: 0, origin: SoundOrigin::Fixed(origin) },
+                        SoundRequest { qpath: qpath.to_owned(), entity, channel, origin: SoundOrigin::Fixed(origin) },
                         sound,
                     );
                 }
@@ -1187,6 +1230,7 @@ impl SoundPresenter {
         self.offline_capture_active = true;
         self.backend = Some(offline);
         if let Some(backend) = &mut self.backend {
+            backend.set_jk2_mode(jka_assets::pk3::active_jk2().is_some());
             backend.set_underwater(self.underwater_mode, self.listener_submerged);
         }
         self.map_music = None;
@@ -1251,6 +1295,7 @@ impl SoundPresenter {
 
     pub fn set_mix(&mut self, effects_volume: f32, voice_volume: f32, separation: f32) {
         if let Some(backend) = &mut self.backend {
+            backend.set_jk2_mode(jka_assets::pk3::active_jk2().is_some());
             backend.set_mix(effects_volume, voice_volume, separation);
         }
     }
@@ -1362,6 +1407,7 @@ impl SoundPresenter {
             steam_audio_environmental_enabled,
         )?;
         backend.set_steam_audio_hrtf_interpolation(steam_audio_hrtf_interpolation);
+        backend.set_jk2_mode(jka_assets::pk3::active_jk2().is_some());
         backend.set_mix(effects_volume, voice_volume, separation);
         backend.set_music_level((music_volume * self.music_mult).clamp(0.0, 1.0));
         backend.set_rate(rate);
@@ -1649,17 +1695,15 @@ impl SoundPresenter {
             return Ok(vec![format!("sound/chars/{generic}/misc/{stem}")]);
         }
 
-        let mut candidates = Vec::with_capacity(2);
-        if !profile.sound_dir.is_empty() {
-            candidates.push(format!("sound/chars/{}/misc/{stem}", profile.sound_dir));
-        } else if !info.model_name.is_empty() {
-            candidates.push(format!("sound/chars/{}/misc/{stem}", info.model_name));
-        }
-        // TaystJK CG_LoadCISounds falls back to a generic male/female voice
-        // ONLY for player-model registrations, not CG_HandleNPCSounds.
-        let generic = if profile.female { "mp_generic_female" } else { "mp_generic_male" };
-        candidates.push(format!("sound/chars/{generic}/misc/{stem}"));
-        Ok(candidates)
+        // JK2's sounds.cfg provides a path relative to sound/; JKA's supplies
+        // only the soundset name. Keep the gender fallback player-only (NPCs
+        // use the separate snapshot-registered sound banks above).
+        Ok(player_custom_sound_candidates(
+            &profile,
+            &info.model_name,
+            stem,
+            jka_assets::pk3::active_jk2().is_some(),
+        ))
     }
 
     fn register_custom_sound(
@@ -1690,7 +1734,7 @@ impl SoundPresenter {
     }
 
     fn custom_sound_profile(&mut self, info: &crate::cgame::ClientInfo) -> Result<CustomSoundProfile, String> {
-        let key = format!("{}|{}", info.model_name, info.skin_name).to_ascii_lowercase();
+        let key = format!("{}|{}|{}", info.model_name, info.skin_name, jka_assets::pk3::active_jk2().is_some()).to_ascii_lowercase();
         if let Some(profile) = self.custom_sound_profiles.get(&key) {
             return Ok(profile.clone());
         }
@@ -1710,7 +1754,7 @@ impl SoundPresenter {
         };
 
         let mut profile = CustomSoundProfile {
-            sound_dir: model.to_owned(),
+            sound_dir: None,
             female: info.female,
         };
         for config in config_paths {
@@ -1721,7 +1765,7 @@ impl SoundPresenter {
                 if let Some(first) = lines.next() {
                     let first = first.trim();
                     if !first.is_empty() {
-                        profile.sound_dir = first.to_owned();
+                        profile.sound_dir = Some(first.to_owned());
                     }
                 }
                 // OpenJK scans the last line for an 'f' gender marker.
@@ -1856,6 +1900,16 @@ fn saber_impact_request(
         super::entity_vec3(&event.state, "origin").unwrap_or(event.position),
     );
     match event.event {
+        EntityEvent::EV_SABER_HIT if jka_assets::pk3::active_jk2().is_some() => {
+            // MVSDK cg_event.c: every saber hit, including eventParm=0
+            // (world contact), plays the original unnumbered hit sample.
+            Ok(Some(SoundRequest {
+                qpath: "sound/weapons/saber/saberhit.wav".to_owned(),
+                entity: event.entity_num,
+                channel: CHAN_AUTO,
+                origin,
+            }))
+        }
         EntityEvent::EV_SABER_HIT => {
             // OpenJK EV_SABER_HIT only starts hitSound for flesh/special hits.
             if event.parm == 0 {
@@ -1904,6 +1958,15 @@ fn saber_impact_request(
                 "sound/weapons/saber/saberblock{}.wav",
                 event_variant(event, 9) + 1
             );
+            if jka_assets::pk3::active_jk2().is_some() {
+                // MVSDK: always one of saberblock1..9, without .sab overrides.
+                return Ok(Some(SoundRequest {
+                    qpath,
+                    entity: event.entity_num,
+                    channel: CHAN_AUTO,
+                    origin,
+                }));
+            }
             if let Some((definition, second_style)) =
                 impact_saber_definition(saber_definitions, event, game, siege_classes)
             {
@@ -1947,6 +2010,17 @@ fn saber_attack_request(
     game: &ClientGameState,
     siege_classes: &[SiegeClassVisual],
 ) -> Result<SoundRequest, &'static str> {
+    if jka_assets::pk3::active_jk2().is_some() {
+        // JK2 has no JKA .sab swing override; MVSDK always picks saberhup1..8.
+        return Ok(SoundRequest {
+            qpath: format!("sound/weapons/saber/saberhup{}.wav", event_variant(event, 8) + 1),
+            entity: event.entity_num,
+            channel: CHAN_WEAPON,
+            origin: super::entity_vec3(&event.state, "pos.trBase")
+                .map(SoundOrigin::Fixed)
+                .unwrap_or(SoundOrigin::Fixed(event.position)),
+        });
+    }
     let info = if event.state.field_i32("eType").unwrap_or(ET_PLAYER) == ET_NPC {
         game.npc_client_info(&event.state).ok()
     } else {
@@ -2014,10 +2088,17 @@ fn sound_request(event: &PresentationEvent, game: &ClientGameState) -> Result<Op
         }
         EntityEvent::EV_GENERAL_SOUND | EntityEvent::EV_GLOBAL_SOUND | EntityEvent::EV_ENTITY_SOUND => {
             let channel = match event.event {
+                // MVSDK uses saberEntityNum as a loop tracker only; ordinary
+                // EV_GENERAL_SOUND plays on CHAN_VOICE.
+                EntityEvent::EV_GENERAL_SOUND if jk2 => CHAN_VOICE,
                 EntityEvent::EV_GENERAL_SOUND => event.state.field_i32("saberEntityNum").unwrap_or(0),
+                EntityEvent::EV_GLOBAL_SOUND if jk2 => CHAN_AUTO,
                 EntityEvent::EV_GLOBAL_SOUND => CHAN_MENU1, // positioned at the listener's head
                 _ => {
-                    entity = u16::try_from(event.state.field_i32("clientNum").unwrap_or(-1))
+                    // MVSDK EV_ENTITY_SOUND uses weapon for the caller entity,
+                    // while the JKA presenter has used clientNum.
+                    let entity_field = if jk2 { "weapon" } else { "clientNum" };
+                    entity = u16::try_from(event.state.field_i32(entity_field).unwrap_or(-1))
                         .ok().filter(|&n| n < 1024).ok_or("SOUND_INVALID_ENTITY")?;
                     event.state.field_i32("trickedentindex").unwrap_or(0)
                 }
@@ -2219,6 +2300,15 @@ fn saber_unholster_sounds(
     game: &ClientGameState,
     siege_classes: &[SiegeClassVisual],
 ) -> Option<PreparedSound> {
+    if jka_assets::pk3::active_jk2().is_some() {
+        // MVSDK cg_event.c EV_SABER_UNHOLSTER: one fixed sample, CHAN_AUTO.
+        return Some(PreparedSound::from(SoundRequest {
+            qpath: "sound/weapons/saber/saberon.wav".to_owned(),
+            entity: event.entity_num,
+            channel: CHAN_AUTO,
+            origin: SoundOrigin::Entity(event.position),
+        }));
+    }
     let info = if event.state.field_i32("eType").unwrap_or(ET_PLAYER) == ET_NPC {
         game.npc_client_info(&event.state).ok()
     } else if event.entity_num < MAX_CLIENTS {
@@ -2923,6 +3013,37 @@ mod tests {
             server_time: 1_000,
             state,
         }
+    }
+
+    #[test]
+    fn jk2_sounds_cfg_uses_directory_relative_to_sound_root() {
+        // Original JK2 Jan sounds.cfg: `chars/jan/misc\r\nf`.
+        let jan = CustomSoundProfile { sound_dir: Some("chars/jan/misc".to_owned()), female: true };
+        assert_eq!(
+            player_custom_sound_candidates(&jan, "jan", "jump1", true),
+            vec!["sound/chars/jan/misc/jump1", "sound/chars/mp_generic_female/misc/jump1"],
+        );
+        // Without sounds.cfg, MVSDK tries the model's standard sound directory.
+        let no_cfg = CustomSoundProfile { sound_dir: None, female: false };
+        assert_eq!(
+            player_custom_sound_candidates(&no_cfg, "kyle", "jump1", true),
+            vec!["sound/chars/kyle/misc/jump1", "sound/chars/mp_generic_male/misc/jump1"],
+        );
+    }
+
+    #[test]
+    fn jka_sounds_cfg_uses_soundset_name() {
+        let jan = CustomSoundProfile { sound_dir: Some("jan".to_owned()), female: true };
+        assert_eq!(
+            player_custom_sound_candidates(&jan, "jan", "jump1", false),
+            vec!["sound/chars/jan/misc/jump1", "sound/chars/mp_generic_female/misc/jump1"],
+        );
+        // JKA's missing-config model fallback still uses chars/<model>/misc.
+        let no_cfg = CustomSoundProfile { sound_dir: None, female: false };
+        assert_eq!(
+            player_custom_sound_candidates(&no_cfg, "kyle", "jump1", false),
+            vec!["sound/chars/kyle/misc/jump1", "sound/chars/mp_generic_male/misc/jump1"],
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 use super::loading_layout::{self, ConnectionPromptUi};
 use crate::ui::{
     lighten, rect, rect_gradient, text, textured_rect_with_source, with_alpha, MapLoadingBar,
-    MapLoadingUi, UiVertex, HUD_INK_BOTTOM, HUD_INK_TOP, HUD_VALUE,
+    MapLoadingPhase, MapLoadingUi, UiVertex, HUD_INK_BOTTOM, HUD_INK_TOP, HUD_VALUE,
 };
 
 /// Neon edge (cyan to magenta) with a soft glow on `glow_dir` (+1 below, -1 above).
@@ -190,20 +190,29 @@ fn ellipsize(txt: &UiText<'_>, value: &str, px: f32, max_w: f32) -> String {
     result
 }
 
-/// Keep the basename, .pk3 suffix and maximum readable prefix inside the
-/// Taffy label cell. Raw substring length is not a font-width measurement.
-fn fit_download_label(txt: &UiText<'_>, name: &str, px: f32, max_w: f32) -> String {
-    let basename = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    if txt.width(basename, px) <= max_w { return basename.to_owned(); }
-    let chars: Vec<char> = basename.chars().collect();
-    for total in (8..chars.len()).rev() {
-        let tail = 6.min(total.saturating_sub(3));
-        let head = total - tail - 3;
-        let candidate = format!("{}...{}", chars.iter().take(head).copied().collect::<String>(),
-            chars.iter().skip(chars.len() - tail).copied().collect::<String>());
-        if txt.width(&candidate, px) <= max_w { return candidate; }
+/// Caption inside a progress rail. Download names keep their PK3 suffix,
+/// and a pending READY rail explicitly says what the client is awaiting.
+/// Width checks use the real UI font rather than character-count guesses.
+fn task_bar_caption(txt: &UiText<'_>, bar: &MapLoadingBar,
+    download_name: Option<&str>, px: f32, max_w: f32) -> String
+{
+    if bar.label == "SERVER CONTENT" {
+        if let Some(name) = download_name {
+            let prefix = "DL: ";
+            let basename = name.rsplit(['/', '\\']).next().unwrap_or(name);
+            for chars in (8..=basename.chars().count().max(8)).rev() {
+                let label = format!("{prefix}{}", short_download_name(name, chars));
+                if txt.width(&label, px) <= max_w { return label; }
+            }
+            return ellipsize(txt, "DOWNLOADING", px, max_w);
+        }
     }
-    ellipsize(txt, basename, px, max_w)
+    let label = match bar.label {
+        "SERVER SNAPSHOT" if bar.total == 0 || bar.completed < bar.total => "AWAIT FIRST SNAPSHOT",
+        "VIDEO" => "RESTART VIDEO",
+        other => other,
+    };
+    ellipsize(txt, label, px, max_w)
 }
 
 fn draw_line(txt: &UiText<'_>, out: &mut Vec<UiVertex>, value: &str,
@@ -353,8 +362,12 @@ fn paint_connection_prompt(txt: &UiText<'_>, out: &mut Vec<UiVertex>, prompt: &C
     neon_edge(out, x, y, bw, 2.0, -1.0, w, h);
     match prompt {
         ConnectionPromptUi::MissingMap { map_name, reason, can_download } => {
-            draw_line(txt, out, "THE SERVER USES A MAP NOT INSTALLED LOCALLY", g.kicker, 12.5*s, LOAD_CYAN, w, h);
-            title(txt, out, "MAP NOT FOUND", g.title, 24.0*s, [0.90, 0.97, 1.0, 1.0], w, h);
+            let missing_paks = reason.starts_with("Missing server-referenced PK3");
+            draw_line(txt, out, if missing_paks { "SERVER-REFERENCED CONTENT IS MISSING" }
+                else { "THE SERVER USES A MAP NOT INSTALLED LOCALLY" },
+                g.kicker, 12.5*s, LOAD_CYAN, w, h);
+            title(txt, out, if missing_paks { "PK3 DOWNLOAD REQUIRED" } else { "MAP NOT FOUND" },
+                g.title, 24.0*s, [0.90, 0.97, 1.0, 1.0], w, h);
             rect(out, g.subject[0], g.subject[1], g.subject[2], g.subject[3], [0.045, 0.065, 0.12, 0.99], w, h);
             draw_line(txt, out, map_name, [g.subject[0]+13.0*s, g.subject[1], g.subject[2]-26.0*s, g.subject[3]],
                 18.0*s, LOAD_AMBER, w, h);
@@ -362,7 +375,7 @@ fn paint_connection_prompt(txt: &UiText<'_>, out: &mut Vec<UiVertex>, prompt: &C
             // Help is two separate lines within the one Taffy reserved cell.
             let half = g.help[3] * 0.5;
             draw_line(txt, out, "Choose how to continue:", [g.help[0],g.help[1],g.help[2],half], 13.0*s, LOAD_LABEL, w, h);
-            draw_line(txt, out, if *can_download { "HTTP preferred; legacy JKA download used when enabled." }
+            draw_line(txt, out, if *can_download { "HTTP preferred; legacy UDP used when enabled." }
                 else { "Autodownload is disabled in Setup > Network." },
                 [g.help[0],g.help[1]+half,g.help[2],half], 12.0*s,
                 if *can_download { LOAD_FAINT } else { LOAD_AMBER }, w, h);
@@ -415,43 +428,75 @@ pub(in crate::ui) fn build_loading_screen(
         g.kicker,14.0*s,LOAD_CYAN,w,h);
     let heading = loading.map_name.to_ascii_uppercase();
     title(&txt,out,&heading,g.heading,25.0*s,[0.92,0.98,1.0,1.0],w,h);
+    // Count completed work units, not estimated seconds. A cold shader
+    // compile can dominate wall time; the header deliberately says TASKS.
     let visible: Vec<&MapLoadingBar> = loading.bars.iter().filter(|bar| !bar.skipped).collect();
-    let overall = if visible.is_empty() {0.0} else {
+    let completed = visible.iter().filter(|bar| bar.total > 0
+        && bar.completed >= bar.total).count();
+    let total = visible.len();
+    let overall = if total == 0 { 0.0 } else {
         visible.iter().map(|b| if b.label == "SERVER CONTENT" {
             loading.download_overall_fraction.unwrap_or_else(|| loading_fraction(b))
-        } else {loading_fraction(b)}).sum::<f32>() / visible.len() as f32
+        } else { loading_fraction(b) }).sum::<f32>() / total as f32
     };
-    let percent = format!("{}%",(overall*100.0).round() as u32);
-    txt.draw_right(out, &percent, g.percentage[0]+g.percentage[2],
-        txt.baseline_in(g.percentage,18.0*s),18.0*s,LOAD_AMBER);
+    let count = format!("{completed}/{total} TASKS");
+    txt.draw_right(out, &count, g.percentage[0] + g.percentage[2],
+        txt.baseline_in(g.percentage, 14.0*s), 14.0*s, LOAD_AMBER);
     progress_track(out, g.overall_track[0],g.overall_track[1],g.overall_track[2],
         g.overall_track[3],overall,LOAD_CYAN,LOAD_MAGENTA,w,h);
-    for (bar,cells) in visible.iter().zip(g.rows.iter()) {
-        let done = bar.total>0 && bar.completed>=bar.total;
-        let fraction=loading_fraction(bar);
-        let label = if bar.label == "SERVER CONTENT" {
-            if let Some(name) = loading.download_file_name.as_deref() {
-                fit_download_label(&txt, name, 13.6*s, cells[0][2])
-            } else {bar.label.to_owned()}
-        } else {bar.label.to_owned()};
-        draw_line(&txt,out,&label,cells[0],13.6*s,
-            if bar.no_work || bar.total==0 {LOAD_FAINT} else {LOAD_LABEL},w,h);
-        let (from,to) = if bar.no_work {(with_alpha(LOAD_FAINT,0.35),LOAD_FAINT)}
-            else if done {(with_alpha(LOAD_DONE,0.6),LOAD_DONE)}
-            else {(with_alpha(LOAD_CYAN,0.5),LOAD_CYAN)};
-        progress_track(out,cells[1][0],cells[1][1]+cells[1][3]*0.42,
-            cells[1][2],(cells[1][3]*0.17).max(3.0),fraction,from,to,w,h);
-        let status = if bar.no_work {"N/A".to_owned()} else if bar.total==0 {"WAIT".to_owned()}
-            else if done {"DONE".to_owned()} else if bar.total==1 {"WORKING".to_owned()}
-            else if bar.label=="SERVER CONTENT" {format!("{}%",(fraction*100.0).floor() as u32)}
-            else {format!("{}/{}",bar.completed,bar.total)};
-        draw_line(&txt,out,&status,cells[2],12.4*s,
-            if bar.no_work || bar.total==0 {LOAD_FAINT} else if done {LOAD_DONE} else {LOAD_LABEL},w,h);
-    }
-    if let Some(status) = loading.status_line.as_deref() {
-        let [fx,fy,fw,fh]=g.status;
-        rect(out,fx,fy+1.0*s,fw,1.0*s,with_alpha(LOAD_CYAN,0.25),w,h);
-        draw_two_lines(&txt,out,status,[fx,fy+5.0*s,fw,(fh-5.0*s).max(1.0)],13.7*s,LOAD_LABEL);
+
+    for (idx, phase) in MapLoadingPhase::ALL.iter().copied().enumerate() {
+        let group: Vec<_> = visible.iter().copied().filter(|bar| bar.phase == phase).collect();
+        let layout = &g.phases[idx];
+        let done = group.iter().filter(|b| b.total > 0 && b.completed >= b.total).count();
+        let active = group.iter().filter(|b| b.total > 0 && b.completed < b.total).count();
+        let previous_complete = visible.iter().filter(|b| (b.phase as usize) < idx)
+            .all(|b| b.total > 0 && b.completed >= b.total);
+        // The first frame cannot be produced while GPU setup is pending.
+        let blocked = !previous_complete && active == 0;
+        for (bar, bounds) in group.iter().zip(layout.bars.iter()) {
+            let complete = bar.total > 0 && bar.completed >= bar.total;
+            let (from,to) = if bar.no_work {
+                (with_alpha(LOAD_FAINT,0.45), LOAD_FAINT)
+            } else if complete {
+                (with_alpha(LOAD_DONE,0.72), LOAD_DONE)
+            } else {
+                (with_alpha(LOAD_CYAN,0.60), LOAD_CYAN)
+            };
+            progress_track(out, bounds[0],bounds[1],bounds[2],bounds[3],
+                loading_fraction(bar),from,to,w,h);
+            // Labels live inside the Taffy-sized rails, never in a separate
+            // footer. UiText centres the text vertically and supplies a soft
+            // drop shadow for contrast over partially filled tracks.
+            let px = (12.0*s).min((bounds[3]-5.0*s).max(0.0));
+            if px >= 7.0 {
+                let inset = 7.0*s;
+                let cell = [bounds[0]+inset, bounds[1],
+                    (bounds[2]-2.0*inset).max(1.0), bounds[3]];
+                let label = task_bar_caption(&txt, bar, loading.download_file_name.as_deref(),
+                    px, cell[2]);
+                let ink = if bar.no_work { LOAD_LABEL }
+                    else if complete { [0.025, 0.10, 0.13, 1.0] }
+                    else { [0.89, 0.96, 1.0, 1.0] };
+                txt.draw(out, &label, cell[0], txt.baseline_in(cell, px), px, ink);
+            }
+        }
+        let name = format!("{}. {}", idx+1, phase.title());
+        let finished = !group.is_empty() && done == group.len();
+        txt.draw_centered(out, &name, layout.heading, 12.5*s,
+            if finished { LOAD_DONE } else if blocked { LOAD_FAINT } else { LOAD_LABEL });
+        let stage_status = if group.is_empty() { "NOT NEEDED".to_owned() }
+            else if finished { "COMPLETE".to_owned() }
+            else if blocked || (phase == MapLoadingPhase::Ready && !previous_complete) {
+                "WAITING".to_owned()
+            } else if active > 0 {
+                format!("{active} ACTIVE")
+            } else { "PENDING".to_owned() };
+        txt.draw_centered(out, &stage_status, layout.status, 10.5*s,
+            if finished { LOAD_DONE }
+            else if active > 0 && !blocked
+                && !(phase == MapLoadingPhase::Ready && !previous_complete) { LOAD_CYAN }
+            else { LOAD_FAINT });
     }
     if let Some(cancel) = g.cancel {
         paint_button(&txt,out,cancel,"CANCEL CONNECTION",false,true,
@@ -524,7 +569,9 @@ pub(in crate::ui) fn build_shader_compile_progress(
 
 #[cfg(test)]
 mod download_label_tests {
-    use super::{neon_heading, short_download_name, LOAD_CYAN};
+    use super::{neon_heading, short_download_name, task_bar_caption, LOAD_CYAN};
+    use crate::ui::{MapLoadingBar, MapLoadingPhase};
+    use crate::ui::text::UiText;
 
     #[test]
     fn loading_headings_reuse_neon_menu_vector_letterforms() {
@@ -533,6 +580,29 @@ mod download_label_tests {
             24.0, LOAD_CYAN, 1280, 720);
         assert!(!out.is_empty());
         assert!(out.iter().all(|v| v.textured == 0.0));
+    }
+
+    #[test]
+    fn pending_snapshot_is_named_in_its_ready_bar() {
+        let font = UiText::legacy_only(None, 1280, 720);
+        let bar = MapLoadingBar { phase: MapLoadingPhase::Ready,
+            label: "SERVER SNAPSHOT", completed: 0, total: 1,
+            skipped: false, no_work: false };
+        assert_eq!(task_bar_caption(&font, &bar, None, 12.0, 180.0),
+            "AWAIT FIRST SNAPSHOT");
+    }
+
+    #[test]
+    fn download_bar_preserves_filename_suffix_within_real_font_width() {
+        let font = UiText::legacy_only(None, 1280, 720);
+        let bar = MapLoadingBar { phase: MapLoadingPhase::Assets,
+            label: "SERVER CONTENT", completed: 7, total: 20,
+            skipped: false, no_work: false };
+        let caption = task_bar_caption(&font, &bar,
+            Some("japro/extremely_long_custom_map_pack.pk3"), 12.0, 142.0);
+        assert!(caption.starts_with("DL: "));
+        assert!(caption.ends_with("k.pk3"));
+        assert!(font.width(&caption, 12.0) <= 142.0);
     }
 
     #[test]

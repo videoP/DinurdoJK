@@ -281,11 +281,20 @@ pub struct FxLightSegment {
     pub weight: f32,
 }
 
-/// A Sound primitive (S_StartSound at `origin`, CHAN_AUTO).
+/// A sound emitted by authored EFX (CHAN_AUTO), or by the saber contact
+/// presenter (JK2 wall scrapes use CHAN_WEAPON with no entity).
 #[derive(Clone, Debug, PartialEq)]
 pub struct FxSound {
     pub origin: [f32; 3],
     pub qpath: String,
+    pub entity: u16,
+    pub channel: i32,
+}
+
+impl FxSound {
+    pub fn auto(origin: [f32; 3], qpath: String) -> Self {
+        Self { origin, qpath, entity: 1023, channel: 0 }
+    }
 }
 
 /// A lit saber blade this frame, kept apart from its FX draws so the renderer
@@ -1279,7 +1288,7 @@ impl FxSystem {
         match fx.kind {
             PrimType::Sound => {
                 if let Some(qpath) = shader {
-                    self.sounds.push(FxSound { origin: org, qpath });
+                    self.sounds.push(FxSound::auto(org, qpath));
                 }
                 return;
             }

@@ -551,6 +551,9 @@ impl App {
         }
         if changed {
             self.console_reflow.borrow_mut().valid = false;
+            if self.console_search_open {
+                self.rebuild_console_search(false);
+            }
             self.mark_companion_console_dirty();
             if self.overlay == OverlayMode::Console {
                 self.publish_ui();

@@ -48,6 +48,16 @@ video_cvars! {
     CvarType::Bool, Bool, tint_hud, |value| value,
     |app| { app.mark_config_dirty(); app.publish_ui(); };
 
+    JK2_DRAW_INVENTORY, APP_JK2_DRAW_INVENTORY, "cg_drawInventory", "1", "0|1",
+    "MVSDK JK2: persistently list available holdable items and trip mines in the upper right (not the temporary selector). JK2 only.",
+    CvarType::Bool, Bool, jk2_draw_inventory, |value| value,
+    |app| { app.mark_config_dirty(); app.publish_ui(); };
+
+    JK2_ENHANCED_FLAGS, APP_JK2_ENHANCED_FLAGS, "cg_enhancedFlagStatus", "2", "0|1|2",
+    "MVSDK JK2 CTF: 0 off, 1 flag icons/carriers, 2 also show carry time. Supports the optional yellow/TEAM_FREE flag.",
+    CvarType::Int { min: 0, max: 2 }, Int, jk2_enhanced_flag_status, |value: i32| value as u8,
+    |app| { app.mark_config_dirty(); app.publish_ui(); };
+
     HUD_STYLE, APP_HUD_STYLE, "cg_hudStyle", "0", "0|1",
     "Native Rust HUD style: 0 DinurdoJK panels, 1 Native (JK2 or JKA retail HUD based on active game).",
     CvarType::Int { min: 0, max: 1 }, Int, hud_style, |value: i32| value as u8,

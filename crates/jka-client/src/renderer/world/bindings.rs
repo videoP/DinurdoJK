@@ -420,6 +420,10 @@ pub(in crate::renderer) fn create_world_bind_group(
                 resource: wgpu::BindingResource::Sampler(&reflection_probes.sampler),
             },
             wgpu::BindGroupEntry {
+                binding: 36,
+                resource: wgpu::BindingResource::TextureView(&reflection_probes.brdf_view),
+            },
+            wgpu::BindGroupEntry {
                 binding: 32,
                 resource: additive_uniforms[0].binding(),
             },

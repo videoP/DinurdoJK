@@ -466,6 +466,25 @@ app_cvars! {
             }
         ]
     }
+    APP_R_RELIGHTMATCHSYSTEMTIME {
+        runtime: CvarDef::new("r_relightMatchSystemTime", "0", "0|1",
+            "Use OS local time for Relighting. Realtime follows the clock (minute resolution); Baked samples it only when the next map loads. 0 uses the saved manual r_relightTime.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(i32::from(app.video.relight_match_system_time)),
+            |app, value| {
+                let CvarValue::Int(enabled) = value else { unreachable!() };
+                app.set_relighting_match_system_time(enabled != 0);
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(enabled) = parse_bool(value) { settings.relight_match_system_time = enabled; }
+            }),
+            archive: Some((36376, |state| i32::from(state.video.relight_match_system_time).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
     APP_R_CLOUDAERIAL {
         runtime: CvarDef::new(
                 "r_cloudAerial",

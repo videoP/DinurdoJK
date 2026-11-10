@@ -23,7 +23,15 @@ impl UiSnapshot {
     /// widgets only draw under `cg_drawHud`, so the native element comes back
     /// with it: the user's setting never ends up hiding both.
     pub(in crate::ui) fn native_replaced(&self, element: NativeHud) -> bool {
-        self.video.draw_hud && self.native_hidden.contains(element)
+        self.video.draw_hud
+            && (self.native_hidden.contains(element) || self.broadcast_replaces(element))
+    }
+
+    /// cg_specHud observer card: it carries the observed player's health,
+    /// armor, ammo and Force, so the native corner meters step aside.
+    pub(in crate::ui) fn broadcast_replaces(&self, element: NativeHud) -> bool {
+        matches!(element, NativeHud::Health | NativeHud::Shield | NativeHud::Ammo | NativeHud::Force)
+            && self.spectator_broadcast.as_ref().is_some_and(|b| b.replaces_native_vitals())
     }
 
 }

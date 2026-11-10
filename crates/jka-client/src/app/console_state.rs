@@ -135,6 +135,8 @@ impl App {
         self.console_path_links.clear();
         self.console_chat_ids.clear();
         self.console_scroll = 0;
+        self.console_hl2_scroll_to = Some(0);
+        self.console_hl2_page_delta = 0;
         self.console_selection_anchor = None;
         self.console_selection_focus = None;
         self.console_selecting = false;
@@ -647,12 +649,28 @@ impl App {
         }
     }
 
+    /// Text the active console actually displays for a logical log line.
+    /// The classic viewport always uses its stored row; HL2 may show a live
+    /// Unicode chat translation. Hit testing, Ctrl+C, select-all and find
+    /// must all use this same view to keep copied text identical to the screen.
+    pub(in crate::app) fn console_selection_line(&self, index: usize) -> Option<std::borrow::Cow<'_, str>> {
+        let raw = self.console_lines.get(index)?;
+        if self.console_hl2 {
+            if let Some(id) = self.console_chat_ids.get(index).copied().flatten() {
+                if let Some(translated) = self.console_chat_translation_line(raw, id) {
+                    return Some(std::borrow::Cow::Owned(translated));
+                }
+            }
+        }
+        Some(std::borrow::Cow::Borrowed(raw))
+    }
+
     pub(in crate::app) fn console_word_selection(
         &self,
         point: ConsolePoint,
     ) -> Option<(ConsolePoint, ConsolePoint)> {
-        let raw = self.console_lines.get(point.line)?;
-        let plain = crate::logging::strip_jka_colors(raw);
+        let raw = self.console_selection_line(point.line)?;
+        let plain = crate::logging::strip_jka_colors(&raw);
         let chars: Vec<char> = plain.chars().collect();
         if chars.is_empty() {
             return None;
@@ -754,6 +772,25 @@ impl App {
         }
     }
 
+    /// A single character-coordinate selection shared by the classic renderer
+    /// and the HL2 log. Neither viewport owns a second copy/selection buffer.
+    pub(in crate::app) fn console_selection_bounds(&self) -> Option<(ConsolePoint, ConsolePoint)> {
+        let mut start = self.console_selection_anchor?;
+        let mut end = self.console_selection_focus?;
+        if (start.line, start.col) > (end.line, end.col) {
+            std::mem::swap(&mut start, &mut end);
+        }
+        (start != end).then_some((start, end))
+    }
+
+    pub(in crate::app) fn finish_console_selection(&mut self) {
+        self.console_selecting = false;
+        if self.console_selection_anchor == self.console_selection_focus {
+            self.console_selection_anchor = None;
+            self.console_selection_focus = None;
+        }
+    }
+
     pub(in crate::app) fn select_all_console(&mut self) {
         let Some(last_line) = self.console_lines.len().checked_sub(1) else {
             self.console_selection_anchor = None;
@@ -762,9 +799,8 @@ impl App {
             return;
         };
         let last_col = self
-            .console_lines
-            .get(last_line)
-            .map(|raw| crate::logging::strip_jka_colors(raw).chars().count())
+            .console_selection_line(last_line)
+            .map(|raw| crate::logging::strip_jka_colors(&raw).chars().count())
             .unwrap_or(0);
         self.console_selection_anchor = Some(ConsolePoint { line: 0, col: 0 });
         self.console_selection_focus = Some(ConsolePoint {
@@ -775,22 +811,13 @@ impl App {
     }
 
     pub(in crate::app) fn selected_console_text(&self) -> Option<String> {
-        let (mut start, mut end) = (
-            self.console_selection_anchor?,
-            self.console_selection_focus?,
-        );
-        if (start.line, start.col) > (end.line, end.col) {
-            std::mem::swap(&mut start, &mut end);
-        }
-        if start == end {
-            return None;
-        }
+        let (start, end) = self.console_selection_bounds()?;
         let mut out = String::new();
         for line_index in start.line..=end.line {
-            let Some(raw) = self.console_lines.get(line_index) else {
+            let Some(raw) = self.console_selection_line(line_index) else {
                 break;
             };
-            let plain = crate::logging::strip_jka_colors(raw);
+            let plain = crate::logging::strip_jka_colors(&raw);
             let chars: Vec<char> = plain.chars().collect();
             let left = if line_index == start.line {
                 start.col.min(chars.len())
@@ -810,6 +837,16 @@ impl App {
             }
         }
         (!out.is_empty()).then_some(out)
+    }
+
+    /// The only clipboard-copy path for either console presentation.
+    pub(in crate::app) fn copy_console_selection(&mut self) {
+        if let Some(text) = self.selected_console_text() {
+            if let Err(error) = crate::clipboard::set_text(&text) {
+                self.console_status = format!("CLIPBOARD ERROR: {error}");
+                self.push_console_line(format!("^1{}", self.console_status));
+            }
+        }
     }
 
     pub(in crate::app) fn console_visible_range(&self) -> (usize, usize) {
@@ -834,6 +871,13 @@ impl App {
         else {
             return;
         };
+        // The floating HL2 log uses logical (unwrapped) record rows. Let its
+        // scroll area reveal the requested line rather than changing the
+        // classic console's physical-row scroll offset.
+        if self.console_hl2 {
+            self.console_hl2_scroll_to = Some(hit.line);
+            return;
+        }
         let row_index = self.console_wrap_layout().row_for_point(ConsolePoint {
             line: hit.line,
             col: hit.start_col,
@@ -867,8 +911,9 @@ impl App {
         let mut matches = Vec::new();
 
         if !needle.is_empty() {
-            for (line, raw) in self.console_lines.iter().enumerate() {
-                let plain = crate::logging::strip_jka_colors(raw);
+            for line in 0..self.console_lines.len() {
+                let Some(raw) = self.console_selection_line(line) else { continue; };
+                let plain = crate::logging::strip_jka_colors(&raw);
                 let haystack = plain.to_ascii_lowercase();
                 for (byte_start, _) in haystack.match_indices(&needle) {
                     let byte_end = byte_start + needle.len();

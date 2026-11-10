@@ -85,6 +85,7 @@ impl App {
             mouse: self.mouse_input,
             mouse_repeat_mode: self.in_mouserepeat,
             mouse_repeat_delay: self.in_mouserepeat_delay,
+            confine_cursor: self.in_confine_cursor,
             fov: self.camera.cg_fov(),
             model: self.solo_client_info.model_cvar(),
             force_model: self.force_model.clone(),

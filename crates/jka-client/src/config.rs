@@ -99,6 +99,9 @@ pub struct ClientPresentationSettings {
     pub mouse_repeat_mode: u8,
     /// Optional DinurdoJK first-repeat delay in milliseconds (TaystJK has none).
     pub mouse_repeat_delay: u32,
+    /// in_confineCursor: clip the visible UI pointer to the focused game window.
+    /// Does not affect relative mouse capture during gameplay.
+    pub confine_cursor: bool,
     /// TaystJK/OpenJK horizontal field of view on the 4:3 baseline.
     pub fov: f32,
     /// TaystJK cg_zoomFov: target FOV for the held +zoom bind.
@@ -416,6 +419,7 @@ impl Default for ClientPresentationSettings {
             mouse: MouseInputSettings::default(),
             mouse_repeat_mode: 0,
             mouse_repeat_delay: 0,
+            confine_cursor: true,
             fov: DEFAULT_CG_FOV,
             zoom_fov: 30.0,
             view_bob: ViewBobSettings::default(),
@@ -593,7 +597,7 @@ fn config_section(name: &str) -> usize {
     let n = name.to_ascii_lowercase();
     let n = n.as_str();
     let matches = |needles: &[&str]| needles.iter().any(|needle| n.contains(*needle));
-    if matches(&["sensitivity", "m_yaw", "m_pitch", "mouseaccel", "m_filter", "cl_input", "cl_timerresolution", "in_mouse"]) {
+    if matches(&["sensitivity", "m_yaw", "m_pitch", "mouseaccel", "m_filter", "cl_input", "cl_timerresolution", "in_mouse", "in_confinecursor"]) {
         1
     } else if matches(&["r_mode", "r_custom", "r_window", "r_fullscreen", "r_backend", "r_swapinterval", "r_maxframelatency", "r_earlysubmit", "r_presentcopy", "r_ext_multisample", "com_maxfps", "r_hdrpaperwhite", "r_hdrpeak", "r_hdrstyle"]) {
         2
@@ -1035,6 +1039,30 @@ mod tests {
         fs::write(&path, "seta r_mode \"-1\"\nseta r_customwidth \"1024\"\nseta r_customheight \"768\"\n").unwrap();
         assert!(!load_video_settings(&path).resolution_desktop);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn confined_ui_cursor_setting_round_trips_and_ignores_invalid_values() {
+        let path = std::env::temp_dir().join(format!(
+            "djk-confine-cursor-{}-{:?}.cfg", std::process::id(), std::thread::current().id()
+        ));
+        let mut presentation = ClientPresentationSettings::default();
+        assert!(presentation.confine_cursor);
+        presentation.confine_cursor = false;
+        let saved = format_archived_config(
+            VideoSettings::default(),
+            &crate::keybinds::Bindings::default(),
+            &presentation,
+            &AudioSettings::default(),
+        );
+        assert!(saved.contains("seta in_confineCursor \"0\""));
+        fs::write(&path, saved).unwrap();
+        assert!(!load_client_presentation_settings(&path).confine_cursor);
+        fs::write(&path, "seta in_confineCursor \"1\"\n").unwrap();
+        assert!(load_client_presentation_settings(&path).confine_cursor);
+        fs::write(&path, "seta in_confineCursor \"invalid\"\n").unwrap();
+        assert!(load_client_presentation_settings(&path).confine_cursor);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -2151,10 +2179,11 @@ mod sky_cloud_archive_regression {
         settings.cloud_portal_depth = 2;
         settings.clouds = true;
         settings.relight_time = 22.25;
+        settings.relight_match_system_time = true;
         save_video_settings(&file, settings, &crate::keybinds::Bindings::default(),
             &ClientPresentationSettings::default(), &AudioSettings::default()).unwrap();
         let text = fs::read_to_string(&file).unwrap();
-        for name in ["r_skyBackend", "r_cloudBackend", "r_cloudPortalDepth", "r_relightTime"] {
+        for name in ["r_skyBackend", "r_cloudBackend", "r_cloudPortalDepth", "r_relightTime", "r_relightMatchSystemTime"] {
             assert!(text.contains(&format!("seta {name} ")), "missing archived {name}");
         }
         let loaded = load_video_settings(&file);
@@ -2163,6 +2192,7 @@ mod sky_cloud_archive_regression {
         assert_eq!(loaded.cloud_portal_depth, 2);
         assert!(loaded.clouds);
         assert_eq!(loaded.relight_time, 22.25);
+        assert!(loaded.relight_match_system_time);
         let _ = fs::remove_file(file);
     }
 }

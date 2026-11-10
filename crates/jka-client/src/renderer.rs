@@ -860,6 +860,8 @@ struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline_jobs: PipelineJobManager,
+    /// Bounded device-local BSP PSO history; survives world/map replacements.
+    world_pipeline_catalog: WorldPipelineReuseCatalog,
     /// Composition format; native HDR surfaces use the separate output selection.
     config: wgpu::SurfaceConfiguration,
     hdr_output: Option<hdr_output::HdrOutput>,
@@ -968,6 +970,9 @@ struct Renderer {
     /// period below keeps a glance away from a pond from stuttering the waves.
     ocean_hidden_time: f32,
     ocean_settings: crate::ocean::OceanSettings,
+    /// The map ocean's physics waves for the shared FFT (`SetSailingSea`);
+    /// re-applied whenever the shared ocean is recreated.
+    sailing_sea: Option<std::sync::Arc<jka_movement::SailingSea>>,
     promoted_ocean_overrides: Vec<(usize, crate::ocean::OceanSettings)>,
     world_pipeline_layout: wgpu::PipelineLayout,
     world_pipeline_layout_lean: wgpu::PipelineLayout,
@@ -1474,6 +1479,7 @@ struct Renderer {
     /// the shared worker pool. The current hot variant remains active meanwhile.
     world_variant_pending: Option<WorldShaderVariantKey>,
     pbr_enabled: bool,
+    pbr_cubemaps: bool,
     /// Parallax occlusion on top of PBR (`r_pom`). Only meaningful while PBR is on.
     pom_enabled: bool,
     deluxe_mapping_enabled: bool,

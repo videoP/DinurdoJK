@@ -90,17 +90,23 @@ static void jk2_cg_spine(int version, const jka_player_angle_entity *es,
                          const vec3_t root, vec3_t thoracic, vec3_t upper, vec3_t lower) {
     const int la = es->legs_anim & ~ANIM_TOGGLEBIT;
     const int ta = es->torso_anim & ~ANIM_TOGGLEBIT;
+    /* CG_G2ClientSpineAngles_1_02 passes the raw entityState anims, toggle
+     * bit included, and 1.02 BG_FlippingAnim/BG_SpinningSaberAnim do not
+     * strip it: a toggled saber transition is *not* "spinning" there and
+     * gets the Motion-bone correction. 1.04 masks every argument. */
+    const int pla = version == 2 ? es->legs_anim : la;
+    const int pta = version == 2 ? es->torso_anim : ta;
     const int cl = ci_legs & ~ANIM_TOGGLEBIT;
     const int ct = ci_torso & ~ANIM_TOGGLEBIT;
     int eligible;
     int i;
 
     view[YAW] = AngleDelta(lerp_angles[YAW], root[YAW]);
-    eligible = !BG_FlippingAnim(la) && !BG_SpinningSaberAnim(la)
-        && !BG_SpinningSaberAnim(ta) && !BG_InSpecialJump(la)
-        && !BG_InSpecialJump(ta) && !BG_InDeathAnim(la)
-        && !BG_InDeathAnim(ta) && !BG_SaberInSpecial(es->saber_move)
-        && !BG_SaberInSpecialAttack(ta) && !BG_SaberInSpecialAttack(la)
+    eligible = !BG_FlippingAnim(pla) && !BG_SpinningSaberAnim(pla)
+        && !BG_SpinningSaberAnim(pta) && !BG_InSpecialJump(pla)
+        && !BG_InSpecialJump(pta) && !BG_InDeathAnim(pla)
+        && !BG_InDeathAnim(pta) && !BG_SaberInSpecial(es->saber_move)
+        && !BG_SaberInSpecialAttack(pta) && !BG_SaberInSpecialAttack(pla)
         && !BG_FlippingAnim(cl) && !BG_SpinningSaberAnim(cl)
         && !BG_SpinningSaberAnim(ct) && !BG_InSpecialJump(cl)
         && !BG_InSpecialJump(ct) && !BG_InDeathAnim(cl)
@@ -177,6 +183,14 @@ static void jk2_cg_spine(int version, const jka_player_angle_entity *es,
         upper[ROLL] = view[ROLL]*0.35f;
         lower[ROLL] = view[ROLL]*0.45f;
     }
+}
+
+/* MVSDK bg_panimate.c predicates used by CG_SetLerpFrameAnimation, under
+ * the selected gameplay (1.02 BG_FlippingAnim keeps the toggle bit).
+ * bit0 = BG_FlippingAnim, bit1 = BG_InDeathAnim; -1 = bad version. */
+int jk2_bg_anim_flags(int version, int anim) {
+    if (!jk2_select_versions(version, version)) return -1;
+    return (BG_FlippingAnim(anim) ? 1 : 0) | (BG_InDeathAnim(anim) ? 2 : 0);
 }
 
 int jk2_cg_g2_player_angles(int version, const jka_player_angle_entity *es, int time,

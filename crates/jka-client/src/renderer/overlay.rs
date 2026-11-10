@@ -168,6 +168,9 @@ pub(in crate::renderer) fn create_ui_texture_group(
 pub(in crate::renderer) struct UiExtImageLoader {
     base: PathBuf,
     game: Option<PathBuf>,
+    // Game-specific VFS identity, independent of fs_game's directory name.
+    // JK2 and JKA reuse HUD qpaths (including gfx/hud/hudleft).
+    jk2_version: Option<u8>,
     results_tx: std::sync::mpsc::Sender<UiExtImageResult>,
     results: std::sync::mpsc::Receiver<UiExtImageResult>,
     cache: Arc<std::sync::Mutex<UiExtImageCache>>,
@@ -193,10 +196,10 @@ struct UiExtImageResult {
 }
 
 impl UiExtImageLoader {
-    fn start(base: PathBuf, game: Option<PathBuf>) -> Self {
+    fn start(base: PathBuf, game: Option<PathBuf>, jk2_version: Option<u8>) -> Self {
         let (results_tx, results) = std::sync::mpsc::channel();
         Self {
-            base, game, results_tx, results,
+            base, game, jk2_version, results_tx, results,
             cache: Arc::new(std::sync::Mutex::new(UiExtImageCache::default())),
             pending: false,
         }
@@ -209,12 +212,15 @@ impl UiExtImageLoader {
         let cache = Arc::downgrade(&self.cache);
         let base = self.base.clone();
         let game = self.game.clone();
+        let jk2_version = self.jk2_version;
         let complete = self.results_tx.clone();
         let queued = pool.submit_task(crate::asset_jobs::AssetPriority::Medium, move || {
             // A HUD unload or game switch invalidates its cache and cancels
             // queued work before any costly shader-library parsing begins.
             let Some(cache) = cache.upgrade() else { return; };
-            let mut assets = match AssetSearchPath::open_game(&base, game.as_deref()) {
+            // Pin this job to its requested game: a live game switch must not
+            // make an in-flight atlas read the other game's same-named art.
+            let mut assets = match AssetSearchPath::open_game_as(&base, game.as_deref(), jk2_version) {
                 Ok(assets) => assets,
                 Err(err) => {
                     eprintln!("Extension HUD image asset search: {err}");
@@ -262,7 +268,7 @@ impl UiExtImageLoader {
                 let name = &wanted[index];
                 if !cache.stages.contains_key(name) {
                     if stage_resolver.is_none() {
-                        stage_resolver = AssetSearchPath::open_game(&base, game.as_deref())
+                        stage_resolver = AssetSearchPath::open_game_as(&base, game.as_deref(), jk2_version)
                             .ok().and_then(|assets|
                                 crate::cgame::entity_presenter::EntityPresenter::new(assets, false).ok());
                     }
@@ -423,6 +429,7 @@ impl Renderer {
     /// Upload only the small retained HUD batch when the integer count changes.
     pub(in crate::renderer) fn refresh_shader_compile_progress(&mut self) {
         let status = self.pipeline_jobs.progress().map(|progress| ui::MapLoadingBar {
+            phase: ui::MapLoadingPhase::Gpu,
             label: "COMPILING SHADERS",
             completed: progress.finished,
             total: progress.total,
@@ -505,6 +512,9 @@ impl Renderer {
                     matches!(command, crate::extensions::HudCommand::NativeIcon { .. })))
             || self.ui_state.zoom_scope.is_some()
             || self.ui_state.rocket_lock.is_some()
+            // cg_specHud broadcast cards draw weapon icons from the atlas.
+            || self.ui_state.spectator_broadcast.as_ref().is_some_and(|broadcast|
+                broadcast.players.iter().any(|player| player.weapon.is_some()))
             || self.ui_state.hud.is_some_and(|hud| {
                 hud.force_powers_active != 0 || hud.rage_recovery_until_ms > hud.time_ms
             });
@@ -694,11 +704,13 @@ impl Renderer {
         self.enemy_icon_materials = materials;
     }
 
-    /// Scoreboard avatars: on the first board, pack every model's
+    /// Scoreboard and cg_specHud card avatars: on the first board (or
+    /// broadcast HUD), pack every model's
     /// `icon_default` into one atlas on a worker thread; when it lands, upload
     /// it to binding 9. Returns true on the frame the atlas becomes ready.
     pub(in crate::renderer) fn sync_ui_avatars(&mut self) -> bool {
-        if self.ui_avatar_atlas.is_none() && self.ui_avatar_job.is_none() && self.ui_state.scoreboard.is_some() {
+        let wanted = self.ui_state.scoreboard.is_some() || self.ui_state.spectator_broadcast.is_some();
+        if self.ui_avatar_atlas.is_none() && self.ui_avatar_job.is_none() && wanted {
             let (sender, receiver) = std::sync::mpsc::channel();
             let base = self.base.clone();
             let game = self.detail_texture_game.clone();
@@ -726,6 +738,26 @@ impl Renderer {
     /// Resolve extension and native HUD art off-thread with source-size packing.
     /// This does NOT touch the per-present path or the native icon atlas.
     pub(in crate::renderer) fn sync_ui_extension_images(&mut self) {
+        // A JK2/JKA transition may leave fs_game unchanged (both can be
+        // "base"). The requested image names are not a sufficient cache key:
+        // the shader library and same-named TGA files belong to different
+        // asset namespaces. Drop both the old atlas and its worker cache.
+        let jk2_version = jka_assets::pk3::configured_filesystem_roots(&self.base).active_jk2;
+        if self.ui_ext_image_loader.as_ref().is_some_and(|loader|
+            loader.jk2_version != jk2_version)
+        {
+            self.ui_ext_image_loader = None;
+            self.ui_ext_image_key.clear();
+            self.ui_state.extension_shader_flags.clear();
+            self.ui_state.extension_image_dimensions.clear();
+            self.ui_state.extension_image_uvs.clear();
+            self.ui_icon_shader_materials.retain(|&key, _| key < ui::ICON_NAMES.len());
+            self._ui_ext_images = upload_texture(
+                &self.device, &self.queue, &blank_ui_extension_atlas(),
+            );
+            self.rebuild_ui_bind_group();
+            rverbose!(1, "UI extension images: reset on JK2/JKA asset namespace switch");
+        }
         let wanted = self.ui_state.extension_images.clone();
         if wanted.is_empty() {
             self.ui_ext_image_loader = None;
@@ -746,7 +778,7 @@ impl Renderer {
         if wanted == self.ui_ext_image_key { return; }
         if self.ui_ext_image_loader.is_none() {
             self.ui_ext_image_loader = Some(UiExtImageLoader::start(
-                self.base.clone(), self.detail_texture_game.clone(),
+                self.base.clone(), self.detail_texture_game.clone(), jk2_version,
             ));
         }
         // The previous image atlas remains valid until the new complete
@@ -1180,6 +1212,8 @@ impl Renderer {
 
     pub(in crate::renderer) fn set_transient_ui(
         &mut self,
+        falling_death_fade: f32,
+        falling_death_active: bool,
         chat_lines: Vec<ui::UiChatLine>,
         console_notify_lines: Vec<ui::UiConsoleNotifyLine>,
         center_print: Option<ui::UiCenterPrint>,
@@ -1189,6 +1223,8 @@ impl Renderer {
         force_select: Option<ui::UiForceSelect>,
         weapon_select: Option<ui::UiWeaponSelect>,
         inventory_select: Option<ui::UiInventorySelect>,
+        jk2_flags: Vec<ui::Jk2FlagUi>,
+        jk2_inventory: Option<ui::Jk2InventoryUi>,
         follow_name: Option<String>,
         game_timer: Option<String>,
         mini_scores: Option<ui::UiMiniScores>,
@@ -1204,7 +1240,10 @@ impl Renderer {
         speedometer: Option<crate::speedometer::Ui>,
         lagometer: Option<crate::lagometer::Ui>,
         team_overlay: Option<ui::TeamOverlayUi>,
+        spectator_broadcast: Option<ui::SpectatorBroadcastUi>,
     ) {
+        self.ui_state.falling_death_fade = falling_death_fade;
+        self.ui_state.falling_death_active = falling_death_active;
         self.ui_state.chat_lines = chat_lines;
         self.ui_state.console_notify_lines = console_notify_lines;
         self.ui_state.center_print = center_print;
@@ -1214,6 +1253,8 @@ impl Renderer {
         self.ui_state.force_select = force_select;
         self.ui_state.weapon_select = weapon_select;
         self.ui_state.inventory_select = inventory_select;
+        self.ui_state.jk2_flags = jk2_flags;
+        self.ui_state.jk2_inventory = jk2_inventory;
         self.ui_state.follow_name = follow_name;
         self.ui_state.game_timer = game_timer;
         self.ui_state.mini_scores = mini_scores;
@@ -1228,10 +1269,20 @@ impl Renderer {
         self.ui_state.scoreboard_focus_client = scoreboard_focus_client;
         self.ui_state.killfeed = killfeed;
         self.ui_state.chat_anim = chat_anim;
-        let avatars_ready = self.sync_ui_avatars();
         self.ui_state.speedometer = speedometer;
         self.ui_state.lagometer = lagometer;
         self.ui_state.team_overlay = team_overlay;
+        let replaced_native = |state: &Option<ui::SpectatorBroadcastUi>| {
+            state.as_ref().is_some_and(|b| b.replaces_native_vitals())
+        };
+        let native_vitals_changed =
+            replaced_native(&self.ui_state.spectator_broadcast) != replaced_native(&spectator_broadcast);
+        self.ui_state.spectator_broadcast = spectator_broadcast;
+        let avatars_ready = self.sync_ui_avatars();
+        if native_vitals_changed {
+            // The native health/force meters live in the stable dynamic batch.
+            self.rebuild_dynamic_ui();
+        }
         self.load_ui_icons_if_needed();
         self.sync_ui_team_icons();
         self.sync_enemy_icon_shader();
@@ -3195,5 +3246,20 @@ mod extension_image_atlas_tests {
         let atlas = blank_ui_extension_atlas();
         assert_eq!((atlas.width, atlas.height), (4, 4));
         assert!(atlas.rgba.iter().all(|&b| b == 0));
+    }
+}
+
+#[cfg(test)]
+mod jk2_hud_asset_identity_tests {
+    use super::*;
+
+    #[test]
+    fn extension_image_worker_records_which_games_assets_it_can_read() {
+        let base = PathBuf::from("test-game-root/base");
+        let jka = UiExtImageLoader::start(base.clone(), None, None);
+        let jk2_102 = UiExtImageLoader::start(base.clone(), None, Some(2));
+        let jk2_104 = UiExtImageLoader::start(base, None, Some(4));
+        assert_ne!(jka.jk2_version, jk2_102.jk2_version);
+        assert_ne!(jk2_102.jk2_version, jk2_104.jk2_version);
     }
 }

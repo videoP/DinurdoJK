@@ -231,6 +231,15 @@ impl App {
                 self.video.gen_normal_maps = defaults.gen_normal_maps;
                 self.mark_config_dirty();
             }
+            ui::VIDEO_ROW_POM => {
+                self.video.pom = defaults.pom;
+                self.render_command(RenderCommand::SetPom(self.video.pom));
+            }
+            ui::VIDEO_ROW_PBR_CUBEMAPS => {
+                self.video.pbr_cubemaps = defaults.pbr_cubemaps;
+                self.sync_pbr();
+                self.mark_config_dirty();
+            }
             ui::VIDEO_ROW_DELUXE_MAPPING => {
                 self.video.deluxe_mapping = defaults.deluxe_mapping;
                 self.sync_pbr();

@@ -130,6 +130,25 @@ pub(in crate::scene) fn reflection_probe_descriptors(
             probes.len()
         ));
     }
+    // TaystJK rend2 R_LoadWorldMap: use the first available entity class,
+    // rather than requiring a map to ship explicit misc_cubemap entities.
+    if probes.is_empty() {
+        for class in ["info_player_deathmatch", "info_player_start", "info_player_duel", "info_player_intermission"] {
+            for entity in &bsp.entities {
+                let classname = entity.get(b"classname").and_then(|v| std::str::from_utf8(v).ok());
+                if !classname.is_some_and(|v| v.eq_ignore_ascii_case(class)) { continue; }
+                if let Some(position) = entity.get(b"origin")
+                    .and_then(|v| std::str::from_utf8(v).ok()).and_then(parse_light_triplet) {
+                    probes.push(ReflectionProbeDescriptor { name: None, position, radius: 1000.0 });
+                }
+            }
+            if !probes.is_empty() {
+                warnings.push(format!("{map_name}: {} fallback reflection capture(s) from {class}", probes.len()));
+                break;
+            }
+        }
+    }
+    probes.truncate(128); // Rend2 R_RenderAllCubemaps limit.
     Ok(probes)
 }
 
@@ -158,21 +177,27 @@ pub(in crate::scene) fn load_reflection_probes(
 ) -> Result<Vec<ReflectionProbe>, String> {
     let descriptors = reflection_probe_descriptors(bsp, assets, map_name, warnings)?;
     let mut probes = Vec::new();
-    for (index, descriptor) in descriptors.into_iter().enumerate() {
+    for (index, descriptor) in descriptors.into_iter().take(128).enumerate() {
         let path = cubemap_asset_name(map_name, index, descriptor.name.as_deref());
+        let generated = ReflectionProbe {
+            label: format!("generated:{map_name}/{index:03}"),
+            position: render_position(descriptor.position), radius: descriptor.radius,
+            width: 256, height: 256, mip_level_count: 7,
+            // Empty pixels request GPU capture, not a constant fallback image.
+            rgba: Vec::new(),
+        };
         let Some(asset) = assets
             .read(&path, 128 * 1024 * 1024)
             .map_err(|error| error.to_string())?
         else {
-            warnings.push(format!(
-                "{map_name}: reflection probe image not found: {path}"
-            ));
+            probes.push(generated);
             continue;
         };
         let dds = match image_dds::ddsfile::Dds::read(std::io::Cursor::new(&asset.bytes)) {
             Ok(dds) => dds,
             Err(error) => {
                 warnings.push(format!("{map_name}: failed to parse {path}: {error}"));
+                probes.push(generated);
                 continue;
             }
         };
@@ -180,6 +205,7 @@ pub(in crate::scene) fn load_reflection_probes(
             Ok(decoded) => decoded,
             Err(error) => {
                 warnings.push(format!("{map_name}: failed to decode {path}: {error}"));
+                probes.push(generated);
                 continue;
             }
         };
@@ -188,6 +214,7 @@ pub(in crate::scene) fn load_reflection_probes(
                 "{map_name}: ignored {path}: expected 6-face square cubemap, got {}x{} depth={} layers={}",
                 decoded.width, decoded.height, decoded.depth, decoded.layers
             ));
+            probes.push(generated);
             continue;
         }
         probes.push(ReflectionProbe {
@@ -202,8 +229,8 @@ pub(in crate::scene) fn load_reflection_probes(
     }
     if !probes.is_empty() {
         warnings.push(format!(
-            "{map_name}: loaded {} Rend2 reflection cubemap(s)",
-            probes.len()
+            "{map_name}: {} reflection probe(s), {} request GPU capture",
+            probes.len(), probes.iter().filter(|p| p.rgba.is_empty()).count()
         ));
     }
     Ok(probes)

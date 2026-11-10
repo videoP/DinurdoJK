@@ -294,7 +294,7 @@ impl Renderer {
                 u32::from(self.pbr_enabled && PBR_PROFILE_MATERIALS),
                 u32::from(self.pbr_enabled && self.pom_enabled && PBR_PROFILE_PARALLAX_OCCLUSION),
                 40,
-                0,
+                self.world.as_ref().map_or(0, |world| world.pbr_baked_color_flags),
             ],
             deluxe: [
                 f32::from(self.pbr_enabled && self.deluxe_mapping_enabled),
@@ -321,10 +321,13 @@ impl Renderer {
     pub(in crate::renderer) fn set_pbr_settings(
         &mut self,
         enabled: bool,
+        cubemaps: bool,
         deluxe_mapping: bool,
         deluxe_specular: f32,
     ) {
         self.pbr_enabled = enabled;
+        self.pbr_cubemaps = cubemaps;
+        self.update_lighting_settings();
         self.deluxe_mapping_enabled = deluxe_mapping;
         self.deluxe_specular = deluxe_specular.clamp(0.0, 1.0);
         self.write_material_enhancement_settings();

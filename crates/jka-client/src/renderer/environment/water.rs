@@ -314,6 +314,7 @@ impl Renderer {
                     &self.lake_normal,
                 );
                 ocean.set_enabled(&self.queue, true);
+                ocean.set_sailing_sea(self.sailing_sea.as_deref());
                 self.ocean = Some(ocean);
             } else if let Some(ocean) = &mut self.ocean {
                 ocean.set_settings(&self.queue, self.ocean_settings);
@@ -328,12 +329,26 @@ impl Renderer {
         }
     }
 
+    pub(in crate::renderer) fn set_sailing_sea(
+        &mut self,
+        sea: Option<std::sync::Arc<jka_movement::SailingSea>>,
+    ) {
+        self.sailing_sea = sea;
+        if let Some(ocean) = &mut self.ocean {
+            ocean.set_sailing_sea(self.sailing_sea.as_deref());
+        }
+    }
+
     pub(in crate::renderer) fn set_authored_oceans(
         &mut self,
         descriptors: Vec<crate::ocean::authoring::AuthoredOcean>,
     ) {
         self.authored_ocean_definitions = descriptors.clone();
-        if !self.ocean_enabled {
+        // Native backends (Blue Water, Hybrid, Gerstner) draw water only through
+        // the shared ocean's promoted pools, and an authored instance would claim
+        // a pool it never draws. The app folds the map's values into the shared
+        // settings instead (`effective_ocean_settings`).
+        if !self.ocean_enabled || matches!(self.ocean_settings.backend, 1 | 2) {
             self.authored_oceans.clear();
             return;
         }
@@ -425,6 +440,7 @@ impl Renderer {
                     &self.lake_normal,
                 );
                 ocean.set_enabled(&self.queue, true);
+                ocean.set_sailing_sea(self.sailing_sea.as_deref());
                 self.ocean = Some(ocean);
             } else if let Some(ocean) = &mut self.ocean {
                 ocean.set_enabled(&self.queue, true);

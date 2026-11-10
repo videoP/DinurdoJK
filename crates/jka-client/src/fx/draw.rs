@@ -126,8 +126,10 @@ impl FxBlend {
             Self::DstColorAdd => DynamicModelAlphaMode::DstColorAdd,
             Self::Modulate2x => DynamicModelAlphaMode::Modulate2x,
             Self::Darken => DynamicModelAlphaMode::Darken,
-            Self::Screen => DynamicModelAlphaMode::BlendUnlit,
-            Self::Alpha | Self::Opaque => DynamicModelAlphaMode::BlendUnlit,
+            Self::Screen => DynamicModelAlphaMode::Screen,
+            Self::Alpha => DynamicModelAlphaMode::BlendUnlit,
+            // No blendFunc is an opaque pass, not a source-alpha fade.
+            Self::Opaque => DynamicModelAlphaMode::Opaque,
         }
     }
 }
@@ -1862,6 +1864,37 @@ mod tests {
             FxBlend::from_blend_func("GL_DST_COLOR GL_ONE"),
             FxBlend::DstColorAdd
         );
+    }
+
+    #[test]
+    fn screen_and_opaque_fx_stages_keep_authored_compositing_on_cpu_and_gpu() {
+        // EFX particles without useAlpha carry RGB intensity and a zero alpha
+        // byte. GL_ONE GL_ONE_MINUS_SRC_COLOR must not silently turn into
+        // SRC_ALPHA/ONE_MINUS_SRC_ALPHA (which makes the sprite disappear).
+        let draws = [FxDraw::Sprite {
+            shader_time: 0.0, origin: [100.0, 0.0, 0.0], radius: 4.0,
+            rotation: 0.0, rgba: [224, 96, 32, 0], shader: "screen".into(),
+        }];
+        let screen_stage = || vec![white(FxBlend::Screen)];
+        for surfaces in [
+            tessellate(&draws, &view(), &mut |_| screen_stage()),
+            tessellate_gpu_particles(&draws, &view(), &mut |_| screen_stage()),
+            tessellate_workers(&draws, &view(), &mut |_| screen_stage()),
+        ] {
+            assert_eq!(surfaces.len(), 1);
+            assert_eq!(surfaces[0].alpha_mode, DynamicModelAlphaMode::Screen);
+        }
+        let opaque_stage = || vec![white(FxBlend::Opaque)];
+        for surfaces in [
+            tessellate(&draws, &view(), &mut |_| opaque_stage()),
+            tessellate_gpu_particles(&draws, &view(), &mut |_| opaque_stage()),
+            tessellate_workers(&draws, &view(), &mut |_| opaque_stage()),
+        ] {
+            assert_eq!(surfaces.len(), 1);
+            assert_eq!(surfaces[0].alpha_mode, DynamicModelAlphaMode::Opaque);
+        }
+        assert_eq!(FxBlend::Screen.custom_shader_alpha_mode(), DynamicModelAlphaMode::Screen);
+        assert_eq!(FxBlend::Opaque.custom_shader_alpha_mode(), DynamicModelAlphaMode::Opaque);
     }
 
     #[test]

@@ -341,10 +341,14 @@ impl WorldPipelineVariant {
     /// stays `None`, and those batches take the map lookup exactly as before.
     pub(in crate::renderer) fn build_slot_pipelines(&mut self, keys: &[(PipelineKey, MaterialFragmentKey)]) {
         let resolved: Vec<_> = keys.iter()
-            .map(|&(key, fragment_key)| self.pipelines.contains_key(&key).then(|| {
-                let (binding, pipeline) = self.lookup_base_pipeline(key, fragment_key);
-                (binding, pipeline.clone())
-            }))
+            .map(|&(key, fragment_key)| {
+                (self.pipelines.contains_key(&key)
+                    || self.specialized_pipelines.contains_key(&(key, fragment_key)))
+                    .then(|| {
+                        let (binding, pipeline) = self.lookup_base_pipeline(key, fragment_key);
+                        (binding, pipeline.clone())
+                    })
+            })
             .collect();
         self.slot_pipelines = resolved;
     }
@@ -376,12 +380,15 @@ pub(in crate::renderer) struct VoxelProbeGiGpu {
 pub(in crate::renderer) struct GpuReflectionProbe {
     pub(in crate::renderer) _texture: wgpu::Texture,
     pub(in crate::renderer) view: wgpu::TextureView,
+    pub(in crate::renderer) capture_position: Option<[f32; 3]>,
 }
 
 pub(in crate::renderer) struct ReflectionProbeGpuSet {
     pub(in crate::renderer) probes: Vec<GpuReflectionProbe>,
     pub(in crate::renderer) sampler: wgpu::Sampler,
     pub(in crate::renderer) source_count: usize,
+    pub(in crate::renderer) capture_pending: bool,
+    pub(in crate::renderer) brdf_view: wgpu::TextureView,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -503,6 +510,10 @@ impl WorldGpu {
 }
 
 pub(in crate::renderer) struct WorldGpu {
+    /// Rend2 tr.hdrLighting is set only by authored HDR lightmaps, not by
+    /// promoting an ordinary lightmap into an FP16 GPU texture.
+    /// Bit 0: legacy baked color. Bit 1: LDR lightmap samples already UNORM.
+    pub(in crate::renderer) pbr_baked_color_flags: u32,
     /// Static BSP world-geometry centre (X,Z), for deterministic weather strikes.
     pub(in crate::renderer) weather_anchor: [f32; 2],
     pub(in crate::renderer) collision_mesh: Option<crate::renderer::collision_world::CollisionGpuMesh>,

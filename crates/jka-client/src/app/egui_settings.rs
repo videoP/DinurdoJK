@@ -146,6 +146,7 @@ fn pending_video_reset(key: &str) -> Option<theme::Reset> {
         "resolution" => theme::Reset::Video(ui::VIDEO_ROW_RESOLUTION),
         "voxel_probe_gi" => theme::Reset::Video(ui::VIDEO_ROW_VOXEL_PROBE_GI),
         "gen_normal_maps" => theme::Reset::Video(ui::VIDEO_ROW_GEN_NORMAL_MAPS),
+        "pom" | "cvar:r_pom" => theme::Reset::Video(ui::VIDEO_ROW_POM),
         "float_lightmap" => theme::Reset::Video(ui::VIDEO_ROW_FLOAT_LIGHTMAP),
         "picmip" => theme::Reset::Video(ui::VIDEO_ROW_PICMIP),
         "patch_subdivisions" | "cvar:r_subdivisions" => theme::Reset::Video(ui::VIDEO_ROW_PATCH_SUBDIVISIONS),

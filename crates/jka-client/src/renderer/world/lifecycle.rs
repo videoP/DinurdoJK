@@ -80,6 +80,17 @@ impl Renderer {
 
     fn load_map_internal(&mut self, mut map: PreparedMap, reuse: Option<usize>, resident: Option<StudioCachedWorld>, shared: Option<&crate::renderer::WorldGpu>) -> WorldUploadTimings {
         let load_map_started = Instant::now();
+        // A setting change can enqueue a costly PBR variant immediately before
+        // the application requests a map rebuild. Cancel the obsolete variant
+        // BEFORE beginning the new world's synchronous upload. Native driver
+        // calls cannot be interrupted, but the worker stops between PSOs.
+        self.pipeline_jobs.cancel_slot("world-variant", 0);
+        self.world_variant_pending = None;
+        if let Some(old) = &self.world {
+            self.world_pipeline_catalog.extend_from_variants(
+                &old.pipeline_variants, old.remap_scene_format, old.remap_msaa_samples,
+            );
+        }
         // Invalidate any on-demand collision render build for the previous BSP.
         // Never queue or construct a collision render mesh during map load.
         self.collision_world_job = None;
@@ -198,6 +209,16 @@ impl Renderer {
         initial_shader_variant.baked_sun_relight |= self.baked_sun_removal > 0.0 || self.baked_sun_removal_auto
             && !source_map && map.sun.is_some();
         initial_shader_variant.ray_traced_shadows = false;
+        initial_shader_variant.rt_receiver_glass = false;
+        // PBR/Hybrid PSOs can take seconds each on a cold Vulkan driver. Do not
+        // synchronously compile that entire permutation during world upload:
+        // install an exact, non-PBR raster fallback, then activate the desired
+        // shader variant through the existing cancellable background compiler.
+        // PBR textures and companion data are still uploaded normally below.
+        if initial_shader_variant.pbr {
+            initial_shader_variant = initial_shader_variant.initial_upload_fallback();
+            rverbose!(1, "[WORLD PSO] PBR requested: loading raster fallback; PBR pipeline compilation deferred");
+        }
 
         let detail_texture_by_base = build_auto_detail_by_base_texture(
             map.textures.len(),
@@ -267,6 +288,7 @@ impl Renderer {
             if self.bc_compression_supported { self.texture_compression } else { 0 },
             &mutable_images,
             self.bsp_model_lod_enabled,
+            &self.world_pipeline_catalog,
             map,
             if reuse.is_some() { self.world.as_ref() } else { shared },
             reuse.unwrap_or(if shared.is_some() { shared_texture_count } else { 0 }),
@@ -275,6 +297,9 @@ impl Renderer {
             self.rebuild_world_surface_bind_groups(&mut world);
         }
         world.refresh_pso_slots();
+        self.world_pipeline_catalog.extend_from_variants(
+            &world.pipeline_variants, world.remap_scene_format, world.remap_msaa_samples,
+        );
         upload_timings.pre_build_ms = pre_build_ms;
         let post_bind_started = Instant::now();
         world.cull_bind_group = Some(create_gpu_cull_bind_group(
@@ -315,6 +340,7 @@ impl Renderer {
         self.shadow_resources.rendered_generations = [0; crate::renderer::SHADOW_CASCADES];
         self.shadow_resources.last_csm_mode = None;
         self.world = Some(world);
+        self.write_material_enhancement_settings();
         // Both BSP and model shaders sample the same immutable map irradiance
         // volume. Rebind model materials only at map install (not each frame).
         self.dynamic_model_renderer.install_irradiance_volume(

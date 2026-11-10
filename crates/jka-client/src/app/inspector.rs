@@ -472,7 +472,20 @@ impl App {
         };
         let snapshot_client = ps.field_i32("clientNum").unwrap_or(0);
         let following = ps.field_i32("pm_flags").unwrap_or(0) & 4096 != 0;
-        let (viewer, alive) = if session.live || self.demo_view_mode == DemoViewMode::Authoritative
+        // Demo free camera and the cg_specHud 4 live free camera own no player:
+        // a static centre-ray scan from the camera, never a playerState muzzle.
+        let free_view = self.spectator_broadcast.free_active()
+            || (!session.live && self.demo_view_mode == DemoViewMode::Free);
+        let (viewer, alive) = if free_view {
+            (
+                CrosshairViewer {
+                    client: -1,
+                    team: TEAM_SPECTATOR,
+                    ..CrosshairViewer::default()
+                },
+                true,
+            )
+        } else if session.live || self.demo_view_mode == DemoViewMode::Authoritative
         {
             (
                 CrosshairViewer {
@@ -565,7 +578,7 @@ impl App {
         // the Rust equivalent of both is the newest cl.viewangles sample that the
         // renderer itself will late-latch. Do not substitute lerpAngles here: those
         // are intentionally only the third-person muzzle-offset basis.
-        let newest_input_angles = if following || self.live_remote_view_forced() {
+        let newest_input_angles = if following || free_view || self.live_remote_view_forced() {
             None
         } else {
             self.live_view_angles().or_else(|| {

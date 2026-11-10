@@ -16,8 +16,24 @@ Both backends use the existing recursive native lock.
 
 The JAPRO source is pinned to TaystJK revision
 [`b35ed06fec41c53644352743c6b199a5d5d500f3`](https://github.com/taysta/TaystJK/tree/b35ed06fec41c53644352743c6b199a5d5d500f3).
-The source import is byte-identical; adaptations are in the native host and
-forced-include namespace headers. The host preserves the reference's alias
+The source import is byte-identical except for the jaPRO sailing hunks below;
+other adaptations are in the native host and forced-include namespace headers.
+
+**jaPRO sailing (local fork exception).** The analytic ocean exists only in the
+local `D:/Code/jaPRO` `sailing` branch, so it is taken from there, not upstream:
+`codemp/game/bg_sailing.{c,h}` and `bg_weather.{c,h}` are copied unmodified, and
+`bg_pmove.c` carries that branch's swimmer hunks verbatim between
+`DinurdoJK: jaPRO sailing` markers (sample cache, `PM_SetWaterLevel` analytic
+contents, `PM_WaterMove` current/orbital-relative swimming and float spring,
+shallow-river current, waterspout wind). Boat, paddle and vehicle hunks are not
+ported (including `PM_SetWaterLevel`'s boat-rider exemption). The rest of the
+sailing branch's `bg_pmove.c` is not taken: it forked before upstream movement
+fixes this import already has. `native/japro_sailing.c` mirrors the jaPRO cgame's
+`SP_misc_sailing_ocean/shore/current` from the client's BSP lump, and Rust applies
+`CS_SAILING_OCEANS` (1660+i) through `BG_SailingApplyOceanWeatherString`. Rivers
+and waterspouts need runtime state (solved river field, snapshot waterspout) that
+is not fed yet, so those paths stay inactive. Refresh these files from the fork
+whenever its BG sailing code changes; prediction must match the server exactly. The host preserves the reference's alias
 between `pmove.ps` and `cg.predictedPlayerState`, including direct crouch-jump
 writes. It installs remote player velocities for the player collision fix.
 

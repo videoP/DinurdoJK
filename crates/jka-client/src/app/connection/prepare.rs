@@ -370,12 +370,6 @@ impl App {
     }
 
     pub(in crate::app) fn choose_missing_map_autodownload(&mut self) {
-        if self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some()) {
-            self.console_status = "JK2 AUTODOWNLOAD IS NOT IMPLEMENTED YET".into();
-            self.push_console_line("^3Install the JK2 map PK3 under fs_jk2basepath/base (or fs_jk2basepath/<modname> for a JK2 mod), then retry. JK2 downloads require their own package rules.");
-            self.egui_repaint_requested = true;
-            return;
-        }
         if !self.network.allow_http_downloads && !self.network.allow_legacy_downloads {
             self.console_status = "AUTODOWNLOAD IS DISABLED IN SETUP > NETWORK".into();
             self.push_console_line(
@@ -436,7 +430,13 @@ impl App {
         self.mouse_buttons_down.clear();
         self.last_mouse_motion_at = None;
         self.set_capture(false);
-        self.console_status = format!("MAP NOT FOUND: {map_name}");
+        self.console_status = if self.missing_map_prompt.as_ref().is_some_and(|prompt| {
+            prompt.reason.starts_with("Missing server-referenced PK3")
+        }) {
+            format!("MISSING SERVER PACKAGES: {map_name}")
+        } else {
+            format!("MAP NOT FOUND: {map_name}")
+        };
         self.egui_repaint_requested = true;
         self.publish_ui();
     }

@@ -64,6 +64,10 @@ pub struct VideoSettings {
     pub draw_hud: bool,
     /// TaystJK cg_tintHud: tint native status-HUD chrome red/blue in team games.
     pub tint_hud: bool,
+    /// Bucky MVSDK cg_drawInventory: owned JK2 items at upper right.
+    pub jk2_draw_inventory: bool,
+    /// Bucky MVSDK cg_enhancedFlagStatus: 0 off, 1 carrier, 2 carrier + time.
+    pub jk2_enhanced_flag_status: u8,
     /// 0: DinurdoJK panels; 1: Native multiplayer HUD from active JK2/JKA protocol.
     pub hud_style: u8,
     pub pvs_mode: PvsMode,
@@ -363,8 +367,10 @@ pub struct VideoSettings {
     /// 0/1 retain the legacy Off/On meaning; 2 selects realtime sky lighting.
     /// sun_override remains the master gate for legacy callers.
     pub relighting_mode: u8,
-    /// Simulated Relighting clock, 3 AM through the following 3 AM (3..27).
+    /// User's manual Relighting time, 3 AM through the following 3 AM (3..27).
     pub relight_time: f32,
+    /// Use the OS local clock. Realtime follows it; Baked samples only at map upload.
+    pub relight_match_system_time: bool,
     /// q3map azimuth in degrees: 0=east, 90=north.
     pub sun_yaw: f32,
     /// q3map elevation in degrees above the horizon.
@@ -593,6 +599,7 @@ pub struct VideoSettings {
     pub saber_marks: SaberMarkMode,
     /// Master switch for the complete Rend2-style PBR material profile.
     pub pbr: bool,
+    pub pbr_cubemaps: bool,
     /// Scope base-color replacements owned by PBR-enhanced MTR materials to
     /// PBR map preparation instead of letting them override classic rendering.
     pub allow_asset_overrides: bool,
@@ -757,6 +764,8 @@ impl Default for VideoSettings {
             draw_2d: true,
             draw_hud: true,
             tint_hud: true,
+            jk2_draw_inventory: true,
+            jk2_enhanced_flag_status: 2,
             hud_style: 0,
             pvs_mode: PvsMode::Auto,
             face_plane_cull: false,
@@ -942,6 +951,7 @@ impl Default for VideoSettings {
             sun_override: false,
             relighting_mode: 0,
             relight_time: 15.0,
+            relight_match_system_time: false,
             // Matches the renderer's legacy fallback direction when a map has no authored sun.
             sun_yaw: 314.25595,
             sun_pitch: 57.04725,
@@ -1098,6 +1108,7 @@ impl Default for VideoSettings {
             pbr: true,
             allow_asset_overrides: true,
             gen_normal_maps: false,
+            pbr_cubemaps: true,
             deluxe_mapping: true,
             deluxe_specular: 1.0,
             emissive_area_lights: false,

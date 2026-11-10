@@ -235,6 +235,7 @@ impl PlayerPresenter {
                     current_time,
                     true,
                     false,
+                    None,
                 )?;
             }
             // Apply the current interpolated pitch EVERY frame, including
