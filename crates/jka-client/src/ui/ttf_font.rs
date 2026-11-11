@@ -230,14 +230,24 @@ pub fn rasterize(bytes: &[u8]) -> Result<RasterizedFont, String> {
         .and_then(|id| face.glyph_hor_advance(id))
         .map_or(LINE_PIXELS * 0.25, |a| f32::from(a) * scale);
     let mut glyphs = [ProportionalGlyph::default(); 256];
+    // Slots 256.. are the Cyrillic block, kept only if the face has it:
+    // translated and filtered chat can then be drawn in Russian, Ukrainian...
+    let has_cyrillic = face.glyph_index('\u{416}').is_some();
+    let mut cyrillic = vec![ProportionalGlyph::default(); if has_cyrillic { super::text::CYRILLIC_COUNT } else { 0 }];
     let mut bitmaps = Vec::new();
-    for byte in (32u8..=126).chain(160..=255) {
-        let Some(id) = face.glyph_index(char::from(byte)) else {
-            glyphs[byte as usize].horiz_advance = space.round() as i16;
+    let byte_slots = (32u32..=126).chain(160..=255).map(|code| (code as usize, code));
+    let cyrillic_slots = (0..cyrillic.len()).map(|index| (256 + index, super::text::CYRILLIC_FIRST + index as u32));
+    for (slot, code) in byte_slots.chain(cyrillic_slots) {
+        let Some(id) = char::from_u32(code).and_then(|ch| face.glyph_index(ch)) else {
+            // A missing byte glyph still advances; a missing Cyrillic one
+            // stays empty so the caller falls back to `?`.
+            if slot < 256 {
+                glyphs[slot].horiz_advance = space.round() as i16;
+            }
             continue;
         };
         let advance = face.glyph_hor_advance(id).map_or(space, |a| f32::from(a) * scale);
-        let glyph = &mut glyphs[byte as usize];
+        let glyph = if slot < 256 { &mut glyphs[slot] } else { &mut cyrillic[slot - 256] };
         glyph.horiz_advance = advance.round().max(0.0) as i16;
         let mut outline = Outline { scale, offset: [0.0; 2], start: [0.0; 2], last: [0.0; 2], lines: Vec::new() };
         let Some(bounds) = face.outline_glyph(id, &mut NullBuilder) else {
@@ -255,7 +265,7 @@ pub fn rasterize(bytes: &[u8]) -> Result<RasterizedFont, String> {
         glyph.horiz_offset = left as i16;
         glyph.baseline = top;
         bitmaps.push(GlyphBitmap {
-            byte: byte as usize,
+            byte: slot,
             width,
             height,
             coverage: rasterize_lines(&outline.lines, width as usize, height as usize),
@@ -288,7 +298,7 @@ pub fn rasterize(bytes: &[u8]) -> Result<RasterizedFont, String> {
             let source = &bitmap.coverage[row * bitmap.width as usize..][..bitmap.width as usize];
             alpha[(py as usize + row) * aw + px as usize..][..source.len()].copy_from_slice(source);
         }
-        let glyph = &mut glyphs[bitmap.byte];
+        let glyph = if bitmap.byte < 256 { &mut glyphs[bitmap.byte] } else { &mut cyrillic[bitmap.byte - 256] };
         glyph.s = px as f32 / aw as f32;
         glyph.t = py as f32 / ah as f32;
         glyph.s2 = (px + bitmap.width) as f32 / aw as f32;
@@ -318,7 +328,7 @@ pub fn rasterize(bytes: &[u8]) -> Result<RasterizedFont, String> {
         height: atlas_height,
         mip_level_count,
         rgba,
-        font: ProportionalFont { glyphs, point_size: LINE_PIXELS as i16, height: LINE_PIXELS as i16 },
+        font: ProportionalFont { glyphs, point_size: LINE_PIXELS as i16, height: LINE_PIXELS as i16, cyrillic },
     })
 }
 
@@ -358,6 +368,9 @@ mod tests {
         let m = font.font.glyphs[b'M' as usize];
         assert!(m.width > 20 && m.height > 30 && m.horiz_advance > 20, "{m:?}");
         assert!(font.font.glyphs[b' ' as usize].horiz_advance > 0);
+        let zhe = font.font.wide_glyph('Ж').expect("Segoe UI has Cyrillic");
+        assert!(zhe.width > 20 && zhe.s2 > zhe.s, "{zhe:?}");
+        assert!(font.font.wide_glyph('你').is_none());
         assert_eq!(font.rgba.len() % 4, 0);
         assert!(font.rgba.chunks_exact(4).any(|p| p[3] == 255));
     }

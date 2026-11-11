@@ -71,6 +71,7 @@ impl App {
                 self.egui_scoreboard_settings(ui);
                 self.egui_chat_settings(ui);
                 self.egui_chat_translation_settings(ui);
+                self.egui_chat_filter_settings(ui);
 
                 theme::section(
                     ui,

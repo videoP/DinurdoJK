@@ -50,6 +50,16 @@ const PRIVATE_MASK: &str = "^7[PRIVATE MESSAGE] ********";
 const TEAM_MASK: &str = "^7[TEAM CHAT] ********";
 const CONSOLE_MASK: &str = "********";
 
+/// Unconditional, whatever the privacy switches say: the received text of a
+/// filtered or translated chat line, and the cursor that reveals it, exist
+/// for the local window only. Call on every snapshot painted for the stream.
+pub fn strip_local_only(snapshot: &mut UiSnapshot) {
+    snapshot.chat_anim.pointer = None;
+    for line in &mut snapshot.chat_lines {
+        line.original = None;
+    }
+}
+
 /// Operates on a snapshot exclusively owned by the OBS presenter. Keep local
 /// snapshots untouched, including the local console's command input/cursor.
 pub fn redact_stream_snapshot(snapshot: &mut UiSnapshot, options: StreamerSettings) {
@@ -124,10 +134,14 @@ pub fn redact_stream_transients(
 ) {
     if !options.enabled { return; }
     for line in chat {
+        // The local preview of the stream must not reveal it either.
+        line.original = None;
         if options.hide_team_chat && line.team {
             line.text = TEAM_MASK.to_owned();
+            line.flags = 0;
         } else if options.hide_private_messages && is_private_message(&line.text) {
             line.text = PRIVATE_MASK.to_owned();
+            line.flags = 0;
         }
     }
     for line in notify {
@@ -154,7 +168,7 @@ mod tests {
     #[test]
     fn stream_only_snapshot_does_not_modify_source() {
         let original = crate::ui::UiSnapshot {
-            chat_lines: vec![crate::ui::UiChatLine { text: "^5Luke^7]: ^6secret".into(), alpha: 1.0, team: false, enter: 1.0 }],
+            chat_lines: vec![crate::ui::UiChatLine { text: "^5Luke^7]: ^6secret".into(), alpha: 1.0, team: false, enter: 1.0, ..Default::default() }],
             console_lines: vec!["/connect secret.server".into(), "^5Luke^7]: ^6secret".into()],
             console_input: "rcon password".into(),
             console_status: "secret.server".into(),
@@ -187,8 +201,8 @@ mod tests {
             chat_mode: crate::ui::ChatMode::Team,
             chat_input: "secret tactic".into(),
             chat_lines: vec![
-                crate::ui::UiChatLine { text: "^5Teammate^7: ^5rush left".into(), alpha: 1.0, team: true, enter: 1.0 },
-                crate::ui::UiChatLine { text: "Public: let's talk team tactics".into(), alpha: 1.0, team: false, enter: 1.0 },
+                crate::ui::UiChatLine { text: "^5Teammate^7: ^5rush left".into(), alpha: 1.0, team: true, enter: 1.0, ..Default::default() },
+                crate::ui::UiChatLine { text: "Public: let's talk team tactics".into(), alpha: 1.0, team: false, enter: 1.0, ..Default::default() },
             ],
             console_lines: vec![
                 "^5Teammate^7: ^5rush left".into(),
@@ -240,7 +254,7 @@ mod tests {
         let mut snapshot = UiSnapshot {
             chat_mode: crate::ui::ChatMode::Team,
             chat_input: "private team input".into(),
-            chat_lines: vec![crate::ui::UiChatLine { text: "^5Luke^7]: ^6secret".into(), alpha: 1.0, team: true, enter: 1.0 }],
+            chat_lines: vec![crate::ui::UiChatLine { text: "^5Luke^7]: ^6secret".into(), alpha: 1.0, team: true, enter: 1.0, ..Default::default() }],
             console_notify_lines: vec![crate::ui::UiConsoleNotifyLine { text: "team secret".into(), team: true }],
             console_lines: vec!["rcon password".into()],
             console_input: "tell 2 secret".into(),
@@ -256,6 +270,32 @@ mod tests {
         assert_eq!(snapshot.console_input, "tell 2 secret");
         assert_eq!(snapshot.console_status, "secret.server");
     }
+    #[test]
+    fn stream_snapshot_never_carries_the_received_text_of_a_filtered_line() {
+        let line = crate::ui::UiChatLine {
+            text: "Bob: you ***".into(),
+            alpha: 1.0,
+            enter: 1.0,
+            flags: crate::ui::CHAT_FLAG_CENSORED,
+            original: Some("Bob: you muppet".into()),
+            ..Default::default()
+        };
+        let mut snapshot = UiSnapshot { chat_lines: vec![line.clone()], ..Default::default() };
+        snapshot.chat_anim.pointer = Some([10.0, 10.0]);
+        // Even with streamer privacy switched off.
+        strip_local_only(&mut snapshot);
+        redact_stream_snapshot(&mut snapshot, StreamerSettings { enabled: false, ..Default::default() });
+        assert_eq!(snapshot.chat_lines[0].original, None);
+        assert_eq!(snapshot.chat_anim.pointer, None);
+        // The mark itself stays: viewers may know a line was filtered.
+        assert_eq!(snapshot.chat_lines[0].flags, crate::ui::CHAT_FLAG_CENSORED);
+        assert_eq!(snapshot.chat_lines[0].text, "Bob: you ***");
+        // The local preview of the stream drops it as well.
+        let mut preview = vec![line];
+        redact_stream_transients(&mut preview, &mut [], StreamerSettings { enabled: true, ..Default::default() });
+        assert_eq!(preview[0].original, None);
+    }
+
     #[test]
     fn separate_toggles() {
         let mut snapshot = crate::ui::UiSnapshot {

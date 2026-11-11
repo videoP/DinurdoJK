@@ -16,16 +16,20 @@ pub enum ProviderKind {
     DeepL,
     /// Self-hosted or public LibreTranslate at `cg_chatTranslateUrl`.
     Libre,
+    /// A language model running in the game process (`jka-llm`). Nothing is
+    /// sent anywhere; the model file is downloaded once.
+    Local,
 }
 
 impl ProviderKind {
-    pub const ALL: [Self; 3] = [Self::MyMemory, Self::DeepL, Self::Libre];
+    pub const ALL: [Self; 4] = [Self::MyMemory, Self::DeepL, Self::Libre, Self::Local];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::MyMemory => "mymemory",
             Self::DeepL => "deepl",
             Self::Libre => "libretranslate",
+            Self::Local => "local",
         }
     }
 
@@ -34,6 +38,7 @@ impl ProviderKind {
             Self::MyMemory => "MyMemory",
             Self::DeepL => "DeepL",
             Self::Libre => "LibreTranslate",
+            Self::Local => "Local model",
         }
     }
 
@@ -42,6 +47,7 @@ impl ProviderKind {
             "mymemory" | "0" => Some(Self::MyMemory),
             "deepl" | "1" => Some(Self::DeepL),
             "libretranslate" | "libre" | "2" => Some(Self::Libre),
+            "local" | "llm" | "3" => Some(Self::Local),
             _ => None,
         }
     }
@@ -49,7 +55,7 @@ impl ProviderKind {
     /// Windows Credential Manager entry holding this service's API key.
     pub fn secret_name(self) -> Option<&'static str> {
         match self {
-            Self::MyMemory => None,
+            Self::MyMemory | Self::Local => None,
             Self::DeepL => Some("chat-translate/deepl"),
             Self::Libre => Some("chat-translate/libretranslate"),
         }
@@ -60,7 +66,14 @@ impl ProviderKind {
         match self {
             Self::MyMemory => 400,
             Self::DeepL | Self::Libre => 100,
+            // The model thread takes one job at a time anyway.
+            Self::Local => 0,
         }
+    }
+
+    /// Whether message text leaves this computer.
+    pub fn online(self) -> bool {
+        self != Self::Local
     }
 }
 
@@ -69,6 +82,9 @@ pub struct ProviderConfig {
     pub kind: ProviderKind,
     pub libre_url: String,
     pub key: Option<String>,
+    /// Model address and instruction for `ProviderKind::Local`.
+    pub local_url: String,
+    pub local_prompt: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -90,6 +106,7 @@ pub fn translate(config: &ProviderConfig, request: &Request) -> Result<Translate
         ProviderKind::MyMemory => mymemory(request),
         ProviderKind::DeepL => deepl(config, request),
         ProviderKind::Libre => libre(config, request),
+        ProviderKind::Local => local(config, request),
     }?;
     let text = super::text::sanitize_result(&result.text);
     if text.is_empty() {
@@ -243,6 +260,20 @@ fn libre(config: &ProviderConfig, request: &Request) -> Result<Translated, Strin
     }
     let text = value["translatedText"].as_str().ok_or("LibreTranslate sent no translation")?;
     Ok(Translated { text: text.to_owned(), detected: value["detectedLanguage"]["language"].as_str().map(str::to_owned) })
+}
+
+/// Blocks this translation worker until the model thread has answered.
+fn local(config: &ProviderConfig, request: &Request) -> Result<Translated, String> {
+    let job = crate::chat_llm::translate_job(
+        &config.local_url,
+        &config.local_prompt,
+        request.source,
+        request.target,
+        &request.text,
+    );
+    let answer = jka_llm::engine().generate(job)?;
+    let text = crate::chat_llm::read_translation(&answer).ok_or("the model gave no translation")?;
+    Ok(Translated { text, detected: None })
 }
 
 #[cfg(test)]

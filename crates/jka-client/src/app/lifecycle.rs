@@ -2116,6 +2116,18 @@ impl ApplicationHandler<UserEvent> for App {
             crate::thread_activity::Task::Input,
         );
 
+        // chatSummary without a time covers the stretch with no input at all.
+        match &event {
+            WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => {
+                self.chat_llm.note_input(Instant::now());
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.chat_llm.note_input(Instant::now());
+                self.chat_hover_moved((position.x, position.y));
+            }
+            _ => {}
+        }
+
         if self.renderer_restart_suspended {
             // Still service native window/display events so wgpu surface
             // replacement and CloseRequested continue working. Ignore ALL
@@ -3279,6 +3291,10 @@ impl ApplicationHandler<UserEvent> for App {
     ) {
         if headless() || self.demo_video_export.is_some() || self.renderer_restart_suspended {
             return;
+        }
+        // Mouse look while captured arrives here, not as a window event.
+        if self.window_focused && matches!(event, DeviceEvent::MouseMotion { .. } | DeviceEvent::Button { .. }) {
+            self.chat_llm.note_input(Instant::now());
         }
         if self.render_studio.navigation.looking {
             if !self.studio_navigation_available() {

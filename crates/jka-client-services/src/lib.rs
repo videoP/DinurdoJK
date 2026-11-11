@@ -14,6 +14,7 @@ macro_rules! eprintln {
     ($($arg:tt)*) => { jka_render_core::log::write_line(true, format_args!($($arg)*)) };
 }
 
+pub mod chat_llm;
 pub mod chat_translation;
 pub mod clipboard;
 pub mod credential_store;

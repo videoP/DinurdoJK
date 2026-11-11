@@ -9023,10 +9023,12 @@ impl Renderer {
         // overlays. Draw the native UI first so its late HUD/scoreboard passes
         // cannot cover either of them. In particular, the HL2 console must be
         // above the gameplay HUD even when SMAA, HDR, streaming or CRT defers
-        // the native UI. Keep the existing order for all other egui pages and
-        // for the classic (native WGPU) console.
-        let egui_over_native_ui = self.egui_active && (self.ui_state.loading.is_some()
-            || (self.ui_state.mode == ui::OverlayMode::Console && self.ui_state.console_hl2));
+        // the native UI. The classic (native WGPU) console is opaque, and the
+        // only egui drawn with it is the chat row's right-click popup, which
+        // has to end up over the console as well. Keep the existing order for
+        // all other egui pages.
+        let egui_over_native_ui = self.egui_active
+            && (self.ui_state.loading.is_some() || self.ui_state.mode == ui::OverlayMode::Console);
         if !egui_over_native_ui {
             if legacy_hdr_ui {
                 let perf_ui_call_started = perf_timing.then(Instant::now);

@@ -96,6 +96,7 @@ impl App {
         }
         self.poll_background_results();
         self.poll_chat_translations();
+        self.poll_chat_llm();
         // Still drain map-worker results needed to make the replacement frame,
         // but do not run CGame, local Pmove, demo advancement, audio or network
         // usercmd generation while the graphics subsystem is unavailable.

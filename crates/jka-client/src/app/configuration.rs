@@ -133,6 +133,7 @@ impl App {
             scoreboard: self.scoreboard_settings,
             chat: self.chat_settings,
             chat_translate: self.chat_translation.settings.clone(),
+            chat_llm: self.chat_llm.settings.clone(),
             network: self.network.clone(),
             japro: self.japro_cg,
             master_servers: self.server_browser_for(crate::server_browser::BrowserProtocol::Jka).master_servers.clone(),

@@ -164,6 +164,7 @@ impl App {
             demo_elapsed_ms: self.current_demo_elapsed_ms(now),
             chat_id: None,
             translation: None,
+            censor: None,
         });
         self.last_chat_refresh = Instant::now();
     }

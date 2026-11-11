@@ -508,6 +508,7 @@ mod tests {
             glyphs: [glyph; 256],
             point_size: 9,
             height: 9,
+            cyrillic: Vec::new(),
         };
         super::super::studio_race::draw(&mut out, &race, Some(&font), 1280, 720);
         // Existing 1 MiB transient buffer. World names are capped at 16

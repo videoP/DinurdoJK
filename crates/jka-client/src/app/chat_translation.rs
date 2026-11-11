@@ -35,6 +35,23 @@ pub(in crate::app) enum TranslationState {
     Failed(String),
 }
 
+/// What the chat filter (`cg_chatCensor`) made of a received line.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(in crate::app) enum Censor {
+    /// Not checked: the filter is off or had nothing to look at.
+    #[default]
+    None,
+    /// Waiting for the model. `held` keeps the text off screen meanwhile.
+    Pending { held: bool },
+    Clean,
+    /// `body` replaces the message text. `hidden` means the whole message
+    /// was withheld, so a translation of it is not shown either.
+    Censored { body: String, hidden: bool },
+}
+
+/// Chat-box and console stand-in for a message the filter is still checking.
+pub(in crate::app) const CENSOR_PENDING: &str = "^9...";
+
 pub(in crate::app) struct ChatMessage {
     id: u64,
     kind: crate::cgame::ChatKind,
@@ -57,6 +74,9 @@ pub(in crate::app) struct ChatMessage {
     show_original: bool,
     /// What the message part of its stored console rows currently reads.
     console_shown: String,
+    pub(in crate::app) censor: Censor,
+    /// The shown translation had words masked by the filter.
+    translation_censored: bool,
 }
 
 /// A received chat line, as `notices` hands it over.
@@ -80,6 +100,34 @@ pub(in crate::app) struct ChatRecordTranslation {
     hud: Option<String>,
     marker: String,
     show_original: bool,
+    /// The filter masked words in the translation.
+    censored: bool,
+}
+
+/// What a chat-box record shows instead of the received text while the
+/// filter holds or has changed it.
+#[derive(Debug, Clone)]
+pub(in crate::app) struct ChatRecordCensor {
+    /// Displayed text up to the body, including the body colour code.
+    prefix: String,
+    body: String,
+    /// The filter objected (as opposed to still checking).
+    flagged: bool,
+    hidden: bool,
+}
+
+/// Chat-box line marks, drawn as icons before the sender's name.
+pub(in crate::app) const FLAG_CENSORED: u8 = crate::ui::CHAT_FLAG_CENSORED;
+pub(in crate::app) const FLAG_TRANSLATED: u8 = crate::ui::CHAT_FLAG_TRANSLATED;
+
+/// A chat-box record as it is drawn.
+pub(in crate::app) struct HudChat {
+    pub(in crate::app) text: String,
+    /// Second line for `Display::Both`.
+    pub(in crate::app) below: Option<String>,
+    pub(in crate::app) flags: u8,
+    /// The line as received, for the local-only hover; set when `flags` is.
+    pub(in crate::app) original: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -135,6 +183,9 @@ pub(in crate::app) struct ChatTranslation {
     config: Option<Arc<ProviderConfig>>,
     in_session: bool,
     cjk_font: CjkFont,
+    /// Model address and instruction for the local provider, copied from
+    /// the `cg_chatLlm*` settings.
+    pub(in crate::app) local_model: (String, String),
     rules: HashMap<i32, PlayerRule>,
     /// Classic console right-click menu: message id and cursor position in
     /// physical pixels.
@@ -172,6 +223,19 @@ impl ChatTranslation {
         self.messages.get_mut(index)
     }
 
+    pub(in crate::app) fn message_ref(&self, id: u64) -> Option<&ChatMessage> {
+        self.message(id)
+    }
+
+    pub(in crate::app) fn message_mut_ref(&mut self, id: u64) -> Option<&mut ChatMessage> {
+        self.message_mut(id)
+    }
+
+    /// Forget the cached provider settings (they changed).
+    pub(in crate::app) fn drop_config(&mut self) {
+        self.config = None;
+    }
+
     fn rule_for(&self, message: &ChatMessage) -> Option<&PlayerRule> {
         let rule = self.rules.get(&message.sender?)?;
         (!message.sender_name.is_empty() && rule.name == message.sender_name).then_some(rule)
@@ -191,9 +255,10 @@ impl ChatTranslation {
     fn config(&mut self) -> Arc<ProviderConfig> {
         let kind = self.settings.provider;
         let libre_url = self.settings.libre_url.clone();
+        let (local_url, local_prompt) = self.local_model.clone();
         Arc::clone(self.config.get_or_insert_with(|| {
             let key = kind.secret_name().and_then(|name| crate::credential_store::read_secret(name).ok().flatten());
-            Arc::new(ProviderConfig { kind, libre_url, key })
+            Arc::new(ProviderConfig { kind, libre_url, key, local_url, local_prompt })
         }))
     }
 
@@ -228,21 +293,92 @@ fn marker(source: Option<&str>, target: &str) -> String {
 /// the HL2 console can show any translation.
 fn console_text(display: Display, message: &ChatMessage, unicode: bool) -> Option<String> {
     let TranslationState::Done { source, target, text } = &message.state else { return None };
-    if message.show_original {
+    if message.show_original || message.hidden() {
         return None;
     }
     let marker = marker(source.as_deref(), target);
     let shown = if unicode { Some(text.clone()) } else { text::hud_text(text) };
+    let line = message.shown_line();
     let Some(shown) = shown else {
-        return Some(format!("{} {marker}^9 (HL2 console)", message.text));
+        return Some(format!("{line} {marker}^9 (HL2 console)"));
     };
     Some(match (display, message.body_start) {
-        (Display::Both, _) | (_, None) => format!("{} {marker}^7 {shown}", message.text),
+        (Display::Both, _) | (_, None) => format!("{line} {marker}^7 {shown}"),
         (_, Some(start)) => {
             let prefix: String = message.text.chars().take(start).collect();
             format!("{prefix}{shown} {marker}")
         }
     })
+}
+
+impl ChatMessage {
+    pub(in crate::app) fn sender(&self) -> (Option<i32>, &str) {
+        (self.sender, &self.sender_label)
+    }
+
+    pub(in crate::app) fn team(&self) -> bool {
+        self.team
+    }
+
+    pub(in crate::app) fn is_voice(&self) -> bool {
+        self.kind == crate::cgame::ChatKind::Voice
+    }
+
+    /// The line exactly as received.
+    pub(in crate::app) fn received_line(&self) -> &str {
+        &self.text
+    }
+
+    fn prefix(&self) -> String {
+        self.body_start.map_or_else(String::new, |start| self.text.chars().take(start).collect())
+    }
+
+    /// The message body as received (the whole line when the sender could
+    /// not be separated), still in wire form.
+    pub(in crate::app) fn body(&self) -> String {
+        match self.body_start {
+            Some(start) => self.text.chars().skip(start).collect(),
+            None => self.text.clone(),
+        }
+    }
+
+    fn hidden(&self) -> bool {
+        matches!(self.censor, Censor::Censored { hidden: true, .. })
+    }
+
+    /// The received line as it may be shown: unchanged, held back, or with
+    /// the filter's text in place of the body. Never a translation.
+    pub(in crate::app) fn shown_line(&self) -> String {
+        match &self.censor {
+            Censor::Pending { held: true } => format!("{}{CENSOR_PENDING}", self.prefix()),
+            // Console rows are byte text: a body kept in Cyrillic for the
+            // chat box falls back to the bare mask here.
+            Censor::Censored { body, .. } => {
+                let latin = text::hud_text(body);
+                format!("{}{}", self.prefix(), latin.as_deref().unwrap_or(crate::chat_llm::MASK))
+            }
+            _ => self.text.clone(),
+        }
+    }
+
+    /// Tell the message what its console row was first printed as.
+    pub(in crate::app) fn set_console_shown(&mut self, shown: String) {
+        self.console_shown = shown;
+    }
+
+    /// What the chat-box record needs to mirror `shown_line`.
+    pub(in crate::app) fn record_censor(&self, record_text: &str) -> Option<ChatRecordCensor> {
+        let prefix = || self.body_start.map_or_else(String::new, |start| record_text.chars().take(start).collect());
+        match &self.censor {
+            Censor::Pending { held: true } => {
+                Some(ChatRecordCensor { prefix: prefix(), body: CENSOR_PENDING.to_owned(), flagged: false, hidden: false })
+            }
+            Censor::Censored { body, hidden } => {
+                Some(ChatRecordCensor { prefix: prefix(), body: body.clone(), flagged: true, hidden: *hidden })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Decide whether and how to translate; `Err` is the reason not to.
@@ -274,6 +410,12 @@ fn plan(settings: &ct::Settings, message: &ChatMessage, ask: Ask, hint: Option<&
             return Err(reason.to_owned());
         }
     }
+    // A web service is only asked when the detector is confident, to spare
+    // its quota and keep chat off the network. The local model costs neither:
+    // it gets every line that is not clearly the target language already, and
+    // a translation that comes back unchanged is dropped (see
+    // `finish_chat_translation`).
+    let local = settings.provider == ct::ProviderKind::Local;
     let target = lang::resolve_target(&settings.target);
     let target_script = lang::find(target).map_or(lang::Script::Latin, |language| language.script);
     let already = || Err(format!("already {}", lang::name(target)));
@@ -281,7 +423,7 @@ fn plan(settings: &ct::Settings, message: &ChatMessage, ask: Ask, hint: Option<&
         None => match hint {
             Some(hint) if hint == target && ask != Ask::Manual => return already(),
             Some(hint) if hint != target => Some(hint),
-            _ if ask == Ask::Auto => return Err("no language detected".to_owned()),
+            _ if ask == Ask::Auto && !local => return Err("no language detected".to_owned()),
             _ => None,
         },
         Some(detection) => {
@@ -298,7 +440,7 @@ fn plan(settings: &ct::Settings, message: &ChatMessage, ask: Ask, hint: Option<&
                 } else {
                     Some(hint)
                 }
-            } else if detection.code == Some(target) && (sure || detection.script == target_script) {
+            } else if detection.code == Some(target) && (sure || (!local && detection.script == target_script)) {
                 if ask != Ask::Manual {
                     return already();
                 }
@@ -309,7 +451,7 @@ fn plan(settings: &ct::Settings, message: &ChatMessage, ask: Ask, hint: Option<&
                 detection.code.filter(|_| detection.confidence >= 0.5)
             } else if sure && detection.code.is_some() {
                 detection.code
-            } else if ask == Ask::Auto {
+            } else if ask == Ask::Auto && !local {
                 return Err("language uncertain".to_owned());
             } else {
                 None
@@ -319,17 +461,40 @@ fn plan(settings: &ct::Settings, message: &ChatMessage, ask: Ask, hint: Option<&
     Ok(Request { source, target, text })
 }
 
-/// Chat-box text for a record: the line itself, or its translated form, plus
-/// an optional second line for `Both`.
-pub(in crate::app) fn hud_chat_text(display: Display, record: &ChatRecord) -> (String, Option<String>) {
-    let Some(translation) = record.translation.as_ref().filter(|t| !t.show_original && display != Display::Original) else {
-        return (record.text.clone(), None);
+/// A chat-box record as drawn: the line itself, the filter's version of it,
+/// or its translated form, plus an optional second line for `Both`.
+///
+/// `wide` says the chat box can draw Cyrillic (the docked styles): the hover
+/// then shows the received line decoded instead of byte for byte.
+pub(in crate::app) fn hud_chat(display: Display, record: &ChatRecord, wide: bool) -> HudChat {
+    let censor = record.censor.as_ref();
+    let line = censor.map_or_else(|| record.text.clone(), |censor| format!("{}{}", censor.prefix, censor.body));
+    let mut flags = if censor.is_some_and(|censor| censor.flagged) { FLAG_CENSORED } else { 0 };
+    let translation = record
+        .translation
+        .as_ref()
+        .filter(|t| !t.show_original && display != Display::Original)
+        // A withheld message stays withheld in every language.
+        .filter(|_| !censor.is_some_and(|censor| censor.hidden));
+    let (text, below) = match translation {
+        None => (line, None),
+        Some(translation) => {
+            flags |= FLAG_TRANSLATED;
+            if translation.censored {
+                flags |= FLAG_CENSORED;
+            }
+            match (&translation.hud, display) {
+                (Some(hud), Display::Both) => (line, Some(format!("  {}^7 {hud}", translation.marker))),
+                (Some(hud), _) => (format!("{}{hud} {}", translation.prefix, translation.marker), None),
+                (None, _) => (format!("{line} {}^9 (HL2 console)", translation.marker), None),
+            }
+        }
     };
-    match (&translation.hud, display) {
-        (Some(hud), Display::Both) => (record.text.clone(), Some(format!("  {}^7 {hud}", translation.marker))),
-        (Some(hud), _) => (format!("{}{hud} {}", translation.prefix, translation.marker), None),
-        (None, _) => (format!("{} {}^9 (HL2 console)", record.text, translation.marker), None),
-    }
+    let original = (flags != 0).then(|| {
+        let decoded = text::decode(&crate::cgame::text_to_jka_bytes(&record.text), ct::Codepage::Auto);
+        text::hud_text_wide(&decoded, true).filter(|_| wide).unwrap_or_else(|| record.text.clone())
+    });
+    HudChat { text, below, flags, original }
 }
 
 impl App {
@@ -363,6 +528,8 @@ impl App {
             state: TranslationState::None,
             show_original: false,
             console_shown: chat.text.to_owned(),
+            censor: Censor::None,
+            translation_censored: false,
         });
         state.next_id
     }
@@ -375,7 +542,12 @@ impl App {
             return;
         }
         let Some(message) = state.message(id) else { return };
-        if message.kind == crate::cgame::ChatKind::Voice || message.own {
+        if message.kind == crate::cgame::ChatKind::Voice {
+            return;
+        }
+        // cg_chatTranslateIgnoreSelf: you know what you wrote. A message of
+        // your own can still be translated by hand from the console.
+        if message.own && self.chat_llm.settings.translate_ignore_self {
             return;
         }
         let ask = match state.rule_for(message).map_or(RuleMode::Default, |rule| rule.mode) {
@@ -418,7 +590,7 @@ impl App {
         let key = ct::Key { provider: config.kind, request };
         match state.translator.submit(key, id, &config) {
             Submit::Cached(translated) => {
-                self.finish_chat_translation(id, Ok(translated));
+                self.filter_then_finish_chat_translation(id, Ok(translated));
                 self.publish_transient_ui();
             }
             Submit::Pending => {}
@@ -430,8 +602,11 @@ impl App {
         }
     }
 
-    fn finish_chat_translation(&mut self, id: u64, result: Result<Translated, String>) {
+    /// `censored` says the filter masked words in this translation.
+    pub(in crate::app) fn finish_chat_translation(&mut self, id: u64, result: Result<Translated, String>, censored: bool) {
         let display = self.chat_translation.settings.display;
+        let (codepage, max_chars) =
+            (self.chat_translation.settings.codepage, usize::from(self.chat_translation.settings.max_chars));
         let Some(message) = self.chat_translation.message_mut(id) else { return };
         let TranslationState::Pending { source, target, ask } = message.state else { return };
         let translated = match result {
@@ -446,11 +621,22 @@ impl App {
             message.state = TranslationState::Skipped(format!("already {}", lang::name(target)));
             return;
         }
+        // The message came back as it went in: it was the target language.
+        let same = |a: &str, b: &str| {
+            let fold = |value: &str| -> String { value.chars().filter(|ch| ch.is_alphanumeric()).flat_map(char::to_lowercase).collect() };
+            fold(a) == fold(b)
+        };
+        let sent = text::provider_text(&crate::cgame::text_to_jka_bytes(&message.body()), codepage, max_chars);
+        if ask != Ask::Manual && same(&sent, &translated.text) {
+            message.state = TranslationState::Skipped(format!("already {}", lang::name(target)));
+            return;
+        }
         let marker = marker(source.as_deref(), target);
-        let hud = text::hud_text(&translated.text);
+        let hud = text::hud_text_wide(&translated.text, self.chat_settings.docked());
         message.show_original = display == Display::Original && ask == Ask::Auto;
         let show_original = message.show_original;
         let body_start = message.body_start;
+        message.translation_censored = censored;
         message.state = TranslationState::Done { source, target, text: translated.text };
         if matches!(target, "zh" | "ja" | "ko") && matches!(self.chat_translation.cjk_font, CjkFont::NotNeeded) {
             self.chat_translation.cjk_font = load_cjk_font(target);
@@ -459,7 +645,7 @@ impl App {
         // line is not revived, the console keeps the translation.
         if let Some(record) = self.chat_lines.iter_mut().find(|record| record.chat_id == Some(id)) {
             let prefix = body_start.map_or_else(String::new, |start| record.text.chars().take(start).collect());
-            record.translation = Some(ChatRecordTranslation { prefix, hud, marker, show_original });
+            record.translation = Some(ChatRecordTranslation { prefix, hud, marker, show_original, censored });
         }
         self.sync_console_chat_rows(Some(id));
     }
@@ -473,6 +659,8 @@ impl App {
                 // Player rules are per connection: slots mean nothing elsewhere.
                 self.chat_translation.rules.clear();
                 self.cancel_chat_translations();
+                self.cancel_chat_filter();
+                self.cancel_chat_summary();
             }
         }
         if !self.chat_translation.translator.active() {
@@ -484,7 +672,7 @@ impl App {
         }
         for (ids, result) in finished {
             for id in ids {
-                self.finish_chat_translation(id, result.clone());
+                self.filter_then_finish_chat_translation(id, result.clone());
             }
         }
         self.publish_transient_ui();
@@ -503,6 +691,8 @@ impl App {
     pub(in crate::app) fn chat_translation_settings_changed(&mut self) {
         self.chat_translation.config = None;
         self.cancel_chat_translations();
+        // The local provider's model is loaded only while it is selected.
+        self.chat_llm_configure();
         self.mark_config_dirty();
         self.publish_ui();
         self.publish_transient_ui();
@@ -518,11 +708,11 @@ impl App {
     /// Rewrite stored console rows of translated (or toggled) messages, so the
     /// classic console, its selection and copy all see the shown text. The
     /// chat log on disk keeps the original. `only` limits it to one message.
-    fn sync_console_chat_rows(&mut self, only: Option<u64>) {
+    pub(in crate::app) fn sync_console_chat_rows(&mut self, only: Option<u64>) {
         let display = self.chat_translation.settings.display;
         let mut changes = HashMap::new();
         for message in self.chat_translation.messages.iter_mut().filter(|message| only.is_none_or(|id| message.id == id)) {
-            let wanted = console_text(display, message, false).unwrap_or_else(|| message.text.clone());
+            let wanted = console_text(display, message, false).unwrap_or_else(|| message.shown_line());
             if wanted != message.console_shown {
                 let shown = std::mem::replace(&mut message.console_shown, wanted.clone());
                 changes.insert(message.id, (shown, wanted));
@@ -584,6 +774,19 @@ impl App {
         let shown = console_text(self.chat_translation.settings.display, message, true)?;
         let stamp = line.strip_suffix(message.console_shown.as_str())?;
         Some(format!("{stamp}{shown}"))
+    }
+
+    /// The message as received, decoded, when what is shown differs from it:
+    /// the HL2 console's hover text. egui never reaches the stream output.
+    pub(in crate::app) fn console_chat_original(&self, id: u64) -> Option<String> {
+        let state = &self.chat_translation;
+        let message = state.message(id)?;
+        let changed = matches!(message.censor, Censor::Censored { .. })
+            || (matches!(message.state, TranslationState::Done { .. }) && !message.show_original);
+        changed.then(|| {
+            let bytes = text::strip_color_bytes(&crate::cgame::text_to_jka_bytes(&message.text));
+            format!("Original (never on the stream output):\n{}", text::decode(&bytes, state.settings.codepage))
+        })
     }
 
     /// Right-click menu entries for a console chat row.
@@ -904,6 +1107,8 @@ mod tests {
             state: TranslationState::None,
             show_original: false,
             console_shown: text.to_owned(),
+            censor: Censor::None,
+            translation_censored: false,
         }
     }
 
@@ -936,6 +1141,22 @@ mod tests {
     }
 
     #[test]
+    fn local_model_gets_lines_the_detector_is_unsure_about() {
+        let start = "Bob^7: ^2".len();
+        let local = ct::Settings { provider: ct::ProviderKind::Local, ..english() };
+        // Too short for the detector: a web service is not asked, the local
+        // model is, without a source language.
+        let short = message("Bob^7: ^2vamos todos", Some(start));
+        assert!(plan(&english(), &short, Ask::Auto, None).is_err());
+        let request = plan(&local, &short, Ask::Auto, None).unwrap();
+        assert_eq!((request.text.as_str(), request.target), ("vamos todos", "en"));
+        // Clearly the target language already, or chat shorthand: still skipped.
+        let english_line = message("Bob^7: ^2where is the enemy flag carrier going right now", Some(start));
+        assert!(plan(&local, &english_line, Ask::Auto, None).is_err());
+        assert!(plan(&local, &message("Bob^7: ^2gg wp", Some(start)), Ask::Auto, None).is_err());
+    }
+
+    #[test]
     fn classic_console_rows_fold_or_point_to_the_hl2_console() {
         let start = "Bob^7: ^2".len();
         let mut done = message("Bob^7: ^2hola amigos", Some(start));
@@ -959,6 +1180,85 @@ mod tests {
         assert!(state.rule_for(&chat).is_none());
         chat.sender = None;
         assert!(state.rule_for(&chat).is_none());
+    }
+
+    fn record(text: &str) -> ChatRecord {
+        ChatRecord {
+            text: text.to_owned(),
+            team: false,
+            created: std::time::Instant::now(),
+            demo_elapsed_ms: None,
+            chat_id: Some(1),
+            translation: None,
+            censor: None,
+        }
+    }
+
+    #[test]
+    fn filtered_lines_keep_the_name_and_never_show_the_received_text() {
+        let line = "Bob^7: ^2you utter muppet";
+        let start = "Bob^7: ^2".len();
+        let mut chat = message(line, Some(start));
+        assert_eq!(chat.shown_line(), line);
+        chat.censor = Censor::Pending { held: true };
+        assert_eq!(chat.shown_line(), "Bob^7: ^2^9...");
+        chat.censor = Censor::Pending { held: false };
+        assert_eq!(chat.shown_line(), line);
+        chat.censor = Censor::Censored { body: "you utter ***".to_owned(), hidden: false };
+        assert_eq!(chat.shown_line(), "Bob^7: ^2you utter ***");
+
+        let mut shown = record(line);
+        shown.censor = chat.record_censor(line);
+        let hud = hud_chat(Display::Translated, &shown, false);
+        assert_eq!(hud.text, "Bob^7: ^2you utter ***");
+        assert_eq!(hud.flags, FLAG_CENSORED);
+        // The received line travels only as the local hover text.
+        assert_eq!(hud.original.as_deref(), Some(line));
+
+        // A translation of a masked message shows both marks, and the
+        // console's "both" form builds on the masked line.
+        chat.state = TranslationState::Done { source: Some("en".to_owned()), target: "de", text: "du ***".to_owned() };
+        assert_eq!(console_text(Display::Both, &chat, false).unwrap(), "Bob^7: ^2you utter *** ^9[en>de]^7 du ***");
+        shown.translation = Some(ChatRecordTranslation {
+            prefix: "Bob^7: ^2".to_owned(),
+            hud: Some("du ***".to_owned()),
+            marker: "^9[en>de]".to_owned(),
+            show_original: false,
+            censored: true,
+        });
+        let hud = hud_chat(Display::Translated, &shown, false);
+        assert_eq!((hud.text.as_str(), hud.flags), ("Bob^7: ^2du *** ^9[en>de]", FLAG_CENSORED | FLAG_TRANSLATED));
+
+        // A withheld message is withheld in every language.
+        chat.censor = Censor::Censored { body: "^9[hidden]".to_owned(), hidden: true };
+        assert!(console_text(Display::Translated, &chat, false).is_none());
+        shown.censor = chat.record_censor(line);
+        let hud = hud_chat(Display::Translated, &shown, false);
+        assert_eq!((hud.text.as_str(), hud.flags), ("Bob^7: ^2^9[hidden]", FLAG_CENSORED));
+    }
+
+    #[test]
+    fn docked_chat_keeps_cyrillic_and_the_console_falls_back() {
+        let line = crate::cgame::bytes_to_lossless_ascii("Ivan^7: ^2ты полный дурак".as_bytes());
+        let start = "Ivan^7: ^2".len();
+        let mut chat = message(&line, Some(start));
+        chat.censor = Censor::Censored { body: "ты полный ***".to_owned(), hidden: false };
+        // The byte-font console cannot draw it.
+        assert_eq!(chat.shown_line(), "Ivan^7: ^2***");
+        let mut shown = record(&line);
+        shown.censor = chat.record_censor(&line);
+        let hud = hud_chat(Display::Translated, &shown, true);
+        assert_eq!(hud.text, "Ivan^7: ^2ты полный ***");
+        // The hover shows what was written, readable.
+        assert_eq!(hud.original.as_deref(), Some("Ivan^7: ^2ты полный дурак"));
+        // Without a font for it the hover stays byte for byte.
+        assert_eq!(hud_chat(Display::Translated, &shown, false).original.as_deref(), Some(line.as_str()));
+    }
+
+    #[test]
+    fn untouched_lines_have_no_marks_and_no_hover() {
+        let hud = hud_chat(Display::Translated, &record("Bob^7: ^2hello"), false);
+        assert_eq!((hud.text.as_str(), hud.flags, hud.original), ("Bob^7: ^2hello", 0, None));
     }
 
     #[test]

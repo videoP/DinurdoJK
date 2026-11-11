@@ -1069,4 +1069,23 @@ commands! {
         CommandResult::Handled
     }
 
+    cmd_chat_summary ["chatSummary", ] ("chatSummary [minutes] [truth|cleanse]", "Summarize recent chat with the local model. Without minutes it covers the time since you last touched the game (window in the background or away); if you were not away, the last 10 minutes. truth (default) is written from the chat as sent; cleanse is a clean version with disclaimers for hostile stretches.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        match crate::chat_llm::history::parse_args(&words[1..]) {
+            Ok((minutes, pass)) => self.start_chat_summary(minutes, pass),
+            Err(usage) => self.push_console_line(format!("^3CHAT SUMMARY:^7 {usage}")),
+        }
+        CommandResult::Handled
+    }
+
+    cmd_chat_llm_status ["chatLlmStatus", ] ("chatLlmStatus", "Show the local chat models (download and load state), the chat filter settings and its counters.", CommandScope::Always) |self, command| {
+        if command.split_whitespace().count() != 1 {
+            return CommandResult::Unhandled;
+        }
+        for line in self.chat_llm_status_lines() {
+            self.push_console_line(line);
+        }
+        CommandResult::Handled
+    }
+
 }

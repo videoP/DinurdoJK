@@ -48,7 +48,12 @@ impl App {
             1.0 - ease_out(since / CLOSE_MS)
         };
         let idle_ms = now.saturating_duration_since(state.last_key).as_millis().min(u128::from(u32::MAX)) as u32;
-        UiChatAnim { open, idle_ms, caret: (idle_ms / 530) % 2 == 0 }
+        UiChatAnim {
+            open,
+            idle_ms,
+            caret: (idle_ms / 530) % 2 == 0,
+            pointer: if self.captured { None } else { self.chat_llm.pointer },
+        }
     }
 
     /// True while chat sounds are held back because we just attacked.

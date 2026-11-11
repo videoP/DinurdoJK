@@ -400,6 +400,8 @@ impl App {
                 team: false,
                 alpha: 1.0,
                 enter: 1.0,
+                flags: 0,
+                original: None,
             })
             .into();
         }

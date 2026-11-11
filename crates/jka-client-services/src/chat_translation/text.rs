@@ -206,11 +206,19 @@ const LATIN_EXTENDED_A: &[u8; 128] = b"AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGgHhHhI
 /// the lossless one-char-per-byte form, folding common punctuation and
 /// accented letters, or `None` if it needs glyphs the HUD does not have.
 pub fn hud_text(text: &str) -> Option<String> {
+    hud_text_wide(text, false)
+}
+
+/// `hud_text` for a surface that can also draw the Cyrillic block
+/// (U+0400..=U+04FF) from the TrueType UI font: those letters are kept as
+/// they are, next to the one-char-per-byte Latin text.
+pub fn hud_text_wide(text: &str, cyrillic: bool) -> Option<String> {
     let mut out = String::with_capacity(text.len());
     for ch in text.chars() {
         let code = ch as u32;
         match code {
             0x20..=0x7E | 0xA0..=0xFF => out.push(ch),
+            0x400..=0x4FF if cyrillic => out.push(ch),
             0x100..=0x17F => out.push(char::from(LATIN_EXTENDED_A[(code - 0x100) as usize])),
             0x218 | 0x219 => out.push(if code == 0x218 { 'S' } else { 's' }),
             0x21A | 0x21B => out.push(if code == 0x21A { 'T' } else { 't' }),
@@ -265,5 +273,7 @@ mod tests {
         assert_eq!(hud_text("Zażółć “quote” – ok…").unwrap(), "Zazólc \"quote\" - ok...");
         assert_eq!(hud_text("très").unwrap(), "très");
         assert!(hud_text("Привет").is_none());
+        assert_eq!(hud_text_wide("Привет, *** – ok", true).unwrap(), "Привет, *** - ok");
+        assert!(hud_text_wide("你好", true).is_none());
     }
 }

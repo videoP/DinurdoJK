@@ -128,7 +128,8 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", move_lean: 0.75", "")
         .replace(", underwater: 2", "")
         .replace(", footstep_trace: false", "")
-        .replace(", chat_translate: Settings { mode: Off, target: \"\", display: Translated, provider: MyMemory, libre_url: \"\", team: false, demos: false, codepage: Auto, max_chars: 300 }", "");
+        .replace(", chat_translate: Settings { mode: Off, target: \"\", display: Translated, provider: MyMemory, libre_url: \"\", team: false, demos: false, codepage: Auto, max_chars: 300 }", "")
+        .replace(", chat_llm: Settings { translate_url: \"\", translate_prompt: \"\", censor: false, censor_hold: true, censor_severity: 3, censor_action: Cleanse, censor_ragebait: false, assist_url: \"\", censor_prompt: \"\", summary_prompt: \"\", threads: 0, translate_ignore_self: true }", "");
     for byte in projected.bytes() {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
     }

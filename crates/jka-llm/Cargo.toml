@@ -1,0 +1,15 @@
+[package]
+name = "jka-llm"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# In-process llama.cpp (CPU). Building it needs CMake, a C++ toolchain and
+# libclang (bindgen). Without the feature every request reports that this
+# build has no local model runtime.
+llama = ["dep:llama-cpp-2"]
+
+[dependencies]
+llama-cpp-2 = { version = "=0.1.161", default-features = false, optional = true }

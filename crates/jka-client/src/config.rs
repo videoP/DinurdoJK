@@ -122,6 +122,8 @@ pub struct ClientPresentationSettings {
     pub chat: crate::ui::ChatSettings,
     /// DinurdoJK `cg_chatTranslate*`.
     pub chat_translate: crate::chat_translation::Settings,
+    /// DinurdoJK local chat models: `cg_chatCensor*`, `cg_chatLlm*`, prompts.
+    pub chat_llm: crate::chat_llm::Settings,
     pub model: String,
     /// DinurdoJK compact forced-player-model cvar: 0=off, model=all other players, ally,enemy=team split.
     pub force_model: String,
@@ -431,6 +433,7 @@ impl Default for ClientPresentationSettings {
             scoreboard: crate::ui::ScoreboardSettings::default(),
             chat: crate::ui::ChatSettings::default(),
             chat_translate: crate::chat_translation::Settings::default(),
+            chat_llm: crate::chat_llm::Settings::default(),
             model: "kyle".to_owned(),
             force_model: "0".to_owned(),
             crosshair: CrosshairSettings::default(),
