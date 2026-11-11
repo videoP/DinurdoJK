@@ -1362,6 +1362,7 @@ impl Renderer {
                         render_ocean,
                         (self.ocean_settings.backend == 3).then(|| self.lake_planar_enabled()),
                         &self.planar_slot_history,
+                        frame_time,
                     )
                 })
         } else {
@@ -1397,9 +1398,10 @@ impl Renderer {
                         let source = world.coarse_batches.get(view.coarse_batch_index);
                         if let Some(reflector) = reflector {
                             println!(
-                                "[PLANAR DEBUG] slot={} selected {:?} batch={} plane=[{:.4}, {:.4}, {:.4}, {:.2}] area={:.1} cluster={:?} tcGen={:?} authored={} env_candidate={} texture={:?} bounds=[{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}]",
+                                "[PLANAR DEBUG] slot={} selected {:?} view={} batch={} plane=[{:.4}, {:.4}, {:.4}, {:.2}] area={:.1} cluster={:?} tcGen={:?} authored={} env_candidate={} texture={:?} bounds=[{:.1},{:.1},{:.1}]..[{:.1},{:.1},{:.1}]",
                                 slot,
                                 view.kind,
+                                if view.camera_portal { "CAMERA PORTAL" } else { "MIRROR/PLANAR" },
                                 view.coarse_batch_index,
                                 view.plane[0],
                                 view.plane[1],
@@ -1476,7 +1478,7 @@ impl Renderer {
                         view.camera_position.z,
                         camera_pos_time[3],
                     ],
-                    clip_plane: view.plane,
+                    clip_plane: view.clip_plane,
                     render_flags: [
                         1,
                         (u32::from(self.static_bsp_ao_enabled) | (u32::from(self.sky_fractal_override) << 1)
@@ -1579,7 +1581,8 @@ impl Renderer {
             let planar_format = crate::renderer::reflections::planar::PLANAR_COLOR_FORMAT;
             self.dynamic_model_renderer.ensure_planar_model_pipelines(
                 &mut self.pipeline_jobs, &self.device, planar_format,
-                planar_views.iter().flatten().any(|view| view.kind == PlanarReflectorKind::Authored));
+                planar_views.iter().flatten().any(|view| view.kind == PlanarReflectorKind::Authored),
+                planar_views.iter().flatten().any(|view| view.camera_portal));
         }
         let glass_capture_needed = world_glass_possible
             || self.dynamic_model_renderer.draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass)
@@ -2920,6 +2923,12 @@ impl Renderer {
                 let Some(reflection_view) = reflection_view else {
                     continue;
                 };
+                let reflection_pipelines = if reflection_view.camera_portal {
+                    &active_pipeline_variant.camera_portal_pipelines
+                } else { &active_pipeline_variant.reflection_pipelines };
+                let reflection_fog_pipelines = if reflection_view.camera_portal {
+                    &active_pipeline_variant.camera_portal_fog_pass_pipelines
+                } else { &active_pipeline_variant.reflection_fog_pass_pipelines };
                 let indices: &[usize] = if self.pvs_mode == PvsMode::Off {
                     &world.coarse_all_batches
                 } else if let Some(cluster) = reflection_view.cluster {
@@ -2931,7 +2940,10 @@ impl Renderer {
                     &world.coarse_all_batches
                 };
                 let reflection_area_mask =
-                    if self.pvs_mode == PvsMode::Off || reflection_view.cluster.is_none() {
+                    if self.pvs_mode == PvsMode::Off || reflection_view.cluster.is_none()
+                        || reflection_view.camera_portal {
+                        // A remote portal can look into a different area; the
+                        // *main* camera's area mask must not hide its geometry.
                         None
                     } else {
                         area_mask
@@ -2963,7 +2975,7 @@ impl Renderer {
                         // The reflection shader discards every fragment behind
                         // the mirror plane (OpenJK's portal clip plane), so a
                         // batch wholly behind it cannot contribute a pixel.
-                        && (sky || !aabb_behind_plane(batch.bounds_min, batch.bounds_max, reflection_view.plane))
+                        && (sky || !aabb_behind_plane(batch.bounds_min, batch.bounds_max, reflection_view.clip_plane))
                         && batch.source.vertices != selected_range
                         && (sky
                             || aabb_intersects_clip_frustum(
@@ -3186,8 +3198,7 @@ impl Renderer {
                                     }
                                 };
                                 if current_pipeline != Some(representative.source.pipeline) {
-                                    let Some(pipeline) = active_pipeline_variant
-                                        .reflection_pipelines
+                                    let Some(pipeline) = reflection_pipelines
                                         .get(&representative.source.pipeline)
                                     else {
                                         continue;
@@ -3223,8 +3234,7 @@ impl Renderer {
                             continue;
                         }
                         if current_pipeline != Some(batch.source.pipeline) {
-                            if let Some(pipeline) = active_pipeline_variant
-                                .reflection_pipelines
+                            if let Some(pipeline) = reflection_pipelines
                                 .get(&batch.source.pipeline)
                             {
                                 if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
@@ -3276,8 +3286,7 @@ impl Renderer {
                             && (batch.source.fog[3] > 0.001
                                 || self.weather.fog.legacy_drawfog_value() == 1);
                         if needs_fog_pass {
-                            if let Some(fog_pipeline) = active_pipeline_variant
-                                .reflection_fog_pass_pipelines
+                            if let Some(fog_pipeline) = reflection_fog_pipelines
                                 .get(&(batch.source.pipeline, surface_writes_depth))
                             {
                                 if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
@@ -3340,8 +3349,7 @@ impl Renderer {
                         };
                         let batch = &world.coarse_batches[inline_visible[position as usize]];
                         if current_pipeline != Some(batch.source.pipeline) {
-                            let Some(pipeline) = active_pipeline_variant
-                                .reflection_pipelines
+                            let Some(pipeline) = reflection_pipelines
                                 .get(&batch.source.pipeline)
                             else {
                                 continue;
@@ -3387,8 +3395,7 @@ impl Renderer {
                         if let Some(writes_depth) =
                             inline_run_fog_depth(&self.weather.fog, render_ocean, batch, kind)
                         {
-                            if let Some(fog_pipeline) = active_pipeline_variant
-                                .reflection_fog_pass_pipelines
+                            if let Some(fog_pipeline) = reflection_fog_pipelines
                                 .get(&(batch.source.pipeline, writes_depth))
                             {
                                 if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
@@ -3431,9 +3438,9 @@ impl Renderer {
                 // portal_only=true and is invisible to the main camera.
                 let authored_portal = reflection_view.kind == PlanarReflectorKind::Authored;
                 self.dynamic_model_renderer.draw_planar_scene_phase(
-                    &mut pass, &self.planar_camera_bind_groups[slot], true, authored_portal);
+                    &mut pass, &self.planar_camera_bind_groups[slot], true, authored_portal, !reflection_view.camera_portal);
                 self.dynamic_model_renderer.draw_planar_scene_phase(
-                    &mut pass, &self.planar_camera_bind_groups[slot], false, authored_portal);
+                    &mut pass, &self.planar_camera_bind_groups[slot], false, authored_portal, !reflection_view.camera_portal);
                 drop(pass);
                 // Per-view world flares use this reflection's just-rendered depth
                 // before the next slot clears the shared depth attachment.

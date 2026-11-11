@@ -170,6 +170,19 @@ impl Flex {
         }
     }
 
+    /// Split the parent's main axis by `grow` weight from a zero basis, so
+    /// siblings divide space in exact proportion regardless of their content.
+    pub(crate) fn set_share(&mut self, node: NodeId, grow: f32) {
+        if let Ok(style) = self.tree.style(node) {
+            let mut style = style.clone();
+            style.flex_grow = grow;
+            style.flex_shrink = 1.0;
+            style.flex_basis = length(0.0);
+            style.min_size = Size { width: length(0.0), height: length(0.0) };
+            let _ = self.tree.set_style(node, style);
+        }
+    }
+
     /// Lay `root` out inside a `width` x `height` viewport, then offset the
     /// whole tree by `origin`.
     pub(crate) fn compute(&mut self, root: NodeId, width: f32, height: f32) {

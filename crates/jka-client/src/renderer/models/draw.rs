@@ -807,13 +807,16 @@ impl DynamicModelRenderer {
         camera: &'a wgpu::BindGroup,
         depth_writing_phase: bool,
         authored_portal: bool,
+        mirror_winding: bool,
     ) {
         let (vertices, indices) = self.prepared_dynamic_buffers();
         pass.set_bind_group(0, camera, &[]);
         for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER {
             if alpha_mode == DynamicModelAlphaMode::Glass
                 || dynamic_model_writes_depth(alpha_mode) != depth_writing_phase { continue; }
-            if let Some(pipeline) = &self.planar_model_pipelines[alpha_mode.index()] {
+            let planar_models = if mirror_winding { &self.planar_model_pipelines }
+                else { &self.camera_portal_model_pipelines };
+            if let Some(pipeline) = &planar_models[alpha_mode.index()] {
                 let mut bound = false;
                 let mut prior = None;
                 for draw in &self.draws {
@@ -874,9 +877,11 @@ impl DynamicModelRenderer {
             for draw in &self.skin_draws {
                 if draw.alpha_mode != alpha_mode { continue; }
                 let pipeline = if draw.source_material {
-                    self.planar_skin_source_pipelines[alpha_mode.index()].as_ref()
+                    if mirror_winding { self.planar_skin_source_pipelines[alpha_mode.index()].as_ref() }
+                    else { self.camera_portal_skin_source_pipelines[alpha_mode.index()].as_ref() }
                 } else {
-                    self.planar_skin_pipelines[alpha_mode.index()].as_ref()
+                    if mirror_winding { self.planar_skin_pipelines[alpha_mode.index()].as_ref() }
+                    else { self.camera_portal_skin_pipelines[alpha_mode.index()].as_ref() }
                 };
                 let Some(pipeline) = pipeline else { continue; };
                 let Some(mesh) = self.ghoul2_meshes.get(&draw.mesh_key) else { continue; };

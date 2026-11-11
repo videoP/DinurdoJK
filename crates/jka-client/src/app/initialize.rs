@@ -289,6 +289,8 @@ impl App {
             chat_log_browser_show_voice: true,
             chat_log_browser_show_session: true,
             asset_preview_player_presenter: None,
+            asset_preview_player_init: None,
+            asset_preview_player_error: None,
             asset_preview_entity_presenter: None,
             asset_preview_model_key: None,
             asset_preview_shader_key: None,

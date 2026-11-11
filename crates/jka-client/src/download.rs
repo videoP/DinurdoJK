@@ -67,10 +67,9 @@ pub fn referenced_downloads(
         return Ok(Vec::new());
     }
 
-    // PK3 downloads follow the *active game's* writable root. JK2 must never
-    // fall through to JKA's GameData/base or fs_homepath; both games share the
-    // downloader, not their asset namespace. This also respects fs_jk2homepath
-    // (and fs_homepath for JKA), but never writes into CD or fs_forcegame.
+    // Server PK3s retain the server's base/fs_game placement even when a
+    // writable forcegame override is active. Downloads respect per-game
+    // homepath, but never land in forcegame, CD or the other game's root.
     let roots = jka_assets::pk3::configured_filesystem_roots(base_dir);
     let download_root = download_root_for(base_dir, &roots);
     // The server's mod name is its literal directory name (no prefixes).
@@ -195,10 +194,10 @@ fn is_stock_assets(name: &str, jk2: bool) -> bool {
 }
 
 fn download_root_for(base_dir: &Path, roots: &jka_assets::pk3::FilesystemRoots) -> PathBuf {
-    // filesystem_write_directory owns the JKA/JK2 root, including optional
-    // game-specific homepath. Asking for base avoids deriving an install root
-    // from self.game (which may point at a physically different mod layer).
-    let base_write = jka_assets::pk3::filesystem_write_directory(base_dir, None, roots);
+    // Bypass forcegame: a referenced `japlus/foo` or `base/foo` PK3 must
+    // be downloaded into that server-selected directory, not the override.
+    // Preserve the JKA/JK2 homepath split even with forcegame enabled.
+    let base_write = jka_assets::pk3::filesystem_unforced_write_directory(base_dir, None, roots);
     base_write.parent().unwrap_or(base_write.as_path()).to_path_buf()
 }
 
@@ -534,6 +533,17 @@ mod tests {
             active_jk2: None, homepath: Some("/user/jka".into()), ..roots
         };
         assert_eq!(download_root_for(base, &roots), PathBuf::from("/user/jka"));
+        // A forcegame write override must not redirect server package writes
+        // or silently bypass the homepath used by downloaded PK3s.
+        let forced = jka_assets::pk3::FilesystemRoots {
+            forcegame: Some("test".into()), jk2forcegame: Some("jk2-test".into()),
+            ..roots.clone()
+        };
+        assert_eq!(download_root_for(base, &forced), PathBuf::from("/user/jka"));
+        let jk2_forced = jka_assets::pk3::FilesystemRoots {
+            active_jk2: Some(2), ..forced
+        };
+        assert_eq!(download_root_for(base, &jk2_forced), PathBuf::from("/user/jk2"));
     }
 
     #[test]

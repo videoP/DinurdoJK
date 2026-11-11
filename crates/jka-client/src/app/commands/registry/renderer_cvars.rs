@@ -2105,6 +2105,30 @@ app_cvars! {
         implementations: [impl App {
             fn cvar_set_r_bakedsunremovalauto(&mut self, name: &str, value: &str) -> Result<(), String> {
                 self.video.baked_sun_removal_auto = Self::parse_cvar_bool(name, value)?;
+                if self.video.baked_sun_removal_auto { self.video.baked_sun_removal_contour = false; }
+                self.sync_post_effects();
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_BAKEDSUNREMOVALCONTOUR {
+        runtime: CvarDef::new("r_bakedSunRemovalContour", "", "0|1", "Use the cached contour-guided original sunlight removal field: local shadow-edge direct fits plus conservative nearby bounced-light gradients. 0 returns to Auto or manual. Fails closed when the lightmap has insufficient valid contours.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(bool_value(app.video.baked_sun_removal_contour)),
+            |app, value| App::cvar_set_r_bakedsunremovalcontour(app, APP_R_BAKEDSUNREMOVALCONTOUR.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsunremovalcontour, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.baked_sun_removal_contour = parse_bool(value).unwrap_or(settings.baked_sun_removal_contour);
+            }),
+            archive: Some((59, |state| bool_value(state.video.baked_sun_removal_contour))),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_r_bakedsunremovalcontour(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.baked_sun_removal_contour = Self::parse_cvar_bool(name, value)?;
+                if self.video.baked_sun_removal_contour { self.video.baked_sun_removal_auto = false; }
                 self.sync_post_effects();
                 self.mark_config_dirty();
                 self.publish_ui();

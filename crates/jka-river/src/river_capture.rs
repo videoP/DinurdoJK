@@ -41,6 +41,40 @@ pub struct Selection<'a> {
     pub sides: Sides,
 }
 
+/// The source-level riverbed rule shared by the dense patch and sparse
+/// tiles: overhead brushes whose solid starts above `water_level` are
+/// dropped, grounded solids are kept whole and terrain without brush
+/// thickness is clipped to the level. Returns a convex polygon (3 or 4
+/// vertices, map units); None when nothing remains.
+pub fn clip_collision(
+    t: &[[f32; 3]; 3],
+    solid_bottom_z: Option<f32>,
+    water_level: Option<f32>,
+) -> Option<([[f32; 3]; 4], usize)> {
+    let mut polygon = [[0.0f32; 3]; 4];
+    let count = if let Some(level) = water_level {
+        if solid_bottom_z.is_some_and(|bottom| bottom > level) { return None; }
+        if solid_bottom_z.is_some() { polygon[..3].copy_from_slice(t); 3 }
+        else {
+            let mut count = 0;
+            let mut previous = t[2];
+            for &current in t {
+                let prev_inside = previous[2] <= level;
+                let curr_inside = current[2] <= level;
+                if prev_inside != curr_inside {
+                    let frac = (level - previous[2]) / (current[2] - previous[2]);
+                    let mut p = std::array::from_fn(|a| previous[a] + frac * (current[a] - previous[a]));
+                    p[2] = level; polygon[count] = p; count += 1;
+                }
+                if curr_inside { polygon[count] = current; count += 1; }
+                previous = current;
+            }
+            count
+        }
+    } else { polygon[..3].copy_from_slice(t); 3 };
+    (count >= 3).then_some((polygon, count))
+}
+
 pub struct BspCapture {
     positions: Vec<[f32; 3]>,
     groups: Vec<(MeshClass, Sides, Vec<u32>)>,
@@ -177,27 +211,7 @@ impl BspCapture {
             if outside {
                 continue;
             }
-            let mut polygon = [[0.0f32; 3]; 4];
-            let count = if let Some(level) = water_level {
-                if solid_bottom_z.is_some_and(|bottom| bottom > level) { continue; }
-                if solid_bottom_z.is_some() { polygon[..3].copy_from_slice(t); 3 }
-                else {
-                    let mut count = 0;
-                    let mut previous = t[2];
-                    for &current in t {
-                        let prev_inside = previous[2] <= level;
-                        let curr_inside = current[2] <= level;
-                        if prev_inside != curr_inside {
-                            let frac = (level - previous[2]) / (current[2] - previous[2]);
-                            let mut p = std::array::from_fn(|a| previous[a] + frac * (current[a] - previous[a]));
-                            p[2] = level; polygon[count] = p; count += 1;
-                        }
-                        if curr_inside { polygon[count] = current; count += 1; }
-                        previous = current;
-                    }
-                    count
-                }
-            } else { polygon[..3].copy_from_slice(t); 3 };
+            let Some((polygon, count)) = clip_collision(t, solid_bottom_z, water_level) else { continue; };
             for k in 2..count {
                 for p in [polygon[0], polygon[k - 1], polygon[k]] {
                 let converted = std::array::from_fn::<_, 3, _>(|axis| {
@@ -724,5 +738,14 @@ impl DepthCaptures {
     /// Payload only, excluding mesh uploads and implementation allocation padding.
     pub fn logical_bytes(&self) -> u64 {
         u64::from(self.resolution).pow(2) * (CHANNELS as u64 + 1) * 4
+    }
+
+    /// The five linear-depth layers of the latest capture (sparse tile commit).
+    pub fn depth_layers(&self) -> &wgpu::Texture {
+        &self.texture
+    }
+
+    pub fn resolution(&self) -> u32 {
+        self.resolution
     }
 }

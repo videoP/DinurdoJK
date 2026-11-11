@@ -505,7 +505,7 @@ impl Renderer {
                 self.baked_indirect_highlight_preserve,
                 baked_shadow_ids[0], baked_shadow_ids[1],
             ],
-            baked_sun_debug_mode: [if sun_bake_ready { self.baked_sun_debug_mode } else { 0 }, u32::from(self.baked_sun_cache_active()), u32::from(self.static_sun_lightmap_active()) | (u32::from(self.baked_local_lightmap_active()) << 1) | (u32::from(self.baked_local_shadows && !self.baked_local_lightmap_active()) << 2) | (u32::from(self.static_world_csm_composed()) << 3), u32::from(self.baked_local_moving_casters()) | (u32::from(all_local_baked)<<1) | (u32::from(self.lamp_shadow_ab == 4)<<2)
+            baked_sun_debug_mode: [if sun_bake_ready { self.baked_sun_debug_mode } else { 0 }, u32::from(self.baked_sun_cache_active()), u32::from(self.static_sun_lightmap_active()) | (u32::from(self.baked_local_lightmap_active()) << 1) | (u32::from(self.baked_local_shadows && !self.baked_local_lightmap_active()) << 2) | (u32::from(self.static_world_csm_composed()) << 3) | (u32::from(self.baked_sun_removal_contour && self.world.as_ref().is_some_and(|world| world.sun_bake.contour_masks.is_some())) << 4), u32::from(self.baked_local_moving_casters()) | (u32::from(all_local_baked)<<1) | (u32::from(self.lamp_shadow_ab == 4)<<2)
                 | (u32::from(self.world.as_ref().and_then(|w| w.baked_sun_cache.as_ref())
                     .is_some_and(|cache| cache.sky_overlay_active()))<<8)],
             runtime_sun_direction: {

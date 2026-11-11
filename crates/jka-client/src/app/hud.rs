@@ -267,6 +267,7 @@ impl App {
             scoreboard_focus_client,
             demo_timeline: self.demo_timeline_ui(Instant::now()),
             asset_mapping: self.asset_mapping_ui(),
+            shader_remap: self.shader_remap_snapshot(),
             demo_browser: if self.front_end && self.frontend_page == crate::app::FrontendPage::PlayDemo
                 && self.overlay == OverlayMode::Game { Some(self.native_demo_browser_ui()) } else { None },
             prediction_debug,

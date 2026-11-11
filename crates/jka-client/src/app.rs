@@ -122,7 +122,7 @@ mod emote_gallery;
 mod egui_model_placement;
 mod map_mod_ent;
 mod egui_emote_radial;
-mod egui_shader_remap;
+mod shader_remap_editor;
 mod egui_entity_graph;
 mod egui_menu;
 mod egui_pages;
@@ -146,7 +146,7 @@ mod session_tools;
 mod ui_catalog;
 
 use egui_entity_graph::EntityGraphUi;
-use egui_shader_remap::ShaderRemapUi;
+use shader_remap_editor::ShaderRemapUi;
 use egui_menu::VideoSection;
 use frontend::{
     build_demo_index, AssetDetail, AssetEntry, AssetFilter, AssetKind, ChatLogRangeFilter,
@@ -369,6 +369,10 @@ pub struct App {
     chat_log_browser_show_voice: bool,
     chat_log_browser_show_session: bool,
     asset_preview_player_presenter: Option<PlayerPresenter>,
+    // CPU-only VFS / Ghoul2 bootstrap runs on its own worker. Never scan
+    // installed .shader/.mtr files on the UI thread when Profile opens.
+    asset_preview_player_init: Option<std::sync::mpsc::Receiver<Result<(PlayerPresenter, Option<EntityPresenter>), String>>>,
+    asset_preview_player_error: Option<String>,
     asset_preview_entity_presenter: Option<EntityPresenter>,
     asset_preview_model_key: Option<(String, i32, i32, i32)>,
     asset_preview_shader_key: Option<(String, String, i32)>,

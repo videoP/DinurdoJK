@@ -55,7 +55,7 @@ app_cvars! {
     APP_FS_HOMEPATH {
         runtime: CvarDef::new(
             "fs_homepath", "", "JKA writable root",
-            "Optional writable JKA root holding base/ and mod folders directly (configs, demos, screenshots, downloads). Blank = write beside the JKA root. Must differ from fs_jk2homepath. Restart required.",
+            "Optional JKA home root holding base/ and mod folders directly. Used for regular writes and downloads unless fs_forcegame redirects game-owned writes. Must differ from fs_jk2homepath. Restart required.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(app.fs_roots.homepath.as_ref().map_or(String::new(), |p| p.display().to_string())),
             |app, value| App::set_fs_homepath(app, &value.to_string())
@@ -66,7 +66,7 @@ app_cvars! {
     APP_FS_JK2HOMEPATH {
         runtime: CvarDef::new(
             "fs_jk2homepath", "", "JK2 writable root",
-            "Optional writable JK2 root holding base/ and mod folders directly. Blank = write inside the JK2 root. Must differ from fs_homepath. Never mounted in JKA. Restart required.",
+            "Optional JK2 home root holding base/ and mod folders directly. Used for regular writes and downloads unless fs_jk2forcegame redirects game-owned writes. Must differ from fs_homepath. Never mounted in JKA. Restart required.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(app.fs_roots.jk2homepath.as_ref().map_or(String::new(), |p| p.display().to_string())),
             |app, value| App::set_fs_jk2homepath(app, &value.to_string())
@@ -77,7 +77,7 @@ app_cvars! {
     APP_FS_JK2FORCEGAME {
         runtime: CvarDef::new(
             "fs_jk2forcegame", "", "JK2 asset override folder",
-            "Optional highest-priority JK2 asset layer fs_jk2basepath/<name>/, above DinurdoJK/shared and fs_game. Never mounted by JKA. Does not change write paths. Restart required.",
+            "Optional highest-priority JK2 read/write override at fs_jk2basepath/<name>/, above DinurdoJK/shared and fs_game. Configs, demos and screenshots write here; server PK3 downloads remain under fs_game. JKA unaffected. Restart required.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(app.fs_roots.jk2forcegame.clone().unwrap_or_default()),
             |app, value| App::set_fs_jk2forcegame(app, &value.to_string())
@@ -88,7 +88,7 @@ app_cvars! {
     APP_FS_FORCEGAME {
         runtime: CvarDef::new(
             "fs_forcegame", "", "JKA asset override folder",
-            "Optional highest-priority JKA asset layer fs_basepath/<name>/, above DinurdoJK/shared and fs_game. Does not change game directories or write paths. Restart required.",
+            "Optional highest-priority JKA read/write override at fs_basepath/<name>/, above DinurdoJK/shared and fs_game. Configs, demos and screenshots write here; server PK3 downloads remain under fs_game. Restart required.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
             |app| CvarValue::String(app.fs_roots.forcegame.clone().unwrap_or_default()),
             |app, value| App::set_fs_forcegame(app, &value.to_string())

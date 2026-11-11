@@ -58,6 +58,8 @@ pub(in crate::renderer) struct SunBake {
     pub(in crate::renderer) ready: bool,
     pub(in crate::renderer) auto_strength: Option<f32>,
     masks: Option<Vec<Vec<u8>>>,
+    pub(in crate::renderer) contour_masks: Option<Vec<Vec<u8>>>,
+    active_contour: bool,
     mask_sizes: Vec<[u32; 2]>,
     upload: Option<MaskUpload>,
 }
@@ -106,6 +108,8 @@ impl SunBake {
             ready: false,
             auto_strength: None,
             masks: None,
+            contour_masks: None,
+            active_contour: false,
             mask_sizes,
             upload: None,
         }
@@ -118,11 +122,7 @@ impl SunBake {
         images: &[GpuImage],
         bases: &[TextureData],
     ) -> Option<Vec<GpuImage>> {
-        Some(
-            self.upload
-                .as_ref()?
-                .apply(device, queue, images, bases, self.masks.as_ref()?),
-        )
+        Some(self.upload.as_ref()?.apply(device, queue, images, bases, self.active_mask()?))
     }
 
     /// AO can finish before or after sunlight; patch only its output alpha.
@@ -133,7 +133,7 @@ impl SunBake {
         image: [u32; 2],
         rect: [u32; 4],
     ) {
-        let Some(mask) = self.masks.as_ref().and_then(|masks| masks.get(texture)) else {
+        let Some(mask) = self.active_mask().and_then(|masks| masks.get(texture)) else {
             return;
         };
         let Some(&base) = self.mask_sizes.get(texture) else {
@@ -144,6 +144,14 @@ impl SunBake {
 
     pub(in crate::renderer) fn has_masks(&self) -> bool {
         self.masks.is_some()
+    }
+
+    fn active_mask(&self) -> Option<&[Vec<u8>]> {
+        if self.active_contour {
+            self.contour_masks.as_deref()
+        } else {
+            self.masks.as_deref()
+        }
     }
 }
 
@@ -183,7 +191,7 @@ fn fingerprint(source: &Source) -> u64 {
     // Same deterministic FoldHasher on disk and across runs. Bump the cache
     // magic/version whenever reconstruction math changes.
     let mut hash = scene::FoldHasher::default();
-    hash.write(b"baked-sun-v2-auto");
+    hash.write(b"baked-sun-v5-clip-cap");
     hash.write(&source.cache.map_hash.to_le_bytes());
     hash.write(bytemuck::cast_slice(&source.vertices));
     hash.write(bytemuck::cast_slice(&source.surface_ids));
@@ -371,6 +379,10 @@ impl Renderer {
             return BakedSunAutoStatus::Unavailable;
         };
         if bake.ready {
+            if self.baked_sun_removal_contour {
+                return if bake.contour_masks.is_some() { BakedSunAutoStatus::ContourGuided }
+                    else { BakedSunAutoStatus::Unavailable };
+            }
             return match bake.auto_strength.filter(|value| value.is_finite() && *value >= 0.0) {
                 Some(value) => BakedSunAutoStatus::Calibrated(value),
                 None => BakedSunAutoStatus::Unavailable,
@@ -386,7 +398,8 @@ impl Renderer {
     /// One settings/ready/channel check in ordinary frames. Hashing, cache I/O,
     /// tracing and pipeline compilation stay on the background worker.
     pub(in crate::renderer) fn sync_sun_bake(&mut self) {
-        let desired = self.baked_sun_removal_auto || requested(self.effective_baked_sun_removal(), self.baked_sun_debug_mode);
+        let desired = self.baked_sun_removal_auto || self.baked_sun_removal_contour
+            || requested(self.effective_baked_sun_removal(), self.baked_sun_debug_mode);
         let worker_override = self.bake_threads;
         let Some(world) = self.world.as_mut() else {
             return;
@@ -424,6 +437,15 @@ impl Renderer {
                 }
             }
         }
+        // Switching Auto/Contour Guided is a one-shot alpha reinstallation,
+        // never a retrace, per-frame pixel branch or new world shader variant.
+        let switch = self.world.as_ref().is_some_and(|world| {
+            let bake = &world.sun_bake;
+            let use_contour = self.baked_sun_removal_contour && self.baked_sun_debug_mode != 2
+                && bake.contour_masks.is_some();
+            bake.ready && bake.masks.is_some() && bake.active_contour != use_contour
+        });
+        if switch { self.switch_sun_removal_mask(); }
         if !desired {
             return;
         }
@@ -454,6 +476,33 @@ impl Renderer {
         }
     }
 
+    fn switch_sun_removal_mask(&mut self) {
+        let Some(mut world) = self.world.take() else { return; };
+        let contour = self.baked_sun_removal_contour && self.baked_sun_debug_mode != 2
+            && world.sun_bake.contour_masks.is_some();
+        if let (Some(upload), Some(masks)) = (world.sun_bake.upload.as_ref(),
+            if contour { world.sun_bake.contour_masks.as_deref() } else { world.sun_bake.masks.as_deref() }) {
+            // Preserve the warm compositing pipeline, chart textures, and sky
+            // resources. Only exchange the immutable alpha source and force a
+            // one-shot recomposition; never rebuild a pipeline on mode changes.
+            let source = world.baked_sun_cache.as_ref().map(|cache| &cache.original)
+                .unwrap_or(&world.lightmaps);
+            let replacement = upload.apply(&self.device, &self.queue, source,
+                &world.lightmap_base_data, masks);
+            if let Some(cache) = world.baked_sun_cache.as_mut() {
+                cache.original = replacement.clone();
+                cache.strength = None;
+            }
+            world.lightmaps = replacement;
+            world.sun_bake.active_contour = contour;
+            self.rebuild_world_surface_bind_groups(&mut world);
+        }
+        self.world = Some(world);
+        self.history_valid = false;
+        self.update_lighting_settings();
+        println!("[BAKED SUN] switched cached removal mask to {}", if contour { "contour guided" } else { "original" });
+    }
+
     fn install_sun_bake(&mut self, result: Completed, started: Instant) {
         let Some(mut world) = self.world.take() else {
             return;
@@ -468,6 +517,10 @@ impl Renderer {
             );
             return;
         };
+        let mut calibration = data.calibration;
+        world.sun_bake.contour_masks = calibration.contour_masks.take();
+        let contour = self.baked_sun_removal_contour && self.baked_sun_debug_mode != 2
+            && world.sun_bake.contour_masks.is_some();
         if let (Some(masks), Some(upload)) = (data.masks, result.upload) {
             let images = world
                 .baked_sun_cache
@@ -479,8 +532,9 @@ impl Renderer {
                 &self.queue,
                 &images,
                 &world.lightmap_base_data,
-                &masks,
+                if contour { world.sun_bake.contour_masks.as_ref().unwrap() } else { &masks },
             );
+            world.sun_bake.active_contour = contour;
             world.baked_sun_encoding = world
                 .sun_bake
                 .source
@@ -490,21 +544,26 @@ impl Renderer {
             world.sun_bake.upload = Some(upload);
             self.rebuild_world_surface_bind_groups(&mut world);
         }
-        if !data.calibration.surfaces.is_empty() {
+        if !calibration.surfaces.is_empty() {
             self.queue.write_buffer(
                 &world.legacy_dlight_surface_mask_buffer,
                 (world.legacy_dlight_surfaces.len().max(1) * 4) as u64,
-                bytemuck::cast_slice(&data.calibration.surfaces),
+                bytemuck::cast_slice(&calibration.surfaces),
             );
         }
-        world.sun_bake.auto_strength = data.calibration.auto_strength;
+        world.sun_bake.auto_strength = calibration.auto_strength;
         if self.baked_sun_removal_auto {
-            match data.calibration.auto_strength {
+            match calibration.auto_strength {
                 Some(strength) => println!("[BAKED SUN AUTO] applying calibrated removal {strength:.3}x"),
                 None => println!("[BAKED SUN AUTO] insufficient reliable shadow evidence; preserving authored lightmap"),
             }
         }
-        world.baked_sun_radiance = Some(data.calibration.radiance);
+        if self.baked_sun_removal_contour {
+            println!("[BAKED SUN CONTOUR] {}", if contour {
+                format!("{} local contour regions ready", calibration.contour_regions)
+            } else { "insufficient valid contour evidence; original lighting preserved".to_string() });
+        }
+        world.baked_sun_radiance = Some(calibration.radiance);
         world.sun_bake.ready = true;
         // The worker's full tracing/material snapshot is no longer needed.
         // Retain only byte masks and dimensions for later AO updates.

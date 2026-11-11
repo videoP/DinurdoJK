@@ -2153,20 +2153,11 @@ impl ApplicationHandler<UserEvent> for App {
         if self.studio_navigation_window_event(&event) { return; }
         if self.scoreboard_cursor_window_event(&event) { return; }
 
-        // A focused Remap Editor text field owns *every* typed key before
-        // global shortcuts and Dev-bind dismissal. Otherwise a shader path
-        // containing a key bound to /dev (or the console toggle) would close
-        // the editor instead of entering the character. Escape remains the
-        // explicit menu-close key; without text focus Dev still means Back.
-        if self.overlay == OverlayMode::ShaderRemap
-            && self.egui_ctx.memory(|m| m.focused().is_some())
-            && matches!(
-                &event,
-                WindowEvent::KeyboardInput { event: key, .. }
-                    if key.physical_key != PhysicalKey::Code(KeyCode::Escape)
-            )
-        {
-            let _ = self.route_egui_window_event(&event);
+        // The native Shader Remaps page takes pointer input and, while one of
+        // its text fields is focused, *every* key (Escape just unfocuses), so
+        // a shader path containing a key bound to /dev or the console cannot
+        // close the page. Unused keys fall through: Escape and Dev mean Back.
+        if self.native_shader_remap_event(&event) {
             return;
         }
 

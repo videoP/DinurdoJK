@@ -54,6 +54,30 @@ CvarDef::new("r_riverDebug", "0", "0|1|2", "Live riversource diagnostics: 0 off,
     }));
     Ok(())
 }),
+CvarDef::new("r_riverSparse", "1", "0|1", "Long-distance rivers (applies to rivers placed afterwards): 0 the native single rectangle of the authored radius; 1 sparse tiles that grow along the wet channel over the whole map, drawn through a camera window of r_riverWindow cells. Same Unreal hydraulic stages either way.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(jka_river::river_tiles::sparse_enabled()), |app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    jka_river::river_tiles::set_sparse_enabled(enabled);
+    app.push_console_line(format!("^3r_riverSparse:^7 {} (re-place the river to apply)", if enabled { "ON (sparse tiles)" } else { "OFF (native rectangle)" }));
+    Ok(())
+}),
+CvarDef::new("r_riverTileSize", "32", "16|32|64|128", "Sparse river tile side in cells (power of two). Smaller tiles follow narrow channels more tightly; larger tiles need fewer activations.", CvarType::Int { min: 16, max: 128 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(jka_river::river_tiles::tile_size() as i32), |app, value| {
+    let CvarValue::Int(cells) = value else { unreachable!() };
+    jka_river::river_tiles::set_tile_size(cells as u32);
+    app.push_console_line(format!("^3r_riverTileSize:^7 {} cells", jka_river::river_tiles::tile_size()));
+    Ok(())
+}),
+CvarDef::new("r_riverTileGuard", "2", "1..4", "Sparse river guard ring in tiles kept resident around wet tiles. Wider rings let fast-fill run more solver frames per occupancy readback.", CvarType::Int { min: 1, max: 4 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(jka_river::river_tiles::guard_tiles() as i32), |app, value| {
+    let CvarValue::Int(tiles) = value else { unreachable!() };
+    jka_river::river_tiles::set_guard_tiles(tiles as u32);
+    app.push_console_line(format!("^3r_riverTileGuard:^7 {} tiles", jka_river::river_tiles::guard_tiles()));
+    Ok(())
+}),
+CvarDef::new("r_riverWindow", "512", "128..2048", "Sparse river presentation window in cells around the camera (rounded to whole tiles). The whole river is simulated; only this window is drawn.", CvarType::Int { min: 128, max: 2048 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(jka_river::river_tiles::window_cells() as i32), |app, value| {
+    let CvarValue::Int(cells) = value else { unreachable!() };
+    jka_river::river_tiles::set_window_cells(cells as u32);
+    app.push_console_line(format!("^3r_riverWindow:^7 {} cells", jka_river::river_tiles::window_cells()));
+    Ok(())
+}),
 CvarDef::new("cm_collisionMerge", "0", "0|1", "Experimental collision union: 0 exact OpenJK BSP collision, 1 merge perfectly flush solid box brushes at map load. Live A/B switch; affects local movement prediction and may differ from vanilla servers.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(jka_movement::collision_merge_enabled()), |app, value| {
     let CvarValue::Bool(enabled) = value else { unreachable!() };
     jka_movement::set_collision_merge_enabled(enabled);

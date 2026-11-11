@@ -313,6 +313,19 @@ pub const REFLECTION_CACHE_PROBE: u8 = 1 << 0;
 pub const REFLECTION_CACHE_SSR: u8 = 1 << 1;
 pub const REFLECTION_CACHE_PLANAR: u8 = 1 << 2;
 
+/// Map-authored misc_portal_camera resolved through misc_portal_surface's target.
+/// Coordinates and direction are converted to the renderer's Y-up convention.
+/// Values are computed once at map preparation, never looked up by texture name.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PortalCamera {
+    pub surface_origin: [f32; 3],
+    pub camera_origin: [f32; 3],
+    pub camera_forward: [f32; 3],
+    pub roll_degrees: f32,
+    pub rotation_speed: f32,
+    pub swing: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct DrawBatch {
     pub vertices: Range<u32>,
@@ -499,6 +512,8 @@ pub struct DrawBatch {
     /// Origin of the untargeted misc_portal_surface that authorizes this mirror.
     /// id Tech 3 uses this portal entity position as the reflected view's PVS origin.
     pub planar_pvs_origin: [f32; 3],
+    /// Resolved remote view for a targeted id Tech 3 portal; None for a mirror.
+    pub portal_camera: Option<PortalCamera>,
     pub skybox: Option<[usize; 6]>,
     /// Nearest Rend2 reflection probe selected once at map preparation time.
     pub reflection_probe: Option<usize>,

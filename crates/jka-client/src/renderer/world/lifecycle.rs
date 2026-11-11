@@ -206,7 +206,7 @@ impl Renderer {
         // lazily compile/switch to the dedicated RT pipeline variant.
         let mut initial_shader_variant = self.world_shader_variant_key_for_source_map(source_map);
         // The incoming BSP's sun is not installed in self.world yet.
-        initial_shader_variant.baked_sun_relight |= self.baked_sun_removal > 0.0 || self.baked_sun_removal_auto
+        initial_shader_variant.baked_sun_relight |= self.baked_sun_removal > 0.0 || self.baked_sun_removal_auto || self.baked_sun_removal_contour
             && !source_map && map.sun.is_some();
         initial_shader_variant.ray_traced_shadows = false;
         initial_shader_variant.rt_receiver_glass = false;

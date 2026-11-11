@@ -71,11 +71,16 @@ pub fn build_vertices(
     if ui.video.draw_2d && ui.video.reflection_debug {
         build_reflection_debug_legend(&mut out, ui, width, height);
     }
+    // Native Shader Remaps page; drawn before the console so it stays on top.
+    if ui.shader_remap.is_some() {
+        super::shader_remap::build(&mut out, ui, width, height);
+    }
     match ui.mode {
         OverlayMode::None | OverlayMode::Chat => {}
         OverlayMode::Console if !ui.console_hl2 => build_console(&mut out, ui, width, height),
         OverlayMode::Console => {},
         // The Game/Video menus are drawn by egui; see `app::egui_menu`.
+        // ShaderRemap is native and drawn above from `ui.shader_remap`.
         OverlayMode::Video
         | OverlayMode::Game
         | OverlayMode::Vgs

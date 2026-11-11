@@ -31,8 +31,8 @@ impl App {
         self.solo_levelshot_texture_map = None;
         self.model_placement.thumbnails.clear();
         self.model_placement.thumbnails_pending.clear();
-        self.shader_remap_ui.thumbnails.clear();
-        self.shader_remap_ui.thumbnails_pending.clear();
+        // egui textures die with the context; drop handles and in-flight keys.
+        self.shader_remap_ui.thumbs = Default::default();
     }
 
     /// Console steals input, not the menu's visual layer or 3D preview.
@@ -73,7 +73,6 @@ impl App {
                     | OverlayMode::BmodelPicker
                     | OverlayMode::MapMods
                     | OverlayMode::EmoteRadial
-                    | OverlayMode::ShaderRemap
                     | OverlayMode::StrafeTrails
                     | OverlayMode::RaceGhosts
                     | OverlayMode::Telemarks
@@ -394,6 +393,7 @@ impl App {
         if !self.front_end { self.release_neon_chrome(); }
         self.poll_server_browser_events();
         self.poll_ui_catalog();
+        self.tick_shader_remap();
         if self.front_end && self.frontend_page == FrontendPage::PlayDemo {
             self.update_native_demo_browser();
         }
@@ -617,10 +617,6 @@ impl App {
         }
         if painted_overlay == OverlayMode::EmoteRadial {
             self.egui_emote_radial(ui);
-            return;
-        }
-        if painted_overlay == OverlayMode::ShaderRemap {
-            self.egui_shader_remap(ui);
             return;
         }
         if painted_overlay == OverlayMode::EntityGraph {

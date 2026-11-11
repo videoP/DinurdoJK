@@ -611,13 +611,13 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         .count();
     if authored_portal_batch_count != 0 && planar_mirror_batch_count == 0 {
         warnings.push(
-            "portal shader surfaces found, but none has an untargeted misc_portal_surface within 64 units; no planar mirrors enabled"
+            "portal shader surfaces found, but none has a valid misc_portal_surface within 64 units; no authored portal views enabled"
                 .into(),
         );
     }
     if options.planar_reflections && camera_portal_count != 0 {
         warnings.push(format!(
-            "{camera_portal_count} targeted misc_portal_surface camera portal(s) detected; planar mirror pass leaves camera portals on their authored material"
+            "{camera_portal_count} targeted misc_portal_surface camera portal(s) parsed for remote portal views"
         ));
     }
 

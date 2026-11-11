@@ -181,7 +181,9 @@ impl Renderer {
             &self.device, &self.queue,
             &crate::renderer::overlay::blank_ui_extension_atlas(),
         );
-        self.rebuild_ui_bind_group();
+        // Switching mods also invalidates the pending scoreboard avatar job
+        // and its decoded cells. One bind-group rebuild covers both textures.
+        self.invalidate_ui_avatars();
         // The enemy-info shader resolver owns its own VFS/material cache.
         // A mod switch must never retain the previous mod's icon shaders.
         self.enemy_icon_key = None;
@@ -611,7 +613,7 @@ impl Renderer {
             // Blue Water moonlight shares this existing Relighting shader path.
             // Select the variant when Relighting is enabled, not every sunset.
             || (self.sky_backend == 1 && self.sun_override)
-            || ((self.baked_sun_removal > 0.0 || self.baked_sun_removal_auto)
+            || ((self.baked_sun_removal > 0.0 || self.baked_sun_removal_auto || self.baked_sun_removal_contour)
                 && self.world.as_ref().is_some_and(|world| !world.source_map && world.sun.is_some()))
     }
 

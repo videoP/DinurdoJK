@@ -470,6 +470,19 @@ impl App {
         if !self.profile_preview_active {
             return;
         }
+        // The worker may still be indexing large mod installations. Leave the
+        // last completed draw in place rather than blocking or caching a failed
+        // preview key that would prevent the character from appearing later.
+        if let Err(error) = self.ensure_asset_preview_player_presenter() {
+            if error != "Profile presenter initializing" {
+                let message = format!("PROFILE PREVIEW: {error}");
+                if self.console_status != message {
+                    self.console_status = message.clone();
+                    self.push_console_line(format!("^1{message}"));
+                }
+            }
+            return;
+        }
 
         self.update_studio_camera_rig();
 
@@ -927,6 +940,15 @@ impl App {
             presenter.set_md3_geometry_cache(self.video.md3_geometry_cache);
             return Ok(());
         }
+        // Profile's paired presenter worker is also preparing the MD3/FX side.
+        // Never parse the same VFS on the UI thread while that job is pending.
+        if self.asset_preview_player_init.is_some() {
+            self.ensure_asset_preview_player_presenter()?;
+            if let Some(presenter) = self.asset_preview_entity_presenter.as_mut() {
+                presenter.set_md3_geometry_cache(self.video.md3_geometry_cache);
+                return Ok(());
+            }
+        }
         let mut assets =
             jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref())
                 .map_err(|error| format!("ASSET VIEWER VFS ERROR: {error}"))?;
@@ -939,19 +961,105 @@ impl App {
         Ok(())
     }
 
+    /// Start expensive, CPU-only Ghoul2/material setup without blocking Profile.
+    /// The worker owns a VFS snapshot, and its receiver is dropped on fs_game/
+    /// fs_restart so an old result can never enter the new asset namespace.
+    pub(in crate::app) fn begin_asset_preview_player_presenter(&mut self) {
+        if self.asset_preview_player_presenter.is_some()
+            || self.asset_preview_player_init.is_some()
+            || self.asset_preview_player_error.is_some()
+        {
+            return;
+        }
+        let base = self.base.clone();
+        let game = self.game.clone();
+        let pbr = self.video.pbr;
+        let overrides = self.video.allow_asset_overrides;
+        let shared_shaders = self.game_session.as_ref()
+            .and_then(|session| session.player_presenter.shader_definitions_for(pbr))
+            .or_else(|| self.local_player_presenter.as_ref()
+                .and_then(|presenter| presenter.shader_definitions_for(pbr)))
+            .or_else(|| self.asset_preview_entity_presenter.as_ref()
+                .and_then(|presenter| presenter.shader_definitions_for(pbr)));
+        // Don't replace a populated Asset Viewer MD3 cache merely because the
+        // user opened Profile after visiting that page.
+        let need_entity = self.asset_preview_entity_presenter.is_none();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        match std::thread::Builder::new()
+            .name("profile-ghoul2-init".to_owned())
+            .spawn(move || {
+                let started = Instant::now();
+                let result = (|| -> Result<(PlayerPresenter, Option<EntityPresenter>), String> {
+                    let mut assets = jka_assets::pk3::AssetSearchPath::open_game(&base, game.as_deref())
+                        .map_err(|error| format!("ASSET VIEWER VFS ERROR: {error}"))?;
+                    assets.set_allow_asset_overrides(overrides);
+                    let vfs_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    let presenter = PlayerPresenter::new_with_shared_shaders(assets, pbr, shared_shaders)
+                        .map_err(|error| format!("ASSET VIEWER GLM ERROR: {error}"))?;
+                    let ghoul2_ms = started.elapsed().as_secs_f64() * 1000.0 - vfs_ms;
+                    let entity = if need_entity {
+                        let mut entity_assets = jka_assets::pk3::AssetSearchPath::open_game(&base, game.as_deref())
+                            .map_err(|error| format!("PROFILE ENTITY VFS ERROR: {error}"))?;
+                        entity_assets.set_allow_asset_overrides(overrides);
+                        Some(EntityPresenter::new_with_shared_shaders(
+                            entity_assets, pbr, presenter.shader_definitions_for(pbr))
+                            .map_err(|error| format!("PROFILE ENTITY ERROR: {error}"))?)
+                    } else { None };
+                    rverbose!(1, "[PROFILE INIT] VFS {:.1} ms, Ghoul2/materials {:.1} ms, MD3/FX + VFS {:.1} ms",
+                        vfs_ms, ghoul2_ms, started.elapsed().as_secs_f64() * 1000.0 - vfs_ms - ghoul2_ms);
+                    Ok((presenter, entity))
+                })();
+                let _ = tx.send(result);
+            })
+        {
+            Ok(_) => self.asset_preview_player_init = Some(rx),
+            Err(error) => self.asset_preview_player_error = Some(format!(
+                "could not start Profile Ghoul2 loader: {error}")),
+        }
+    }
+
     pub(in crate::app) fn ensure_asset_preview_player_presenter(&mut self) -> Result<(), String> {
         if self.asset_preview_player_presenter.is_some() {
+            // Render Studio might have installed an instance while initialization
+            // was pending; don't retain a never-consumed worker result.
+            self.asset_preview_player_init = None;
             return Ok(());
         }
-        let mut assets =
-            jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref())
-                .map_err(|error| format!("ASSET VIEWER VFS ERROR: {error}"))?;
-        assets.set_allow_asset_overrides(self.video.allow_asset_overrides);
-        self.asset_preview_player_presenter = Some(
-            PlayerPresenter::new(assets, self.video.pbr)
-                .map_err(|error| format!("ASSET VIEWER GLM ERROR: {error}"))?,
-        );
-        Ok(())
+        self.begin_asset_preview_player_presenter();
+        if let Some(error) = self.asset_preview_player_error.as_ref() {
+            return Err(error.clone());
+        }
+        let Some(receiver) = self.asset_preview_player_init.as_ref() else {
+            return Err("Profile presenter initializing".to_owned());
+        };
+        match receiver.try_recv() {
+            Ok(Ok((presenter, entity))) => {
+                self.asset_preview_player_init = None;
+                if let Some(mut entity) = entity {
+                    entity.set_md3_geometry_cache(self.video.md3_geometry_cache);
+                    if self.asset_preview_entity_presenter.is_none() {
+                        self.asset_preview_entity_presenter = Some(entity);
+                    }
+                }
+                self.asset_preview_player_presenter = Some(presenter);
+                self.profile_preview_key = None;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                self.asset_preview_player_init = None;
+                self.asset_preview_player_error = Some(error.clone());
+                Err(error)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                Err("Profile presenter initializing".to_owned())
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.asset_preview_player_init = None;
+                let error = "Profile Ghoul2 loader exited without a result".to_owned();
+                self.asset_preview_player_error = Some(error.clone());
+                Err(error)
+            }
+        }
     }
 
     pub(in crate::app) fn clear_asset_preview_runtime(&mut self) {
@@ -1067,6 +1175,11 @@ impl App {
             }
             Err(error) => {
                 self.solo_dynamic_models = Arc::new(Vec::new());
+                // Async player/FX bootstrap is not a missing model. Retry the
+                // same selection next frame instead of caching its failure.
+                if error == "Profile presenter initializing" {
+                    return;
+                }
                 self.asset_preview_model_key = Some(key);
                 let message = format!("ASSET VIEWER PREVIEW: {qpath}: {error}");
                 if self.console_status != message {

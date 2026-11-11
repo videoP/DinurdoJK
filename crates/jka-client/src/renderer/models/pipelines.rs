@@ -61,6 +61,9 @@ impl DynamicModelRenderer {
         self.planar_model_pipelines = Default::default();
         self.planar_skin_pipelines = Default::default();
         self.planar_skin_source_pipelines = Default::default();
+        self.camera_portal_model_pipelines = Default::default();
+        self.camera_portal_skin_pipelines = Default::default();
+        self.camera_portal_skin_source_pipelines = Default::default();
         self.planar_fx_sprite_pipelines = Default::default();
         self.planar_fx_rope_pipeline = None;
         self.planar_model_format = None;
@@ -346,12 +349,16 @@ impl DynamicModelRenderer {
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
         authored_portal_visible: bool,
+        camera_portal_visible: bool,
     ) {
         if self.planar_model_format != Some(format) {
             self.planar_model_format = Some(format);
             self.planar_model_pipelines = Default::default();
             self.planar_skin_pipelines = Default::default();
             self.planar_skin_source_pipelines = Default::default();
+            self.camera_portal_model_pipelines = Default::default();
+            self.camera_portal_skin_pipelines = Default::default();
+            self.camera_portal_skin_source_pipelines = Default::default();
             self.planar_fx_sprite_pipelines = Default::default();
             self.planar_fx_rope_pipeline = None;
         }
@@ -399,6 +406,44 @@ impl DynamicModelRenderer {
                         create_ghoul2_skin_pipeline_winding(&device, &layout, &shader, format,
                             1, mode, legacy_fog, model_wet, false, source, true)
                     });
+                }
+            }
+        }
+        if camera_portal_visible {
+            for mode in DYNAMIC_MODEL_ALPHA_ORDER {
+                if mode == DynamicModelAlphaMode::Glass { continue; }
+                let index = mode.index();
+                if self.model_alpha_mask & (1 << index) != 0 && self.camera_portal_model_pipelines[index].is_none() {
+                    let key = PipelineJobKey::new("camera-portal-dynamic-model", index as u32, config);
+                    if let Some(ready) = jobs.take_ready(key) {
+                        self.camera_portal_model_pipelines[index] = Some(ready);
+                    } else {
+                        let device = device.clone(); let layout = self.pipeline_layout.clone();
+                        let shader = self.shader.clone(); let fog = self.legacy_fog_compiled;
+                        let wet = self.model_wet_compiled;
+                        jobs.request(key, "camera portal MD3 variant", move || {
+                            create_dynamic_model_pipeline_inner_winding(&device, &layout, &shader,
+                                format, 1, mode, fog, wet, false, false, false, false)
+                        });
+                    }
+                }
+                for (source, needed) in [(false, self.skin_alpha_mask), (true, self.skin_source_mask)] {
+                    if needed & (1 << index) == 0 { continue; }
+                    let pipeline = if source { &mut self.camera_portal_skin_source_pipelines[index] }
+                        else { &mut self.camera_portal_skin_pipelines[index] };
+                    if pipeline.is_some() { continue; }
+                    let kind = if source { "camera-portal-ghoul2-source" } else { "camera-portal-ghoul2-model" };
+                    let key = PipelineJobKey::new(kind, index as u32, config);
+                    if let Some(ready) = jobs.take_ready(key) { *pipeline = Some(ready); }
+                    else {
+                        let device = device.clone(); let layout = self.skin_pipeline_layout.clone();
+                        let shader = self.skin_shader.clone(); let fog = self.legacy_fog_compiled;
+                        let wet = self.model_wet_compiled;
+                        jobs.request(key, "camera portal Ghoul2 variant", move || {
+                            create_ghoul2_skin_pipeline_winding(&device, &layout, &shader,
+                                format, 1, mode, fog, wet, false, source, false)
+                        });
+                    }
                 }
             }
         }

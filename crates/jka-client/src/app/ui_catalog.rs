@@ -53,7 +53,8 @@ pub(super) enum CatalogRequest {
     /// `gfx/2d/crosshair*` thumbnail for the settings picker, by `cg_crosshairImage`.
     CrosshairImage { index: u8 },
     ShaderNames,
-    ShaderThumbnail { map_label: String, source: String, image_path: String },
+    /// `source` is the cache key echoed back; `max_px` bounds the decode.
+    ShaderThumbnail { map_label: String, source: String, image_path: String, max_px: u32 },
     ScreenshotCatalog,
     ScreenshotImage { path: PathBuf },
 }
@@ -474,20 +475,26 @@ fn worker_main(jobs: Receiver<Job>, results: Sender<CatalogResult>) {
                 names.dedup();
                 ("shader names", CatalogPayload::ShaderNames(names))
             }
-            CatalogRequest::ShaderThumbnail { map_label, source, image_path } => {
-                // The UI worker owns VFS reads and decoding. Bound previews
-                // to 96px so a map with thousands of materials stays cheap.
+            CatalogRequest::ShaderThumbnail { map_label, source, image_path, max_px } => {
+                // The UI worker owns VFS reads and decoding. Grid tiles ask
+                // for 128px and the inspector for 320px; the editor caps
+                // in-flight requests and evicts least-recently-used textures.
+                // `image_path` lists candidates (editor image, stage maps,
+                // the name itself) one per line; the first decodable wins.
                 let mut decoded = None;
-                let stem = crate::scene::canonical_shader_name(&image_path);
-                for ext in ["tga", "png", "jpg", "jpeg"] {
-                    if let Ok(Some(asset)) = assets.read(&format!("{stem}.{ext}"), 8 * 1024 * 1024) {
-                        if let Ok(raw) = image::load_from_memory(&asset.bytes) {
-                            let preview = raw.thumbnail(96, 96).to_rgba8();
-                            decoded = Some(DecodedImage {
-                                size: [preview.width() as usize, preview.height() as usize],
-                                rgba: preview.into_raw(),
-                            });
-                            break;
+                'candidates: for candidate in image_path.lines() {
+                    let stem = crate::scene::canonical_shader_name(candidate);
+                    if stem.is_empty() { continue; }
+                    for ext in ["tga", "png", "jpg", "jpeg"] {
+                        if let Ok(Some(asset)) = assets.read(&format!("{stem}.{ext}"), 8 * 1024 * 1024) {
+                            if let Ok(raw) = image::load_from_memory(&asset.bytes) {
+                                let preview = raw.thumbnail(max_px, max_px).to_rgba8();
+                                decoded = Some(DecodedImage {
+                                    size: [preview.width() as usize, preview.height() as usize],
+                                    rgba: preview.into_raw(),
+                                });
+                                break 'candidates;
+                            }
                         }
                     }
                 }

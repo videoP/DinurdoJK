@@ -167,15 +167,25 @@ impl App {
             }
             ui.add_enabled_ui(baked_sun_ready, |ui| {
                 theme::row(ui, "Automatic sunlight removal",
-                    "Measure the strength that minimizes residual contrast across the original sunlight/shadow edges in the BSP lightmap. Calibration runs on the background bake and is cached; if there are too few reliable shadow samples, Auto preserves the original lighting. The console reports the fitted multiplier.",
+                    "Auto uses a single robust sun/shadow edge fit. Contour Guided fits local strengths along shadow contours and conservatively estimates nearby bounce gradients; corrections blend smoothly on the same BSP lightmap chart. Both modes are background-baked and cached.",
                     theme::Reset::None, |ui| {
-                        if let Some(enabled) = theme::switch(ui, self.video.baked_sun_removal_auto) {
-                            self.video.baked_sun_removal_auto = enabled;
-                            self.sync_post_effects();
-                            self.mark_config_dirty();
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(self.video.baked_sun_removal_auto && !self.video.baked_sun_removal_contour, "Auto").clicked() {
+                                let was_auto = self.video.baked_sun_removal_auto && !self.video.baked_sun_removal_contour;
+                                self.video.baked_sun_removal_auto = !was_auto;
+                                self.video.baked_sun_removal_contour = false;
+                                self.sync_post_effects();
+                                self.mark_config_dirty();
+                            }
+                            if ui.selectable_label(self.video.baked_sun_removal_contour, "Auto (Contour Guided)").clicked() {
+                                self.video.baked_sun_removal_contour = !self.video.baked_sun_removal_contour;
+                                if self.video.baked_sun_removal_contour { self.video.baked_sun_removal_auto = false; }
+                                self.sync_post_effects();
+                                self.mark_config_dirty();
+                            }
+                        });
                     });
-                if self.video.baked_sun_removal_auto {
+                if self.video.baked_sun_removal_auto || self.video.baked_sun_removal_contour {
                     // Render a disabled *copy* of the standard slider. Never
                     // write back to the archived manual r_bakedSunRemoval value.
                     // Unlike the manual slider, Auto can fit above 1x.
@@ -197,6 +207,9 @@ impl App {
                                         strength,
                                     );
                                 });
+                            }
+                            crate::renderer::BakedSunAutoStatus::ContourGuided => {
+                                ui.label("Contour-guided field ready (variable strength + local bounce)");
                             }
                             crate::renderer::BakedSunAutoStatus::Calibrating => {
                                 ui.label("Calibrating...");
@@ -406,6 +419,7 @@ impl App {
         self.video.baked_sun_shadow_map = d.baked_sun_shadow_map;
         self.video.baked_sun_removal = d.baked_sun_removal;
         self.video.baked_sun_removal_auto = d.baked_sun_removal_auto;
+        self.video.baked_sun_removal_contour = d.baked_sun_removal_contour;
         self.video.baked_sun_edge_softness = d.baked_sun_edge_softness;
         self.video.baked_sun_direct_limit = d.baked_sun_direct_limit;
         self.video.baked_indirect_scale = d.baked_indirect_scale;

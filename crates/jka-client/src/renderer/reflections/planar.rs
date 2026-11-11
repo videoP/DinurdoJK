@@ -176,6 +176,7 @@ pub(in crate::renderer) fn collect_planar_reflectors(
             // Authored JKA mirrors use misc_portal_surface exactly. Promoted
             // environment surfaces have no portal entity, so retain their
             // surface centre and nudge it to the camera side at selection time.
+            portal_camera: if kind == PlanarReflectorKind::Authored { batch.source.portal_camera } else { None },
             pvs_origin: if kind == PlanarReflectorKind::Authored {
                 batch.source.planar_pvs_origin
             } else {
@@ -711,6 +712,32 @@ fn lake_planar_reflection_survives_receding_screen_coverage() {
     ));
 }
 
+/// id Tech 3 PerpendicularVector, evaluated in JKA coordinates.
+///
+/// The smallest-component axis choice (including X/Y/Z tie order) is not
+/// rotation-invariant. Our render axes are (JKA X, JKA Z, -JKA Y); choosing
+/// the basis *after* that conversion rotates the portal frame by 90 degrees
+/// for walls whose normal is along X. TaystJK chooses it in JKA space before
+/// CG_Portal and R_GetPortalOrientations transform the view.
+fn quake_perpendicular(n: Vec3) -> Vec3 {
+    let jka = Vec3::new(n.x, -n.z, n.y);
+    let basis = if jka.x.abs() <= jka.y.abs() && jka.x.abs() <= jka.z.abs() { Vec3::X }
+        else if jka.y.abs() <= jka.z.abs() { Vec3::Y } else { Vec3::Z };
+    let perpendicular = (basis - jka * jka.dot(basis)).normalize_or_zero();
+    Vec3::new(perpendicular.x, perpendicular.z, -perpendicular.y)
+}
+
+#[test]
+fn camera_portal_perpendicular_preserves_jka_axis_tie_order() {
+    // A JKA X-facing wall uses JKA +Y as its second portal axis. In the
+    // renderer that is -Z, not +Y. The old render-space basis caused the
+    // reported 90-degree rotation on Castingcouch's wall portal.
+    assert!((quake_perpendicular(Vec3::X) - Vec3::NEG_Z).length() < 1e-6);
+    assert!((quake_perpendicular(Vec3::NEG_X) - Vec3::NEG_Z).length() < 1e-6);
+    // A JKA Y-facing wall chooses +X in both coordinate systems.
+    assert!((quake_perpendicular(Vec3::NEG_Z) - Vec3::X).length() < 1e-6);
+}
+
 pub(in crate::renderer) fn select_planar_reflection_views(
     world: &WorldGpu,
     camera: &Camera,
@@ -722,6 +749,7 @@ pub(in crate::renderer) fn select_planar_reflection_views(
     ocean_enabled: bool,
     lake_planar: Option<bool>,
     previous_planes: &[Option<[f32; 4]>; PLANAR_REFLECTION_SLOTS],
+    time_seconds: f32,
 ) -> [Option<PlanarReflectionView>; PLANAR_REFLECTION_SLOTS] {
     let planar_budget = reflection_quality
         .planar_slot_budget()
@@ -840,7 +868,7 @@ pub(in crate::renderer) fn select_planar_reflection_views(
         // reflection slot on the same geometric plane.
         if let Some(existing) = candidates
             .iter_mut()
-            .find(|existing| planar_planes_equivalent(existing.4, plane))
+            .find(|existing| planar_planes_equivalent(existing.4, plane) && existing.3.portal_camera == reflector.portal_camera)
         {
             let candidate_is_better = score > existing.2;
             let union = (existing.5 .0.min(ndc_rect.0), existing.5 .1.max(ndc_rect.1));
@@ -918,11 +946,54 @@ pub(in crate::renderer) fn select_planar_reflection_views(
     let mut views = [None; PLANAR_REFLECTION_SLOTS];
     for (slot, (_, _, _, reflector, plane, ndc_rect)) in ordered.into_iter().enumerate() {
         let plane_normal = Vec3::new(plane[0], plane[1], plane[2]).normalize_or_zero();
-        let reflected_position = reflect_point_across_plane(camera.position, plane);
-        let reflected_forward = (camera.forward()
-            - 2.0 * plane_normal * camera.forward().dot(plane_normal))
-        .normalize_or_zero();
-        let reflected_view_proj = main_view_proj * reflection_matrix(plane);
+        // TaystJK R_GetPortalOrientations/R_MirrorPoint/R_MirrorVector:
+        // A targeted portal maps the viewer's pose through the source plane
+        // into a remote camera frame. Unlike a mirror the transform has a
+        // positive determinant, so normal front-face winding must be used.
+        let (reflected_position, reflected_forward, reflected_view_proj, clip_plane) =
+            if let Some(remote) = reflector.portal_camera {
+                let source_normal = plane_normal;
+                let source_y = quake_perpendicular(source_normal);
+                let source_axes = glam::Mat3::from_cols(source_normal, source_y,
+                    source_normal.cross(source_y));
+                let remote_forward = Vec3::from_array(remote.camera_forward).normalize_or_zero();
+                let remote_y = quake_perpendicular(remote_forward);
+                // CG_Portal negates axis[1]; R_GetPortalOrientations negates
+                // camera axes [0,1]. Net: (-forward, +perp, -cross).
+                let camera_x = -remote_forward;
+                let angle = if remote.swing {
+                    if remote.rotation_speed != 0.0 {
+                        time_seconds * remote.rotation_speed
+                    } else {
+                        remote.roll_degrees + (time_seconds * 3.0).sin() * 4.0
+                    }
+                } else { remote.roll_degrees };
+                let spin = glam::Quat::from_axis_angle(camera_x, angle.to_radians());
+                let camera_y = spin * remote_y;
+                let camera_axes = glam::Mat3::from_cols(camera_x, camera_y,
+                    camera_x.cross(camera_y));
+                let source_origin = Vec3::from_array(remote.surface_origin);
+                let surface_origin = source_origin
+                    - source_normal * (source_normal.dot(source_origin) + plane[3]);
+                let remote_origin = Vec3::from_array(remote.camera_origin);
+                let remote_from_surface = camera_axes * source_axes.transpose();
+                let remote_position = remote_origin
+                    + remote_from_surface * (camera.position - surface_origin);
+                let remote_forward_view = (remote_from_surface * camera.forward()).normalize_or_zero();
+                let surface_from_remote = Mat4::from_translation(surface_origin)
+                    * Mat4::from_mat3(source_axes * camera_axes.transpose())
+                    * Mat4::from_translation(-remote_origin);
+                (remote_position, remote_forward_view,
+                    main_view_proj * surface_from_remote,
+                    [remote_forward.x, remote_forward.y, remote_forward.z,
+                        -remote_forward.dot(remote_origin)])
+            } else {
+                let reflected_position = reflect_point_across_plane(camera.position, plane);
+                let reflected_forward = (camera.forward()
+                    - 2.0 * plane_normal * camera.forward().dot(plane_normal))
+                    .normalize_or_zero();
+                (reflected_position, reflected_forward, main_view_proj * reflection_matrix(plane), plane)
+            };
         let pvs_origin = if reflector.kind == PlanarReflectorKind::Authored {
             Vec3::from_array(reflector.pvs_origin)
         } else {
@@ -938,6 +1009,8 @@ pub(in crate::renderer) fn select_planar_reflection_views(
             view_proj: reflected_view_proj,
             camera_position: reflected_position,
             camera_forward: reflected_forward,
+            camera_portal: reflector.portal_camera.is_some(),
+            clip_plane,
             cluster,
             coarse_batch_index: reflector.coarse_batch_index,
             cull_view_proj: ndc_rect_narrowing(ndc_rect.0, ndc_rect.1) * reflected_view_proj,

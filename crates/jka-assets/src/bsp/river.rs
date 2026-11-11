@@ -237,9 +237,12 @@ fn sink(entity: &Entity, models: &[Model], entity_index: usize) -> Result<Sink, 
 /// bathymetry samples them) and solid triangle soups. Liquid and clip-only
 /// brushes are not bed. A face is kept only if it can be ground:
 ///  - its outward normal points up (a ceiling's underside never is), and
-///  - the point one unit in front of it is in a playable BSP cluster, so the
-///    outside of the skybox and faces buried between brushes are dropped.
-///    Maps compiled without vis keep the up-facing test only.
+///  - for patches and triangle soups only, the point one unit in front of it
+///    is in a playable BSP cluster (maps compiled without vis skip this).
+///    Solid brush tops are kept even when buried in a ceiling or the sky:
+///    the capture keeps the highest surface, as Unreal's depth render does,
+///    so a wall running up into the ceiling is a full-height wall instead of
+///    a hole. Roofs are still dropped by their solid's bottom height.
 /// Sky flags are honoured when the BSP carries them (Tsangpo's does not).
 /// Z-up JKA map units; returned triangles face up.
 /// Up-facing collision surface with the bottom of its parent solid brush.
@@ -292,9 +295,7 @@ pub fn collision_surfaces(bsp: &Bsp) -> Result<Vec<CollisionSurface>, String> {
             for point in &polygon {
                 bottom_z = bottom_z.min(point[2]);
             }
-            if plane.normal[2] <= UP || flags & SURF_SKY != 0
-                || polygon.len() < 3 || !in_air(&polygon, plane.normal)
-            {
+            if plane.normal[2] <= UP || flags & SURF_SKY != 0 || polygon.len() < 3 {
                 continue;
             }
             for k in 2..polygon.len() {

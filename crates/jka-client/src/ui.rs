@@ -67,6 +67,8 @@ pub(crate) use studio_race_map::{StudioRaceMap, MAX_MAP_TRIANGLES};
 mod console;
 mod demo;
 pub mod demo_browser;
+pub(crate) mod kit;
+pub(crate) mod shader_remap;
 pub(crate) mod asset_mapping;
 mod frametime_graph;
 pub(crate) use frametime_graph::{build_frame_time_graph_vertices, FrameGraphSummary};
@@ -569,9 +571,9 @@ pub struct UiMatchStats {
     pub gauntlet: i32,
 }
 
-/// Every player icon (`icon_<skin>` of every model), packed once into one
-/// texture (binding 9) so the scoreboard's avatars cost a single texture and
-/// no reloads.
+/// Currently requested scoreboard/spectator model icons in one small
+/// texture (binding 9). The renderer updates the atlas when players change
+/// models or skins; it never scans the entire installed model collection.
 #[derive(Debug, Clone, Default)]
 pub struct AvatarAtlas {
     pub columns: u32,
@@ -1773,6 +1775,8 @@ pub struct UiSnapshot {
     pub scoreboard_focus_client: Option<i32>,
     pub demo_timeline: Option<DemoTimelineUi>,
     pub demo_browser: Option<demo_browser::DemoBrowserUi>,
+    /// Native Taffy/WGPU Shader Remaps page (visible tiles only).
+    pub shader_remap: Option<shader_remap::ShaderRemapView>,
     /// Taffy/WGPU asset path recovery, independent of mounted game archives.
     pub asset_mapping: Option<asset_mapping::AssetMappingUi>,
     pub prediction_debug: Option<PredictionDebugUi>,
@@ -1912,6 +1916,7 @@ impl Default for UiSnapshot {
             scoreboard_focus_client: None,
             demo_timeline: None,
             demo_browser: None,
+            shader_remap: None,
             asset_mapping: None,
             prediction_debug: None,
             hud: None,

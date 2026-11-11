@@ -794,6 +794,7 @@ impl App {
             entity_sun_lighting: effective.entity_sun_lighting,
             baked_sun_removal: effective.baked_sun_removal,
             baked_sun_removal_auto: effective.baked_sun_removal_auto,
+            baked_sun_removal_contour: effective.baked_sun_removal_contour,
             baked_sun_cache: effective.baked_sun_cache,
             lightmap_smoothing: self.video.lightmap_smoothing,
             baked_sun_aa: self.video.baked_sun_aa,

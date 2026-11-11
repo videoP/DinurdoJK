@@ -162,9 +162,10 @@ impl Renderer {
         self.sun_color = effects.sun_color.map(|channel| channel.clamp(0.0, 1.0));
         self.sun_visibility = effects.sun_visibility;
         self.entity_sun_lighting = effects.entity_sun_lighting;
-        let old_baked_sun_removal = (self.baked_sun_removal, self.baked_sun_removal_auto);
+        let old_baked_sun_removal = (self.baked_sun_removal, self.baked_sun_removal_auto, self.baked_sun_removal_contour);
         self.baked_sun_removal = effects.baked_sun_removal.clamp(0.0, 1.0);
         self.baked_sun_removal_auto = effects.baked_sun_removal_auto;
+        self.baked_sun_removal_contour = effects.baked_sun_removal_contour;
         self.baked_sun_cache = effects.baked_sun_cache;
         self.lightmap_smoothing = effects.lightmap_smoothing.min(2);
         self.baked_sun_aa = effects.baked_sun_aa.min(3);
@@ -189,7 +190,7 @@ impl Renderer {
         self.baked_sun_direct_limit = effects.baked_sun_direct_limit.clamp(0.0, 0.9);
         let current_sun = (self.sun_override, self.sun_yaw, self.sun_pitch,
                            self.sun_intensity, self.sun_color);
-        let solar_uniforms_changed = old_baked_sun_removal != (self.baked_sun_removal, self.baked_sun_removal_auto)
+        let solar_uniforms_changed = old_baked_sun_removal != (self.baked_sun_removal, self.baked_sun_removal_auto, self.baked_sun_removal_contour)
             || old_baked_sun_shadow_map != self.baked_sun_shadow_map
             || old_indirect != (self.baked_indirect_scale, self.baked_indirect_saturation,
                 self.baked_indirect_power, self.baked_indirect_highlight_preserve,

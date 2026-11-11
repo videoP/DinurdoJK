@@ -23,5 +23,6 @@ pub mod river_runtime;
 pub mod river_settings;
 pub mod river_slw;
 pub mod river_surface;
+pub mod river_tiles;
 pub mod river_water_info;
 pub mod river_water_info_capture;

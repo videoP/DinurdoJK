@@ -170,6 +170,22 @@ impl super::Renderer {
             water.warned_unsampleable = true;
             eprintln!("[RIVER] the water look needs post-processing or MSAA (the scene must be copyable); not drawn");
         }
+        // Sparse (long-distance) rivers keep their presentation window around
+        // the camera; dense patches ignore this.
+        {
+            let eye = jka_render_core::coordinates::jka_position(camera.position.to_array());
+            let grid = self.world.as_ref().and_then(|world| world.entity_light_grid.as_ref());
+            let map_toward_sun = grid.and_then(|grid| grid.map_toward_sun());
+            for river in &mut self.live_rivers {
+                river.update_view(
+                    &self.device,
+                    &self.queue,
+                    eye,
+                    |point| grid.and_then(|grid| grid.sample_classic_entity_light(point)),
+                    map_toward_sun,
+                );
+            }
+        }
         let water = self.river_surface.as_ref();
         let device = &self.device;
         self.live_rivers.retain_mut(|river| {

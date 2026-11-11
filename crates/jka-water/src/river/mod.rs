@@ -16,10 +16,12 @@ pub mod capture;
 pub mod control;
 pub mod foam;
 pub mod foam_field;
+pub mod frame_reference;
 pub mod grid_mesh;
 pub mod material;
 pub mod ocean;
 pub mod slw;
+pub mod sparse;
 pub mod stages;
 pub mod surface;
 pub mod transport;
@@ -27,7 +29,11 @@ pub mod water_body;
 pub mod water_info;
 pub mod wave_advection;
 
-pub const SHALLOW_SHADER: &str = include_str!("shallow.wgsl");
+/// Stages 6..14 over the native single dense rectangle.
+pub const SHALLOW_SHADER: &str = concat!(include_str!("shallow.wgsl"), include_str!("shallow_dense.wgsl"));
+/// The same stage bodies over resident tiles of a virtual rectangle
+/// (`sparse`), plus the per-slot occupancy kernel. Not an Unreal system.
+pub const SPARSE_SHALLOW_SHADER: &str = concat!(include_str!("shallow.wgsl"), include_str!("shallow_sparse.wgsl"));
 
 /// Selected transport settings from the main river asset's cached shader.
 #[derive(Clone, Copy, Debug)]

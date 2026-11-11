@@ -365,12 +365,7 @@ impl App {
                         }
                     }
                 }
-                CatalogPayload::ShaderNames(names) => {
-                    self.shader_remap_ui.implicit_targets = names;
-                    self.shader_remap_ui.targets.extend(self.shader_remap_ui.implicit_targets.iter().cloned());
-                    self.shader_remap_ui.targets.sort_unstable();
-                    self.shader_remap_ui.targets.dedup();
-                }
+                CatalogPayload::ShaderNames(names) => self.install_remap_shader_names(names),
                 CatalogPayload::ModelThumbnail { qpath, image } => {
                     self.model_placement.thumbnails_pending.remove(&qpath);
                     if let Some(image) = image {
@@ -384,17 +379,7 @@ impl App {
                     }
                 }
                 CatalogPayload::ShaderThumbnail { map_label, source, image } => {
-                    if map_label != self.shader_remap_ui.map_label { continue; }
-                    self.shader_remap_ui.thumbnails_pending.remove(&source);
-                    if let Some(image) = image {
-                        self.shader_remap_ui.thumbnails.insert(source.clone(), ctx.load_texture(
-                            format!("shader-remap-thumb:{source}"),
-                            egui::ColorImage::from_rgba_unmultiplied(image.size, &image.rgba),
-                            egui::TextureOptions::LINEAR,
-                        ));
-                    } else {
-                        self.shader_remap_ui.thumbnails_missing.insert(source);
-                    }
+                    self.install_remap_thumb(map_label, source, image);
                 }
                 CatalogPayload::CrosshairImage { index, image } => {
                     let key = Self::crosshair_image_key(index);

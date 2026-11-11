@@ -995,7 +995,7 @@ impl App {
         // A superseded early frontend result must not hold a stale BSP alive.
         self.deferred_frontend_map = None;
         self.shader_remaps.clear();
-        self.shader_remap_ui = Default::default();
+        self.reset_shader_remap_ui();
         self.shader_remap_upload = false;
         self.shader_remap_dirty = false;
         let sub_bsp_names = if purpose == MapLoadPurpose::FrontendBackground {

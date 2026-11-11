@@ -230,6 +230,7 @@ impl App {
         self.profile_body_highlight = None;
         self.profile_studio_cosmetic_group = 0;
         self.profile_preview_key = None;
+        self.begin_asset_preview_player_presenter();
     }
 
     pub(in crate::app) fn sync_profile_preview_mode(&mut self, active: bool) {

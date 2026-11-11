@@ -281,6 +281,9 @@ impl App {
         self.chat_log_browser_selected = None;
         self.chat_log_browser_detail_path = None;
         self.chat_log_browser_detail = None;
+        // Dropping a pending receiver makes a superseded VFS result harmless.
+        self.asset_preview_player_init = None;
+        self.asset_preview_player_error = None;
         self.asset_preview_player_presenter = None;
         self.asset_preview_entity_presenter = None;
         self.asset_preview_model_key = None;

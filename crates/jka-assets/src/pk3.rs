@@ -254,7 +254,7 @@ pub struct FilesystemRoots {
     pub active_jk2: Option<u8>,
     /// Immutable session-only JK2 pure policy; never saved in user settings.
     pub jk2_pure: Option<Arc<crate::jk2_pure::Jk2PurePolicy>>,
-    /// Optional JKA-only, highest-priority read-only asset layer: fs_basepath/<name>/.
+    /// Optional JKA-only, highest-priority readable and writable asset layer: fs_basepath/<name>/.
     pub forcegame: Option<String>,
     /// Optional JK2-only counterpart: fs_jk2basepath/<name>/.
     pub jk2forcegame: Option<String>,
@@ -478,9 +478,10 @@ pub fn installed_packages(base: &Path, game: Option<&Path>) -> Vec<PackageInfo> 
     packages
 }
 
-/// Resolve game-owned writes independently of the read-only fs_forcegame
-/// override. Configs, demos, screenshots and downloads retain legacy paths;
-/// never write into a forcegame folder or fs_cdpath.
+/// Resolve game-owned writes using the same highest-priority forcegame layer
+/// as reads. If no forcegame is configured, use the ordinary active fs_game
+/// (or base) under its writable home/install root. CD roots are never writable.
+/// Server-managed PK3 downloads are the exception; they keep fs_game paths.
 pub fn game_write_directory(base: &Path, game: Option<&Path>) -> PathBuf {
     let roots = configured_filesystem_roots(base);
     filesystem_write_directory(base, game, &roots)
@@ -488,6 +489,16 @@ pub fn game_write_directory(base: &Path, game: Option<&Path>) -> PathBuf {
 
 /// Pure counterpart for testing and for callers that already know the roots.
 pub fn filesystem_write_directory(base: &Path, game: Option<&Path>, roots: &FilesystemRoots) -> PathBuf {
+    if let Some(forced) = filesystem_forcegame_directory(base, roots, roots.active_jk2.is_some()) {
+        return forced;
+    }
+    filesystem_unforced_write_directory(base, game, roots)
+}
+
+/// Physical fs_game/base write destination, bypassing forcegame. Only server
+/// downloads need this: referenced PK3s must retain their server-specified
+/// base/mod directory and honor the game's optional homepath.
+pub fn filesystem_unforced_write_directory(base: &Path, game: Option<&Path>, roots: &FilesystemRoots) -> PathBuf {
     let jk2 = roots.active_jk2.is_some();
     let root = game_home_root(roots, jk2).unwrap_or_else(|| if jk2 {
         // JK2 cannot start without fs_jk2basepath (see missing_jk2_stock_archive),
@@ -592,9 +603,8 @@ pub fn filesystem_game_layer_dirs(base: &Path, game: Option<&Path>, roots: &File
     dirs
 }
 
-/// Resolve the per-game forcegame asset directory inside that game's install
-/// root. Unlike DinurdoJK/shared, these override layers are never shared
-/// between JK2 and JKA. They do not change game-owned write destinations.
+/// Resolve the per-game forcegame read/write override inside that game's
+/// installation root (not homepath). JK2 and JKA never share override folders.
 pub fn filesystem_forcegame_directory(base: &Path, roots: &FilesystemRoots, jk2: bool) -> Option<PathBuf> {
     let name = if jk2 { roots.jk2forcegame.as_ref() } else { roots.forcegame.as_ref() }?;
     let root = if jk2 { jk2_root_directory(base, roots) }
@@ -604,8 +614,9 @@ pub fn filesystem_forcegame_directory(base: &Path, roots: &FilesystemRoots, jk2:
 
 /// Mount order, highest first: active game's forcegame (if set),
 /// DinurdoJK/shared, active game mod, local base, CD base. forcegame is a
-/// read-only asset override, *not* an fs_game selection or writable directory.
-/// CD roots never contribute mod folders or writes. JK2/JKA stay isolated.
+/// writable override, not an fs_game selection: server-selected mod names
+/// and downloaded PK3 destinations stay unchanged. CD roots are read-only.
+/// JK2 and JKA remain isolated.
 pub fn filesystem_search_dirs(base: &Path, game: Option<&Path>, roots: &FilesystemRoots) -> Vec<PathBuf> {
     let jk2 = roots.active_jk2.is_some();
     let root = if jk2 { jk2_root_directory(base, roots) }
@@ -2295,12 +2306,14 @@ mod filesystem_roots_tests {
             PathBuf::from("/jk2-home/base"), PathBuf::from("/external/outcast/base"),
             PathBuf::from("/cd/base"),
         ]);
-        assert_eq!(filesystem_write_directory(base, None, &roots), PathBuf::from("/jk2-home/base"));
+        assert_eq!(filesystem_write_directory(base, None, &roots), PathBuf::from("/external/outcast/my-mod"));
+        assert_eq!(filesystem_unforced_write_directory(base, None, &roots), PathBuf::from("/jk2-home/base"));
         assert_eq!(filesystem_game_layer_dirs(base, None, &roots), vec![
             PathBuf::from("/jk2-home/base"), PathBuf::from("/external/outcast/base"),
         ]);
         let jka = FilesystemRoots { active_jk2: None, ..roots };
-        assert_eq!(filesystem_write_directory(base, None, &jka), PathBuf::from("/jka-home/base"));
+        assert_eq!(filesystem_write_directory(base, None, &jka), PathBuf::from("/client/jka-mod"));
+        assert_eq!(filesystem_unforced_write_directory(base, None, &jka), PathBuf::from("/jka-home/base"));
     }
 
     #[test]
@@ -2316,7 +2329,7 @@ mod filesystem_roots_tests {
     }
 
     #[test]
-    fn forcegame_isolated_by_game_above_shared_without_redirecting_writes() {
+    fn forcegame_isolated_by_game_and_redirects_writes_to_highest_priority_layer() {
         let base = Path::new("/client/base");
         let roots = FilesystemRoots {
             forcegame: Some("Eternal".into()), jk2forcegame: Some("jk2-custom".into()),
@@ -2331,7 +2344,9 @@ mod filesystem_roots_tests {
             PathBuf::from("/client/base"),
             PathBuf::from("/jka-cd/base"),
         ]);
-        assert_eq!(filesystem_write_directory(base, Some(jka_mod), &roots), jka_mod);
+        assert_eq!(filesystem_write_directory(base, Some(jka_mod), &roots), PathBuf::from("/client/Eternal"));
+        assert_eq!(filesystem_write_directory(base, None, &roots), PathBuf::from("/client/Eternal"));
+        assert_eq!(filesystem_unforced_write_directory(base, Some(jka_mod), &roots), jka_mod);
         let jk2 = FilesystemRoots {
             active_jk2: Some(4), jk2basepath: Some("/client/jk2root".into()), ..roots
         };
@@ -2343,18 +2358,41 @@ mod filesystem_roots_tests {
             PathBuf::from("/client/jk2root/base"),
             PathBuf::from("/jk2-cd/base"),
         ]);
-        assert_eq!(filesystem_write_directory(base, Some(jk2_mod), &jk2), jk2_mod);
+        assert_eq!(filesystem_write_directory(base, Some(jk2_mod), &jk2), PathBuf::from("/client/jk2root/jk2-custom"));
+        assert_eq!(filesystem_write_directory(base, None, &jk2), PathBuf::from("/client/jk2root/jk2-custom"));
+        assert_eq!(filesystem_unforced_write_directory(base, Some(jk2_mod), &jk2), jk2_mod);
         // Having JKA's forcegame configured must not mount it for JK2.
         let jk2_unset = FilesystemRoots { jk2forcegame: None, ..jk2.clone() };
         assert_eq!(filesystem_search_dirs(base, None, &jk2_unset).first(),
             Some(&PathBuf::from("/client/DinurdoJK/shared")));
+        assert_eq!(filesystem_write_directory(base, Some(jk2_mod), &jk2_unset), jk2_mod);
         // Likewise, JK2's forced override does not leak into JKA.
         let jka_unset = FilesystemRoots { forcegame: None, active_jk2: None, ..jk2.clone() };
         assert_eq!(filesystem_search_dirs(base, None, &jka_unset).first(),
             Some(&PathBuf::from("/client/DinurdoJK/shared")));
+        assert_eq!(filesystem_write_directory(base, Some(jka_mod), &jka_unset), jka_mod);
         // A JK2 override is not mapped into JKA when JK2's root is absent.
         let without_jk2_root = FilesystemRoots { jk2basepath: None, ..jk2 };
         assert_eq!(filesystem_forcegame_directory(base, &without_jk2_root, true), None);
+        assert_eq!(filesystem_write_directory(base, None, &without_jk2_root),
+            PathBuf::from("/client/DinurdoJK/cache/jk2-unconfigured/base"));
+    }
+
+    #[test]
+    fn forcegame_write_path_is_first_read_layer_even_when_override_does_not_exist() {
+        let base = Path::new("/jka/base");
+        let roots = FilesystemRoots {
+            forcegame: Some("test".into()),
+            homepath: Some("/user/jka".into()),
+            ..Default::default()
+        };
+        let mod_dir = Path::new("/jka/japlus");
+        let forced = PathBuf::from("/jka/test");
+        assert_eq!(filesystem_write_directory(base, Some(mod_dir), &roots), forced);
+        assert_eq!(filesystem_search_dirs(base, Some(mod_dir), &roots).first(), Some(&forced));
+        assert_eq!(filesystem_unforced_write_directory(base, Some(mod_dir), &roots),
+            PathBuf::from("/user/jka/japlus"));
+        assert_eq!(filesystem_write_directory(base, None, &roots), forced);
     }
 
     #[test]

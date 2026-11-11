@@ -95,6 +95,7 @@ fn collision_heights_at(collision: &[jka_assets::bsp::river::CollisionSurface], 
 }
 
 use crate::river_gpu::{BoundaryInput, Simulation};
+use crate::river_tiles::{Bins, SparseSimulation, Spawn, Window};
 use jka_water::river::authoring::{Domain, Endpoint};
 use jka_water::river::boundary::{Controls as BoundaryControls, SourceBox, WaterInfo};
 use jka_water::river::capture::{Camera, Channel, Settings};
@@ -210,7 +211,7 @@ pub struct LiveRiver {
     pub grid: Grid,
     inlet: SourceBox,
     controls: Controls,
-    simulation: Simulation,
+    solver: Solver,
     material: Option<crate::river_material::Presentation>,
     pub mesh: crate::river_grid_mesh::Mesh,
     pub simulated_seconds: f64,
@@ -228,6 +229,94 @@ pub struct LiveRiver {
     convergence: Option<SolveConvergence>,
     /// Debug-only readback of GPU water and reconstructed bed near source.
     wet_spot_probe: Option<WetSpotProbe>,
+}
+
+/// The native single rectangle, or the sparse tile pool for long rivers.
+enum Solver {
+    Dense(Simulation),
+    Sparse(Box<SparseRiver>),
+}
+
+/// Sparse solver plus the camera window the dense presentation chain reads.
+struct SparseRiver {
+    simulation: SparseSimulation,
+    window: Window,
+    /// Lattice corner XY and river Z (cm); solver positions are relative to it.
+    solver_origin_cm: [f64; 3],
+    dx_cm: f32,
+    /// The window moved since the last gather.
+    shifted: bool,
+    /// The window holds at least one completed solver frame.
+    presented: bool,
+    throttled_frames: u64,
+}
+
+impl SparseRiver {
+    /// Presentation origin: the window centre, rebased in Z by its offset.
+    fn window_origin_cm(&self) -> [f64; 3] {
+        let cells = f64::from(self.window.cells());
+        let o = self.window.origin_cell().unwrap_or([0, 0]);
+        let dx = f64::from(self.dx_cm);
+        [
+            self.solver_origin_cm[0] + (f64::from(o[0]) + 0.5 * cells) * dx,
+            self.solver_origin_cm[1] + (f64::from(o[1]) + 0.5 * cells) * dx,
+            self.solver_origin_cm[2] + f64::from(self.window.height_offset_cm()),
+        ]
+    }
+
+    fn cell_of(&self, map: [f32; 2]) -> [i32; 2] {
+        let cm = f64::from(CENTIMETRES_PER_MAP_UNIT);
+        std::array::from_fn(|a| ((f64::from(map[a]) * cm - self.solver_origin_cm[a]) / f64::from(self.dx_cm)).floor() as i32)
+    }
+}
+
+/// Count lattice cells inside a source box, using the GPU's rotated-box test,
+/// over a bounded rectangle (`grid_min` is the lattice corner, zero).
+fn source_cell_count_in(dx: f32, source: SourceBox, rect: [i32; 4]) -> u32 {
+    let (sin, cos) = source.angle.sin_cos();
+    let mut count = 0;
+    for y in rect[1]..rect[3] {
+        for x in rect[0]..rect[2] {
+            let local_x = (x as f32 + 0.5) * dx - source.position[0];
+            let local_y = (y as f32 + 0.5) * dx - source.position[1];
+            let local_z = -source.position[2];
+            let rotated_x = cos * local_x + sin * local_y;
+            let rotated_y = -sin * local_x + cos * local_y;
+            if rotated_x >= -0.5 * source.size[0] && rotated_x <= 0.5 * source.size[0]
+                && rotated_y >= -0.5 * source.size[1] && rotated_y <= 0.5 * source.size[1]
+                && local_z >= -0.5 * source.size[2] && local_z <= 0.5 * source.size[2]
+            { count += 1; }
+        }
+    }
+    count
+}
+
+/// Classic lightgrid ambient for the presentation window at a quarter of its
+/// resolution (the field is smooth and sampled bilinearly by UV).
+fn window_ambient(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    origin_cm: [f64; 3],
+    grid: Grid,
+    level: f32,
+    light: impl FnMut([f32; 3]) -> Option<jka_render_core::light::ClassicEntityLight>,
+    map_toward_sun: Option<[f32; 3]>,
+) -> Result<crate::river_slw::ClassicAmbient, String> {
+    let n = (grid.dimensions[0] / 4).max(16);
+    let size = grid.world_size.map(|v| v / CENTIMETRES_PER_MAP_UNIT);
+    let cm = f64::from(CENTIMETRES_PER_MAP_UNIT);
+    let centre = [(origin_cm[0] / cm) as f32, (origin_cm[1] / cm) as f32];
+    let texels = crate::river_slw::classic_ambient_texels(
+        [n, n],
+        |x, y| [
+            centre[0] + ((x as f32 + 0.5) / n as f32 - 0.5) * size[0],
+            centre[1] + ((y as f32 + 0.5) / n as f32 - 0.5) * size[1],
+            level,
+        ],
+        light,
+        map_toward_sun,
+    );
+    crate::river_slw::ClassicAmbient::upload(device, queue, &texels)
 }
 
 // Keep ordinary map anchors intact, but avoid sending huge source heights to
@@ -256,6 +345,9 @@ impl LiveRiver {
         map_toward_sun: Option<[f32; 3]>,
     ) -> Result<Self, String> {
         source.validate()?;
+        if crate::river_tiles::sparse_enabled() {
+            return Self::spawn_sparse(device, queue, collision, source, light, map_toward_sun);
+        }
         let debug = debug_mode();
         let started = (debug >= 2).then(Instant::now);
         let cm = f64::from(CENTIMETRES_PER_MAP_UNIT);
@@ -376,6 +468,8 @@ impl LiveRiver {
         )?;
         depths.encode_capture(device, &mut encoder, &capture.meshes())?;
         let bed = depths.encode_prepare(device, &mut encoder, settings, &info)?;
+        // The void (no captured geometry) is a wall, never water.
+        crate::river_tiles::encode_void_walls(device, &mut encoder, &bed.geometry, count as u32, settings.floor(), cameras[0].height);
         let mut boundary_controls =
             BoundaryControls::cached_river_variant(1.0 / 60.0, domain.grid_min());
         boundary_controls.match_spline = false;
@@ -459,7 +553,7 @@ impl LiveRiver {
             grid,
             inlet: source_box,
             controls,
-            simulation,
+            solver: Solver::Dense(simulation),
             material: None,
             mesh,
             simulated_seconds: 0.0,
@@ -472,6 +566,190 @@ impl LiveRiver {
             convergence,
             wet_spot_probe: None,
         })
+    }
+
+    /// Long-distance river: the same native stages over resident tiles of a
+    /// lattice covering the riverbed candidates of the map (river_tiles.rs).
+    /// The authored radius/resolution only set the native cell size; water
+    /// may then flow as far as the bed allows. Presentation reads a dense
+    /// camera window gathered from the pool.
+    fn spawn_sparse(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        collision: &[jka_assets::bsp::river::CollisionSurface],
+        source: LocalSource,
+        light: impl FnMut([f32; 3]) -> Option<jka_render_core::light::ClassicEntityLight>,
+        map_toward_sun: Option<[f32; 3]>,
+    ) -> Result<Self, String> {
+        let debug = debug_mode();
+        let started = (debug >= 1).then(Instant::now);
+        let cm = f64::from(CENTIMETRES_PER_MAP_UNIT);
+        let [cx, cy, _] = source.center.map(f64::from);
+        // ResolutionMaxAxis across the authored square: the dense cell size.
+        let side = (2.0 * f64::from(source.radius) * cm) as f32;
+        let dx_cm = Grid::max_axis([side, side], source.resolution)?.cell_size[0];
+        let tile = crate::river_tiles::tile_size();
+        let guard = crate::river_tiles::guard_tiles();
+        let bins = Bins::new(collision, source.water_level, f64::from(dx_cm) / cm, tile, [cx, cy])?;
+        let [zmin, zmax] = bins.z_range();
+        let native_bottom_cm = (f64::from(zmin.min(source.water_level)) - 8.0) * cm;
+        let origin_z = river_renderable_origin_z(native_bottom_cm, f64::from(source.water_level) * cm);
+        let min_map = bins.min_map();
+        let solver_origin = [min_map[0] * cm, min_map[1] * cm, origin_z];
+        let lattice = bins.lattice();
+        let dims = lattice.dimensions();
+        let lattice_grid = Grid {
+            dimensions: dims,
+            world_size: dims.map(|n| n as f32 * dx_cm),
+            cell_size: [dx_cm; 2],
+        };
+        let controls = Controls { speed: 1.0, ..Controls::default() };
+        let frame = Frame::new(lattice_grid, controls, 1.0 / 60.0)?;
+        // The native Rebuild source-box conversion, local to the lattice corner.
+        let top_cm = f64::from(zmax.max(source.water_level)) * cm + 8.0 * cm;
+        let domain = Domain {
+            origin: solver_origin,
+            vertical_extent: ((top_cm - origin_z) * 0.5).max(1.0),
+            grid: lattice_grid,
+        };
+        let width = f64::from(source.source_width) * cm;
+        let source_box: SourceBox = domain.boundary(
+            Endpoint {
+                position: [cx * cm, cy * cm, f64::from(source.water_level) * cm],
+                tangent: [0.0; 3],
+                width: width as f32,
+            },
+            false,
+            width as f32,
+        )?;
+        let centre_cm = [source_box.position[0], source_box.position[1]];
+        let reach = (0.5 * width as f32 / dx_cm).ceil() as i32 + 2;
+        let centre_cell = centre_cm.map(|v| (v / dx_cm).floor() as i32);
+        let source_cells = [
+            centre_cell[0] - reach,
+            centre_cell[1] - reach,
+            centre_cell[0] + reach + 1,
+            centre_cell[1] + reach + 1,
+        ];
+        let mut boundary_controls = BoundaryControls::cached_river_variant(1.0 / 60.0, [0.0; 3]);
+        boundary_controls.match_spline = false;
+        if let (SourceMode::WaterLevel, Some(cfs)) = (source.mode, source.discharge_cfs) {
+            let cells = source_cell_count_in(dx_cm, source_box, source_cells);
+            boundary_controls.source_rise_limit_cm =
+                source_rise_per_step_cm(cfs, frame.hydraulic_duration(), cells, f64::from(dx_cm) * f64::from(dx_cm))?;
+        }
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("sparse river spawn") });
+        let mut simulation = SparseSimulation::new(
+            device,
+            &mut encoder,
+            Spawn {
+                bins,
+                dx_cm,
+                origin_z_cm: origin_z,
+                parameters: frame.parameters(),
+                substeps: frame.substeps(),
+                transport: Transport::default(),
+                presentation: Presentation::default(),
+                boxes: std::slice::from_ref(&source_box),
+                controls: boundary_controls,
+                source_cells,
+                guard,
+            },
+        )?;
+        simulation.set_height_source(source.mode == SourceMode::WaterLevel, boundary_controls.source_rise_limit_cm);
+        let level_cm = (f64::from(source.water_level) * cm - origin_z) as f32;
+        if source.mode == SourceMode::Discharge {
+            let cfs = source.discharge_cfs.expect("validated discharge mode has a CFS rate");
+            let rect = simulation.inlet_rect(centre_cm, width as f32);
+            simulation.enable_inlet(device, rect, level_cm, cfs);
+        }
+        let cells = (crate::river_tiles::window_cells() / tile).max(4) * tile;
+        let mut window = Window::new(device, cells);
+        window.follow(&simulation, centre_cell);
+        let grid = window.grid(dx_cm);
+        let mesh = crate::river_grid_mesh::encode(device, &mut encoder, GridMesh::new(grid.dimensions, grid.world_size)?)?;
+        queue.submit(Some(encoder.finish()));
+        let sparse = SparseRiver {
+            simulation,
+            window,
+            solver_origin_cm: solver_origin,
+            dx_cm,
+            shifted: true,
+            presented: false,
+            throttled_frames: 0,
+        };
+        let origin_cm = sparse.window_origin_cm();
+        let ambient = window_ambient(device, queue, origin_cm, grid, source.water_level, light, map_toward_sun)?;
+        if debug > 0 {
+            let tiles = lattice.tiles();
+            eprintln!("[RIVER DBG SPARSE] at=({:.1},{:.1},{:.1}) level={:.1} cell={:.2}u tile={} cells guard={} lattice={}x{} tiles ({}x{} cells) resident={} window={}x{} cells bed_z=[{:.1},{:.1}] origin_z={:.1}u spawn_cpu={:.2}ms",
+                source.center[0], source.center[1], source.center[2], source.water_level,
+                f64::from(dx_cm) / cm, tile, guard, tiles[0], tiles[1], dims[0], dims[1],
+                sparse.simulation.resident_tiles(), cells, cells, zmin, zmax, origin_z / cm,
+                started.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0));
+        }
+        use wgpu::util::DeviceExt;
+        let authored = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("river independent material"),
+            contents: bytemuck::cast_slice(&crate::river_settings::Settings::default().uniform()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        });
+        Ok(Self {
+            id: 0,
+            authored,
+            foam_minimum_depth: std::cell::Cell::new(60.0),
+            source,
+            origin_cm,
+            grid,
+            inlet: source_box,
+            controls,
+            solver: Solver::Sparse(Box::new(sparse)),
+            material: None,
+            mesh,
+            simulated_seconds: 0.0,
+            pending_seconds: 0.0,
+            ambient,
+            foam: None,
+            body_groups: None,
+            debug: DebugStats::new(),
+            settled: false,
+            // Steady-state detection reads the dense state; sparse rivers keep
+            // the authored rate (still bounded by the residency margin).
+            convergence: None,
+            wet_spot_probe: None,
+        })
+    }
+
+    /// Sparse rivers: keep the presentation window around the camera. A move
+    /// rebuilds the window ambient and drops foam history and body bindings,
+    /// which are tied to the window placement. Dense rivers ignore this.
+    pub fn update_view(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        eye_map: [f32; 3],
+        light: impl FnMut([f32; 3]) -> Option<jka_render_core::light::ClassicEntityLight>,
+        map_toward_sun: Option<[f32; 3]>,
+    ) {
+        let Solver::Sparse(sparse) = &mut self.solver else { return };
+        if !eye_map.iter().all(|v| v.is_finite()) {
+            return;
+        }
+        let eye_cell = sparse.cell_of([eye_map[0], eye_map[1]]);
+        if !sparse.window.follow(&sparse.simulation, eye_cell) {
+            return;
+        }
+        self.origin_cm = sparse.window_origin_cm();
+        sparse.shifted = true;
+        self.foam = None;
+        self.body_groups = None;
+        match window_ambient(device, queue, self.origin_cm, self.grid, self.source.water_level, light, map_toward_sun) {
+            Ok(ambient) => self.ambient = ambient,
+            Err(error) => eprintln!("[RIVER] window lighting failed: {error}"),
+        }
+        if debug_mode() > 0 {
+            eprintln!("[RIVER DBG SPARSE] window moved to cell {:?}; height offset {:.1}cm", sparse.window.origin_cell(), sparse.window.height_offset_cm());
+        }
     }
 
     /// The native frames (sources, substeps, surface/normals) that real time
@@ -488,7 +766,7 @@ impl LiveRiver {
         water: Option<&crate::river_surface::RiverSurface>,
     ) -> Result<(), String> {
         let diag = debug_mode();
-        if diag < 2 {
+        if diag < 2 || !matches!(self.solver, Solver::Dense(_)) {
             self.wet_spot_probe = None;
         } else {
             if self.wet_spot_probe.is_none() {
@@ -521,24 +799,58 @@ impl LiveRiver {
         self.pending_seconds = available.min(limit);
         let mut moved = false;
         let mut steps = 0u32;
+        if let Solver::Sparse(sparse) = &mut self.solver {
+            // Completed occupancy samples grow residency before any new frame.
+            sparse.simulation.update_residency(device, encoder)?;
+        }
         while self.pending_seconds >= step {
-            self.simulation
-                .encode_reference_frame(device, encoder, frame)?;
+            match &mut self.solver {
+                Solver::Dense(simulation) => simulation.encode_reference_frame(device, encoder, frame)?,
+                Solver::Sparse(sparse) => {
+                    // Never outrun the proven guard margin; wait for residency.
+                    if sparse.simulation.frames_available() == 0 {
+                        sparse.throttled_frames += 1;
+                        break;
+                    }
+                    sparse.simulation.encode_reference_frame(device, encoder, frame)?;
+                }
+            }
             self.pending_seconds -= step;
             self.simulated_seconds += step;
             steps += 1;
             moved = true;
         }
-        if moved {
-            if let Some(probe) = self.convergence.as_mut() {
-                probe.encode_sample(encoder, &self.simulation, self.simulated_seconds);
+        let mut shifted = false;
+        match &mut self.solver {
+            Solver::Dense(simulation) => {
+                if moved {
+                    if let Some(probe) = self.convergence.as_mut() {
+                        probe.encode_sample(encoder, simulation, self.simulated_seconds);
+                    }
+                    if let Some(probe) = self.wet_spot_probe.as_mut() {
+                        probe.encode_sample(encoder, simulation);
+                    }
+                }
             }
-            if let Some(probe) = self.wet_spot_probe.as_mut() {
-                probe.encode_sample(encoder, &self.simulation);
+            Solver::Sparse(sparse) => {
+                if moved {
+                    sparse.simulation.encode_occupancy(device, encoder);
+                }
+                shifted = std::mem::take(&mut sparse.shifted);
+                if (moved || shifted) && sparse.simulation.started() {
+                    sparse.window.encode_gather(device, encoder, &sparse.simulation);
+                    sparse.presented = true;
+                } else if shifted {
+                    sparse.shifted = true;
+                }
             }
         }
         if self.material.is_none() {
-            if let Some(fields) = self.simulation.output_fields() {
+            let fields = match &self.solver {
+                Solver::Dense(simulation) => simulation.output_fields(),
+                Solver::Sparse(sparse) => sparse.presented.then(|| sparse.window.fields()),
+            };
+            if let Some(fields) = fields {
                 self.material = Some(crate::river_material::Presentation::new(device, &fields)?);
             }
         }
@@ -548,20 +860,24 @@ impl LiveRiver {
             }
             return Ok(());
         };
-        if moved || material.textures().is_none() {
+        if moved || shifted || material.textures().is_none() {
             material.encode(encoder);
         }
         if self.foam.is_none() {
             use jka_water::river::foam_field::{native_sim_res, Placement, Setup};
             let placement = Placement::unrotated(self.origin_cm, &self.grid)?;
             let world = self.grid.world_size.map(f64::from);
-            let setup = Setup::native(
-                &self.grid,
-                placement,
-                native_sim_res(world, self.source.resolution as i32),
-            );
+            let resolution = match &self.solver {
+                Solver::Dense(_) => self.source.resolution as i32,
+                Solver::Sparse(sparse) => sparse.window.cells() as i32,
+            };
+            let setup = Setup::native(&self.grid, placement, native_sim_res(world, resolution));
+            let state = match &self.solver {
+                Solver::Dense(simulation) => simulation.state_textures(),
+                Solver::Sparse(sparse) => sparse.window.state_textures(),
+            };
             let inputs = crate::river_foam::FieldInputs {
-                state: self.simulation.state_textures(),
+                state,
                 normal_grid: material.normal_grid(),
             };
             let mut field = crate::river_foam::Field::new(device, inputs, &setup)?;
@@ -571,7 +887,11 @@ impl LiveRiver {
         let foam = self.foam.as_mut().expect("created above");
         let frame = jka_water::river::foam_field::Frame::new(scaled, world_time);
         foam.set_minimum_depth(self.foam_minimum_depth.get() * CENTIMETRES_PER_MAP_UNIT);
-        foam.encode_frame(device, encoder, self.simulation.state_index(), frame)?;
+        let state_index = match &self.solver {
+            Solver::Dense(simulation) => simulation.state_index(),
+            Solver::Sparse(_) => 0,
+        };
+        foam.encode_frame(device, encoder, state_index, frame)?;
         if self.body_groups.is_none() {
             if let (Some(water), Some(textures)) = (water, material.textures()) {
                 let (pair, _) = foam.foam_pair();
@@ -603,6 +923,10 @@ impl LiveRiver {
         let body_ready = self.body_groups.is_some();
         let status = if !copyable { "NOT DRAWN: scene not copyable" } else if !pipeline_ready { "NOT DRAWN: scene copy/pipeline unavailable" } else if !body_ready { "NOT DRAWN: material/foam/body bindings not ready" } else { "DRAW SUBMITTED (GPU depth/visibility unknown)" };
         eprintln!("[RIVER DBG] patch={} at=({:.0},{:.0},{:.0}) age={:.1}s sim={:.2}s pending={:.4}s rate={}x solve_target={}x solve_state={} frames={} steps={} ({:.1}/s) zero_step={} capped={} dropped_sim={:.3}s material={} foam={} body={} status={}", index, self.source.center[0], self.source.center[1], self.source.center[2], age, self.simulated_seconds, self.pending_seconds, if self.settled { 1.0 } else { self.source.rate }, self.source.rate, if self.settled { "NORMAL" } else if self.convergence.is_some() { "SOLVING" } else { "NORMAL" }, self.debug.frames, self.debug.steps, self.debug.steps as f64 / interval, self.debug.zero_step_frames, self.debug.capped_frames, self.debug.dropped_seconds, self.material.is_some(), self.foam.is_some(), body_ready, status);
+        if let Solver::Sparse(sparse) = &self.solver {
+            let tiles = sparse.simulation.lattice().tiles();
+            eprintln!("[RIVER DBG SPARSE] patch={} resident_tiles={} queued={} lattice={}x{} solver_frames={} frames_available={} throttled_render_frames={} window_cell={:?} pool={:.1}MiB", index, sparse.simulation.resident_tiles(), sparse.simulation.queued_tiles(), tiles[0], tiles[1], sparse.simulation.solver_frames(), sparse.simulation.frames_available(), sparse.throttled_frames, sparse.window.origin_cell(), (sparse.simulation.logical_bytes() + sparse.window.logical_bytes()) as f64 / 1048576.0);
+        }
         if mode >= 2 { eprintln!("[RIVER DBG PERF] patch={} CPU_encode={:.3}ms/s {:.4}ms/render-frame last_solver_steps={} grid={}x{} estimated_solver_kernel_dispatches={}", index, self.debug.cpu_encode_ms / interval, self.debug.cpu_encode_ms / self.debug.frames.max(1) as f64, self.debug.last_steps, self.grid.dimensions[0], self.grid.dimensions[1], self.debug.steps * (4 + u64::from(self.controls.substeps) * 6)); }
         self.debug.reset_interval(now);
     }
@@ -635,24 +959,53 @@ impl LiveRiver {
         let cm = f64::from(CENTIMETRES_PER_MAP_UNIT);
         let frame = Frame::new(self.grid, self.controls, 1.0 / 60.0)?;
         let mut rise_limit = 0.0;
-        if let (SourceMode::WaterLevel, Some(q)) = (source.mode, source.discharge_cfs) {
-            let grid_min = [-self.grid.world_size[0] * 0.5, -self.grid.world_size[1] * 0.5, 0.0];
-            let cells = source_cell_count(self.grid, grid_min, self.inlet);
-            let area = f64::from(self.grid.cell_size[0]) * f64::from(self.grid.cell_size[1]);
-            rise_limit = source_rise_per_step_cm(q, frame.hydraulic_duration(), cells, area)?;
+        let area = f64::from(self.grid.cell_size[0]) * f64::from(self.grid.cell_size[1]);
+        let cfs = if source.mode == SourceMode::Discharge { source.discharge_cfs } else { None };
+        match &mut self.solver {
+            Solver::Dense(simulation) => {
+                if let (SourceMode::WaterLevel, Some(q)) = (source.mode, source.discharge_cfs) {
+                    let grid_min = [-self.grid.world_size[0] * 0.5, -self.grid.world_size[1] * 0.5, 0.0];
+                    let cells = source_cell_count(self.grid, grid_min, self.inlet);
+                    rise_limit = source_rise_per_step_cm(q, frame.hydraulic_duration(), cells, area)?;
+                }
+                simulation.set_height_source(source.mode == SourceMode::WaterLevel, rise_limit);
+                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("river live inlet controls") });
+                simulation.update_discharge(device, &mut encoder, self.grid,
+                    source.source_width * CENTIMETRES_PER_MAP_UNIT,
+                    (f64::from(source.water_level) * cm - self.origin_cm[2]) as f32,
+                    cfs);
+                queue.submit(Some(encoder.finish()));
+            }
+            Solver::Sparse(sparse) => {
+                let dx = sparse.dx_cm;
+                let centre = [self.inlet.position[0], self.inlet.position[1]];
+                let reach = (0.5 * source.source_width * CENTIMETRES_PER_MAP_UNIT / dx).ceil() as i32 + 2;
+                let cell = centre.map(|v| (v / dx).floor() as i32);
+                if let (SourceMode::WaterLevel, Some(q)) = (source.mode, source.discharge_cfs) {
+                    let rect = [cell[0] - reach, cell[1] - reach, cell[0] + reach + 1, cell[1] + reach + 1];
+                    let cells = source_cell_count_in(dx, self.inlet, rect);
+                    rise_limit = source_rise_per_step_cm(q, frame.hydraulic_duration(), cells, area)?;
+                }
+                sparse.simulation.set_height_source(source.mode == SourceMode::WaterLevel, rise_limit);
+                match cfs {
+                    Some(q) if !sparse.simulation.has_inlet() => {
+                        let rect = sparse.simulation.inlet_rect(centre, source.source_width * CENTIMETRES_PER_MAP_UNIT);
+                        let level = (f64::from(source.water_level) * cm - sparse.solver_origin_cm[2]) as f32;
+                        sparse.simulation.enable_inlet(device, rect, level, q);
+                    }
+                    other => sparse.simulation.set_inlet(other),
+                }
+            }
         }
-        self.simulation.set_height_source(source.mode == SourceMode::WaterLevel, rise_limit);
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("river live inlet controls") });
-        self.simulation.update_discharge(device, &mut encoder, self.grid,
-            source.source_width * CENTIMETRES_PER_MAP_UNIT,
-            (f64::from(source.water_level) * cm - self.origin_cm[2]) as f32,
-            if source.mode == SourceMode::Discharge { source.discharge_cfs } else { None });
-        queue.submit(Some(encoder.finish()));
         self.source = source;
         self.settled = false;
+        let Solver::Dense(simulation) = &self.solver else {
+            self.convergence = None;
+            return Ok(());
+        };
         if source.rate != 1.0 {
             if self.convergence.is_none() {
-                self.convergence = Some(SolveConvergence::new(device, &self.simulation));
+                self.convergence = Some(SolveConvergence::new(device, simulation));
             }
             let probe = self.convergence.as_mut().expect("created above");
             probe.restart(self.simulated_seconds);
@@ -664,7 +1017,10 @@ impl LiveRiver {
 
     #[cfg(any(test, feature = "test-support"))]
     pub fn state(&self) -> &wgpu::Texture {
-        self.simulation.state()
+        match &self.solver {
+            Solver::Dense(simulation) => simulation.state(),
+            Solver::Sparse(sparse) => &sparse.window.state_textures()[0],
+        }
     }
 
     /// SimGridRT (height/depth/velocity, cm) and NormalsRT once available.
@@ -698,3 +1054,7 @@ mod source_cfs_tests {
         assert!(source_rise_per_step_cm(1.0, 1.0, 0, 100.0).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "river_sparse_gpu_tests.rs"]
+mod sparse_gpu_tests;

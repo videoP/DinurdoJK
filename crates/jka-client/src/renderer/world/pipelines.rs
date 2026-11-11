@@ -73,21 +73,16 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn scene_format(&self) -> wgpu::TextureFormat {
-        if self.asset_preview_mode {
-            self.preview_scene_format()
-        } else {
-            self.gameplay_scene_format()
-        }
+        // Preview uses the exact gameplay world/Ghoul2/MD3/FX pipelines and
+        // scene targets. Only the final presentation format differs. Switching
+        // menus must never trigger a synchronous world PSO rebuild.
+        self.gameplay_scene_format()
     }
 
     pub(in crate::renderer) fn set_asset_preview_mode(&mut self, enabled: bool) {
-        let old_scene_format = self.scene_format();
         self.asset_preview_mode = enabled;
         if !enabled {
             self.asset_preview_viewport = None;
-        }
-        if old_scene_format != self.scene_format() {
-            self.request_scene_rebuild();
         }
     }
 
@@ -248,6 +243,9 @@ impl Renderer {
         self.companion_scene_targets.clear();
         self.dlss.release();
         let (render_width, render_height) = self.render_extent();
+        // Its bind group references the previous scene color texture.
+        // Preserve the core renderer pipelines, only refresh this small blit.
+        self.preview_present = None;
         self.targets = create_targets(
             &self.device,
             render_width,
@@ -1416,6 +1414,18 @@ impl WorldPipelineReuseCatalog {
                     legacy_fog_pass_pipeline_key(original, writes_depth), format, samples,
                 ), pipeline);
             }
+            for (&original, pipeline) in &set.camera_portal_pipelines {
+                self.insert(WorldPassPipelineIdentity::new(
+                    variant, WorldPipelinePass::Reflection { authored_fog: variant.legacy_fog },
+                    original, PLANAR_COLOR_FORMAT, 1,
+                ), pipeline);
+            }
+            for (&(original, writes_depth), pipeline) in &set.camera_portal_fog_pass_pipelines {
+                self.insert(WorldPassPipelineIdentity::new(
+                    variant, WorldPipelinePass::ReflectionFog,
+                    legacy_fog_pass_pipeline_key(original, writes_depth), PLANAR_COLOR_FORMAT, 1,
+                ), pipeline);
+            }
             for (&original, pipeline) in &set.reflection_pipelines {
                 self.insert(WorldPassPipelineIdentity::new(
                     variant, WorldPipelinePass::Reflection { authored_fog: variant.legacy_fog },
@@ -1612,6 +1622,33 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
             .map(|(pipeline,key)| (key,pipeline)).collect()
     } else { BTreeMap::new() };
 
+    // TaystJK: a remote misc_portal_camera view has ordinary (non-mirrored)
+    // winding. Match all authored material/depth/fog states, but compile this
+    // second family only for maps actually containing targeted camera portals.
+    let camera_portal_pipelines = if plan.has_camera_portals && shader_variant.planar_reflections {
+        let originals = &plan.base_keys;
+        compile_cached_world_pass("camera-portal-runtime", originals, reusable, cancelled,
+            |&original| WorldPassPipelineIdentity::new(shader_variant,
+                WorldPipelinePass::Reflection { authored_fog: shader_variant.legacy_fog },
+                original, PLANAR_COLOR_FORMAT, 1),
+            |&original| create_reflection_world_pipeline(device, layout, shader,
+                original, shader_variant.legacy_fog, shader_variant))?
+            .into_iter().zip(originals.iter().copied()).map(|(p,k)| (k,p)).collect()
+    } else { BTreeMap::new() };
+
+    let camera_portal_fog_pass_pipelines = if plan.has_camera_portals
+        && shader_variant.legacy_fog && shader_variant.planar_reflections {
+        let jobs = &plan.fog_jobs;
+        compile_cached_world_pass("camera-portal-fog-runtime", jobs, reusable, cancelled,
+            |&(original, writes_depth)| WorldPassPipelineIdentity::new(shader_variant,
+                WorldPipelinePass::ReflectionFog,
+                legacy_fog_pass_pipeline_key(original, writes_depth), PLANAR_COLOR_FORMAT, 1),
+            |&(original, writes_depth)| create_world_pipeline(device, layout, shader,
+                PLANAR_COLOR_FORMAT, legacy_fog_pass_pipeline_key(original, writes_depth),
+                1, true, true, Some(shader_variant), false, None))?
+            .into_iter().zip(jobs.iter().copied()).map(|(p,k)| (k,p)).collect()
+    } else { BTreeMap::new() };
+
     let specialized_pipelines = if shader_variant.material_specialization {
         let started = Instant::now();
         let (unique, slots) = specialized_pipeline_plan(&plan.material_jobs, shader_variant);
@@ -1649,6 +1686,8 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
         fog_pass_pipelines,
         reflection_pipelines,
         reflection_fog_pass_pipelines,
+        camera_portal_pipelines,
+        camera_portal_fog_pass_pipelines,
         specialized_pipelines,
         slot_pipelines: Vec::new(),
     })

@@ -34,6 +34,9 @@ impl Renderer {
     /// clear conditions; remove progressively more of that original direct sun
     /// before adding the soft replacement. Do not mutate the archived cvar.
     pub(in crate::renderer) fn effective_baked_sun_removal(&self) -> f32 {
+        if self.baked_sun_removal_contour {
+            return self.world.as_ref().and_then(|world| world.sun_bake.contour_masks.as_ref()).map_or(0.0, |_| super::original_sun::CONTOUR_MASK_SCALE);
+        }
         if self.baked_sun_removal_auto {
             // Pending or low-confidence calibration must not guess: preserve the BSP.
             return self.world.as_ref().and_then(|world| world.sun_bake.auto_strength).unwrap_or(0.0);

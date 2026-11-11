@@ -4019,6 +4019,9 @@ fn remove_baked_sun(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f3
     // A change-triggered compute pass already subtracted each original luxel.
     if (lighting_settings.baked_sun_debug_mode.y != 0u && input.baked_sun_fit.z == 4.0 && input.shell_kind == 0u) { return baked_indirect_tone(lightmap); }
     if (input.baked_sun_fit.z == 4.0) { return sample_authored_baked_sun(lightmap, input); }
+    // The contour mask has an explicit 3x encoding range. Do not apply that
+    // strength to legacy fallback surfaces without a projected lightmap.
+    if ((lighting_settings.baked_sun_debug_mode.z & 16u) != 0u) { return baked_indirect_tone(lightmap); }
     let strength = lighting_settings.baked_sun_direction_strength.w;
     var remaining = lightmap;
     let toward_old = normalize(lighting_settings.baked_sun_direction_strength.xyz);

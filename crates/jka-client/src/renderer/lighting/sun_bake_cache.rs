@@ -4,7 +4,7 @@ use super::sun_bake::BakeData;
 use image::{ImageDecoder, ImageEncoder};
 use std::{hash::Hasher, io::Cursor, path::Path};
 
-const MAGIC: &[u8; 8] = b"JKASUN02";
+const MAGIC: &[u8; 8] = b"JKASUN04";
 const ROW: u32 = 4096;
 
 fn checksum(bytes: &[u8]) -> u64 {
@@ -32,6 +32,15 @@ pub(super) fn encode(key: u64, data: &BakeData) -> Result<Vec<u8>, String> {
         raw.extend_from_slice(&(mask.len() as u64).to_le_bytes());
         raw.extend_from_slice(mask);
     }
+    // Distinct optional contour mask, same dimensions as the immutable
+    // original visibility. Explicit region count is an integrity indicator.
+    raw.extend_from_slice(&(data.calibration.contour_regions as u32).to_le_bytes());
+    let contour = data.calibration.contour_masks.as_deref().unwrap_or(&[]);
+    raw.extend_from_slice(&(contour.len() as u32).to_le_bytes());
+    for mask in contour {
+        raw.extend_from_slice(&(mask.len() as u64).to_le_bytes());
+        raw.extend_from_slice(mask);
+    }
     let raw_len = raw.len();
     let sum = checksum(&raw);
     let height = raw_len.div_ceil(ROW as usize) as u32;
@@ -52,14 +61,12 @@ pub(super) fn encode(key: u64, data: &BakeData) -> Result<Vec<u8>, String> {
 }
 
 fn max_payload(surface_count: usize, sizes: &[[u32; 2]]) -> Option<usize> {
-    sizes.iter().try_fold(
-        24usize.checked_add(surface_count.checked_mul(16)?)?,
-        |bytes, size| {
-            bytes
-                .checked_add(8)?
-                .checked_add((size[0] as usize).checked_mul(size[1] as usize)?)
-        },
-    )
+    let mut bytes = 32usize.checked_add(surface_count.checked_mul(16)?)?;
+    for size in sizes {
+        let count = (size[0] as usize).checked_mul(size[1] as usize)?;
+        bytes = bytes.checked_add(16)?.checked_add(count.checked_mul(2)?)?;
+    }
+    Some(bytes)
 }
 
 struct Reader<'a>(&'a [u8]);
@@ -93,7 +100,7 @@ pub(super) fn decode(
     }
     let len = usize::try_from(header.u64()?).ok()?;
     let sum = header.u64()?;
-    if len < 24 || len > max_payload(surfaces, sizes)? {
+    if len < 32 || len > max_payload(surfaces, sizes)? {
         return None;
     }
     let decoder = image::codecs::png::PngDecoder::new(Cursor::new(header.0)).ok()?;
@@ -140,16 +147,26 @@ pub(super) fn decode(
         }
         Some(masks)
     };
-    if !reader.0.is_empty() {
+    let contour_regions = reader.u32()? as usize;
+    let contour_count = reader.u32()? as usize;
+    if contour_count != 0 && (contour_count != sizes.len() || contour_regions < 4 || masks.is_none()) {
         return None;
     }
+    if contour_count == 0 && contour_regions != 0 { return None; }
+    let contour_masks = if contour_count == 0 { None } else {
+        let mut images = Vec::with_capacity(contour_count);
+        for size in sizes {
+            let expected = (size[0] as usize).checked_mul(size[1] as usize)?;
+            if reader.u64()? != expected as u64 { return None; }
+            images.push(reader.take(expected)?.to_vec());
+        }
+        Some(images)
+    };
+    if !reader.0.is_empty() { return None; }
     Some(BakeData {
         calibration: BakedSunCalibration {
-            radiance,
-            auto_strength,
-            surfaces: fits,
-        },
-        masks,
+            radiance, auto_strength, contour_masks, contour_regions, surfaces: fits,
+        }, masks,
     })
 }
 

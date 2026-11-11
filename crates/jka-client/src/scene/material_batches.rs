@@ -529,6 +529,7 @@ pub(in crate::scene) fn stage_batch(
         authored_environment_composite,
         planar_plane: [0.0; 4],
         planar_pvs_origin: [0.0; 3],
+        portal_camera: None,
         skybox: material.skybox,
         reflection_probe: None,
         reflection_probe_position_radius: [0.0; 4],

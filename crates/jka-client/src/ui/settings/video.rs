@@ -393,6 +393,8 @@ pub struct VideoSettings {
     pub baked_sun_removal: f32,
     /// Estimate removal from contrasts across the original baked sun shadows.
     pub baked_sun_removal_auto: bool,
+    /// Separate contour-guided direct + conservative bounce removal mode.
+    pub baked_sun_removal_contour: bool,
     pub baked_sun_cache: bool,
     /// 0 original bilinear, 1 bicubic reconstruction, 2 softened bicubic.
     pub lightmap_smoothing: u8,
@@ -964,6 +966,7 @@ impl Default for VideoSettings {
             entity_sun_lighting: false,
             baked_sun_removal: 0.0,
             baked_sun_removal_auto: true,
+            baked_sun_removal_contour: false,
             baked_sun_cache: true,
             lightmap_smoothing: 0,
             baked_sun_aa: 1,
@@ -1267,6 +1270,7 @@ impl VideoSettings {
             effective.entity_sun_lighting = false;
             effective.baked_sun_removal = 0.0;
             effective.baked_sun_removal_auto = false;
+            effective.baked_sun_removal_contour = false;
             effective.emissive_area_lights = false;
         }
         // Residual baked-light grading belongs to Baked only. Render with

@@ -2289,6 +2289,7 @@ pub(in crate::renderer) fn build_world(
             fog_jobs: crate::renderer::legacy_fog_pass_jobs(&coarse_batches),
             material_jobs: material_specialization_jobs(coarse_batches.iter().chain(&full_batches)),
             has_planar_reflectors: !planar_reflectors.is_empty(),
+            has_camera_portals: planar_reflectors.iter().any(|r| r.portal_camera.is_some()),
         };
         let never_cancel = std::sync::atomic::AtomicBool::new(false);
         let compiled = create_world_pipeline_variant_from_plan(

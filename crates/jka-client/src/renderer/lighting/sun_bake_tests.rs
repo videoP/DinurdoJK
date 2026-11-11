@@ -138,6 +138,8 @@ fn sun_cache_lossless_roundtrip_rejects_stale_truncated_and_corrupt_results() {
         calibration: BakedSunCalibration {
             radiance: [0.25, 0.5, 1.],
             auto_strength: Some(0.35),
+            contour_regions: 12,
+            contour_masks: Some(vec![(0..1024).map(|v| (v * 19) as u8).collect()]),
             surfaces: vec![[0., 1., 4., -1.], [260., 2.2, 4., 1.]],
         },
         masks: Some(vec![(0..1024).map(|v| (v * 73) as u8).collect()]),
@@ -147,6 +149,8 @@ fn sun_cache_lossless_roundtrip_rejects_stale_truncated_and_corrupt_results() {
     assert_eq!(decoded.masks, data.masks);
     assert_eq!(decoded.calibration.radiance, data.calibration.radiance);
     assert_eq!(decoded.calibration.auto_strength, data.calibration.auto_strength);
+    assert_eq!(decoded.calibration.contour_masks, data.calibration.contour_masks);
+    assert_eq!(decoded.calibration.contour_regions, data.calibration.contour_regions);
     assert_eq!(decoded.calibration.surfaces, data.calibration.surfaces);
     assert!(cache::decode(&file, 43, 2, &[[32, 32]]).is_none());
     assert!(cache::decode(&file, 42, 3, &[[32, 32]]).is_none());

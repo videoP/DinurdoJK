@@ -594,8 +594,8 @@ impl App {
     fn save_asset_mapping(&mut self,restart:bool) {
         let Some(state)=self.asset_mapping.as_ref() else {return;};
         let result=state.proposed(&self.base,&self.fs_roots).and_then(|proposed| {
-            // These are game-root asset overrides, not fs_game selections or
-            // write roots. Never create a JK2 override under JKA's root when
+            // These are game-root read/write overrides, not fs_game selections.
+            // Never create a JK2 override under JKA's root when
             // fs_jk2basepath is unset; it remains dormant until configured.
             let jka_base=restart_jka_base(&proposed,&self.base);
             for jk2 in [false,true] {
@@ -605,8 +605,8 @@ impl App {
                             if jk2 {"JK2"} else {"JKA"},directory.display()))?;
                 }
             }
-            // Existing INI store and no live VFS remount. forcegame never
-            // changes where configs, demos, screenshots or downloads are written.
+            // Existing INI store and no live VFS remount. On restart, forcegame
+            // redirects game-owned writes; server PK3 downloads stay in fs_game.
             crate::filesystem_paths::save(&self.base,&proposed)?;
             Ok(proposed)
         });

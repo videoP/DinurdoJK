@@ -27,6 +27,8 @@ pub enum BakedSunAutoStatus {
     Unavailable,
     /// Map-specific measured sunlight subtraction coefficient.
     Calibrated(f32),
+    /// Cached contour-guided per-luxel removal is ready.
+    ContourGuided,
 }
 
 impl SunBakeStage {
@@ -919,6 +921,8 @@ pub struct PostEffects {
     /// 0..1: estimated subtraction of authored direct sunlight from BSP baked lighting.
     pub baked_sun_removal: f32,
     pub baked_sun_removal_auto: bool,
+    /// Separate contour-guided direct + conservative bounce removal mode.
+    pub baked_sun_removal_contour: bool,
     pub baked_sun_cache: bool,
     pub lightmap_smoothing: u8,
     pub baked_sun_aa: u8,
@@ -1389,6 +1393,10 @@ pub enum RenderCommand {
     CaptureFrontendScene { path: PathBuf, neutral_gamma: bool },
     CaptureVideoFrame { frame_index: u64, depth: bool, alpha: bool },
     SetUi(UiSnapshot),
+    /// Shader Remaps: decoded RGBA for one thumbnail atlas slot.
+    RemapThumb { slot: usize, size: [u32; 2], rgba: Vec<u8> },
+    /// Shader Remaps: drop the thumbnail atlas (page state discarded).
+    RemapThumbsRelease,
     SetStreamerSettings(crate::streamer::StreamerSettings),
     /// One small update per gameplay tick; Disruptor/zoom state is not a
     /// settings-change or a scoreboard/chat transient.

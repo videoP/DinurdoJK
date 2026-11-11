@@ -1224,6 +1224,7 @@ impl Renderer {
                 texture_entry(7),
                 texture_entry(8),
                 texture_entry(9),
+                texture_entry(10),
             ],
         });
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1306,6 +1307,7 @@ impl Renderer {
         let ui_clean_font = upload_cached_texture(&device, &queue, &ui_clean_font_data);
         // Filled in the background the first time a scoreboard is shown.
         let ui_avatars = upload_cached_texture(&device, &queue, &empty_ui_font_texture("JKA UI avatar atlas (not loaded)"));
+        let ui_remap_thumbs = upload_cached_texture(&device, &queue, &empty_ui_font_texture("Shader Remaps thumbnails (not loaded)"));
         let (ui_splash_data, ui_splash_size) = load_ui_loading_texture(base, game, None, size.width as f32 / size.height.max(1) as f32 >= 1.5);
         let ui_splash = upload_cached_texture(&device, &queue, &ui_splash_data);
         // The movement key atlas (27 TGAs) is only drawn while cg_movementKeys is
@@ -1350,6 +1352,7 @@ impl Renderer {
         let ui_images = [
             &ui_font, &ui_small_font, &ui_splash, &ui_keys, &ui_icons,
             &ui_team_icons, &ui_ext_images, &ui_clean_font, &ui_avatars,
+            &ui_remap_thumbs,
         ];
         let ui_bind_group = super::overlay::create_ui_texture_group(
             &device, &ui_texture_layout, &ui_font_sampler, ui_images, false);
@@ -2579,8 +2582,13 @@ impl Renderer {
             _ui_clean_font: ui_clean_font,
             ui_clean_font_metrics: ui_clean_font_metrics.map(std::sync::Arc::new),
             _ui_avatars: ui_avatars,
+            _ui_remap_thumbs: ui_remap_thumbs,
+            ui_remap_thumbs_live: false,
             ui_avatar_atlas: None,
             ui_avatar_job: None,
+            ui_avatar_loaded_keys: Vec::new(),
+            ui_avatar_scope: None,
+            ui_avatar_cache: Arc::new(std::sync::Mutex::new(Default::default())),
             studio_race_font: None,
             _ui_splash: ui_splash,
             _ui_keys: ui_keys,
@@ -2641,6 +2649,7 @@ impl Renderer {
             studio_lens: None,
             studio_lens_gpu: None,
             asset_preview_background: None,
+            preview_present: None,
             menu_backdrop: None,
             neon_menu: Default::default(),
             world: None,
@@ -2721,6 +2730,7 @@ impl Renderer {
             entity_sun_lighting: false,
             baked_sun_removal: 0.0,
             baked_sun_removal_auto: false,
+            baked_sun_removal_contour: false,
             baked_sun_cache: true,
             lightmap_smoothing: 0,
             baked_sun_aa: 1,

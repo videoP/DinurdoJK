@@ -97,6 +97,7 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", dlss: false, dlss_mode: Dlaa, dlss_model: Transformer", "")
         .replace(", baked_sun_removal: 0.0", "")
         .replace(", baked_sun_removal_auto: false", "")
+        .replace(", baked_sun_removal_contour: false", "")
         .replace(", relighting_mode: 0", "")
         .replace(", sky_world_light_isolation: false", "")
         .replace(", sky_world_lighting_strength: 1.0", "")

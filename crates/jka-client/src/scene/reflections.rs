@@ -1,7 +1,7 @@
 //! Reflections.
 use crate::scene::{
     parse_light_triplet, render_position, AssetSearchPath, BlendMode, Bsp, DrawBatch, DrawClass,
-    GpuVertex, MapDocument, PlanarGroupKey, ReflectionProbe, Vec3, REFLECTION_CACHE_PLANAR,
+    GpuVertex, MapDocument, PlanarGroupKey, PortalCamera, ReflectionProbe, Vec3, REFLECTION_CACHE_PLANAR,
     REFLECTION_CACHE_PROBE, REFLECTION_CACHE_SSR,
 };
 
@@ -376,7 +376,8 @@ pub(in crate::scene) const PORTAL_SURFACE_MAX_DISTANCE: f32 = 64.0;
 #[derive(Clone, Copy)]
 pub(in crate::scene) struct PortalSurfaceAnchor {
     pub(in crate::scene) origin: [f32; 3],
-    pub(in crate::scene) mirror: bool,
+    pub(in crate::scene) targeted: bool,
+    pub(in crate::scene) camera: Option<PortalCamera>,
 }
 
 pub(in crate::scene) const ENVIRONMENT_PLANAR_DISTANCE_EPSILON: f32 = 0.5;
@@ -519,100 +520,108 @@ pub(in crate::scene) fn assign_planar_reflection_planes(
     }
 }
 
+/// Match the exact OpenJK/TaystJK 64-unit plane association, retaining a
+/// targeted camera as an authored portal rather than mistakenly disabling it.
 pub(in crate::scene) fn retain_authored_planar_mirrors(
     batches: &mut [DrawBatch],
     anchors: &[PortalSurfaceAnchor],
 ) {
     for batch in batches.iter_mut().filter(|batch| batch.planar_reflection) {
         let normal = Vec3::from_array([
-            batch.planar_plane[0],
-            batch.planar_plane[1],
-            batch.planar_plane[2],
+            batch.planar_plane[0], batch.planar_plane[1], batch.planar_plane[2],
         ]);
         let distance = batch.planar_plane[3];
-        let matching_anchor = anchors
-            .iter()
-            .filter_map(|anchor| {
-                let plane_distance = (normal.dot(Vec3::from_array(anchor.origin)) + distance).abs();
-                (plane_distance <= PORTAL_SURFACE_MAX_DISTANCE).then_some((plane_distance, *anchor))
-            })
-            .min_by(|(a, _), (b, _)| a.total_cmp(b));
-        if let Some((_, anchor)) = matching_anchor.filter(|(_, anchor)| anchor.mirror) {
-            batch.planar_pvs_origin = anchor.origin;
-        } else {
-            // A targeted misc_portal_surface denotes a camera portal, not a
-            // mirror. Leave those authored portal surfaces on their material
-            // path until the client has a real portal-camera entity renderer.
-            batch.planar_reflection = false;
+        let matching_anchor = anchors.iter().filter_map(|anchor| {
+            let plane_distance = (normal.dot(Vec3::from_array(anchor.origin)) + distance).abs();
+            (plane_distance <= PORTAL_SURFACE_MAX_DISTANCE).then_some((plane_distance, *anchor))
+        }).min_by(|(a, _), (b, _)| a.total_cmp(b));
+        if let Some((_, anchor)) = matching_anchor {
+            if !anchor.targeted || anchor.camera.is_some() {
+                batch.planar_pvs_origin = anchor.camera.map_or(anchor.origin, |camera| camera.camera_origin);
+                batch.portal_camera = anchor.camera;
+                continue;
+            }
         }
+        // No valid surface entity, or its target camera is absent: never
+        // fabricate a mirror (TaystJK R_GetPortalOrientations returns false).
+        batch.planar_reflection = false;
     }
+}
+
+/// Parse the worldspawn entity table once, resolving targetnames the same way
+/// as game/g_misc.c locateCamera: camera origin, target direction or angle,
+/// camera swing/speed flags and roll. All lookups are at map preparation.
+fn parse_portal_anchors(
+    entities: &[std::collections::BTreeMap<String, String>],
+) -> (Vec<PortalSurfaceAnchor>, usize) {
+    let mut anchors = Vec::new();
+    let mut targeted_count = 0;
+    fn property<'a>(
+        entity: &'a std::collections::BTreeMap<String, String>,
+        key: &str,
+    ) -> &'a str {
+        entity.get(key).map(String::as_str).unwrap_or("").trim()
+    }
+    let origin = |entity: &std::collections::BTreeMap<String, String>| {
+        parse_light_triplet(property(entity, "origin")).map(render_position)
+    };
+    for surface in entities.iter().filter(|entity| property(entity, "classname").eq_ignore_ascii_case("misc_portal_surface")) {
+        let Some(surface_origin) = origin(surface) else { continue; };
+        let target_name = property(surface, "target");
+        if target_name.is_empty() {
+            anchors.push(PortalSurfaceAnchor { origin: surface_origin, targeted: false, camera: None });
+            continue;
+        }
+        targeted_count += 1;
+        let camera = entities.iter().find(|entity| {
+            property(entity, "targetname").eq_ignore_ascii_case(target_name)
+                && property(entity, "classname").eq_ignore_ascii_case("misc_portal_camera")
+        }).and_then(|camera| {
+            let camera_jka = parse_light_triplet(property(camera, "origin"))?;
+            let camera_origin = render_position(camera_jka);
+            let camera_target = property(camera, "target");
+            let forward_jka = entities.iter().find(|entity| {
+                !camera_target.is_empty() && property(entity, "targetname").eq_ignore_ascii_case(camera_target)
+            }).and_then(origin).map(|target_origin| {
+                Vec3::from_array(target_origin) - Vec3::from_array(camera_origin)
+            }).filter(|direction| direction.length_squared() > 1e-8).map(Vec3::normalize)
+                .unwrap_or_else(|| {
+                    // G_SetMovedir: JKA angle is yaw around +Z; angles is pitch/yaw/roll.
+                    let angles = parse_light_triplet(property(camera, "angles"));
+                    let angle = property(camera, "angle").parse::<f32>().unwrap_or(0.0);
+                    let pitch = angles.map_or(0.0, |angles| angles[0]).to_radians();
+                    let yaw = angles.map_or(angle, |angles| angles[1]);
+                    let direction = if angles.is_none() && angle == -1.0 { [0.0, 0.0, 1.0] }
+                        else if angles.is_none() && angle == -2.0 { [0.0, 0.0, -1.0] }
+                        else { [pitch.cos() * yaw.to_radians().cos(), pitch.cos() * yaw.to_radians().sin(), -pitch.sin()] };
+                    Vec3::from_array(render_position(direction)).normalize_or_zero()
+                });
+            if forward_jka.length_squared() < 0.5 { return None; }
+            let flags = property(camera, "spawnflags").parse::<u32>().unwrap_or(0);
+            Some(PortalCamera {
+                surface_origin,
+                camera_origin,
+                camera_forward: forward_jka.to_array(),
+                roll_degrees: property(camera, "roll").parse::<f32>().unwrap_or(0.0),
+                rotation_speed: if flags & 1 != 0 { 25.0 } else if flags & 2 != 0 { 75.0 } else { 0.0 },
+                swing: flags & 4 == 0,
+            })
+        });
+        anchors.push(PortalSurfaceAnchor { origin: surface_origin, targeted: true, camera });
+    }
+    (anchors, targeted_count)
 }
 
 pub(in crate::scene) fn bsp_portal_surface_anchors(bsp: &Bsp) -> (Vec<PortalSurfaceAnchor>, usize) {
-    let mut anchors = Vec::new();
-    let mut camera_portals = 0usize;
-    for entity in &bsp.entities {
-        let Some(classname) = entity
-            .get(b"classname")
-            .and_then(|value| std::str::from_utf8(value).ok())
-        else {
-            continue;
-        };
-        if !classname.eq_ignore_ascii_case("misc_portal_surface") {
-            continue;
-        }
-        let targeted = entity
-            .get(b"target")
-            .and_then(|value| std::str::from_utf8(value).ok())
-            .is_some_and(|value| !value.trim().is_empty());
-        if targeted {
-            camera_portals += 1;
-        }
-        let Some(origin) = entity
-            .get(b"origin")
-            .and_then(|value| std::str::from_utf8(value).ok())
-            .and_then(parse_light_triplet)
-        else {
-            continue;
-        };
-        anchors.push(PortalSurfaceAnchor {
-            origin: render_position(origin),
-            mirror: !targeted,
-        });
-    }
-    (anchors, camera_portals)
+    let entities = bsp.entities.iter().map(|entity| {
+        entity.properties.iter().filter_map(|(key, value)| {
+            Some((String::from_utf8(key.clone()).ok()?, String::from_utf8(value.clone()).ok()?))
+        }).collect::<std::collections::BTreeMap<_, _>>()
+    }).collect::<Vec<_>>();
+    parse_portal_anchors(&entities)
 }
 
-pub(in crate::scene) fn map_portal_surface_anchors(
-    document: &MapDocument,
-) -> (Vec<PortalSurfaceAnchor>, usize) {
-    let mut anchors = Vec::new();
-    let mut camera_portals = 0usize;
-    for entity in &document.entities {
-        if !entity
-            .classname()
-            .is_some_and(|classname| classname.eq_ignore_ascii_case("misc_portal_surface"))
-        {
-            continue;
-        }
-        let targeted = entity
-            .properties
-            .get("target")
-            .is_some_and(|target| !target.trim().is_empty());
-        if targeted {
-            camera_portals += 1;
-        }
-        let Some(origin) = entity
-            .properties
-            .get("origin")
-            .and_then(|value| parse_light_triplet(value))
-        else {
-            continue;
-        };
-        anchors.push(PortalSurfaceAnchor {
-            origin: render_position(origin),
-            mirror: !targeted,
-        });
-    }
-    (anchors, camera_portals)
+pub(in crate::scene) fn map_portal_surface_anchors(document: &MapDocument) -> (Vec<PortalSurfaceAnchor>, usize) {
+    let entities = document.entities.iter().map(|entity| entity.properties.clone()).collect::<Vec<_>>();
+    parse_portal_anchors(&entities)
 }

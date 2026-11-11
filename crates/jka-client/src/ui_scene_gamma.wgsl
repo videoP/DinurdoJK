@@ -22,8 +22,10 @@ struct VertexOut {
 @group(0) @binding(7) var ui_ext_images: texture_2d<f32>;
 // Clean TrueType UI font (scoreboard, kill feed), mipped; see ui::text::clean_text.
 @group(0) @binding(8) var ui_clean_font: texture_2d<f32>;
-// Every model's icon_default (scoreboard avatars); see renderer::sync_ui_avatars.
+// On-demand connected-player scoreboard/specHUD icons; see renderer::sync_ui_avatars.
 @group(0) @binding(9) var ui_avatars: texture_2d<f32>;
+// Shader Remaps thumbnail slots; see renderer::set_remap_thumb.
+@group(0) @binding(10) var ui_remap_thumbs: texture_2d<f32>;
 
 // Same source controls both ordinary sRGB and encoded UNORM output.
 // In encoded mode the RGB sampled from the atlas is already encoded.
@@ -81,8 +83,11 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         return compensate_ui(textureSampleLevel(ui_ext_images, ui_font_sampler, input.uv, 0.0) * input.color);
     } else if input.textured < 8.5 {
         glyph = textureSampleGrad(ui_clean_font, ui_font_sampler, input.uv, uv_dx, uv_dy);
-    } else {
+    } else if input.textured < 9.5 {
         return compensate_ui(textureSampleLevel(ui_avatars, ui_font_sampler, input.uv, 0.0) * input.color);
+    } else {
+        // Shader Remaps thumbnail slot atlas; see ui::shader_remap.
+        return compensate_ui(textureSampleLevel(ui_remap_thumbs, ui_font_sampler, input.uv, 0.0) * input.color);
     }
     return compensate_ui(vec4<f32>(input.color.rgb, input.color.a * glyph.a));
 }

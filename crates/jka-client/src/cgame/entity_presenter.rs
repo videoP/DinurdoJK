@@ -227,7 +227,7 @@ fn force_shockwave_surface(
 pub struct EntityPresenter {
     assets: AssetSearchPath,
     pbr: bool,
-    shaders: BTreeMap<String, Shader>,
+    shaders: Arc<BTreeMap<String, Shader>>,
     shader_remaps: scene::ShaderRemapState,
     textures: Textures,
     texture_arcs: HashMap<usize, Arc<TextureData>>,
@@ -526,18 +526,32 @@ fn md3_world_bounds(mins: [f32; 3], maxs: [f32; 3], origin: [f32; 3],
 }
 
 impl EntityPresenter {
-    pub fn new(mut assets: AssetSearchPath, pbr: bool) -> Result<Self, String> {
-        let mut shader_warnings = Vec::new();
-        let (shaders, diagnostics) =
-            materials::shader_library(&mut assets, &mut shader_warnings, pbr)?;
-        devprintln!(
-            1,
-            "ENTITY ASSETS: shaderDefs={} mtrDefs={}",
-            diagnostics.shader_definitions, diagnostics.mtr_definitions,
-        );
-        for warning in shader_warnings {
-            rverbose!(1, "ENTITY MATERIAL WARNING: {warning}");
-        }
+    pub(crate) fn shader_definitions_for(&self, pbr: bool) -> Option<Arc<BTreeMap<String, Shader>>> {
+        (self.pbr == pbr).then(|| Arc::clone(&self.shaders))
+    }
+
+    pub fn new(assets: AssetSearchPath, pbr: bool) -> Result<Self, String> {
+        Self::new_with_shared_shaders(assets, pbr, None)
+    }
+
+    pub(crate) fn new_with_shared_shaders(
+        mut assets: AssetSearchPath, pbr: bool,
+        shared_shaders: Option<Arc<BTreeMap<String, Shader>>>,
+    ) -> Result<Self, String> {
+        let shaders = if let Some(shared) = shared_shaders {
+            devprintln!(1, "ENTITY ASSETS: reusing {} shared shader definitions", shared.len());
+            shared
+        } else {
+            let mut shader_warnings = Vec::new();
+            let (shaders, diagnostics) =
+                materials::shader_library(&mut assets, &mut shader_warnings, pbr)?;
+            devprintln!(1, "ENTITY ASSETS: shaderDefs={} mtrDefs={}",
+                diagnostics.shader_definitions, diagnostics.mtr_definitions);
+            for warning in shader_warnings {
+                rverbose!(1, "ENTITY MATERIAL WARNING: {warning}");
+            }
+            Arc::new(shaders)
+        };
         Ok(Self {
             assets,
             pbr,
@@ -1143,7 +1157,7 @@ impl EntityPresenter {
         let mut shader_warnings = Vec::new();
         let (shaders, diagnostics) =
             materials::shader_library(&mut self.assets, &mut shader_warnings, self.pbr)?;
-        self.shaders = shaders;
+        self.shaders = Arc::new(shaders);
         for warning in shader_warnings {
             rverbose!(1, "ENTITY MATERIAL REFRESH WARNING: {warning}");
         }

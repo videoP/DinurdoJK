@@ -1,12 +1,77 @@
 //! CPU reference for the actual Niagara stencil/sampling operations in stages
 //! 8, 9, 10, 13 and 14. Original algorithms: Copyright Epic Games, Inc.
 //! Integer loads use zero outside the grid; filtered samples clamp to edges.
+//! Storage may be dense or sparse-tiled (`sparse::Residency`); both present
+//! the same virtual dense grid, so every stage's arithmetic is identical.
 
+use super::sparse::{Residency, UNRESIDENT_GEOMETRY};
 use super::{Geometry, Parameters, Presentation, Transport, Water};
+
+/// Where a field's cells live. Tiled storage keeps the dense coordinates and
+/// edge policy of its lattice; only residency differs.
+#[derive(Clone, Copy, Debug)]
+pub enum Storage<'a> {
+    Dense { width: usize, height: usize },
+    Tiled(&'a Residency),
+}
+
+enum Lookup {
+    Cell(usize),
+    Outside,
+    Unresident,
+}
+
+impl Storage<'_> {
+    pub fn dimensions(self) -> [usize; 2] {
+        match self {
+            Self::Dense { width, height } => [width, height],
+            Self::Tiled(r) => r.lattice().dimensions().map(|n| n as usize),
+        }
+    }
+
+    pub fn len(self) -> usize {
+        match self {
+            Self::Dense { width, height } => width * height,
+            Self::Tiled(r) => r.cell_count(),
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// Grid cell of a storage index.
+    pub fn cell(self, index: usize) -> [i32; 2] {
+        match self {
+            Self::Dense { width, .. } => [(index % width) as i32, (index / width) as i32],
+            Self::Tiled(r) => r.cell(index),
+        }
+    }
+
+    /// Storage index of a stored cell; None outside the grid or not resident.
+    pub fn index(self, at: [i32; 2]) -> Option<usize> {
+        match self.lookup(at[0], at[1]) {
+            Lookup::Cell(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    fn lookup(self, x: i32, y: i32) -> Lookup {
+        let [w, h] = self.dimensions();
+        if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+            return Lookup::Outside;
+        }
+        match self {
+            Self::Dense { width, .. } => Lookup::Cell(y as usize * width + x as usize),
+            Self::Tiled(r) => r.index([x, y]).map_or(Lookup::Unresident, Lookup::Cell),
+        }
+    }
+}
 
 pub struct Field<'a> {
     pub width: usize,
     pub height: usize,
+    storage: Storage<'a>,
     water: &'a [Water],
     geometry: &'a [Geometry],
     filtered_sample: Option<&'a dyn Fn([f32; 2], usize) -> f32>,
@@ -31,9 +96,29 @@ impl<'a> Field<'a> {
         {
             return Err("invalid river reference grid dimensions or channel lengths");
         }
+        Self::with_storage(Storage::Dense { width, height }, water, geometry)
+    }
+
+    /// Any storage layout; channel slices are in storage order.
+    pub fn with_storage(
+        storage: Storage<'a>,
+        water: &'a [Water],
+        geometry: &'a [Geometry],
+    ) -> Result<Self, &'static str> {
+        let [width, height] = storage.dimensions();
+        if width == 0
+            || height == 0
+            || width > i32::MAX as usize
+            || height > i32::MAX as usize
+            || water.len() != storage.len()
+            || geometry.len() != storage.len()
+        {
+            return Err("invalid river reference grid dimensions or channel lengths");
+        }
         Ok(Self {
             width,
             height,
+            storage,
             water,
             geometry,
             filtered_sample: None,
@@ -49,6 +134,10 @@ impl<'a> Field<'a> {
         self
     }
 
+    pub fn storage(&self) -> Storage<'a> {
+        self.storage
+    }
+
     fn filtered(&self, unit: [f32; 2], at: [f32; 2], channel: usize) -> f32 {
         match self.filtered_sample {
             Some(sample) => sample(unit, channel),
@@ -56,19 +145,20 @@ impl<'a> Field<'a> {
         }
     }
 
-    fn index(&self, x: i32, y: i32) -> Option<usize> {
-        (x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height)
-            .then(|| y as usize * self.width + x as usize)
-    }
-
     pub fn water(&self, x: i32, y: i32) -> Water {
-        self.index(x, y).map(|i| self.water[i]).unwrap_or_default()
+        match self.storage.lookup(x, y) {
+            Lookup::Cell(i) => self.water[i],
+            _ => Water::default(),
+        }
     }
 
+    /// Outside the grid: zero. Inside but not resident: the border wall.
     pub fn geometry(&self, x: i32, y: i32) -> Geometry {
-        self.index(x, y)
-            .map(|i| self.geometry[i])
-            .unwrap_or_default()
+        match self.storage.lookup(x, y) {
+            Lookup::Cell(i) => self.geometry[i],
+            Lookup::Outside => Geometry::default(),
+            Lookup::Unresident => UNRESIDENT_GEOMETRY,
+        }
     }
 
     fn clamp(&self, x: i32, y: i32) -> (i32, i32) {

@@ -1,4 +1,6 @@
 //! State.
+use jka_assets::shader::Shader;
+use std::collections::BTreeMap;
 use crate::cgame::player_presenter::{
     footsteps, load_humanoid_animations, load_saber_animation_scales, load_saber_definitions,
     load_vehicle_definitions, materials, AnimationSet, Arc, AssetRegistry, AssetSearchPath,
@@ -52,6 +54,51 @@ pub(in crate::cgame::player_presenter) fn resolve_vehicle_model_request(
         format!("{prefix}model_{skin_name}.skin")
     });
     Ok((glm, skin, label))
+}
+
+/// MVSDK `CG_MapTorsoToWeaponFrame`: -1 for animations outside the hand
+/// frame ranges. `Option` allows the calling viewmodel to reset cleanly.
+fn map_torso_to_weapon_frame(frame: i32, first: i32, animation_name: Option<&str>) -> Option<usize> {
+    let offset = frame - first;
+    match animation_name {
+        Some("TORSO_DROPWEAP1") if (0..5).contains(&offset) => Some((offset + 6) as usize),
+        Some("TORSO_RAISEWEAP1") if (0..4).contains(&offset) => Some((offset + 10) as usize),
+        Some(
+            "BOTH_ATTACK1" | "BOTH_ATTACK2" | "BOTH_ATTACK3" | "BOTH_ATTACK4"
+            | "BOTH_ATTACK5" | "BOTH_ATTACK6" | "BOTH_ATTACK7" | "BOTH_ATTACK8"
+            | "BOTH_ATTACK9" | "BOTH_ATTACK10" | "BOTH_ATTACK11" | "BOTH_ATTACK12"
+            | "BOTH_THERMAL_THROW",
+        ) if (0..6).contains(&offset) => Some((offset + 1) as usize),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod view_weapon_frame_tests {
+    use super::map_torso_to_weapon_frame as map;
+
+    #[test]
+    fn jk2_tripmine_attack3_uses_six_hand_throw_frames() {
+        // MVSDK WeaponAttackAnim[WP_TRIP_MINE] == BOTH_ATTACK3.
+        for offset in 0..6 {
+            assert_eq!(map(800 + offset, 800, Some("BOTH_ATTACK3")), Some((offset + 1) as usize));
+        }
+        assert_eq!(map(806, 800, Some("BOTH_ATTACK3")), None);
+        assert_eq!(map(799, 800, Some("BOTH_ATTACK3")), None);
+    }
+
+    #[test]
+    fn mvsdk_weapon_frame_mapping_includes_attack5_to_12_and_thermal() {
+        for name in [
+            "BOTH_ATTACK5", "BOTH_ATTACK6", "BOTH_ATTACK7", "BOTH_ATTACK8",
+            "BOTH_ATTACK9", "BOTH_ATTACK10", "BOTH_ATTACK11", "BOTH_ATTACK12",
+            "BOTH_THERMAL_THROW",
+        ] {
+            assert_eq!(map(105, 100, Some(name)), Some(6));
+        }
+        assert_eq!(map(24, 20, Some("TORSO_DROPWEAP1")), Some(10));
+        assert_eq!(map(23, 20, Some("TORSO_RAISEWEAP1")), Some(13));
+    }
 }
 
 impl PlayerPresenter {
@@ -154,7 +201,22 @@ impl PlayerPresenter {
         self.saber_definitions.install_jk2_native();
     }
 
-    pub fn new(mut assets: AssetSearchPath, pbr: bool) -> Result<Self, String> {
+    pub fn new(assets: AssetSearchPath, pbr: bool) -> Result<Self, String> {
+        Self::new_with_shared_shaders(assets, pbr, None)
+    }
+
+    // A gameplay presenter already parsed this VFS's shader definitions.
+    // Profile has a separate animation/model instance, but can share immutable
+    // material definitions rather than re-reading every .shader/.mtr archive.
+    pub(crate) fn shader_definitions_for(&self, pbr: bool) -> Option<Arc<BTreeMap<String, Shader>>> {
+        (self.pbr == pbr).then(|| Arc::clone(&self.shaders))
+    }
+
+    pub(crate) fn new_with_shared_shaders(
+        mut assets: AssetSearchPath,
+        pbr: bool,
+        shared_shaders: Option<Arc<BTreeMap<String, Shader>>>,
+    ) -> Result<Self, String> {
         jka_assets::body_shape::anny::configure_assets(&assets);
         let animations = load_humanoid_animations(&mut assets)?;
         let anim_events =
@@ -166,23 +228,28 @@ impl PlayerPresenter {
         let saber_scales = load_saber_animation_scales(&mut assets)?;
         let saber_definitions = load_saber_definitions(&mut assets)?;
         let vehicle_definitions = load_vehicle_definitions(&mut assets)?;
-        let mut shader_warnings = Vec::new();
-        let (shaders, diagnostics) =
-            materials::shader_library(&mut assets, &mut shader_warnings, pbr)?;
-        devprintln!(
-            1,
-            "PLAYER ASSETS: humanoid animations={} saberDefs={} vehicleDefs={} shaderDefs={} mtrDefs={}",
-            animations.animations.len(),
-            saber_definitions.len(),
-            vehicle_definitions.len(),
-            diagnostics.shader_definitions,
-            diagnostics.mtr_definitions,
-        );
-        for warning in shader_warnings {
-            rverbose!(1, "PLAYER MATERIAL WARNING: {warning}");
-        }
+        let shaders = if let Some(shared) = shared_shaders {
+            devprintln!(1, "PLAYER ASSETS: reusing {} shared shader definitions", shared.len());
+            shared
+        } else {
+            let mut shader_warnings = Vec::new();
+            let (definitions, diagnostics) =
+                materials::shader_library(&mut assets, &mut shader_warnings, pbr)?;
+            devprintln!(
+                1,
+                "PLAYER ASSETS: humanoid animations={} saberDefs={} vehicleDefs={} shaderDefs={} mtrDefs={}",
+                animations.animations.len(),
+                saber_definitions.len(),
+                vehicle_definitions.len(),
+                diagnostics.shader_definitions,
+                diagnostics.mtr_definitions,
+            );
+            for warning in shader_warnings {
+                rverbose!(1, "PLAYER MATERIAL WARNING: {warning}");
+            }
+            Arc::new(definitions)
+        };
         let asset_source = AssetSource::from_search_path(&assets);
-        let shaders = Arc::new(shaders);
         let shader_remaps = crate::scene::ShaderRemapState::default();
         let load_shared = Arc::new(ModelLoadShared::new(
             Arc::clone(&shaders),
@@ -381,10 +448,11 @@ impl PlayerPresenter {
         }
     }
 
-    /// TaystJK `CG_MapTorsoToWeaponFrame`: sample the already-advanced local
-    /// Ghoul2 lower_lumbar animation and map it onto the MD3 hand animation.
-    /// The returned `(frame, oldframe, backlerp)` is consumed by the viewmodel
-    /// tag interpolation exactly like refEntity_t.
+    /// MVSDK/TaystJK `CG_MapTorsoToWeaponFrame`: map torso frames onto the
+    /// invisible MD3 hand's `tag_weapon` animation. JK2 `CG_AddViewWeapon`
+    /// consumes `cent->pe.torso` directly, not a Ghoul2 bone sample (notably,
+    /// JK2 1.02 drives `upper_lumbar` instead of `lower_lumbar`). Keep the
+    /// existing Ghoul2 sample for JKA so its viewmodel timing is unchanged.
     pub fn view_weapon_frames(
         &mut self,
         entity_num: u16,
@@ -413,6 +481,32 @@ impl PlayerPresenter {
         self.view_weapon_frame = 0;
         self.view_weapon_frame_time = 0;
 
+        let Some(animation) = self.animations.get(torso_anim) else {
+            return (0, 0, 0.0);
+        };
+        let first = i32::from(animation.first_frame);
+        let animation_name = AnimationSet::name(torso_anim);
+        let map = |frame: i32| map_torso_to_weapon_frame(frame, first, animation_name);
+
+        if self.assets.jk2_version().is_some() {
+            // MVSDK CG_AddViewWeapon reads the predicted centity's torso lerp
+            // frame pair and backlerp. Its CG_RunLerpFrame already advanced
+            // these values for this presentation tick, irrespective of which
+            // Ghoul2 lumbar bone the particular JK2 version animates.
+            let Some(state) = self.entities.get(&entity_num) else {
+                return (0, 0, 0.0);
+            };
+            let torso = &state.animation.torso;
+            let Some(frame) = map(torso.frame) else {
+                return (0, 0, 0.0);
+            };
+            let Some(oldframe) = map(torso.old_frame) else {
+                return (frame, frame, 0.0);
+            };
+            return (frame, oldframe, torso.backlerp);
+        }
+
+        // TaystJK/OpenJK Ghoul2 path for JKA, unchanged.
         let current_frame = self.entities.get_mut(&entity_num).and_then(|state| {
             let lower_lumbar = Ghoul2Animator::bone_index(&state.model.animation_gla, "lower_lumbar")?;
             state
@@ -425,26 +519,6 @@ impl PlayerPresenter {
         let Some(current_frame) = current_frame else {
             return (0, 0, 0.0);
         };
-
-        let Some(animation) = self.animations.get(torso_anim) else {
-            return (0, 0, 0.0);
-        };
-        let first = i32::from(animation.first_frame);
-        let map = |frame: i32| -> Option<usize> {
-            let offset = frame - first;
-            match AnimationSet::name(torso_anim) {
-                Some("TORSO_DROPWEAP1") if (0..5).contains(&offset) => Some((offset + 6) as usize),
-                Some("TORSO_RAISEWEAP1") if (0..4).contains(&offset) => {
-                    Some((offset + 10) as usize)
-                }
-                Some(
-                    "BOTH_ATTACK1" | "BOTH_ATTACK2" | "BOTH_ATTACK3" | "BOTH_ATTACK4"
-                    | "BOTH_ATTACK10" | "BOTH_THERMAL_THROW",
-                ) if (0..6).contains(&offset) => Some((offset + 1) as usize),
-                _ => None,
-            }
-        };
-
         let frame = map(current_frame.ceil() as i32);
         let oldframe = map(current_frame.floor() as i32);
         match (frame, oldframe) {

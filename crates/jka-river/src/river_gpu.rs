@@ -111,7 +111,7 @@ enum GeometryInput<'a> {
 /// layers share an array here; sampling never interpolates between layers.
 pub const WATER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
-fn state_texture(device: &wgpu::Device, dimensions: [u32; 2], label: &str) -> wgpu::Texture {
+pub(crate) fn state_texture(device: &wgpu::Device, dimensions: [u32; 2], label: &str) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {

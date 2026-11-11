@@ -9,9 +9,17 @@ use crate::renderer::{
 };
 use crate::renderer::lighting::shadow_resources::OriginalSunShadowCache;
 
+#[path = "original_sun_contours.rs"]
+mod contours;
+
+/// Flux packing scale shared by CPU contour masks and the existing compositor.
+pub(in crate::renderer) const CONTOUR_MASK_SCALE: f32 = 3.0;
+
 pub(in crate::renderer) struct BakedSunCalibration {
     pub radiance: [f32; 3],
     pub auto_strength: Option<f32>,
+    pub contour_masks: Option<Vec<Vec<u8>>>,
+    pub contour_regions: usize,
     /// Shadow luminance, direct upper bound, classification, reserved.
     /// Classification: 0 fallback, 1 paired fit, 2 fully lit, 3 fully shadowed,
     /// 4 authored UV projection (exposure, gamma, kind, signed compensation).
@@ -124,6 +132,7 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     let photons = color / color.max_element().max(0.00001) * sun.intensity * encoding.brightness;
     let sun_y = photons.dot(Vec3::new(0.2126, 0.7152, 0.0722));
     let refined = std::sync::atomic::AtomicUsize::new(0);
+    let clip_capped = std::sync::atomic::AtomicUsize::new(0);
     let toward = -Vec3::from_array(sun.direction).normalize_or_zero();
     let azimuth = (-toward.z).atan2(toward.x);
     let elevation = toward.y.asin();
@@ -233,6 +242,11 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     // authored sun magnitude, which may be exactly what needs calibration;
     // allowing its edge reconstruction to influence the fit is circular.
     let auto_strength = calibrate_authored_sun(lightmaps, &samples, &owners, sun_y, encoding, cancelled);
+    // Keep the unrefined visibility solely for independent contour *fitting*;
+    // synthesize the alternative removal from the final refined visibility.
+    let unrefined_flux: Vec<Vec<u8>> = lightmaps.iter()
+        .map(|image| image.rgba.chunks_exact(4).map(|pixel| pixel[3]).collect())
+        .collect();
     // Refine/extend only after the fitted coefficient is fixed, retaining
     // the existing manually selected edge reconstruction behavior.
     lightmaps.par_iter_mut().zip(samples.par_iter()).zip(owners.par_iter())
@@ -244,6 +258,17 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
                 ),
                 std::sync::atomic::Ordering::Relaxed,
             );
+            // Clipped luxels hold less sun than predicted; cap BEFORE UV padding
+            // so padded chart borders inherit the capped value.
+            if let Some(strength) = auto_strength {
+                let mut alpha: Vec<u8> = image.rgba.chunks_exact(4).map(|p| p[3]).collect();
+                let lowered = cap_clipped_removal(&image.rgba, &mut alpha, image.width as usize,
+                    texels, owners, sun_y, strength, encoding);
+                if lowered > 0 {
+                    for (pixel, value) in image.rgba.chunks_exact_mut(4).zip(&alpha) { pixel[3] = *value; }
+                    clip_capped.fetch_add(lowered, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             // Match bilinear sampling at chart edges without bleeding another chart.
             let alpha: Vec<_> = image.rgba.chunks_exact(4).map(|p| p[3]).collect();
             for (index, sample) in texels.iter().enumerate() {
@@ -271,6 +296,21 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
                 }
             }
         });
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    let (mut contour_masks, contour_regions) = contours::build_contour_masks(
+        lightmaps, &unrefined_flux, &samples, &owners, photons, sun_y, auto_strength, encoding, cancelled)
+        .map_or((None, 0), |(masks, regions)| (Some(masks), regions));
+    if let Some(masks) = contour_masks.as_mut() {
+        let lowered: usize = masks.par_iter_mut().zip(lightmaps.par_iter()).zip(samples.par_iter()).zip(owners.par_iter())
+            .map(|(((mask, image), texels), owners)| {
+                if image.rgba16f.is_some() || mask.len() * 4 != image.rgba.len() { return 0; }
+                cap_clipped_removal(&image.rgba, mask, image.width as usize, texels, owners, sun_y, CONTOUR_MASK_SCALE, encoding)
+            })
+            .sum();
+        clip_capped.fetch_add(lowered, std::sync::atomic::Ordering::Relaxed);
+    }
+    println!("[BAKED SUN] clipped-luxel cap lowered {} mask luxels (Auto + contour)",
+        clip_capped.load(std::sync::atomic::Ordering::Relaxed));
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) { return None; }
     let mut surfaces = vec![[0.0; 4]; surface_count];
     for batch in batches {
@@ -307,6 +347,8 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     Some(BakedSunCalibration {
         radiance: radiance.to_array(),
         auto_strength,
+        contour_masks,
+        contour_regions,
         surfaces,
     })
 }
@@ -581,6 +623,94 @@ fn refine_authored_sun_edges(
         .sum()
 }
 
+/// Compilers clip a luxel whose sun + ambient exceeds 255 (q3map ColorNormalize
+/// scales the brightest channel to 255). Subtracting the full predicted sun
+/// from such a luxel drives it below its unclipped shadowed neighbours, so
+/// former sunlit floors turn into dark ghosts with bright bands along walls
+/// (measured at mp/ffa3: 12.3% of lit luxels are exactly 255, 1% of shadow).
+/// For clipped luxels, estimate the sun-free value from unclipped luxels on
+/// the same chart and plane (BFS fill + smoothing) and never remove more than
+/// observed minus that estimate. Unclipped luxels are untouched.
+#[allow(clippy::too_many_arguments)]
+fn cap_clipped_removal(
+    rgba: &[u8],
+    alpha: &mut [u8],
+    width: usize,
+    texels: &[Option<crate::renderer::StaticAoTexelSample>],
+    owners: &[u32],
+    sun_y: f32,
+    strength: f32,
+    encoding: crate::scene::BakedSunEncoding,
+) -> usize {
+    let count = alpha.len();
+    if width == 0 || sun_y <= 0.0 || strength <= 0.0 || texels.len() != count
+        || owners.len() != count || rgba.len() != count * 4 { return 0; }
+    let height = count / width;
+    let luma = Vec3::new(0.2126, 0.7152, 0.0722);
+    let clipped = |i: usize| rgba[i * 4..i * 4 + 3].iter().any(|&c| c >= 254);
+    let valid = |i: usize| texels[i].is_some() && owners[i] != 0;
+    if !(0..count).any(|i| valid(i) && clipped(i)) { return 0; }
+    let removal = sun_y * strength / 255.0;
+    let observed: Vec<f32> = (0..count)
+        .map(|i| if valid(i) { compiled_lightmap_photons(&rgba[i * 4..i * 4 + 4], encoding).dot(luma) } else { 0.0 })
+        .collect();
+    // Sun-free estimate: known on unclipped luxels, filled on clipped ones.
+    let mut estimate = vec![0.0f32; count];
+    let mut known = vec![false; count];
+    let mut queue = std::collections::VecDeque::new();
+    for i in 0..count {
+        if valid(i) && !clipped(i) {
+            estimate[i] = observed[i] - removal * alpha[i] as f32;
+            known[i] = true;
+        }
+    }
+    let linked = |i: usize, j: usize| {
+        valid(j) && owners[j] == owners[i]
+            && Vec3::from_array(texels[i].unwrap().normal).dot(Vec3::from_array(texels[j].unwrap().normal)) > 0.99
+    };
+    let neighbours = |i: usize| {
+        let (x, y) = (i % width, i / width);
+        [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)]
+            .into_iter()
+            .filter(move |&(nx, ny)| nx < width && ny < height)
+            .map(move |(nx, ny)| ny * width + nx)
+    };
+    for i in 0..count {
+        if known[i] && neighbours(i).any(|j| linked(i, j) && clipped(j)) { queue.push_back(i); }
+    }
+    let mut filled = Vec::new();
+    while let Some(i) = queue.pop_front() {
+        for j in neighbours(i) {
+            if known[j] || !linked(i, j) { continue; }
+            let (sum, n) = neighbours(j).filter(|&k| known[k] && linked(j, k))
+                .fold((0.0, 0u32), |(s, n), k| (s + estimate[k], n + 1));
+            if n == 0 { continue; }
+            estimate[j] = sum / n as f32;
+            known[j] = true;
+            filled.push(j);
+            queue.push_back(j);
+        }
+    }
+    // A few relaxation passes remove BFS direction bias on large clipped areas.
+    for _ in 0..16 {
+        let previous = estimate.clone();
+        for &j in &filled {
+            let (sum, n) = neighbours(j).filter(|&k| known[k] && linked(j, k))
+                .fold((0.0, 0u32), |(s, n), k| (s + previous[k], n + 1));
+            if n > 0 { estimate[j] = sum / n as f32; }
+        }
+    }
+    let mut lowered = 0;
+    for &j in &filled {
+        let cap = ((observed[j] - estimate[j]) / removal).clamp(0.0, 255.0).round() as u8;
+        if cap < alpha[j] {
+            alpha[j] = cap;
+            lowered += 1;
+        }
+    }
+    lowered
+}
+
 /// Estimate the compiled direct term, rather than treating compiler sun units
 /// as linear texture values. Each comparison is within ONE authored surface;
 /// triangle-interior samples cannot read a different packed lightmap chart.
@@ -693,7 +823,7 @@ pub(in crate::renderer) fn estimate_baked_sun_radiance(
     let fitted = fitted_direct_energy(&mut estimates)?;
     println!("[BAKED SUN] calibrated from {} mixed sun/shadow surfaces: linear direct RGB {:?}",
         estimates.len(), (hue * fitted).to_array());
-    Some(BakedSunCalibration { radiance: (hue * fitted).to_array(), auto_strength: None, surfaces: surface_fits })
+    Some(BakedSunCalibration { radiance: (hue * fitted).to_array(), auto_strength: None, contour_masks: None, contour_regions: 0, surfaces: surface_fits })
 }
 
 fn fitted_direct_energy(estimates: &mut [(f32, f32)]) -> Option<f32> {

@@ -1052,11 +1052,18 @@ struct Renderer {
     /// Clean TrueType UI font (binding 8) and its metrics.
     _ui_clean_font: GpuImage,
     ui_clean_font_metrics: Option<std::sync::Arc<ui::ProportionalFont>>,
-    /// Scoreboard avatar atlas (binding 9), its lookup, and the background
-    /// build that produces both; no job and no atlas means not started.
+    /// Scoreboard/spectator avatars (binding 9). Only displayed player icons
+    /// are packed; decoded CPU cells are reused across atlas rebuilds.
     _ui_avatars: GpuImage,
     ui_avatar_atlas: Option<std::sync::Arc<ui::AvatarAtlas>>,
-    ui_avatar_job: Option<std::sync::mpsc::Receiver<(TextureData, ui::AvatarAtlas)>>,
+    ui_avatar_job: Option<std::sync::mpsc::Receiver<overlay::UiAvatarBuild>>,
+    ui_avatar_loaded_keys: Vec<String>,
+    ui_avatar_scope: Option<(Option<PathBuf>, Option<u8>)>,
+    ui_avatar_cache: Arc<std::sync::Mutex<overlay::UiAvatarIconCache>>,
+    /// Shader Remaps thumbnail slot atlas (binding 10). A 1x1 placeholder
+    /// until the page uploads its first thumbnail; released with the page.
+    _ui_remap_thumbs: GpuImage,
+    ui_remap_thumbs_live: bool,
     /// Studio overlay font, keyed by its choice (None inner = failed to load).
     studio_race_font: Option<(String, Option<(GpuImage, crate::ui::ProportionalFont, wgpu::BindGroup)>)>,
     _ui_splash: GpuImage,
@@ -1145,6 +1152,9 @@ struct Renderer {
     studio_lens: Option<StudioLens>,
     studio_lens_gpu: Option<studio_lens::StudioLensGpu>,
     asset_preview_background: Option<frame::preview_background::PreviewBackground>,
+    /// Lazy fullscreen presentation of the gameplay-format Profile scene.
+    /// Reuses gameplay PSOs even when HDR/bloom needs an FP16 scene target.
+    preview_present: Option<frame::preview::PreviewPresent>,
     // Created only after opening a menu page that requests the live blurred/
     // desaturated backdrop. Normal gameplay and the VIDEO setup tab do not
     // compile or allocate this pass.
@@ -1244,6 +1254,7 @@ struct Renderer {
     entity_sun_lighting: bool,
     baked_sun_removal: f32,
     baked_sun_removal_auto: bool,
+    baked_sun_removal_contour: bool,
     baked_sun_cache: bool,
     lightmap_smoothing: u8,
     baked_sun_aa: u8,

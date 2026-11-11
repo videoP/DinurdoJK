@@ -494,6 +494,13 @@ pub(in crate::renderer) struct DynamicModelRenderer {
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     pub(in crate::renderer) planar_skin_source_pipelines:
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    /// Ordinary front face used only for targeted remote camera portals.
+    pub(in crate::renderer) camera_portal_model_pipelines:
+        [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    pub(in crate::renderer) camera_portal_skin_pipelines:
+        [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
+    pub(in crate::renderer) camera_portal_skin_source_pipelines:
+        [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     /// Mirror-view FX PSOs (single-sample, lazy); saber core and glow are FX.
     pub(in crate::renderer) planar_fx_sprite_pipelines:
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],

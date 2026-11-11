@@ -244,6 +244,7 @@ pub(in crate::renderer) struct WorldPipelineCompilePlan {
     /// Every eligible (pipeline, material key) pair; see `material_specialization_eligible`.
     pub(in crate::renderer) material_jobs: Vec<(PipelineKey, MaterialFragmentKey)>,
     pub(in crate::renderer) has_planar_reflectors: bool,
+    pub(in crate::renderer) has_camera_portals: bool,
 }
 
 impl WorldPipelineCompilePlan {
@@ -269,6 +270,7 @@ impl WorldPipelineCompilePlan {
             fog_jobs: legacy_fog_pass_jobs(&world.coarse_batches),
             material_jobs: material_specialization_jobs(world.all_world_batches()),
             has_planar_reflectors: !world.planar_reflectors.is_empty(),
+            has_camera_portals: world.planar_reflectors.iter().any(|r| r.portal_camera.is_some()),
         }
     }
 }
@@ -294,6 +296,10 @@ pub(in crate::renderer) struct WorldPipelineVariant {
     // the matching cull/depth state without rebuilding a key at runtime.
     pub(in crate::renderer) fog_pass_pipelines: BTreeMap<(PipelineKey, bool), wgpu::RenderPipeline>,
     pub(in crate::renderer) reflection_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    /// Remote camera portals have positive winding; mirrors invert it.
+    pub(in crate::renderer) camera_portal_pipelines: BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    pub(in crate::renderer) camera_portal_fog_pass_pipelines:
+        BTreeMap<(PipelineKey, bool), wgpu::RenderPipeline>,
     pub(in crate::renderer) reflection_fog_pass_pipelines:
         BTreeMap<(PipelineKey, bool), wgpu::RenderPipeline>,
     /// r_fragmentShaderMode 1: base-pass PSOs per material, keyed by the batch's
@@ -403,6 +409,7 @@ pub(in crate::renderer) struct PlanarReflector {
     pub(in crate::renderer) kind: PlanarReflectorKind,
     pub(in crate::renderer) plane: [f32; 4],
     pub(in crate::renderer) pvs_origin: [f32; 3],
+    pub(in crate::renderer) portal_camera: Option<scene::PortalCamera>,
     pub(in crate::renderer) cull: CullMode,
     pub(in crate::renderer) bounds_min: [f32; 3],
     pub(in crate::renderer) bounds_max: [f32; 3],
@@ -417,6 +424,9 @@ pub(in crate::renderer) struct PlanarReflectionView {
     pub(in crate::renderer) view_proj: Mat4,
     pub(in crate::renderer) camera_position: Vec3,
     pub(in crate::renderer) camera_forward: Vec3,
+    /// Remote camera uses proper (not reflected) winding and its own clip plane.
+    pub(in crate::renderer) camera_portal: bool,
+    pub(in crate::renderer) clip_plane: [f32; 4],
     pub(in crate::renderer) cluster: Option<usize>,
     pub(in crate::renderer) coarse_batch_index: usize,
     /// `view_proj` narrowed to the screen rectangle covered by the visible

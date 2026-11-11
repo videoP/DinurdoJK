@@ -1,4 +1,5 @@
 //! Overlay.
+use std::collections::BTreeSet;
 use crate::renderer::{
     append_vignette_vertices, create_menu_backdrop_resources, create_screen_fx_pipeline,
     load_ui_key_atlas, pipeline_hash, try_load_texture_asset,
@@ -138,7 +139,7 @@ pub(in crate::renderer) fn create_ui_texture_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
-    images: [&GpuImage; 9],
+    images: [&GpuImage; 10],
     encoded: bool,
 ) -> wgpu::BindGroup {
     let views: Vec<_> = images.iter().map(|image| {
@@ -158,6 +159,7 @@ pub(in crate::renderer) fn create_ui_texture_group(
             wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&views[6]) },
             wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&views[7]) },
             wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&views[8]) },
+            wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&views[9]) },
         ],
     })
 }
@@ -478,7 +480,7 @@ impl Renderer {
         let images = [
             &self._ui_font, &self._ui_small_font, splash, &self._ui_keys,
             &self._ui_icons, &self._ui_team_icons, &self._ui_ext_images,
-            &self._ui_clean_font, &self._ui_avatars,
+            &self._ui_clean_font, &self._ui_avatars, &self._ui_remap_thumbs,
         ];
         self.ui_bind_group = create_ui_texture_group(
             &self.device, &self.ui_texture_layout, &self._ui_font_sampler, images, false);
@@ -708,31 +710,126 @@ impl Renderer {
     /// broadcast HUD), pack every model's
     /// `icon_default` into one atlas on a worker thread; when it lands, upload
     /// it to binding 9. Returns true on the frame the atlas becomes ready.
+    /// Write one decoded Shader Remaps thumbnail into its atlas slot. The
+    /// atlas is allocated on first use; the app owns slot assignment/LRU and
+    /// only references a slot after sending its pixels.
+    pub(in crate::renderer) fn set_remap_thumb(&mut self, slot: usize, size: [u32; 2], rgba: Vec<u8>) {
+        use crate::ui::shader_remap as remap;
+        if slot >= remap::SLOTS || size[0] == 0 || size[1] == 0
+            || size[0] > remap::slot_max_px(slot) || size[1] > remap::slot_max_px(slot)
+            || rgba.len() != (size[0] * size[1] * 4) as usize
+        {
+            return;
+        }
+        if !self.ui_remap_thumbs_live {
+            let blank = TextureData {
+                label: "Shader Remaps thumbnail atlas".into(),
+                source: None,
+                width: remap::ATLAS_W,
+                height: remap::ATLAS_H,
+                rgba: vec![0u8; (remap::ATLAS_W * remap::ATLAS_H * 4) as usize].into(),
+                rgba16f: None, mip_level_count: 1, clamp: true, srgb: true,
+            };
+            self._ui_remap_thumbs = upload_texture(&self.device, &self.queue, &blank);
+            self.ui_remap_thumbs_live = true;
+            self.rebuild_ui_bind_group();
+        }
+        let [x, y] = remap::slot_origin(slot);
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self._ui_remap_thumbs._texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size[0] * 4),
+                rows_per_image: Some(size[1]),
+            },
+            wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+        );
+    }
+
+    /// Free the ~31 MB thumbnail atlas when the page's state is discarded.
+    pub(in crate::renderer) fn release_remap_thumbs(&mut self) {
+        if !self.ui_remap_thumbs_live { return; }
+        self._ui_remap_thumbs = upload_texture(&self.device, &self.queue,
+            &empty_ui_font_texture("Shader Remaps thumbnails (not loaded)"));
+        self.ui_remap_thumbs_live = false;
+        self.rebuild_ui_bind_group();
+    }
+
+    pub(in crate::renderer) fn invalidate_ui_avatars(&mut self) {
+        self.ui_avatar_job = None;
+        self.ui_avatar_loaded_keys.clear();
+        self.ui_avatar_scope = None;
+        self.ui_avatar_cache = Arc::new(std::sync::Mutex::new(Default::default()));
+        self.ui_avatar_atlas = None;
+        self.ui_state.avatar_atlas = None;
+        self._ui_avatars = upload_texture(
+            &self.device, &self.queue,
+            &crate::renderer::empty_ui_font_texture("JKA UI avatars (not loaded)"),
+        );
+        self.rebuild_ui_bind_group();
+    }
+
     pub(in crate::renderer) fn sync_ui_avatars(&mut self) -> bool {
-        let wanted = self.ui_state.scoreboard.is_some() || self.ui_state.spectator_broadcast.is_some();
-        if self.ui_avatar_atlas.is_none() && self.ui_avatar_job.is_none() && wanted {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let base = self.base.clone();
-            let game = self.detail_texture_game.clone();
-            let spawned = std::thread::Builder::new().name("ui-avatars".into()).spawn(move || {
-                let started = Instant::now();
-                let (data, atlas) = load_ui_avatar_atlas(&base, game.as_deref());
-                eprintln!("UI AVATARS: {} player icons in {:.0} ms", atlas.cells.len(), started.elapsed().as_secs_f64() * 1000.0);
-                let _ = sender.send((data, atlas));
-            });
-            if spawned.is_ok() {
-                self.ui_avatar_job = Some(receiver);
+        let wanted = wanted_ui_avatar_icons(&self.ui_state);
+        if wanted.is_empty() && self.ui_avatar_atlas.is_none() && self.ui_avatar_job.is_none() {
+            return false;
+        }
+        let scope = (
+            self.detail_texture_game.clone(),
+            jka_assets::pk3::configured_filesystem_roots(&self.base).active_jk2,
+        );
+        let mut invalidated = false;
+        if self.ui_avatar_scope.as_ref() != Some(&scope) {
+            if self.ui_avatar_scope.is_some() {
+                self.invalidate_ui_avatars();
+                invalidated = true;
+            }
+            self.ui_avatar_scope = Some(scope.clone());
+        }
+        if let Some(job) = self.ui_avatar_job.as_ref() {
+            match job.try_recv() {
+                Ok(result) => {
+                    self.ui_avatar_job = None;
+                    if result.keys == wanted {
+                        self._ui_avatars = upload_texture(&self.device, &self.queue, &result.data);
+                        let atlas = Arc::new(result.atlas);
+                        self.ui_state.avatar_atlas = Some(atlas.clone());
+                        self.ui_avatar_atlas = Some(atlas);
+                        self.ui_avatar_loaded_keys = result.keys;
+                        self.rebuild_ui_bind_group();
+                        return true;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return invalidated,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.ui_avatar_job = None,
             }
         }
-        let Some(job) = self.ui_avatar_job.as_ref() else { return false };
-        let Ok((data, atlas)) = job.try_recv() else { return false };
-        self.ui_avatar_job = None;
-        self._ui_avatars = upload_texture(&self.device, &self.queue, &data);
-        let atlas = std::sync::Arc::new(atlas);
-        self.ui_state.avatar_atlas = Some(atlas.clone());
-        self.ui_avatar_atlas = Some(atlas);
-        self.rebuild_ui_bind_group();
-        true
+        if wanted.is_empty() || (self.ui_avatar_atlas.is_some() && self.ui_avatar_loaded_keys == wanted) {
+            return invalidated;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let base = self.base.clone();
+        let game = scope.0;
+        let jk2 = scope.1;
+        let cache = self.ui_avatar_cache.clone();
+        let spawned = std::thread::Builder::new().name("ui-avatars".into()).spawn(move || {
+            let started = Instant::now();
+            let mut cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (data, atlas) = load_ui_avatar_atlas(&base, game.as_deref(), jk2, &wanted, &mut cache);
+            eprintln!("UI AVATARS: {} player icons in {:.0} ms ({} requested)",
+                atlas.cells.len(), started.elapsed().as_secs_f64() * 1000.0, wanted.len());
+            let _ = sender.send(UiAvatarBuild { keys: wanted, data, atlas });
+        });
+        if spawned.is_ok() {
+            self.ui_avatar_job = Some(receiver);
+        }
+        invalidated
     }
 
     /// Resolve extension and native HUD art off-thread with source-size packing.
@@ -2686,69 +2783,107 @@ fn decode_ui_extension_images(
     (images, flags, dimensions)
 }
 
-/// Dynamic atlas for CG_DrawTeamOverlay model, weapon and powerup icons.
-/// Each cell key may contain newline-separated candidate qpaths; the first
-/// existing image wins (team-skin icon -> team fallback -> defer art).
-/// Every player icon the game can see (`models/players/<model>/icon_<skin>`,
-/// every model and every skin, stock and pk3 alike), at 48 px, in one atlas
-/// keyed `model/skin`. Runs off the render thread (see `sync_ui_avatars`).
-pub(in crate::renderer) fn load_ui_avatar_atlas(base: &Path, game: Option<&Path>) -> (TextureData, ui::AvatarAtlas) {
+/// Cached 48x48 RGBA cells, including misses. The map is only accessed by
+/// the avatar worker; it is pruned to the active request on each build.
+pub(in crate::renderer) type UiAvatarIconCache = HashMap<String, Option<Vec<u8>>>;
+
+pub(in crate::renderer) struct UiAvatarBuild {
+    pub keys: Vec<String>,
+    pub data: TextureData,
+    pub atlas: ui::AvatarAtlas,
+}
+
+/// Convert `model/skin` into only the real icon candidates the legacy HUD
+/// lookup might sample. Composite skins use the head icon, then default.
+fn add_ui_avatar_candidates(keys: &mut BTreeSet<String>, key: &str) {
+    let key = key.trim().to_ascii_lowercase();
+    let (model, skin) = key.split_once('/').unwrap_or((key.as_str(), "default"));
+    if model.is_empty() || model.contains("..") || model.contains('\\') || model.contains(':') {
+        return;
+    }
+    let skin = skin.split('|').next().unwrap_or("default");
+    if skin.is_empty() || skin.contains('/') || skin.contains("..") || skin.contains('\\') {
+        return;
+    }
+    keys.insert(format!("{model}/{skin}"));
+    keys.insert(format!("{model}/default"));
+}
+
+/// Requested icons from the latest UI snapshot. Model changes are visible
+/// through these fields even if score/ping values do not change. There is no
+/// asset enumeration and no per-model work for players not on this HUD.
+fn wanted_ui_avatar_icons(state: &ui::UiSnapshot) -> Vec<String> {
+    let mut keys = BTreeSet::new();
+    if let Some(board) = state.scoreboard.as_ref().filter(|board|
+        board.chrome.avatars && !board.chrome.stats_open
+    ) {
+        for entry in &board.entries {
+            add_ui_avatar_candidates(&mut keys, &entry.model);
+            add_ui_avatar_candidates(&mut keys, &entry.model_fallback);
+        }
+    }
+    if let Some(broadcast) = state.spectator_broadcast.as_ref() {
+        for player in &broadcast.players {
+            add_ui_avatar_candidates(&mut keys, &player.model);
+            add_ui_avatar_candidates(&mut keys, &player.model_fallback);
+        }
+    }
+    // Defensive limit against untrusted model strings, not an eagerly
+    // preallocated atlas. Real multiplayer sessions are far below this.
+    keys.into_iter().take(1024).collect()
+}
+
+/// On-demand scoreboard/spectator player-icon atlas, with a CPU cell cache
+/// across model changes. Only `wanted` qpaths are read; no `assets.names()`
+/// walk, no scan of all installed models, and no synchronous disk work.
+pub(in crate::renderer) fn load_ui_avatar_atlas(
+    base: &Path,
+    game: Option<&Path>,
+    jk2: Option<u8>,
+    wanted: &[String],
+    cache: &mut UiAvatarIconCache,
+) -> (TextureData, ui::AvatarAtlas) {
     const CELL: u32 = 48;
-    const COLUMNS: u32 = 128;
-    // 8192 px tall at most: inside every adapter's minimum texture limit.
-    const MAX_ICONS: usize = (COLUMNS * (8192 / CELL)) as usize;
-    let mut icons: Vec<String> = Vec::new();
-    let mut assets = AssetSearchPath::open_game(base, game).ok();
-    if let Some(assets) = assets.as_ref() {
-        for name in assets.names() {
-            let lower = name.to_ascii_lowercase();
-            let Some(rest) = lower.strip_prefix("models/players/") else { continue };
-            let Some((model, file)) = rest.split_once('/') else { continue };
-            let Some(stem) = file.strip_suffix(".tga").or_else(|| file.strip_suffix(".jpg")).or_else(|| file.strip_suffix(".png")) else {
-                continue;
-            };
-            let Some(skin) = stem.strip_prefix("icon_") else { continue };
-            if !skin.is_empty() && !model.contains('/') {
-                icons.push(format!("{model}/{skin}"));
-            }
-        }
-    }
-    icons.sort();
-    icons.dedup();
-    if icons.len() > MAX_ICONS {
-        // Keep every model's default icon before extra skins.
-        icons.sort_by_key(|key| !key.ends_with("/default"));
-        icons.truncate(MAX_ICONS);
-    }
-    let rows = (icons.len() as u32).div_ceil(COLUMNS).max(1);
-    let (width, height) = (COLUMNS * CELL, rows * CELL);
+    const MAX_COLUMNS: u32 = 8;
+    cache.retain(|key, _| wanted.binary_search(key).is_ok());
+    // A texture for two players is two cells, not 128 columns by 8192px.
+    let columns = (wanted.len() as u32).clamp(1, MAX_COLUMNS);
+    let rows = (wanted.len() as u32).div_ceil(columns).max(1);
+    let (width, height) = (columns * CELL, rows * CELL);
     let mut rgba = vec![0u8; (width * height * 4) as usize];
-    let mut atlas = ui::AvatarAtlas { columns: COLUMNS, rows, cells: Default::default() };
-    if let Some(assets) = assets.as_mut() {
-        for key in icons {
-            let Some((model, skin)) = key.split_once('/') else { continue };
-            let qpath = format!("models/players/{model}/icon_{skin}");
-            let Some(image) = try_load_texture_asset_from_search_path(assets, &qpath, true, false, true, "avatar") else {
-                continue;
-            };
-            let Some(source) = image::RgbaImage::from_raw(image.width, image.height, image.rgba.into_vec()) else {
-                continue;
-            };
-            let cell_image = if source.width() == CELL && source.height() == CELL {
-                source
-            } else {
-                image::imageops::resize(&source, CELL, CELL, image::imageops::FilterType::Triangle)
-            };
-            let index = atlas.cells.len() as u32;
-            let (col, row) = (index % COLUMNS, index / COLUMNS);
-            let row_bytes = (CELL * 4) as usize;
-            for y in 0..CELL {
-                let src = y as usize * row_bytes;
-                let dst = ((((row * CELL + y) * width) + col * CELL) * 4) as usize;
-                rgba[dst..dst + row_bytes].copy_from_slice(&cell_image.as_raw()[src..src + row_bytes]);
+    let mut atlas = ui::AvatarAtlas { columns, rows, cells: Default::default() };
+    let mut assets: Option<AssetSearchPath> = None;
+    for key in wanted {
+        if !cache.contains_key(key) {
+            if assets.is_none() {
+                assets = AssetSearchPath::open_game_as(base, game, jk2).ok();
             }
-            atlas.cells.insert(key, index);
+            let cell = assets.as_mut().and_then(|assets| {
+                let (model, skin) = key.split_once('/')?;
+                let qpath = format!("models/players/{model}/icon_{skin}");
+                let image = try_load_texture_asset_from_search_path(
+                    assets, &qpath, true, false, true, "avatar",
+                )?;
+                let source = image::RgbaImage::from_raw(image.width, image.height, image.rgba.into_vec())?;
+                let cell = if source.width() == CELL && source.height() == CELL {
+                    source
+                } else {
+                    image::imageops::resize(&source, CELL, CELL, image::imageops::FilterType::Triangle)
+                };
+                Some(cell.into_raw())
+            });
+            cache.insert(key.clone(), cell);
         }
+        let Some(Some(cell)) = cache.get(key) else { continue };
+        let index = atlas.cells.len() as u32;
+        let (col, row) = (index % columns, index / columns);
+        let row_bytes = (CELL * 4) as usize;
+        for y in 0..CELL {
+            let src = y as usize * row_bytes;
+            let dst = ((((row * CELL + y) * width) + col * CELL) * 4) as usize;
+            rgba[dst..dst + row_bytes].copy_from_slice(&cell[src..src + row_bytes]);
+        }
+        atlas.cells.insert(key.clone(), index);
     }
     let data = TextureData {
         label: "JKA UI avatar atlas".into(),
@@ -2762,6 +2897,45 @@ pub(in crate::renderer) fn load_ui_avatar_atlas(base: &Path, game: Option<&Path>
         srgb: true,
     };
     (data, atlas)
+}
+
+#[cfg(test)]
+mod on_demand_avatar_tests {
+    use super::*;
+
+    #[test]
+    fn requests_skin_head_and_default_without_enumerating_installed_models() {
+        let mut keys = BTreeSet::new();
+        add_ui_avatar_candidates(&mut keys, "Jan/BLUE");
+        add_ui_avatar_candidates(&mut keys, "Custom/red|torso|legs");
+        add_ui_avatar_candidates(&mut keys, "../invalid");
+        add_ui_avatar_candidates(&mut keys, "");
+        assert_eq!(keys.iter().map(String::as_str).collect::<Vec<_>>(), vec![
+            "custom/default", "custom/red", "jan/blue", "jan/default",
+        ]);
+    }
+
+    #[test]
+    fn rebuild_uses_cached_cells_and_only_allocates_requested_columns() {
+        let mut cache = UiAvatarIconCache::new();
+        let bytes = |color| vec![color; 48 * 48 * 4];
+        cache.insert("jan/blue".into(), Some(bytes(25)));
+        cache.insert("jan/default".into(), Some(bytes(50)));
+        cache.insert("kyle/default".into(), Some(bytes(100)));
+        cache.insert("unused/default".into(), Some(bytes(200)));
+        let wanted = vec!["jan/blue".into(), "kyle/default".into()];
+        // All requested icons are cached; no asset search is necessary.
+        let (data, atlas) = load_ui_avatar_atlas(
+            Path::new("not-used"), None, None, &wanted, &mut cache,
+        );
+        assert_eq!((data.width, data.height), (96, 48));
+        assert_eq!(atlas.cells.len(), 2);
+        assert_eq!(atlas.cell("Jan/blue"), Some(0));
+        assert_eq!(atlas.cell("kyle/red"), Some(1));
+        assert_eq!(data.rgba[0], 25);
+        assert_eq!(data.rgba[48 * 4], 100);
+        assert_eq!(cache.len(), 2); // discarded unused cached models
+    }
 }
 
 pub(in crate::renderer) fn load_ui_team_icon_atlas(

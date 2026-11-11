@@ -273,6 +273,8 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::CaptureFrontendScene { .. } => "CaptureFrontendScene",
         RenderCommand::CaptureVideoFrame { .. } => "CaptureVideoFrame",
         RenderCommand::SetUi(..) => "SetUi",
+        RenderCommand::RemapThumb { .. } => "RemapThumb",
+        RenderCommand::RemapThumbsRelease => "RemapThumbsRelease",
         RenderCommand::SetStreamerSettings(..) => "SetStreamerSettings",
         RenderCommand::SetCombatUi { .. } => "SetCombatUi",
         RenderCommand::SetNeonMenu(..) => "SetNeonMenu",
@@ -712,6 +714,7 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
         entity_sun_lighting: effective_lighting.entity_sun_lighting,
         baked_sun_removal: effective_lighting.baked_sun_removal,
         baked_sun_removal_auto: effective_lighting.baked_sun_removal_auto,
+        baked_sun_removal_contour: effective_lighting.baked_sun_removal_contour,
         baked_sun_cache: effective_lighting.baked_sun_cache,
         lightmap_smoothing: video.lightmap_smoothing,
         baked_sun_aa: video.baked_sun_aa,
@@ -2005,6 +2008,8 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::CaptureFrontendScene { path, neutral_gamma }) => renderer.request_frontend_scene_capture(path, neutral_gamma),
                     Ok(RenderCommand::CaptureVideoFrame { frame_index, depth, alpha }) => renderer.request_video_frame_capture(frame_index, depth, alpha),
                     Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
+                    Ok(RenderCommand::RemapThumb { slot, size, rgba }) => renderer.set_remap_thumb(slot, size, rgba),
+                    Ok(RenderCommand::RemapThumbsRelease) => renderer.release_remap_thumbs(),
                     Ok(RenderCommand::SetStreamerSettings(settings)) => {
                         renderer.stream_output.set_settings(settings);
                         if settings.enabled && (renderer.studio_world_viewport.is_some() || renderer.studio_export_size.is_some()) {

@@ -4,6 +4,10 @@
 // This file supplies individual stages, not a complete hydraulic solver.
 // Water/velocity attributes use the source's Float override: R32f array layers.
 // Geometry/output format parity remains separate.
+// Cell storage and addressing come from a prelude appended at build time:
+// shallow_dense.wgsl (the native single rectangle) or shallow_sparse.wgsl
+// (resident tiles of a virtual rectangle; not an Unreal system). Both keep
+// the dense coordinates and edge policy, so these stage bodies are shared.
 
 struct Parameters {
     dimensions: vec4<u32>, // nx, ny, extrapolation radius, extrapolate into dry
@@ -12,9 +16,7 @@ struct Parameters {
     fade: vec4<f32>,       // shallow fade start/speed, advection multiplier, minimum advected depth
 }
 @group(0) @binding(0) var<uniform> params: Parameters;
-@group(0) @binding(1) var water: texture_2d_array<f32>; // height, depth, vx, vy layers
 @group(0) @binding(2) var<storage, read> geometry: array<vec4<f32>>; // bottom, collider, collision vx/vy
-@group(0) @binding(3) var output_water: texture_storage_2d_array<r32float, write>;
 @group(0) @binding(4) var<storage, read_write> previous_bottom: array<f32>;
 @group(0) @binding(5) var<uniform> presentation: vec4<f32>; // radius, height cutoff, method, border
 @group(0) @binding(6) var<storage, read_write> output_normals: array<vec4<f32>>;
@@ -29,50 +31,17 @@ struct Boundary {
 @group(0) @binding(8) var<storage, read> water_info: array<vec4<f32>>; // local height, depth, flow XY
 @group(0) @binding(9) var<storage, read> source_boxes: array<SourceBox>;
 @group(0) @binding(10) var<uniform> boundary: Boundary;
-@group(0) @binding(11) var grid_sampler: sampler;
 
 fn dt_over_dx() -> f32 { return 1.0 / (params.stepping.x / params.stepping.y); }
-
-// Integer Niagara grid loads outside the resource return zero. Sampling and
-// extrapolation stages have their own policies and must not reuse this as a
-// substitute for filtered texture sampling.
-fn in_bounds(at: vec2<i32>) -> bool {
-    return all(at >= vec2<i32>(0)) && all(at < vec2<i32>(params.dimensions.xy));
-}
-fn index(at: vec2<i32>) -> u32 { return u32(at.y) * params.dimensions.x + u32(at.x); }
-fn read_water(at: vec2<i32>) -> vec4<f32> {
-    if !in_bounds(at) { return vec4<f32>(0.0); }
-    return vec4<f32>(textureLoad(water, at, 0, 0).x, textureLoad(water, at, 1, 0).x,
-                     textureLoad(water, at, 2, 0).x, textureLoad(water, at, 3, 0).x);
-}
-fn write_water(at: vec2<i32>, value: vec4<f32>) {
-    textureStore(output_water, at, 0, vec4<f32>(value.x));
-    textureStore(output_water, at, 1, vec4<f32>(value.y));
-    textureStore(output_water, at, 2, vec4<f32>(value.z));
-    textureStore(output_water, at, 3, vec4<f32>(value.w));
-}
-fn read_geometry(at: vec2<i32>) -> vec4<f32> {
-    if !in_bounds(at) { return vec4<f32>(0.0); }
-    return geometry[index(at)];
-}
 
 // PreSim's PrevBottomContour = BottomContour. For fixed captured geometry,
 // only the first step uses the reset zero; later cycles snapshot this bottom.
 @compute @workgroup_size(8,8)
 fn snapshot_bottom(@builtin(global_invocation_id) id: vec3<u32>) {
-    if any(id.xy >= params.dimensions.xy) { return; }
-    let i = id.y * params.dimensions.x + id.x;
+    let at = invocation_cell(id);
+    if !invocation_active(id, at) { return; }
+    let i = index(at);
     previous_bottom[i] = geometry[i].x;
-}
-
-fn clamp_cell(at: vec2<i32>) -> vec2<i32> {
-    return clamp(at, vec2<i32>(0), vec2<i32>(params.dimensions.xy) - 1);
-}
-
-fn bilinear(unit: vec2<f32>, channel: u32) -> f32 {
-    // Niagara's SF_Bilinear / AM_Clamp SampleLevel uses the original UV, not
-    // a UV reconstructed from GridPos. Let the GPU perform texture filtering.
-    return textureSampleLevel(water, grid_sampler, unit, i32(channel), 0.0).x;
 }
 
 // NiagaraDataInterfaceGrid2DCollection.ush::Basic1DCubic, not Catmull-Rom.
@@ -115,8 +84,8 @@ fn sample_cubic(sample_index: vec2<f32>, channel: u32) -> f32 {
 
 @compute @workgroup_size(8, 8)
 fn source_and_sink(@builtin(global_invocation_id) id: vec3<u32>) {
-    let at = vec2<i32>(id.xy);
-    if !in_bounds(at) { return; }
+    let at = invocation_cell(id);
+    if !invocation_active(id, at) { return; }
     var water = read_water(at);
     let geo = read_geometry(at);
     let position = boundary.origin.xyz + vec3<f32>((vec2<f32>(at) + 0.5) * params.stepping.x, 0.0);
@@ -167,8 +136,8 @@ fn source_and_sink(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(8, 8)
 fn distribute_overlap(@builtin(global_invocation_id) id: vec3<u32>) {
-    let at = vec2<i32>(id.xy);
-    if !in_bounds(at) { return; }
+    let at = invocation_cell(id);
+    if !invocation_active(id, at) { return; }
     let input = read_water(at);
     // The selected cached shader passes half-width 0 and overlap multiplier 0.
     // Its remaining operation is depth clamping and height reconstruction.
@@ -178,8 +147,8 @@ fn distribute_overlap(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(8, 8)
 fn extrapolate_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
-    let at = vec2<i32>(id.xy);
-    if !in_bounds(at) { return; }
+    let at = invocation_cell(id);
+    if !invocation_active(id, at) { return; }
     var w = read_water(at);
     if (w.y < 1e-5 && params.dimensions.w != 0u) || read_geometry(at).y > 1.0 - 1e-5 {
         var distance = 65500.0;
@@ -200,8 +169,8 @@ fn extrapolate_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(8, 8)
 fn advect_water(@builtin(global_invocation_id) id: vec3<u32>) {
-    let at = vec2<i32>(id.xy);
-    if !in_bounds(at) { return; }
+    let at = invocation_cell(id);
+    if !invocation_active(id, at) { return; }
     let input = read_water(at);
     let geo = read_geometry(at);
     var w = input;
@@ -226,8 +195,8 @@ fn advect_water(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(8, 8)
 fn extrapolate_height(@builtin(global_invocation_id) id: vec3<u32>) {
-    let at = vec2<i32>(id.xy);
-    if !in_bounds(at) { return; }
+    let at = invocation_cell(id);
+    if !invocation_active(id, at) { return; }
     var w = read_water(at);
     let geo = read_geometry(at);
     if geo.y > 1.0 - 1e-5 {
@@ -249,8 +218,8 @@ fn extrapolate_height(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(8, 8)
 fn update_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
-    let at = vec2<i32>(id.xy);
-    if !in_bounds(at) { return; }
+    let at = invocation_cell(id);
+    if !invocation_active(id, at) { return; }
     let input = read_water(at);
     let geo = read_geometry(at);
     let left = read_water(at + vec2<i32>(-1, 0));
@@ -300,8 +269,8 @@ fn limited_slope(left: f32, right: f32) -> f32 {
 
 @compute @workgroup_size(8, 8)
 fn update_depth(@builtin(global_invocation_id) id: vec3<u32>) {
-    let at = vec2<i32>(id.xy);
-    if !in_bounds(at) { return; }
+    let at = invocation_cell(id);
+    if !invocation_active(id, at) { return; }
     let input = read_water(at);
     let geo = read_geometry(at);
     let d = input.y;
@@ -355,8 +324,8 @@ fn update_depth(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(8, 8)
 fn match_spline(@builtin(global_invocation_id) id: vec3<u32>) {
-    let at = vec2<i32>(id.xy);
-    if !in_bounds(at) { return; }
+    let at = invocation_cell(id);
+    if !invocation_active(id, at) { return; }
     let input = read_water(at);
     var water = input;
     if boundary.flags.y != 0u {
@@ -375,8 +344,8 @@ fn match_spline(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(8, 8)
 fn prepare_surface(@builtin(global_invocation_id) id: vec3<u32>) {
-    let at = vec2<i32>(id.xy);
-    if !in_bounds(at) { return; }
+    let at = invocation_cell(id);
+    if !invocation_active(id, at) { return; }
     let input = read_water(at);
     let border = i32(presentation.w);
     let maximum = vec2<i32>(params.dimensions.xy) - 1;
@@ -432,8 +401,8 @@ fn prepare_surface(@builtin(global_invocation_id) id: vec3<u32>) {
 
 @compute @workgroup_size(8, 8)
 fn compute_normals_and_reset(@builtin(global_invocation_id) id: vec3<u32>) {
-    let at = vec2<i32>(id.xy);
-    if !in_bounds(at) { return; }
+    let at = invocation_cell(id);
+    if !invocation_active(id, at) { return; }
     let input = read_water(at);
     let dx = params.stepping.x;
     var normal = vec3<f32>(0.0, 0.0, 1.0);

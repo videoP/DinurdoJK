@@ -738,6 +738,7 @@ impl App {
             ui::ENV_ROW_BAKED_SUN_REMOVAL => {
                 self.video.baked_sun_removal = defaults.baked_sun_removal;
                 self.video.baked_sun_removal_auto = defaults.baked_sun_removal_auto;
+                self.video.baked_sun_removal_contour = defaults.baked_sun_removal_contour;
                 self.sync_post_effects();
                 self.mark_config_dirty();
             }
