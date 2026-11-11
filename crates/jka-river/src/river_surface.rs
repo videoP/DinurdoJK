@@ -80,6 +80,7 @@ pub fn shader_source() -> String {
         crate::river_composite::TRACE_SHADER,
         crate::river_composite::SHADER,
         include_str!("river_underwater.wgsl"),
+        include_str!("river_far.wgsl"),
     ]
     .join("\n")
 }
@@ -161,6 +162,11 @@ impl ViewUniform {
 pub struct RiverSurface {
     module: wgpu::ShaderModule,
     body_layout: wgpu::BindGroupLayout,
+    /// Group 1 of the water-mesh quadtree tiles (river_far.wgsl).
+    far_layout: wgpu::BindGroupLayout,
+    far_pipeline: Option<wgpu::RenderPipeline>,
+    far_composite: Option<wgpu::RenderPipeline>,
+    far_wire: Option<wgpu::RenderPipeline>,
     frame_layout: wgpu::BindGroupLayout,
     env_layout: wgpu::BindGroupLayout,
     pipeline: Option<((wgpu::TextureFormat, u32), wgpu::RenderPipeline)>,
@@ -242,6 +248,22 @@ impl RiverSurface {
                 entry(7, texture(true)),
                 entry(8, sampler(Filtering)),
                 entry(9, uniform()),
+            ],
+        });
+        let storage = || wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        };
+        let far_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("river water mesh"),
+            entries: &[
+                entry(9, uniform()),
+                entry(10, uniform()),
+                entry(11, storage()),
+                entry(12, storage()),
+                entry(13, storage()),
+                entry(14, storage()),
             ],
         });
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -329,6 +351,10 @@ impl RiverSurface {
         Ok(Self {
             module,
             body_layout,
+            far_layout,
+            far_pipeline: None,
+            far_composite: None,
+            far_wire: None,
             frame_layout,
             env_layout,
             pipeline: None,
@@ -497,7 +523,119 @@ impl RiverSurface {
                 multisample: wgpu::MultisampleState { count: samples, ..Default::default() }, multiview_mask: None, cache: None,
             })
         });
+        // Water-mesh quadtree tiles: the same pass states, group 1 = pool.
+        let far_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("river water mesh"),
+            bind_group_layouts: &[
+                Some(camera_layout),
+                Some(&self.far_layout),
+                Some(shadow_receiver_layout),
+                Some(&self.frame_layout),
+                Some(&self.env_layout),
+                Some(&self.sky_layout),
+            ],
+            immediate_size: 0,
+        });
+        let far = |entry: &str, blend: Option<wgpu::BlendState>, write: wgpu::ColorWrites, depth_write: bool, compare: wgpu::CompareFunction| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&far_layout),
+                vertex: wgpu::VertexState {
+                    module: &self.module,
+                    entry_point: Some("vs_far"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(crate::river_far::vertex_layout())],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.module,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState { format, blend, write_mask: write })],
+                }),
+                // FWaterMeshIndexBuffer winds clockwise seen from above, as the grid.
+                primitive: wgpu::PrimitiveState { front_face: wgpu::FrontFace::Cw, cull_mode: None, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: depth_format,
+                    depth_write_enabled: Some(depth_write),
+                    depth_compare: Some(compare),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        self.far_pipeline = Some(far("fs_far", None, wgpu::ColorWrites::ALL, true, depth_compare));
+        self.far_composite = Some(far(
+            "fs_composite_far",
+            Some(wgpu::BlendState {
+                color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::SrcAlpha, operation: wgpu::BlendOperation::Add },
+                alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+            }),
+            wgpu::ColorWrites::COLOR,
+            false,
+            wgpu::CompareFunction::Equal,
+        ));
+        self.far_wire = device.features().contains(wgpu::Features::POLYGON_MODE_LINE).then(|| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("river water mesh wireframe"),
+                layout: Some(&far_layout),
+                vertex: wgpu::VertexState { module: &self.module, entry_point: Some("vs_far"), compilation_options: Default::default(), buffers: &[Some(crate::river_far::vertex_layout())] },
+                fragment: Some(wgpu::FragmentState { module: &self.module, entry_point: Some("fs_far_wire"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::COLOR })] }),
+                primitive: wgpu::PrimitiveState { polygon_mode: wgpu::PolygonMode::Line, cull_mode: None, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState { format: depth_format, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
+                multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+                multiview_mask: None,
+                cache: None,
+            })
+        });
         self.pipeline = Some(((format, samples), pipeline));
+    }
+
+    /// r_showtris river bit: the water mesh tiles, coloured by LOD level.
+    pub fn draw_wire_far<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
+        if let Some(pipeline) = &self.far_wire {
+            self.draw_far_with(pass, pipeline, camera, shadow_receiver, environment, river);
+        }
+    }
+
+    pub fn far_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.far_layout
+    }
+
+    /// The water-mesh quadtree tiles beyond the camera window (base pass).
+    pub fn draw_far<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
+        if let Some(pipeline) = &self.far_pipeline {
+            self.draw_far_with(pass, pipeline, camera, shadow_receiver, environment, river);
+        }
+    }
+
+    /// SingleLayerWaterComposite over the water-mesh quadtree tiles.
+    pub fn draw_composite_far<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
+        if let Some(pipeline) = &self.far_composite {
+            self.draw_far_with(pass, pipeline, camera, shadow_receiver, environment, river);
+        }
+    }
+
+    fn draw_far_with<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, pipeline: &'a wgpu::RenderPipeline, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
+        let (Some(frame), Some(far)) = (&self.frame, river.far_mesh()) else { return };
+        let Some(group) = far.group() else { return };
+        if far.draws.iter().all(|(_, count)| *count == 0) {
+            return;
+        }
+        pass.set_pipeline(pipeline);
+        self.bind_patch(pass, camera, shadow_receiver, environment, frame, group);
+        // One instanced draw per density bucket (one material).
+        for (density, &(first, count)) in far.draws.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let Some(mesh) = far.densities().get(density) else { continue };
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, first..first + count);
+        }
     }
 
     pub fn ready_for(&self, format: wgpu::TextureFormat, samples: u32) -> bool {

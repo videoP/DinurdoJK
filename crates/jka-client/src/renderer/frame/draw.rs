@@ -1946,7 +1946,9 @@ impl Renderer {
             // The scene pass target: post scene, else the swapchain format.
             let river_format = if plan.use_post { self.scene_format() } else { self.config.format };
             let copyable = plan.use_post || self.msaa_samples > 1;
+            self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::RiverSim, false);
             self.encode_live_rivers(&mut encoder, frame_delta, camera, river_format, copyable);
+            self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::RiverSim, true);
         }
         for (authored, ocean) in &mut self.authored_oceans {
             if let Some((sky_average, has_skybox, _, _, _, _)) = ocean_scene_context.as_ref() {
@@ -6759,6 +6761,8 @@ impl Renderer {
                     && self.live_rivers.iter().any(|river| river.body_group().is_some())
             }) {
                 drop(pass);
+                // Encoder endpoints: the river breaks the world pass anyway.
+                self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::RiverDraw, false);
                 let copyable = plan.use_post || self.msaa_samples > 1;
                 if copyable {
                     water.capture(&self.device, &mut encoder, color_view, &self.targets.depth_view);
@@ -6774,9 +6778,12 @@ impl Renderer {
                 if copyable {
                     for river in &self.live_rivers {
                         water.draw(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
+                        // Water mesh quadtree tiles beyond the camera window.
+                        water.draw_far(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
                     }
                     for river in &self.live_rivers {
                         water.draw_composite(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
+                        water.draw_composite_far(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
                     }
                 }
                 if copyable && self.live_rivers.iter().any(|river| river.contains_eye_xy(camera)) {
@@ -6798,8 +6805,10 @@ impl Renderer {
                 if self.wireframe_mask & ui::wireframe::RIVER != 0 {
                     for river in &self.live_rivers {
                         water.draw_wire(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
+                        water.draw_wire_far(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
                     }
                 }
+                self.gpu_profiler.write_render_pass_timestamp(&mut pass, GpuPass::RiverDraw, true);
                 // Restore the world pass's shared bindings for what follows.
                 pass.set_bind_group(0,&self.camera_bind_group,&[]);
                 pass.set_bind_group(2,if enhanced_world_shader {&world.lighting_bind_group}else{&world.lighting_bind_group_lean},&[]);

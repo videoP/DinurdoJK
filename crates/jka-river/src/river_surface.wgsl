@@ -311,10 +311,26 @@ fn river_to_view(v: vec3<f32>) -> vec3<f32> {
         return river_hybrid_underside(input, graph_normal, foam);
     }
 
+    // The classic indirect field of the window (unused under Blue Water).
+    var ambient = vec4<f32>(0.0);
+    var directed = vec4<f32>(0.0);
+    if river_view.sun_illuminance.w <= 0.5 {
+        ambient = textureSampleLevel(ambient_texture, ambient_sampler, input.uv, 0.0);
+        directed = textureSampleLevel(directed_texture, ambient_sampler, input.uv, 0.0);
+    }
+    return river_base_pass(input.clip, input.world, front, graph_normal, foam, pixel_depth, slope, ambient, directed);
+}
+
+// The Single Layer Water base pass after the material graph, shared by the
+// camera window (fs) and the water-mesh quadtree tiles (fs_far). `ambient`
+// and `directed` are the classic indirect field at this pixel.
+fn river_base_pass(clip: vec4<f32>, world: vec3<f32>, front: bool, graph_normal: vec3<f32>, foam: RiverFoam,
+                   pixel_depth: f32, slope: f32, ambient: vec4<f32>, directed: vec4<f32>) -> vec4<f32> {
+    let eye = river_view.eye.xyz;
     // Two-sided: WorldNormal flips on the back face.
     let two_sided_sign = select(-1.0, 1.0, front);
     let n = graph_normal * two_sided_sign;
-    let v = normalize(eye - input.world);
+    let v = normalize(eye - world);
     let n_dot_v = dot(n, v);
     let p = river_slw_parameters();
     let surface = river_slw_surface(p, n_dot_v, two_sided_sign, pixel_depth);
@@ -339,15 +355,13 @@ fn river_to_view(v: vec3<f32>) -> vec3<f32> {
     if river_view.sun_illuminance.w > 0.5 {
         indirect = river_slw_sky_indirect(env_irradiance(env_map, env_sampler, env, river_slw_render_vector(n)));
     } else {
-        let ambient = textureSampleLevel(ambient_texture, ambient_sampler, input.uv, 0.0);
-        let directed = textureSampleLevel(directed_texture, ambient_sampler, input.uv, 0.0);
         indirect = river_slw_classic_indirect(ambient, directed, n);
     }
 
     // Forward directional light (DefaultLitBxDF), light colour E times shadow.
     let l = river_view.sun_direction.xyz;
     let sun = river_view.sun_illuminance.rgb;
-    let map_position = input.world / RIVER_CM_PER_UNIT;
+    let map_position = world / RIVER_CM_PER_UNIT;
     let shadow = cascaded_shadow_visibility(
         vec3<f32>(map_position.x, map_position.z, -map_position.y), river_slw_render_vector(n));
     let direct = river_slw_direct(n, v, l, diffuse_color, specular_color, roughness);
@@ -357,7 +371,7 @@ fn river_to_view(v: vec3<f32>) -> vec3<f32> {
     let size = vec2<f32>(textureDimensions(scene_depth));
     let uv_min = 0.55 / size;
     let uv_max = (size - 0.55) / size;
-    let viewport_uv = clamp(input.clip.xy / size, uv_min, uv_max);
+    let viewport_uv = clamp(clip.xy / size, uv_min, uv_max);
     let ior = river_slw_ior(specular);
     let pixel = river_gather_behind(viewport_uv, size, pixel_depth, slope);
     let distortion = river_slw_uv_distortion(normalize(river_to_view(n)), river_to_view(vec3<f32>(0.0, 0.0, 1.0)),
@@ -377,8 +391,8 @@ fn river_to_view(v: vec3<f32>) -> vec3<f32> {
         dot(textureGather(1, scene_color, scene_sampler, behind_uv), weights),
         dot(textureGather(2, scene_color, scene_sampler, behind_uv), weights));
     // SvPositionToResolvedTranslatedWorld at this pixel and the behind depth.
-    let behind_z = eye.z + (input.world.z - eye.z) * (behind_depth / max(pixel_depth, 1e-4));
-    let volume = river_slw_volume(coefficients, pixel_depth, behind_depth, behind_luminance, 1.0, input.world.z, behind_z,
+    let behind_z = eye.z + (world.z - eye.z) * (behind_depth / max(pixel_depth, 1e-4));
+    let volume = river_slw_volume(coefficients, pixel_depth, behind_depth, behind_luminance, 1.0, world.z, behind_z,
         v, n, ior, l, sun, indirect * RIVER_PI, env_brdf, shadow, vec3<f32>(1.0), water_visibility);
     color += volume.luminance;
     return vec4<f32>(color, 1.0);

@@ -24,6 +24,28 @@ pub fn set_debug_mode(mode: u8) {
     RIVER_DEBUG.store(mode.min(2), Ordering::Relaxed);
 }
 
+// r_riverPause (session-only A/B): no solver frames run, so no simulated
+// time accumulates; presentation (FFT detail, foam, window, body draw)
+// keeps running on the last solved state. Not an Unreal control.
+static RIVER_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn paused() -> bool {
+    RIVER_PAUSE.load(Ordering::Relaxed)
+}
+
+pub fn set_paused(paused: bool) {
+    RIVER_PAUSE.store(paused, Ordering::Relaxed);
+}
+
+/// A moving player hull in map units for the river's PreSim collisions.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MapBody {
+    pub mins: [f32; 3],
+    pub maxs: [f32; 3],
+    /// Map units per second.
+    pub velocity: [f32; 3],
+}
+
 struct DebugStats {
     created: Instant,
     last_report: Instant,
@@ -203,6 +225,12 @@ fn source_rise_per_step_cm(cfs: f32, step_seconds: f64, cells: u32, cell_area_cm
 
 pub struct LiveRiver {
     pub id: crate::river_authoring::Id,
+    /// r_riverDebug: (menu deformation toggle, presented actors) last frame.
+    pub body_source: (bool, usize),
+    /// r_riverDebug: bodies used last frame and the first one (lattice cm).
+    body_debug: (usize, Option<crate::river_tiles::CollisionBody>),
+    /// Water-mesh quadtree tiles beyond the camera window (sparse only).
+    far: Option<crate::river_far::FarMesh>,
     pub authored: wgpu::Buffer,
     foam_minimum_depth: std::cell::Cell<f32>,
     pub source: LocalSource,
@@ -546,6 +574,9 @@ impl LiveRiver {
         });
         Ok(Self {
             id: 0,
+            body_source: (false, 0),
+            body_debug: (0, None),
+            far: None,
             authored,
             foam_minimum_depth: std::cell::Cell::new(60.0),
             source,
@@ -696,6 +727,9 @@ impl LiveRiver {
         });
         Ok(Self {
             id: 0,
+            body_source: (false, 0),
+            body_debug: (0, None),
+            far: None,
             authored,
             foam_minimum_depth: std::cell::Cell::new(60.0),
             source,
@@ -723,6 +757,75 @@ impl LiveRiver {
     /// Sparse rivers: keep the presentation window around the camera. A move
     /// rebuilds the window ambient and drops foam history and body bindings,
     /// which are tied to the window placement. Dense rivers ignore this.
+    pub fn far_mesh(&self) -> Option<&crate::river_far::FarMesh> {
+        self.far.as_ref().filter(|_| crate::river_far::enabled())
+    }
+
+    /// The Water plugin's water mesh beyond the camera window: rebuild the
+    /// quadtree if the wet tiles or the window changed, traverse for this
+    /// view and upload. Sparse rivers only.
+    pub fn prepare_far(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        water: &crate::river_surface::RiverSurface,
+        view: &crate::river_far::FarView<'_>,
+        light: &mut dyn FnMut([f32; 3]) -> Option<jka_render_core::light::ClassicEntityLight>,
+        map_toward_sun: Option<[f32; 3]>,
+    ) {
+        let Solver::Sparse(sparse) = &self.solver else { return };
+        if !crate::river_far::enabled() || !sparse.presented {
+            return;
+        }
+        let simulation = &sparse.simulation;
+        let far = self.far.get_or_insert_with(|| crate::river_far::FarMesh::new(device, simulation.lattice().tile()));
+        let (table, surface, normals) = simulation.presentation_buffers();
+        let bins = simulation.bins();
+        let tile_min_z = |t: [i32; 2]| bins.min_z(t, t);
+        let inputs = crate::river_far::FarInputs {
+            wet_tiles: simulation.wet_tiles(),
+            wet_generation: simulation.wet_generation(),
+            pool_generation: simulation.pool_generation(),
+            table,
+            surface,
+            normals,
+            lattice: simulation.lattice(),
+            dx_cm: simulation.dx_cm(),
+            solver_origin_cm: sparse.solver_origin_cm,
+            window: sparse.window.origin_cell().map(|o| (o, sparse.window.cells())),
+            tile_min_z: &tile_min_z,
+            water_level: self.source.water_level,
+        };
+        far.prepare(device, queue, water.far_layout(), &self.authored, &inputs, view, light, map_toward_sun);
+    }
+
+    /// Moving player hulls for the PreSim collision stage (stage 5), map
+    /// units: absolute box corners and velocity in units/s. Sparse rivers
+    /// only; the native single rectangle keeps its static colliders. Bodies
+    /// outside the lattice are dropped; at most MAX_BODIES are used.
+    /// `velocity_scale` multiplies the body velocity (1 = native).
+    pub fn set_bodies(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, bodies: &[MapBody], velocity_scale: f32) {
+        let Solver::Sparse(sparse) = &mut self.solver else { return };
+        let cm = f64::from(CENTIMETRES_PER_MAP_UNIT);
+        let dims = sparse.simulation.lattice().dimensions();
+        let size = dims.map(|n| f64::from(n) * f64::from(sparse.dx_cm));
+        let margin = 64.0 * cm;
+        let origin = sparse.solver_origin_cm;
+        let converted: Vec<crate::river_tiles::CollisionBody> = bodies
+            .iter()
+            .filter(|b| b.mins.iter().chain(&b.maxs).chain(&b.velocity).all(|v| v.is_finite()))
+            .map(|b| crate::river_tiles::CollisionBody {
+                centre: std::array::from_fn(|a| ((f64::from(b.mins[a]) + f64::from(b.maxs[a])) * 0.5 * cm - origin[a]) as f32),
+                extent: std::array::from_fn(|a| (b.maxs[a] - b.mins[a]).abs() * CENTIMETRES_PER_MAP_UNIT),
+                velocity: b.velocity.map(|v| v * CENTIMETRES_PER_MAP_UNIT),
+            })
+            .filter(|b| (0..2).all(|a| f64::from(b.centre[a]) > -margin && f64::from(b.centre[a]) < size[a] + margin))
+            .take(crate::river_tiles::MAX_BODIES)
+            .collect();
+        self.body_debug = (converted.len(), converted.first().copied());
+        sparse.simulation.set_bodies(device, queue, &converted, velocity_scale);
+    }
+
     pub fn update_view(
         &mut self,
         device: &wgpu::Device,
@@ -764,6 +867,7 @@ impl LiveRiver {
         engine_delta: f32,
         world_time: f64,
         water: Option<&crate::river_surface::RiverSurface>,
+        solve_timestamp: &mut dyn FnMut(&mut wgpu::CommandEncoder, bool),
     ) -> Result<(), String> {
         let diag = debug_mode();
         if diag < 2 || !matches!(self.solver, Solver::Dense(_)) {
@@ -793,7 +897,10 @@ impl LiveRiver {
         // Sinks read the engine delta: give each solver frame its own span.
         let step = Frame::new(self.grid, self.controls, scaled)?.hydraulic_duration();
         let frame = Frame::new(self.grid, self.controls, step as f32)?;
-        let available = self.pending_seconds + f64::from(scaled);
+        // Paused: no solver frames and no simulated time; presentation below
+        // still runs on the last solved state.
+        let paused = paused();
+        let available = if paused { 0.0 } else { self.pending_seconds + f64::from(scaled) };
         let limit = step * f64::from(MAX_STEPS_PER_FRAME);
         let dropped = (available - limit).max(0.0);
         self.pending_seconds = available.min(limit);
@@ -803,7 +910,8 @@ impl LiveRiver {
             // Completed occupancy samples grow residency before any new frame.
             sparse.simulation.update_residency(device, encoder)?;
         }
-        while self.pending_seconds >= step {
+        solve_timestamp(encoder, false);
+        while !paused && self.pending_seconds >= step {
             match &mut self.solver {
                 Solver::Dense(simulation) => simulation.encode_reference_frame(device, encoder, frame)?,
                 Solver::Sparse(sparse) => {
@@ -820,6 +928,7 @@ impl LiveRiver {
             steps += 1;
             moved = true;
         }
+        solve_timestamp(encoder, true);
         let mut shifted = false;
         match &mut self.solver {
             Solver::Dense(simulation) => {
@@ -926,6 +1035,12 @@ impl LiveRiver {
         if let Solver::Sparse(sparse) = &self.solver {
             let tiles = sparse.simulation.lattice().tiles();
             eprintln!("[RIVER DBG SPARSE] patch={} resident_tiles={} queued={} lattice={}x{} solver_frames={} frames_available={} throttled_render_frames={} window_cell={:?} pool={:.1}MiB", index, sparse.simulation.resident_tiles(), sparse.simulation.queued_tiles(), tiles[0], tiles[1], sparse.simulation.solver_frames(), sparse.simulation.frames_available(), sparse.throttled_frames, sparse.window.origin_cell(), (sparse.simulation.logical_bytes() + sparse.window.logical_bytes()) as f64 / 1048576.0);
+        }
+        if let Solver::Sparse(sparse) = &self.solver {
+            let level_cm = f64::from(self.source.water_level) * f64::from(CENTIMETRES_PER_MAP_UNIT) - sparse.solver_origin_cm[2];
+            let dims = sparse.simulation.lattice().dimensions();
+            if let Some(far) = &self.far { let st = far.stats; eprintln!("[RIVER DBG WATERMESH] patch={} enabled={} leaves={} nodes={} depth={} instances={} per_density={:?} rebuilds={}", index, crate::river_far::enabled(), st.leaves, st.nodes, st.tree_depth, st.instances, far.draws.iter().map(|d| d.1).collect::<Vec<_>>(), st.rebuilds); }
+            eprintln!("[RIVER DBG BODIES] patch={} deformation={} actors={} used={} first={:?} first_cell={:?} lattice={}x{} source_level_cm={:.0} dx_cm={:.1}", index, self.body_source.0, self.body_source.1, self.body_debug.0, self.body_debug.1, self.body_debug.1.map(|b| [(b.centre[0] / sparse.dx_cm).floor() as i32, (b.centre[1] / sparse.dx_cm).floor() as i32]), dims[0], dims[1], level_cm, sparse.dx_cm);
         }
         if mode >= 2 { eprintln!("[RIVER DBG PERF] patch={} CPU_encode={:.3}ms/s {:.4}ms/render-frame last_solver_steps={} grid={}x{} estimated_solver_kernel_dispatches={}", index, self.debug.cpu_encode_ms / interval, self.debug.cpu_encode_ms / self.debug.frames.max(1) as f64, self.debug.last_steps, self.grid.dimensions[0], self.grid.dimensions[1], self.debug.steps * (4 + u64::from(self.controls.substeps) * 6)); }
         self.debug.reset_interval(now);

@@ -2492,6 +2492,8 @@ impl Renderer {
             authored_oceans: Vec::new(),
             ocean_spray_pipeline: None,
             live_rivers: Vec::new(),
+            river_actors: Arc::new(Vec::new()),
+            river_interaction: (false, 1.0),
             river_surface: None,
             authored_ocean_definitions: Vec::new(),
             water_boxes: Vec::new(),

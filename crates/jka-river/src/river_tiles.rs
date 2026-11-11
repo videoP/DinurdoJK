@@ -26,6 +26,107 @@ use std::sync::mpsc::{self, Receiver};
 use wgpu::util::DeviceExt;
 
 pub const SHADER: &str = include_str!("river_tiles.wgsl");
+/// PreSim (stage 5) moving-body collisions over the pool; see the file header.
+pub const COLLISIONS_SHADER: &str = include_str!("river_collisions.wgsl");
+/// Bodies stamped per solver frame (the ocean's interaction bound is 16 too).
+pub const MAX_BODIES: usize = 16;
+/// Largest footprint side in cells; a body wider than this at a tiny cell
+/// size is clipped to its centre square.
+const MAX_FOOTPRINT: u32 = 64;
+
+/// A moving axis-aligned box for the PreSim collision stage, in lattice-local
+/// centimetres (XY from the lattice corner, Z in the river's height frame).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CollisionBody {
+    pub centre: [f32; 3],
+    /// Full box size (Unreal BoxExtent; half-size = 0.5 * extent).
+    pub extent: [f32; 3],
+    /// cm/s, lattice axes.
+    pub velocity: [f32; 3],
+}
+
+/// Footprint bookkeeping for the collision stage. Upstream rewrites the whole
+/// grid's collider attributes every PreSim; the pool keeps the static border
+/// and void colliders in the bed, so only body footprints are rewritten and
+/// restored (river_collisions.wgsl).
+struct BodyCollisions {
+    side: u32,
+    /// [first solver frame of a render frame, later solver frames].
+    uniforms: [wgpu::Buffer; 2],
+    saved: wgpu::Buffer,
+    layout: wgpu::BindGroupLayout,
+    restore: wgpu::ComputePipeline,
+    save: wgpu::ComputePipeline,
+    stamp: wgpu::ComputePipeline,
+    /// (pool generation, [uniform variant][state parity]).
+    groups: Option<(u64, [[wgpu::BindGroup; 2]; 2])>,
+    /// Footprint corners written by the last encoded stamp (still in the bed).
+    stamped: Vec<[i32; 2]>,
+    /// Footprint corners of the bodies set for this render frame.
+    current: Vec<[i32; 2]>,
+    /// The first solver frame since `set_bodies` has been encoded.
+    first_done: bool,
+}
+
+impl BodyCollisions {
+    /// Footprints cover a 32-unit-wide body (a JKA player hull is 30) plus a
+    /// cell of margin per side and the floor rounding, in whole workgroups.
+    fn new(device: &wgpu::Device, dx_cm: f32) -> Self {
+        let width_cells = (32.0 * CENTIMETRES_PER_MAP_UNIT / dx_cm).ceil().max(1.0) as u32 + 3;
+        let side = width_cells.div_ceil(8).saturating_mul(8).clamp(8, MAX_FOOTPRINT);
+        let uniform_bytes = 4 * (16 + 4 * MAX_BODIES + 12 * MAX_BODIES) as u64;
+        let uniforms = ["sparse river body collisions (first frame)", "sparse river body collisions (later frames)"].map(|label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: uniform_bytes,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
+        let saved = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sparse river saved footprint colliders"),
+            size: u64::from(side * side) * MAX_BODIES as u64 * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("sparse river body collisions"),
+            entries: &[uniform_entry(0), storage_entry(1, true), storage_entry(2, false), storage_entry(3, false), storage_entry(4, true)],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sparse river body collisions"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("UE river PreSim body collisions"),
+            source: wgpu::ShaderSource::Wgsl(COLLISIONS_SHADER.into()),
+        });
+        let make = |entry: &str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        };
+        Self {
+            side,
+            uniforms,
+            saved,
+            layout,
+            restore: make("restore_bodies"),
+            save: make("save_bodies"),
+            stamp: make("stamp_bodies"),
+            groups: None,
+            stamped: Vec::new(),
+            current: Vec::new(),
+            first_done: false,
+        }
+    }
+}
 
 // Session cvars (r_riverSparse, r_riverTileSize, r_riverTileGuard,
 // r_riverWindow). Read when a river spawns; existing rivers keep theirs.
@@ -409,6 +510,11 @@ pub struct SparseSimulation {
     guard: u32,
     origin_z_cm: f64,
     dx_cm: f32,
+    collisions: Option<BodyCollisions>,
+    /// Tiles whose latest occupancy sample was non-pristine (the water mesh
+    /// quadtree's leaves) and a counter bumped whenever that set changes.
+    wet_tiles: BTreeSet<[i32; 2]>,
+    wet_generation: u64,
 }
 
 pub struct Spawn<'a> {
@@ -649,6 +755,9 @@ impl SparseSimulation {
             guard: spawn.guard,
             origin_z_cm: spawn.origin_z_cm,
             dx_cm: spawn.dx_cm,
+            collisions: None,
+            wet_tiles: BTreeSet::new(),
+            wet_generation: 0,
         };
         for (slot, tile) in initial.iter().enumerate() {
             simulation.commit(device, encoder, *tile, slot as u32, true)?;
@@ -815,6 +924,11 @@ impl SparseSimulation {
                 .filter(|(_, f)| **f != 0)
                 .map(|(slot, _)| self.residency.slot_tile(slot as u32))
                 .collect();
+            let wet: BTreeSet<[i32; 2]> = occupied.iter().copied().collect();
+            if wet != self.wet_tiles {
+                self.wet_tiles = wet;
+                self.wet_generation += 1;
+            }
             let queued: BTreeSet<[i32; 2]> = self.queue.iter().copied().collect();
             for tile in required_tiles(self.lattice, occupied, self.guard) {
                 if !self.residency.is_resident(tile) && !queued.contains(&tile) {
@@ -880,6 +994,8 @@ impl SparseSimulation {
         });
         encoder.copy_buffer_to_buffer(&upload, 0, &self.uniform, 0, 64);
         encoder.copy_buffer_to_buffer(&upload, 64, &self.boundary_uniform, 0, 48);
+        // Stage 5 PreSim: moving-body colliders before the sources (stage 6).
+        self.encode_collisions(device, encoder);
         self.encode_kernel(encoder, Kernel::SourceAndSink);
         if self.inlet_active {
             self.encode_inlet(device, encoder, frame.hydraulic_duration());
@@ -1042,6 +1158,111 @@ impl SparseSimulation {
         pass.dispatch_workgroups(size[0].div_ceil(8), size[1].div_ceil(8), 1);
     }
 
+    // ---- PreSim moving-body collisions (stage 5) ----
+
+    /// Bodies for the solver frames of this render frame, lattice-local cm.
+    /// At most MAX_BODIES are used. An empty list restores the previous
+    /// footprints on the next solver frame and then costs nothing.
+    /// `velocity_scale` multiplies the element velocity (1 = native).
+    pub fn set_bodies(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, bodies: &[CollisionBody], velocity_scale: f32) {
+        if self.collisions.is_none() {
+            if bodies.is_empty() {
+                return;
+            }
+            self.collisions = Some(BodyCollisions::new(device, self.dx_cm));
+        }
+        let lattice = self.lattice;
+        let dx = self.dx_cm;
+        let c = self.collisions.as_mut().expect("created above");
+        let bodies = &bodies[..bodies.len().min(MAX_BODIES)];
+        let half = (c.side / 2) as i32;
+        c.current = bodies
+            .iter()
+            .map(|b| std::array::from_fn(|a| (b.centre[a] / dx).floor() as i32 - half))
+            .collect();
+        let scale = if velocity_scale.is_finite() { velocity_scale.max(0.0) } else { 1.0 };
+        let [tw, th] = lattice.tiles();
+        let dims = lattice.dimensions();
+        let build = |stamp: &[[i32; 2]], restore: &[[i32; 2]], side: u32| -> Vec<u32> {
+            let mut w = Vec::with_capacity(16 + 4 * MAX_BODIES + 12 * MAX_BODIES);
+            w.extend([stamp.len() as u32, restore.len() as u32, side, 0]);
+            w.extend([tw, th, lattice.tile(), lattice.shift()]);
+            w.extend([dims[0], dims[1], 0, 0]);
+            w.extend([dx.to_bits(), scale.to_bits(), 0, 0]);
+            for i in 0..MAX_BODIES {
+                let s = stamp.get(i).copied().unwrap_or([0, 0]);
+                let r = restore.get(i).copied().unwrap_or([0, 0]);
+                w.extend([s[0] as u32, s[1] as u32, r[0] as u32, r[1] as u32]);
+            }
+            for i in 0..MAX_BODIES {
+                let (centre, extent, velocity) = bodies.get(i).map_or(([0.0; 3], [0.0; 3], [0.0; 3]), |b| (b.centre, b.extent, b.velocity));
+                for v in [centre, extent, velocity] {
+                    w.extend([v[0].to_bits(), v[1].to_bits(), v[2].to_bits(), 0]);
+                }
+            }
+            w
+        };
+        // First solver frame: restore what the last encoded stamp left in the
+        // bed. Later frames of the same render frame restore their own stamp.
+        let first = build(&c.current, &c.stamped, c.side);
+        let rest = build(&c.current, &c.current, c.side);
+        queue.write_buffer(&c.uniforms[0], 0, bytemuck::cast_slice(&first));
+        queue.write_buffer(&c.uniforms[1], 0, bytemuck::cast_slice(&rest));
+        c.first_done = false;
+    }
+
+    fn encode_collisions(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
+        let generation = self.generation;
+        let parity = self.current;
+        let pool = &self.pool;
+        let table = &self.table;
+        let Some(c) = self.collisions.as_mut() else { return };
+        let variant = usize::from(c.first_done);
+        let restore = if c.first_done { c.current.len() } else { c.stamped.len() } as u32;
+        let stamp = c.current.len() as u32;
+        if restore == 0 && stamp == 0 {
+            c.first_done = true;
+            return;
+        }
+        if c.groups.as_ref().is_none_or(|(g, _)| *g != generation) {
+            let groups = std::array::from_fn(|v| {
+                std::array::from_fn(|state| {
+                    let entries = [
+                        (0, &c.uniforms[v]),
+                        (1, table),
+                        (2, &pool.geometry),
+                        (3, &c.saved),
+                        (4, &pool.state[state]),
+                    ]
+                    .map(|(binding, buffer)| wgpu::BindGroupEntry { binding, resource: buffer.as_entire_binding() });
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("sparse river body collisions"),
+                        layout: &c.layout,
+                        entries: &entries,
+                    })
+                })
+            });
+            c.groups = Some((generation, groups));
+        }
+        let group = &c.groups.as_ref().expect("bound above").1[variant][parity];
+        let workgroups = c.side.div_ceil(8);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("sparse river PreSim body collisions"), timestamp_writes: None });
+        pass.set_bind_group(0, group, &[]);
+        if restore > 0 {
+            pass.set_pipeline(&c.restore);
+            pass.dispatch_workgroups(workgroups, workgroups, restore);
+        }
+        if stamp > 0 {
+            pass.set_pipeline(&c.save);
+            pass.dispatch_workgroups(workgroups, workgroups, stamp);
+            pass.set_pipeline(&c.stamp);
+            pass.dispatch_workgroups(workgroups, workgroups, stamp);
+        }
+        drop(pass);
+        c.stamped = c.current.clone();
+        c.first_done = true;
+    }
+
     /// Height-mode toggle and Height+CFS rise cap, copied with the next frame.
     pub fn set_height_source(&mut self, enabled: bool, rise_limit_cm: f32) {
         self.boundary_template.flags[0] = u32::from(enabled);
@@ -1050,6 +1271,24 @@ impl SparseSimulation {
 
     pub fn lattice(&self) -> Lattice {
         self.lattice
+    }
+    /// Non-pristine tiles from the latest occupancy sample.
+    pub fn wet_tiles(&self) -> &BTreeSet<[i32; 2]> {
+        &self.wet_tiles
+    }
+    pub fn wet_generation(&self) -> u64 {
+        self.wet_generation
+    }
+    /// Bumped when the pool's buffers are replaced (bind groups go stale).
+    pub fn pool_generation(&self) -> u64 {
+        self.generation
+    }
+    /// (tile slot table, PrepareSurface output, ComputeNormals output).
+    pub fn presentation_buffers(&self) -> (&wgpu::Buffer, &wgpu::Buffer, &wgpu::Buffer) {
+        (&self.table, &self.pool.surface, &self.pool.normals)
+    }
+    pub fn dx_cm(&self) -> f32 {
+        self.dx_cm
     }
     pub fn bins(&self) -> &Bins {
         &self.bins
@@ -1307,6 +1546,7 @@ mod tests {
         validate(jka_water::river::SHALLOW_SHADER);
         validate(SPARSE_SHALLOW_SHADER);
         validate(SHADER);
+        validate(COLLISIONS_SHADER);
     }
 
     #[test]

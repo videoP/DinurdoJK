@@ -77,11 +77,30 @@ fn run(mode: SourceMode) {
         // Walk the camera downstream so the window moves at least once.
         let eye = [300.0 + frame as f32 * 12.0, 512.0, 260.0];
         river.update_view(&device, &queue, eye, |_| None, None);
+        // A player hull wading downstream through the source pool for a while,
+        // then gone: exercises stamp, restore-after-move and final restore.
+        let bodies: Vec<MapBody> = if (30..180).contains(&frame) {
+            let x = 300.0 + (frame - 30) as f32 * 2.0;
+            vec![MapBody { mins: [x - 15.0, 497.0, 176.0], maxs: [x + 15.0, 527.0, 240.0], velocity: [120.0, 0.0, 0.0] }]
+        } else {
+            Vec::new()
+        };
+        river.set_bodies(&device, &queue, &bodies, 1.0);
         let mut encoder = device.create_command_encoder(&Default::default());
-        river.encode_frame(&device, &mut encoder, 1.0 / 60.0, frame as f64 / 60.0, None).expect("sparse frame");
+        river.encode_frame(&device, &mut encoder, 1.0 / 60.0, frame as f64 / 60.0, None, &mut |_, _| {}).expect("sparse frame");
         queue.submit(Some(encoder.finish()));
         device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("GPU frame");
     }
+    // The water mesh quadtree over the wet tiles, from a camera far upstream
+    // (the window does not cover the downstream reach).
+    let surface = crate::river_surface::RiverSurface::new(&device, &queue).expect("river surface resources");
+    let always = |_c: [f64; 3], _e: [f64; 3]| true;
+    let view = crate::river_far::FarView { eye_cm: [0.0, 512.0 * 2.5, 400.0 * 2.5], frustum: &always, lod_morphing: true };
+    river.prepare_far(&device, &queue, &surface, &view, &mut |_| None, None);
+    queue.submit(None);
+    device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("GPU water mesh upload");
+    let far = river.far.as_ref().expect("sparse river builds a water mesh");
+    eprintln!("water mesh: leaves {} nodes {} depth {} instances {} per density {:?}", far.stats.leaves, far.stats.nodes, far.stats.tree_depth, far.stats.instances, far.draws);
     let error = block_on(scope.pop());
     assert!(error.is_none(), "sparse river validation error: {error:?}");
     let Solver::Sparse(sparse) = &river.solver else { unreachable!() };

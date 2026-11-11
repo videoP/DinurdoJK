@@ -61,11 +61,18 @@ fn river_map_radiance(d:vec3<f32>,roughness:f32)->vec3<f32> {
     if masks.material_mask < 0.3333 {
         discard;
     }
+    return river_composite_pass(input.clip, input.world, front, graph_normal, foam, pixel_depth, slope);
+}
 
+// SingleLayerWaterComposite after the material graph, shared by the camera
+// window (fs_composite) and the water-mesh quadtree tiles (fs_composite_far).
+fn river_composite_pass(clip: vec4<f32>, world: vec3<f32>, front: bool, graph_normal: vec3<f32>, foam: RiverFoam,
+                        pixel_depth: f32, slope: f32) -> vec4<f32> {
+    let eye = river_view.eye.xyz;
     // Two-sided: WorldNormal flips on the back face.
     let two_sided_sign = select(-1.0, 1.0, front);
     let n = graph_normal * two_sided_sign;
-    let v = normalize(eye - input.world);
+    let v = normalize(eye - world);
     let n_dot_v = dot(n, v);
     let p = river_slw_parameters();
     let surface = river_slw_surface(p, n_dot_v, two_sided_sign, pixel_depth);
@@ -78,7 +85,7 @@ fn river_map_radiance(d:vec3<f32>,roughness:f32)->vec3<f32> {
 
 
     let size=vec2<f32>(textureDimensions(scene_depth));
-    let uv=clamp(input.clip.xy/size,0.55/size,(size-0.55)/size);
+    let uv=clamp(clip.xy/size,0.55/size,(size-0.55)/size);
     let behind=river_gather_behind(uv,size,pixel_depth,slope);
     let delta_depth=behind.scene_depth-pixel_depth;
     if delta_depth<=0.0 {discard;}
@@ -90,7 +97,7 @@ fn river_map_radiance(d:vec3<f32>,roughness:f32)->vec3<f32> {
     if river_view.sun_illuminance.w>0.5 {
         environment=env_radiance(env_map,env_sampler,env,river_slw_render_vector(off_peak),roughness);
     }
-    let ssr=river_ssr(input.world,mirror,pixel_depth,roughness,input.clip.xy);
+    let ssr=river_ssr(world,mirror,pixel_depth,roughness,clip.xy);
     let reflected=ssr.rgb+environment*(1.0-ssr.a);
     let gf=textureSampleLevel(preintegrated_gf,gf_sampler,vec2<f32>(max(0.0,n_dot_v),roughness),0.0).rg;
     let brdf=river_slw_env_brdf(vec3<f32>(0.08*attributes.specular),gf);

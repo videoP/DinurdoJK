@@ -1,7 +1,7 @@
 //! Diagnostics profiling.
 use crate::renderer::{mpsc, Receiver, TryRecvError};
 
-pub(in crate::renderer) const GPU_PASS_COUNT: usize = 50;
+pub(in crate::renderer) const GPU_PASS_COUNT: usize = 53;
 
 pub(in crate::renderer) const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 
@@ -103,6 +103,16 @@ pub(in crate::renderer) enum GpuPass {
     BlueWaterAtmoTables = 47,
     BlueWaterEnvironment = 48,
     BlueWaterAerialBuild = 49,
+    // Live river (riversource) diagnostics. RiverSim is the whole per-frame
+    // river compute (FFT detail, solver frames, window gather, material,
+    // foam); it is encoded inside the OceanSim interval when an ocean exists,
+    // so it stays out of the fallback frame sum. RiverSolve is nested in
+    // RiverSim (solver frames + player collisions only). RiverDraw is nested
+    // in World (scene copy, Single Layer Water body, composite, submerged).
+    // With several rivers the first written endpoint wins (first river).
+    RiverSim = 50,
+    RiverSolve = 51,
+    RiverDraw = 52,
 }
 
 impl GpuPass {
@@ -163,6 +173,9 @@ impl GpuPass {
         Self::BlueWaterAtmoTables,
         Self::BlueWaterEnvironment,
         Self::BlueWaterAerialBuild,
+        Self::RiverSim,
+        Self::RiverSolve,
+        Self::RiverDraw,
     ];
 
     pub(in crate::renderer) fn label(self) -> &'static str {
@@ -217,6 +230,9 @@ impl GpuPass {
             Self::LocalShadowStatic => "local_shadow_static",
             Self::LocalShadowMoving => "local_shadow_moving",
             Self::WorldMainPass => "world_main_pass",
+            Self::RiverSim => "river_sim",
+            Self::RiverSolve => "river_solve",
+            Self::RiverDraw => "river_draw",
         }
     }
 }

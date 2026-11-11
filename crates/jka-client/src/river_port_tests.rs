@@ -1317,7 +1317,7 @@ fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
     let mut supplied=spawn(LocalSource {discharge_cfs:Some(12.345),..source}).unwrap();
     for i in 0..12 {
         let mut encoder=device.create_command_encoder(&Default::default());
-        supplied.encode_frame(device,&mut encoder,1.0/60.0,f64::from(i)/60.0,None).unwrap();
+        supplied.encode_frame(device,&mut encoder,1.0/60.0,f64::from(i)/60.0,None,&mut |_,_| {}).unwrap();
         queue.submit(Some(encoder.finish()));
     }
     let supplied_state=read_state(device,queue,supplied.state());
@@ -1333,7 +1333,7 @@ fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
     }).unwrap();
     for i in 0..12 {
         let mut encoder = device.create_command_encoder(&Default::default());
-        discharge.encode_frame(device, &mut encoder, 1.0/60.0, f64::from(i)/60.0, None).unwrap();
+        discharge.encode_frame(device, &mut encoder, 1.0/60.0, f64::from(i)/60.0, None, &mut |_, _| {}).unwrap();
         queue.submit(Some(encoder.finish()));
     }
     let discharge_state = read_state(device, queue, discharge.state());
@@ -1391,11 +1391,11 @@ fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
     // frame owns a small control upload until the queue retires it.
     for frame in 0..240 {
         let mut encoder = device.create_command_encoder(&Default::default());
-        river.encode_frame(device, &mut encoder, 1.0 / 60.0, f64::from(frame) / 60.0, Some(&water)).unwrap();
+        river.encode_frame(device, &mut encoder, 1.0 / 60.0, f64::from(frame) / 60.0, Some(&water), &mut |_, _| {}).unwrap();
         queue.submit(Some(encoder.finish()));
     }
     let mut encoder = device.create_command_encoder(&Default::default());
-    river.encode_frame(device, &mut encoder, 0.0, 4.0, Some(&water)).unwrap();
+    river.encode_frame(device, &mut encoder, 0.0, 4.0, Some(&water), &mut |_, _| {}).unwrap();
     water.encode_ocean(device, &mut encoder, 4.0).unwrap();
     assert!(river.body_group().is_some());
     const SIZE: u32 = 64;

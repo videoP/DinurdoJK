@@ -937,6 +937,13 @@ struct Renderer {
     ocean_spray_pipeline: Option<wgpu::RenderPipeline>,
     /// Developer "riversource" patches: native Unreal river solver, debug view.
     live_rivers: Vec<crate::river_runtime::LiveRiver>,
+    /// Presented players for river PreSim collisions (same records the
+    /// ocean interaction reads), refreshed every render frame.
+    river_actors: Arc<Vec<crate::ocean::interaction::ActorSample>>,
+    /// The Water menu's player deformation toggle and strength as set, before
+    /// `resolved_for_gpu` (which clears `interaction` for the Lakes backend
+    /// even while the ocean is off). Rivers are not an ocean backend.
+    river_interaction: (bool, f32),
     river_surface: Option<crate::river_surface::RiverSurface>,
     authored_ocean_definitions: Vec<crate::ocean::authoring::AuthoredOcean>,
     /// Render-space water volumes this frame (at most eight): the bounding box

@@ -1078,12 +1078,17 @@ pub(in crate::renderer) fn render_thread_main(
     // sample cannot tell a ~3ms cascade frame from a ~0.04ms idle frame, and
     // either one read alone gives the wrong answer about what the ocean costs.
     // Accumulate min/avg/max across the trace window for those passes instead.
-    const TRACE_GPU_PASSES: [GpuPass; 5] = [
+    const TRACE_GPU_PASSES: [GpuPass; 8] = [
         GpuPass::Frame,
         GpuPass::OceanSim,
         GpuPass::CoastalSim,
         GpuPass::OceanSurface,
         GpuPass::OceanOptics,
+        // Live river: the solver runs on ~1 render frame in N (60 Hz sim
+        // clock), so its max/avg ratio shows spikes the average hides.
+        GpuPass::RiverSim,
+        GpuPass::RiverSolve,
+        GpuPass::RiverDraw,
     ];
     let mut trace_gpu_sum = [0.0_f64; TRACE_GPU_PASSES.len()];
     let mut trace_gpu_min = [f64::INFINITY; TRACE_GPU_PASSES.len()];
@@ -2472,6 +2477,7 @@ pub(in crate::renderer) fn render_thread_main(
             renderer.weather_server_time_ms = snapshot.weather_server_time_ms;
             renderer.studio_lens=snapshot.studio_lens;
             renderer.ocean_interaction.set_sources(&snapshot.ocean_actors);
+            renderer.river_actors = Arc::clone(&snapshot.ocean_actors);
             if let Some(ocean) = renderer.ocean.as_mut() {
                 ocean.set_lake_actors(&snapshot.ocean_actors);
             }
@@ -3370,7 +3376,7 @@ pub(in crate::renderer) fn render_thread_main(
                 );
             }
             println!(
-"[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dlights={}ms dyn_models={}ms fx_sprites={}ms ocean_sim={}ms coastal_sim={}ms ocean_surface={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms rain_sim={}ms rain_draw={}ms rain_haze={}ms rain_froxel={}ms rain_lens={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms clouds={}ms ssr_visibility={}ms ssr_trace={}ms",
+"[JKA PERF GPU] frame={}ms rt_build={}ms world={}ms dlights={}ms dyn_models={}ms fx_sprites={}ms ocean_sim={}ms coastal_sim={}ms ocean_surface={}ms ocean_optics={}ms grass={}ms grass_prepare={}ms grass_draw={}ms rain_sim={}ms rain_draw={}ms rain_haze={}ms rain_froxel={}ms rain_lens={}ms post={}ms depth={}ms hiz={}ms cull={}ms cluster={}ms ui={}ms clouds={}ms ssr_visibility={}ms ssr_trace={}ms river_sim={}ms river_solve={}ms river_draw={}ms",
                 gpu_ms(GpuPass::Frame),
                 gpu_ms(GpuPass::RtBuild),
                 gpu_ms(GpuPass::World),
@@ -3398,6 +3404,9 @@ pub(in crate::renderer) fn render_thread_main(
                 gpu_ms(GpuPass::Clouds),
                 gpu_ms(GpuPass::SsrVisibility),
                 gpu_ms(GpuPass::SsrTrace),
+                gpu_ms(GpuPass::RiverSim),
+                gpu_ms(GpuPass::RiverSolve),
+                gpu_ms(GpuPass::RiverDraw),
             );
             println!(
                 "[JKA WEATHER PERF] ab[fast_post={} water_field={} fast_vertex={} lean_depth={} static_depth={} opaque_depth={} lean_models={} lean_post={} haze_2d={}] rain_only_depth={} rain_only_post={} rain[sim={}ms draw={}ms haze={}ms froxel={}ms lens={}ms] frame={}ms depth={}ms post={}ms",
@@ -3479,6 +3488,16 @@ pub(in crate::renderer) fn render_thread_main(
                         trace_gpu_max[slot],
                     )
                 });
+            if !renderer.live_rivers.is_empty() {
+                println!(
+                    "[JKA RIVER PERF] avg/min/max_ms sim={} solve={} draw={} frame={} paused={}",
+                    gpu_window[5].as_str(),
+                    gpu_window[6].as_str(),
+                    gpu_window[7].as_str(),
+                    gpu_window[0].as_str(),
+                    u8::from(jka_river::river_runtime::paused()),
+                );
+            }
             if ocean.promoted_surfaces > 0 || ocean.authored_oceans > 0 || renderer.ocean_enabled {
                 println!(
                     "[JKA OCEAN PERF] gates[cvar={} resources={} variant={} active={}] topology_cpu[last/avg/max]={:.4}/{:.4}/{:.4}ms samples={} avg/min/max_ms sim={} coastal={} surface={} optics={} frame={} surfaces[promoted={} authored={}] clipmaps[visible={} drawn={} analytic={} duplicate={} reject_area={} reject_frustum={}] samples_passed={} primed={} triangles={} lod[min_level={} half_cells={}] optics[active={} submerged={} pixels={} viewport={} rect={}x{}+{}+{} unbounded={} sim_hidden={}] settings[mesh_quality={} map_size={} updates={:.1} wind_foam={} sea_spray={} ab[optics_cull={} optics_scissor={} sim_when_hidden={}]]",

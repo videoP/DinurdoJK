@@ -138,6 +138,26 @@ fn md3_entity(p: &ModelPlacement) -> Entity {
         ("_dinurdo_placement", "md3".into())])
 }
 
+/// Missing/unloadable MD3 assets should not prevent unrelated .ent placements
+/// from importing. Keep structural .ent validation separate and atomic.
+fn resolve_md3_placements(
+    candidates: Vec<(usize, ModelPlacement)>,
+    mut frame_bounds: impl FnMut(&str) -> Result<([f32; 3], [f32; 3]), String>,
+) -> (Vec<ModelPlacement>, Vec<String>) {
+    let mut resolved = Vec::with_capacity(candidates.len());
+    let mut skipped = Vec::new();
+    for (entity_index, mut placement) in candidates {
+        match frame_bounds(&placement.qpath) {
+            Ok(bounds) => {
+                placement.bounds = bounds;
+                resolved.push(placement);
+            }
+            Err(error) => skipped.push(format!("entity {entity_index}: {}: {error}", placement.qpath)),
+        }
+    }
+    (resolved, skipped)
+}
+
 /// A placed effect as an `fx_runner`: `fxFile`, `origin`, aim `angles` and
 /// the replay `delay` in milliseconds (OpenJK's runner keys).
 fn fx_entity(p: &FxPlacement) -> Entity {
@@ -332,8 +352,8 @@ impl App {
                     .map_err(|_| format!("entity {i}: invalid modelscale"))?;
                 if !scale.is_finite() || !(0.01..=100.0).contains(&scale) { return Err(format!("entity {i}: invalid scale")); }
                 if property(entity, "modelscale_vec").is_some() { return Err(format!("entity {i}: nonuniform modelscale_vec is not supported")); }
-                md3.push(ModelPlacement { qpath: qpath.into(), origin: point(entity)?,
-                    angles: angles(entity)?, scale, bounds: ([0.0;3], [0.0;3]) });
+                md3.push((i, ModelPlacement { qpath: qpath.into(), origin: point(entity)?,
+                    angles: angles(entity)?, scale, bounds: ([0.0;3], [0.0;3]) }));
             } else if cls.eq_ignore_ascii_case("func_static") &&
                 property(entity, "model").is_some_and(|s| s.starts_with('*')) {
                 let id = property(entity, "model").unwrap()[1..].parse::<u32>()
@@ -360,16 +380,16 @@ impl App {
                 return Err(format!("entity {i}: {cls} cannot be represented by the placement editor; no changes applied"));
             }
         }
-        // Validate every MD3 and resolve its authored bounds before replacing
-        // any placements: failed imports leave current edits untouched.
-        if !md3.is_empty() {
+        // Parse and validate the entire .ent before touching any placements.
+        // An unavailable/broken MD3 is only an asset problem: skip that one
+        // placement while retaining the other MD3, BMODEL, FX and remap edits.
+        let (md3, skipped_models) = if md3.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
             self.ensure_asset_preview_entity_presenter()?;
             let presenter = self.asset_preview_entity_presenter.as_mut().unwrap();
-            for placement in &mut md3 {
-                placement.bounds = presenter.md3_frame_bounds(&placement.qpath)
-                    .map_err(|error| format!("{}: {error}", placement.qpath))?;
-            }
-        }
+            resolve_md3_placements(md3, |qpath| presenter.md3_frame_bounds(qpath))
+        };
         let resume_editing = self.model_placement.edit_mode;
         self.placement_checkpoint(); // importing is a single reversible transaction
         let previous_remaps = std::mem::replace(&mut self.model_placement.authored_remaps, remaps);
@@ -403,9 +423,23 @@ impl App {
         self.model_placement.preview_draws = Arc::new(Vec::new());
         self.ensure_inline_instance_capacity();
         self.model_placement.ent_dirty = false;
-        Ok(format!("Imported {} MD3 + {} BMODEL + {} FX + {} shader remaps from {}",
+        // Show a compact warning in the dialog and preserve per-entity errors in
+        // the console, including which original .ent entity index was skipped.
+        for warning in skipped_models.iter().take(64) {
+            self.push_console_line(format!("^3.ENT IMPORT SKIPPED: {warning}"));
+        }
+        if skipped_models.len() > 64 {
+            self.push_console_line(format!("^3.ENT IMPORT: {} additional MD3 errors omitted", skipped_models.len() - 64));
+        }
+        let skipped_notice = if skipped_models.is_empty() {
+            String::new()
+        } else {
+            format!("; skipped {} missing/unloadable MD3 placement(s) (see console). Re-export will omit skipped entities", skipped_models.len())
+        };
+        Ok(format!("Imported {} MD3 + {} BMODEL + {} FX + {} shader remaps from {}{}",
             self.model_placement.placed.len(), self.model_placement.bmodel_placed.len(),
-            self.model_placement.fx_placed.len(), self.model_placement.authored_remaps.len(), path.display()))
+            self.model_placement.fx_placed.len(), self.model_placement.authored_remaps.len(),
+            path.display(), skipped_notice))
     }
     pub(super) fn egui_map_mods(&mut self, root: &mut egui::Ui) {
         let mut action = None;
@@ -566,6 +600,25 @@ mod tests {
         assert_eq!(property(&decoded[0], "classname"), Some("trigger_always"));
         assert_eq!(property(&decoded[0], "targetShaderName"), Some("models/players/tauntaun/tauntaun_body"));
         assert_eq!(property(&decoded[0], "targetShaderNewName"), Some("models/map_objects/hoth/tauntaun_body_halfeaten"));
+    }
+    #[test]
+    fn missing_md3_skips_only_its_entity_and_keeps_later_placements() {
+        let model = |qpath: &str| ModelPlacement {
+            qpath: qpath.to_owned(), origin: [1.0, 2.0, 3.0],
+            angles: [0.0; 3], scale: 1.0, bounds: ([0.0; 3], [0.0; 3]),
+        };
+        let (resolved, skipped) = resolve_md3_placements(vec![
+            (5, model("models/first.md3")),
+            (6, model("models/missing.md3")),
+            (7, model("models/last.md3")),
+        ], |path| {
+            if path == "models/missing.md3" { Err(format!("missing {path}")) }
+            else { Ok(([-2.0; 3], [2.0; 3])) }
+        });
+        assert_eq!(resolved.iter().map(|p| p.qpath.as_str()).collect::<Vec<_>>(),
+            ["models/first.md3", "models/last.md3"]);
+        assert!(resolved.iter().all(|p| p.bounds == ([-2.0; 3], [2.0; 3])));
+        assert_eq!(skipped, ["entity 6: models/missing.md3: missing models/missing.md3"]);
     }
     #[test]
     fn input_rejects_invalid_or_escaping_filenames() {

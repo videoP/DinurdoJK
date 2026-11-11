@@ -4,6 +4,21 @@
 use crate::river_runtime::LiveRiver;
 use crate::river_surface::{RiverSurface, ViewUniform};
 
+/// A presented player as a JKA player hull (bg_public.h: mins -15,-15,-24;
+/// maxs 15,15,40, or 16 crouched) in map units. Actor origins and velocities
+/// are render space.
+fn river_body(actor: &crate::ocean::interaction::ActorSample) -> crate::river_runtime::MapBody {
+    use jka_render_core::coordinates::jka_position;
+    let origin = jka_position(actor.origin);
+    // CROUCH_VIEWHEIGHT is 12, DEFAULT_VIEWHEIGHT 36 (remote records use 26).
+    let top = if actor.head_height < 20.0 { 16.0 } else { 40.0 };
+    crate::river_runtime::MapBody {
+        mins: [origin[0] - 15.0, origin[1] - 15.0, origin[2] - 24.0],
+        maxs: [origin[0] + 15.0, origin[1] + 15.0, origin[2] + top],
+        velocity: actor.velocity.map_or([0.0; 3], jka_position),
+    }
+}
+
 impl super::Renderer {
     pub(in crate::renderer) fn spawn_live_river(
         &mut self,
@@ -186,10 +201,30 @@ impl super::Renderer {
                 );
             }
         }
+        // Player wake: the Water menu's "Player water deformation" toggle and
+        // "Deformation strength" (1 = native body velocity). Players are the
+        // presented records the ocean reads (filled while cg_waterwake or
+        // ocean interaction is on); each is a JKA player hull.
+        {
+            let (enabled, strength) = self.river_interaction;
+            let bodies: Vec<crate::river_runtime::MapBody> = if enabled {
+                self.river_actors.iter().map(river_body).collect()
+            } else {
+                Vec::new()
+            };
+            for river in &mut self.live_rivers {
+                river.body_source = (enabled, self.river_actors.len());
+                river.set_bodies(&self.device, &self.queue, &bodies, strength);
+            }
+        }
         let water = self.river_surface.as_ref();
         let device = &self.device;
+        let profiler = &mut self.gpu_profiler;
+        let mut solve_timestamp = |encoder: &mut wgpu::CommandEncoder, end: bool| {
+            profiler.write_encoder_timestamp(encoder, super::GpuPass::RiverSolve, end);
+        };
         self.live_rivers.retain_mut(|river| {
-            match river.encode_frame(device, encoder, frame_delta, clock, water) {
+            match river.encode_frame(device, encoder, frame_delta, clock, water, &mut solve_timestamp) {
                 Ok(()) => true,
                 Err(error) => {
                     eprintln!("[RIVER] patch removed: {error}");
@@ -197,6 +232,32 @@ impl super::Renderer {
                 }
             }
         });
+        // Water mesh quadtree beyond the camera window: per-view traversal
+        // (frustum side planes of this camera; depth planes are not tested).
+        if let Some(water) = self.river_surface.as_ref() {
+            let view_proj = camera.view_projection(size[0], size[1]);
+            let planes = [
+                view_proj.row(3) + view_proj.row(0),
+                view_proj.row(3) - view_proj.row(0),
+                view_proj.row(3) + view_proj.row(1),
+                view_proj.row(3) - view_proj.row(1),
+            ];
+            let cm = f64::from(jka_water::river::CENTIMETRES_PER_MAP_UNIT);
+            let frustum = |centre: [f64; 3], extent: [f64; 3]| {
+                // River cm (JKA axes) -> render space map units: (x, z, -y).
+                let c = glam::Vec3::new((centre[0] / cm) as f32, (centre[2] / cm) as f32, (-centre[1] / cm) as f32);
+                let e = glam::Vec3::new((extent[0] / cm) as f32, (extent[2] / cm) as f32, (extent[1] / cm) as f32) * 1.05;
+                planes.iter().all(|p| p.truncate().dot(c) + p.w + p.truncate().abs().dot(e) >= 0.0)
+            };
+            let eye = jka_render_core::coordinates::jka_position(camera.position.to_array()).map(|v| f64::from(v) * cm);
+            let view = jka_river::river_far::FarView { eye_cm: eye, frustum: &frustum, lod_morphing: jka_river::river_far::lod_morph() };
+            let grid = self.world.as_ref().and_then(|world| world.entity_light_grid.as_ref());
+            let map_toward_sun = grid.and_then(|grid| grid.map_toward_sun());
+            let mut light = |point: [f32; 3]| grid.and_then(|grid| grid.sample_classic_entity_light(point));
+            for river in &mut self.live_rivers {
+                river.prepare_far(&self.device, &self.queue, water, &view, &mut light, map_toward_sun);
+            }
+        }
         let debug = crate::river_runtime::debug_mode();
         if debug > 0 {
             let pipeline_ready = self.river_surface.as_ref().is_some_and(|surface| surface.ready_for(scene_format, self.msaa_samples));

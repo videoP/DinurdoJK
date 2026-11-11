@@ -54,6 +54,24 @@ CvarDef::new("r_riverDebug", "0", "0|1|2", "Live riversource diagnostics: 0 off,
     }));
     Ok(())
 }),
+CvarDef::new("r_riverPause", "0", "0|1", "Live river A/B: 1 stops the solver (no simulated time passes) while the water keeps drawing, with FFT detail and foam, from the last solved state. Compare GPU cost with r_gpuTimings 1 ([JKA RIVER PERF] sim/solve/draw) or plain FPS. Session-only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::river_runtime::paused()), |app, value| {
+    let CvarValue::Bool(paused) = value else { unreachable!() };
+    crate::river_runtime::set_paused(paused);
+    app.push_console_line(format!("^3r_riverPause:^7 {}", if paused { "ON (solver stopped; water still drawn)" } else { "OFF (solver running)" }));
+    Ok(())
+}),
+CvarDef::new("r_riverWaterMesh", "1", "0|1", "Sparse rivers beyond the camera window: 1 draws the Unreal Water plugin's water mesh quadtree (LOD tiles over the wet simulation tiles, read straight from the simulation), 0 draws only the window (r_riverWindow).", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(jka_river::river_far::enabled()), |app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    jka_river::river_far::set_enabled(enabled);
+    app.push_console_line(format!("^3r_riverWaterMesh:^7 {}", if enabled { "ON (water mesh beyond the window)" } else { "OFF (window only)" }));
+    Ok(())
+}),
+CvarDef::new("r_riverLodMorph", "1", "0|1", "Water mesh LOD morphing (Unreal r.Water.WaterMesh.LODMorphEnabled): 1 vertices slide toward the next LOD with distance so LOD changes and T-junctions do not pop or crack; 0 off.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(jka_river::river_far::lod_morph()), |app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    jka_river::river_far::set_lod_morph(enabled);
+    app.push_console_line(format!("^3r_riverLodMorph:^7 {}", if enabled { "ON" } else { "OFF" }));
+    Ok(())
+}),
 CvarDef::new("r_riverSparse", "1", "0|1", "Long-distance rivers (applies to rivers placed afterwards): 0 the native single rectangle of the authored radius; 1 sparse tiles that grow along the wet channel over the whole map, drawn through a camera window of r_riverWindow cells. Same Unreal hydraulic stages either way.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(jka_river::river_tiles::sparse_enabled()), |app, value| {
     let CvarValue::Bool(enabled) = value else { unreachable!() };
     jka_river::river_tiles::set_sparse_enabled(enabled);

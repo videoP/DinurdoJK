@@ -286,7 +286,9 @@ impl Renderer {
         &mut self,
         settings: crate::ocean::OceanSettings,
     ) {
-        let mut settings = settings.sanitize().resolved_for_gpu();
+        let sanitized = settings.sanitize();
+        self.river_interaction = (sanitized.interaction, sanitized.interaction_strength);
+        let mut settings = sanitized.resolved_for_gpu();
         let had_lake_planar = self.lake_planar_enabled();
         // Atmospheric wind is renderer-global. Ocean-specific settings may
         // arrive through their legacy API, but they cannot fork the wind field.
