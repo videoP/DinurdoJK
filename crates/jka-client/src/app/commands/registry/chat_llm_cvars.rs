@@ -191,7 +191,7 @@ app_cvars! {
 
     APP_CG_CHATLLMMODEL {
         runtime: CvarDef::new("cg_chatLlmModel", "", "https URL of a .gguf file",
-            "General model for the chat filter and chatSummary. Empty uses Qwen3.5 4B (about 2.7 GB, about a second per message); Setup offers the lighter 2B model (1.3 GB), which misjudges banter. Set it to the same address as cg_chatTranslateModel to keep one model in memory for everything.",
+            "General model for the chat filter and quickRundown. Empty uses Qwen3.5 4B (about 2.7 GB, about a second per message); Setup offers the lighter 2B model (1.3 GB), which misjudges banter. Set it to the same address as cg_chatTranslateModel to keep one model in memory for everything.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.chat_llm.settings.assist_url.clone()),
             |app, value| {
@@ -231,9 +231,9 @@ app_cvars! {
         implementations: []
     }
 
-    APP_CG_CHATSUMMARYPROMPT {
-        runtime: CvarDef::new("cg_chatSummaryPrompt", "", "text",
-            "Instruction given to the model for chatSummary. {player} and {language} are filled in. Empty uses the built-in prompt.",
+    APP_CG_QUICKRUNDOWNPROMPT {
+        runtime: CvarDef::new("cg_quickRundownPrompt", "", "text",
+            "Instruction given to the model for quickRundown. {player} and {language} are filled in. Empty uses the built-in prompt.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.chat_llm.settings.summary_prompt.clone()),
             |app, value| {

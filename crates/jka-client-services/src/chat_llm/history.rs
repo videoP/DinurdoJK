@@ -1,4 +1,4 @@
-//! What `chatSummary` works from: the chat of this session with wall-clock
+//! What `quickRundown` works from: the chat of this session with wall-clock
 //! times, what the filter did to each line, and when the player last touched
 //! the game.
 
@@ -200,9 +200,9 @@ impl Away {
     }
 }
 
-/// `chatSummary [minutes] [truth|cleanse]`, in either order.
+/// `quickRundown [minutes] [truth|cleanse]`, in either order.
 pub fn parse_args(args: &[&str]) -> Result<(Option<f32>, SummaryPass), String> {
-    const USAGE: &str = "usage: chatSummary [minutes] [truth|cleanse]";
+    const USAGE: &str = "usage: quickRundown [minutes] [truth|cleanse]";
     let mut minutes = None;
     let mut pass = None;
     for word in args {

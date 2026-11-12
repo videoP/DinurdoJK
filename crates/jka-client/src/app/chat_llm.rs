@@ -1,5 +1,5 @@
 //! Local-model chat features in the app: the chat filter (`cg_chatCensor`),
-//! `chatSummary`, and the model housekeeping shared with local translation.
+//! `quickRundown`, and the model housekeeping shared with local translation.
 //!
 //! The filter sees every received chat line after it has an id (see
 //! `chat_translation`). With `cg_chatCensorHold` the line's text stays off
@@ -566,7 +566,7 @@ impl App {
                 changed = true;
             }
         }
-        changed |= self.poll_chat_summary();
+        changed |= self.poll_quick_rundown();
         changed |= self.watch_chat_models(now);
         if changed {
             self.publish_transient_ui();
@@ -613,14 +613,14 @@ impl App {
         announced
     }
 
-    /// `chatSummary [minutes] [truth|cleanse]`.
-    pub(in crate::app) fn start_chat_summary(&mut self, minutes: Option<f32>, pass: SummaryPass) {
+    /// `quickRundown [minutes] [truth|cleanse]`.
+    pub(in crate::app) fn start_quick_rundown(&mut self, minutes: Option<f32>, pass: SummaryPass) {
         if self.chat_llm.summary.is_some() {
-            self.push_console_line("^5CHAT SUMMARY:^7 one is already being written");
+            self.push_console_line("^5QUICK RUNDOWN:^7 one is already being written");
             return;
         }
         if !engine().available() {
-            self.push_console_line("^1CHAT SUMMARY:^7 this build has no local model runtime");
+            self.push_console_line("^1QUICK RUNDOWN:^7 this build has no local model runtime");
             return;
         }
         let now = Instant::now();
@@ -642,7 +642,7 @@ impl App {
         };
         let transcript = self.chat_llm.history.transcript(since, pass, history::TRANSCRIPT_CHARS);
         if transcript.messages == 0 {
-            self.push_console_line(format!("^5CHAT SUMMARY:^7 nobody wrote anything in {span}"));
+            self.push_console_line(format!("^5QUICK RUNDOWN:^7 nobody wrote anything in {span}"));
             return;
         }
         let disclaimers = if pass == SummaryPass::Cleanse { self.chat_llm.history.disclaimers(since) } else { Vec::new() };
@@ -664,7 +664,7 @@ impl App {
         );
         let (tx, rx) = mpsc::channel();
         let wait_cancel = Arc::clone(&cancel);
-        let spawned = std::thread::Builder::new().name("chat-summary".to_owned()).spawn(move || {
+        let spawned = std::thread::Builder::new().name("quick-rundown".to_owned()).spawn(move || {
             // The model may still be downloading: wait for it rather than
             // making the player ask again.
             let deadline = Instant::now() + SUMMARY_MODEL_WAIT;
@@ -686,7 +686,7 @@ impl App {
             let _ = tx.send(result);
         });
         if spawned.is_err() {
-            self.push_console_line("^1CHAT SUMMARY:^7 could not start");
+            self.push_console_line("^1QUICK RUNDOWN:^7 could not start");
             return;
         }
         let omitted = if transcript.omitted > 0 {
@@ -699,7 +699,7 @@ impl App {
             other => format!(" Model {}.", other.describe()),
         };
         self.push_console_line(format!(
-            "^5CHAT SUMMARY:^7 {} pass over {span}: {} message{}{omitted}. Writing...{waiting}",
+            "^5QUICK RUNDOWN:^7 {} pass over {span}: {} message{}{omitted}. Writing...{waiting}",
             pass.name(),
             transcript.messages,
             if transcript.messages == 1 { "" } else { "s" },
@@ -708,7 +708,7 @@ impl App {
             Some(SummaryRun { answer: rx, cancel, pass, disclaimers, filter_was_on: self.chat_llm.settings.censor });
     }
 
-    fn poll_chat_summary(&mut self) -> bool {
+    fn poll_quick_rundown(&mut self) -> bool {
         let Some(run) = &self.chat_llm.summary else { return false };
         let result = match run.answer.try_recv() {
             Ok(result) => result,
@@ -717,7 +717,7 @@ impl App {
         };
         let Some(run) = self.chat_llm.summary.take() else { return false };
         match result {
-            Err(error) => self.push_console_line(format!("^1CHAT SUMMARY:^7 failed: {error}")),
+            Err(error) => self.push_console_line(format!("^1QUICK RUNDOWN:^7 failed: {error}")),
             Ok(answer) => {
                 for line in cl::read_summary(&answer) {
                     self.push_console_line(format!("^5SUMMARY:^7 {line}"));
@@ -733,11 +733,11 @@ impl App {
                             "The chat filter was off, so hostile periods are only as the model reported them."
                         };
                         self.push_console_line(format!(
-                            "^3DISCLAIMER:^7 cleansed summary. Wording was softened and hostile content is described, not quoted. {basis} chatSummary truth gives the unfiltered account."
+                            "^3DISCLAIMER:^7 cleansed summary. Wording was softened and hostile content is described, not quoted. {basis} quickRundown truth gives the unfiltered account."
                         ));
                     }
                     SummaryPass::Truth => self.push_console_line(
-                        "^3NOTE:^7 truth pass: written from the chat as it was sent, and may repeat offensive language. chatSummary cleanse gives a clean version.",
+                        "^3NOTE:^7 truth pass: written from the chat as it was sent, and may repeat offensive language. quickRundown cleanse gives a clean version.",
                     ),
                 }
             }
@@ -746,7 +746,7 @@ impl App {
     }
 
     /// Disconnect: stop a summary that is still being written.
-    pub(in crate::app) fn cancel_chat_summary(&mut self) {
+    pub(in crate::app) fn cancel_quick_rundown(&mut self) {
         if let Some(run) = self.chat_llm.summary.take() {
             run.cancel.store(true, Ordering::Relaxed);
         }
@@ -772,7 +772,7 @@ impl App {
             if settings.censor_action == CensorAction::Hide { "hides messages" } else { "masks words" },
             self.chat_llm.status_line(),
         ));
-        lines.push(format!("^3CHAT SUMMARY:^7 {} message(s) kept for chatSummary", self.chat_llm.history.len()));
+        lines.push(format!("^3QUICK RUNDOWN:^7 {} message(s) kept for quickRundown", self.chat_llm.history.len()));
         lines
     }
 

@@ -2116,7 +2116,7 @@ impl ApplicationHandler<UserEvent> for App {
             crate::thread_activity::Task::Input,
         );
 
-        // chatSummary without a time covers the stretch with no input at all.
+        // quickRundown without a time covers the stretch with no input at all.
         match &event {
             WindowEvent::KeyboardInput { .. } | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. } => {
                 self.chat_llm.note_input(Instant::now());

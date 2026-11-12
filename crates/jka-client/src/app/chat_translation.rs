@@ -660,7 +660,7 @@ impl App {
                 self.chat_translation.rules.clear();
                 self.cancel_chat_translations();
                 self.cancel_chat_filter();
-                self.cancel_chat_summary();
+                self.cancel_quick_rundown();
             }
         }
         if !self.chat_translation.translator.active() {

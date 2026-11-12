@@ -1069,11 +1069,11 @@ commands! {
         CommandResult::Handled
     }
 
-    cmd_chat_summary ["chatSummary", ] ("chatSummary [minutes] [truth|cleanse]", "Summarize recent chat with the local model. Without minutes it covers the time since you last touched the game (window in the background or away); if you were not away, the last 10 minutes. truth (default) is written from the chat as sent; cleanse is a clean version with disclaimers for hostile stretches.", CommandScope::Always) |self, command| {
+    cmd_quick_rundown ["quickRundown", ] ("quickRundown [minutes] [truth|cleanse]", "Summarize recent chat with the local model. Without minutes it covers the time since you last touched the game (window in the background or away); if you were not away, the last 10 minutes. truth (default) is written from the chat as sent; cleanse is a clean version with disclaimers for hostile stretches.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match crate::chat_llm::history::parse_args(&words[1..]) {
-            Ok((minutes, pass)) => self.start_chat_summary(minutes, pass),
-            Err(usage) => self.push_console_line(format!("^3CHAT SUMMARY:^7 {usage}")),
+            Ok((minutes, pass)) => self.start_quick_rundown(minutes, pass),
+            Err(usage) => self.push_console_line(format!("^3QUICK RUNDOWN:^7 {usage}")),
         }
         CommandResult::Handled
     }

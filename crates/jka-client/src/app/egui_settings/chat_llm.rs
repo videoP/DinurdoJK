@@ -16,7 +16,7 @@ impl Prompt {
         match self {
             Self::Translate => "cg_chatTranslatePrompt",
             Self::Censor => "cg_chatCensorPrompt",
-            Self::Summary => "cg_chatSummaryPrompt",
+            Self::Summary => "cg_quickRundownPrompt",
         }
     }
 
@@ -284,7 +284,7 @@ impl App {
             ui,
             Prompt::Summary,
             "Summary prompt",
-            "Used by the chatSummary [minutes] [truth|cleanse] console command. {player} and {language} are filled in.",
+            "Used by the quickRundown [minutes] [truth|cleanse] console command. {player} and {language} are filled in.",
         );
         if let Some(note) = &self.chat_llm.edits.note {
             theme::hint(ui, note, theme::TEXT_DIM());
