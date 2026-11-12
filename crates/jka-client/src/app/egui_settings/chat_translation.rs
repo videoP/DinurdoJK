@@ -27,14 +27,12 @@ impl App {
         if settings.mode == Mode::Off {
             return;
         }
-        theme::banner(
-            ui,
-            &format!(
-                "Message text (never names, server or account details) is sent to {}.",
-                if settings.provider == ProviderKind::Libre { "your LibreTranslate server" } else { settings.provider.label() }
-            ),
-            theme::TEXT_DIM(),
-        );
+        let sent_to = match settings.provider {
+            ProviderKind::Local => "Translated on this computer by a local model. Nothing is sent anywhere.".to_owned(),
+            ProviderKind::Libre => "Message text (never names, server or account details) is sent to your LibreTranslate server.".to_owned(),
+            other => format!("Message text (never names, server or account details) is sent to {}.", other.label()),
+        };
+        theme::banner(ui, &sent_to, theme::TEXT_DIM());
         let resolved = lang::resolve_target(&settings.target);
         theme::row(
             ui,
@@ -79,7 +77,7 @@ impl App {
         theme::row(
             ui,
             "Service",
-            "cg_chatTranslateProvider. MyMemory is free without a key (limited characters per day). DeepL needs a free or paid API key. LibreTranslate is a server you run or choose.",
+            "cg_chatTranslateProvider. MyMemory is free without a key (limited characters per day). DeepL needs a free or paid API key. LibreTranslate is a server you run or choose. Local model downloads a translation model once (about 1.1 GB) and runs it on this computer.",
             theme::Reset::None,
             |ui| {
                 for provider in ProviderKind::ALL {
@@ -90,6 +88,9 @@ impl App {
                 }
             },
         );
+        if settings.provider == ProviderKind::Local {
+            self.egui_chat_local_translation_settings(ui);
+        }
         if settings.provider == ProviderKind::Libre {
             theme::row(
                 ui,
@@ -134,6 +135,17 @@ impl App {
         if let Some(note) = &self.chat_translation.key_note {
             theme::hint(ui, note, theme::TEXT_DIM());
         }
+        theme::row(
+            ui,
+            "Ignore my own messages",
+            "cg_chatTranslateIgnoreSelf. Never translate what you wrote yourself. You can still translate one of your messages by hand from the console.",
+            theme::Reset::None,
+            |ui| {
+                if let Some(value) = theme::switch(ui, self.chat_llm.settings.translate_ignore_self) {
+                    let _ = self.set_console_cvar("cg_chatTranslateIgnoreSelf", if value { "1" } else { "0" });
+                }
+            },
+        );
         theme::row(
             ui,
             "Team chat",

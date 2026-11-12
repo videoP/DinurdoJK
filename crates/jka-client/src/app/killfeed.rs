@@ -52,6 +52,33 @@ impl App {
         self.publish_transient_ui();
     }
 
+    /// The newest kills as plain sentences, oldest first: match context for
+    /// the chat filter ("Luke killed Vader (4s ago)").
+    pub(in crate::app) fn recent_kills_for_chat(&self, max: usize, within: Duration) -> Vec<String> {
+        let now = Instant::now();
+        let plain = |name: &str| crate::logging::strip_jka_colors(name).trim().to_owned();
+        let mut kills: Vec<String> = self
+            .killfeed
+            .records
+            .iter()
+            .rev()
+            .filter(|record| now.saturating_duration_since(record.created) <= within)
+            .take(max)
+            .map(|record| {
+                let ago = now.saturating_duration_since(record.created).as_secs();
+                let target = plain(&record.target.1);
+                match &record.attacker {
+                    Some((client, name, _)) if *client != record.target.0 => {
+                        format!("{} killed {target} ({ago}s ago)", plain(name))
+                    }
+                    _ => format!("{target} died ({ago}s ago)"),
+                }
+            })
+            .collect();
+        kills.reverse();
+        kills
+    }
+
     /// Three representative lines so HUD Edit can place and size the feed
     /// before anyone has died.
     pub(in crate::app) fn killfeed_sample_ui(&self) -> Option<UiKillfeed> {

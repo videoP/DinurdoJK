@@ -1319,6 +1319,7 @@ mod tests {
 
     #[test]
     fn translation_picker_layout_keeps_actions_clickable() {
+        let center = |b: Bounds| [b[0] + b[2] * 0.5, b[1] + b[3] * 0.5];
         let menu = ScoreboardMenuUi {
             client: 4, name: "Acrobat".into(), anchor: [400, 300],
             actions: vec![ScoreAction::Translate(true), ScoreAction::TranslateHint(0, false),

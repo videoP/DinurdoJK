@@ -47,14 +47,19 @@ impl App {
                     ((fade_ms - age_ms) / 1_000.0) as f32
                 };
                 // A translation updates the line in place: same slot, age and fade.
-                let (text, below) = crate::app::chat_translation::hud_chat_text(translation_display, line);
-                let ui_line = |text| UiChatLine {
+                let shown = crate::app::chat_translation::hud_chat(translation_display, line, settings.docked());
+                let ui_line = |text, flags, original| UiChatLine {
                     text,
                     team: line.team,
                     alpha: alpha.clamp(0.0, 1.0),
                     enter: (age_ms / 220.0).clamp(0.0, 1.0) as f32,
+                    flags,
+                    original,
                 };
-                Some(std::iter::once(ui_line(text)).chain(below.map(ui_line)))
+                Some(
+                    std::iter::once(ui_line(shown.text, shown.flags, shown.original))
+                        .chain(shown.below.map(move |below| ui_line(below, 0, None))),
+                )
             })
             .flatten()
             .collect();
@@ -154,6 +159,7 @@ impl App {
                 demo_elapsed_ms: Some(f64::from(entry.elapsed_ms)),
                 chat_id: None,
                 translation: None,
+                censor: None,
             });
         }
         if let Some(entry) = notices.iter().rev().find(|entry| {

@@ -541,6 +541,12 @@ impl App {
                                 }
                                 let path_target = self.console_path_links.get(index)
                                     .and_then(|links| links.first()).map(|link| link.target.clone());
+                                // Filtered or translated: the received text on hover.
+                                // egui is local only; the stream output never has it.
+                                let response = match chat_id.and_then(|id| self.console_chat_original(id)) {
+                                    Some(original) if !response.context_menu_opened() => response.on_hover_text(original),
+                                    _ => response,
+                                };
                                 response.context_menu(|ui| {
                                     if ui.add_enabled(self.selected_console_text().is_some(),
                                         egui::Button::new("Copy selected text"))

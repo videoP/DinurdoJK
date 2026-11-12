@@ -80,7 +80,7 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, small_font:
     // Style 2 keeps the dock, animation and layout of style 1, but uses
     // the original JKA small font for every feed and composer glyph.
     let txt = if ui.chat_settings.style == 2 {
-        UiText::legacy_only(small_font, w, h)
+        UiText::legacy_with_wide(ui, small_font, w, h)
     } else {
         UiText::new(ui, small_font, w, h)
     };
@@ -100,14 +100,30 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, small_font:
     };
 
     // Lines, wrapped, newest at the bottom; keep the last `max_lines`.
-    let mut lines: Vec<(String, f32, f32)> = Vec::new();
+    // A row carries its message's marks (first row only) and received text.
+    struct Row<'a> {
+        text: String,
+        alpha: f32,
+        enter: f32,
+        flags: u8,
+        original: Option<&'a str>,
+    }
+    let mark = px * 0.86;
+    let mut lines: Vec<Row<'_>> = Vec::new();
     for line in &ui.chat_lines {
         let alpha = line.alpha.clamp(0.0, 1.0);
         if alpha <= 0.01 {
             continue;
         }
-        for part in wrap(&txt, &line.text, px, width - 20.0 * s) {
-            lines.push((part, alpha, line.enter));
+        let marks = super::chat::chat_marks_width(line.flags, mark);
+        for (index, part) in wrap(&txt, &line.text, px, width - 20.0 * s - marks).into_iter().enumerate() {
+            lines.push(Row {
+                text: part,
+                alpha,
+                enter: line.enter,
+                flags: if index == 0 { line.flags } else { 0 },
+                original: line.original.as_deref(),
+            });
         }
     }
     let skip = lines.len().saturating_sub(max_lines);
@@ -123,10 +139,46 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, small_font:
         rect(out, x0 - 10.0 * s, top, width + 20.0 * s, panel_h, pal::fade(pal::SLAB_BOTTOM(), 0.70 * open), w, h);
         rect(out, x0 - 10.0 * s, top, (2.0 * s).max(1.0), panel_h, pal::fade(pal::ACCENT(), 0.55 * open), w, h);
     }
-    for (index, (text, alpha, enter)) in lines.iter().enumerate() {
+    // The received text of the marked line under the cursor, and that row.
+    let mut hovered: Option<(&str, f32)> = None;
+    for (index, row) in lines.iter().enumerate() {
+        let enter = row.enter;
         let slide = (1.0 - enter.clamp(0.0, 1.0)).powi(2) * 18.0 * s;
-        let baseline = feed_top + index as f32 * line_h + (line_h + txt.cap(px)) * 0.5;
-        txt.draw(out, text, x0 - slide, baseline, px, pal::fade(pal::TEXT(), *alpha * (1.0 - (1.0 - enter).powi(3))));
+        let row_top = feed_top + index as f32 * line_h;
+        let baseline = row_top + (line_h + txt.cap(px)) * 0.5;
+        let fade = row.alpha * (1.0 - (1.0 - enter).powi(3));
+        let marks = super::chat::chat_marks_width(row.flags, mark);
+        if row.flags != 0 {
+            super::chat::draw_chat_marks(out, row.flags, x0 - slide, row_top + line_h * 0.5, mark, fade, w, h);
+        }
+        txt.draw(out, &row.text, x0 - slide + marks, baseline, px, pal::fade(pal::TEXT(), fade));
+        if let (Some(original), Some([pointer_x, pointer_y])) = (row.original, ui.chat_anim.pointer) {
+            let inside = pointer_x >= x0 - 10.0 * s
+                && pointer_x <= x0 + width + 10.0 * s
+                && pointer_y >= row_top
+                && pointer_y < row_top + line_h;
+            if inside {
+                hovered = Some((original, row_top));
+            }
+        }
+    }
+    if let Some((original, row_top)) = hovered {
+        // Local presentation only: the stream snapshot has neither the
+        // cursor nor the received text, so this is never drawn there.
+        let small = px * 0.86;
+        let small_h = line_h * 0.86;
+        let body = wrap(&txt, original, small, width - 24.0 * s);
+        let tip_h = (body.len() as f32 + 1.0) * small_h + 12.0 * s;
+        let above = row_top - tip_h - 4.0 * s;
+        let tip_y = if above >= 0.0 { above } else { row_top + line_h + 4.0 * s };
+        rect(out, x0 - 10.0 * s, tip_y, width + 20.0 * s, tip_h, pal::fade(pal::SLAB_BOTTOM(), 0.97), w, h);
+        rect(out, x0 - 10.0 * s, tip_y, (2.0 * s).max(1.0), tip_h, pal::GOLD(), w, h);
+        let mut baseline = tip_y + 6.0 * s + (small_h + txt.cap(small)) * 0.5;
+        txt.draw(out, "ORIGINAL MESSAGE - only on this screen, not on the stream output", x0, baseline, small * 0.8, pal::GOLD());
+        for line in &body {
+            baseline += small_h;
+            txt.draw(out, line, x0, baseline, small, pal::TEXT());
+        }
     }
     if open <= 0.0 {
         return;

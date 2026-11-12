@@ -5,6 +5,7 @@ pub(crate) use display::AntiAliasingChoice;
 mod killfeed;
 mod match_stats;
 mod chat_anim;
+mod chat_llm;
 mod chat_translation;
 mod scoreboard_cursor;
 mod spectator_broadcast;
@@ -1011,6 +1012,7 @@ pub struct App {
     chat_lines: VecDeque<ChatRecord>,
     /// `cg_chatTranslate*`: received messages, pending and finished translations.
     chat_translation: chat_translation::ChatTranslation,
+    chat_llm: chat_llm::ChatLlm,
     last_chat_refresh: Instant,
     video_selected: usize,
     /// Which section of Setup -> Video the left rail is showing.

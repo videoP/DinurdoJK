@@ -34,7 +34,7 @@ use jka_audio::{audio, eal, steam_audio};
 mod emotes;
 use jka_render_core::camera;
 use jka_client_services::{
-    chat_translation, clipboard, credential_store, display_gamma, filesystem_paths, frontend_cache_color,
+    chat_llm, chat_translation, clipboard, credential_store, display_gamma, filesystem_paths, frontend_cache_color,
     jk2_diagnostics, neon_menu, protocol_link, pure, screenshot, server_browser, startup_timeline, vgs, vote,
 };
 mod cgame;

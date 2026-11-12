@@ -46,6 +46,35 @@ pub struct ProportionalFont {
     pub glyphs: [ProportionalGlyph; 256],
     pub point_size: i16,
     pub height: i16,
+    /// Glyphs for U+0400..=U+04FF, in order. Only a TrueType font that has
+    /// the block fills it; JKA `.fontdat` fonts leave it empty.
+    pub cyrillic: Vec<ProportionalGlyph>,
+}
+
+/// First character of `ProportionalFont::cyrillic`.
+pub const CYRILLIC_FIRST: u32 = 0x400;
+pub const CYRILLIC_COUNT: usize = 256;
+
+/// Text in this client is one char per protocol byte; anything above that
+/// range is real Unicode (a translation, or filtered text).
+fn is_wide(ch: char) -> bool {
+    ch as u32 > 0xFF
+}
+
+impl ProportionalFont {
+    /// Glyph for a character outside the byte range, if this font has it.
+    pub fn wide_glyph(&self, ch: char) -> Option<ProportionalGlyph> {
+        let index = (ch as u32).checked_sub(CYRILLIC_FIRST)? as usize;
+        self.cyrillic.get(index).copied().filter(|glyph| glyph.horiz_advance > 0)
+    }
+
+    /// Glyph for any character: its byte glyph, its Cyrillic glyph, or `?`.
+    fn glyph_for(&self, ch: char) -> ProportionalGlyph {
+        match u8::try_from(ch as u32) {
+            Ok(byte) => self.glyphs[usize::from(byte)],
+            Err(_) => self.wide_glyph(ch).unwrap_or(self.glyphs[usize::from(b'?')]),
+        }
+    }
 }
 
 pub fn parse_fontdat(bytes: &[u8]) -> Result<ProportionalFont, String> {
@@ -124,6 +153,7 @@ pub fn parse_fontdat(bytes: &[u8]) -> Result<ProportionalFont, String> {
         glyphs,
         point_size,
         height,
+        cyrillic: Vec::new(),
     })
 }
 
@@ -907,18 +937,127 @@ pub(in crate::ui) const CLEAN_FONT_SOURCE: f32 = 8.0;
 pub(in crate::ui) struct UiText<'a> {
     clean: Option<&'a ProportionalFont>,
     legacy: Option<&'a ProportionalFont>,
+    /// TrueType font that lends its Cyrillic glyphs to JKA-font text.
+    wide: Option<&'a ProportionalFont>,
     w: u32,
     h: u32,
 }
 
+/// Split into runs of byte-range text and runs of wide (Unicode) text.
+fn wide_runs(value: &str) -> Vec<(bool, &str)> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+    let mut current = None;
+    for (index, ch) in value.char_indices() {
+        let wide = is_wide(ch);
+        if current.is_some_and(|was| was != wide) {
+            runs.push((!wide, &value[start..index]));
+            start = index;
+        }
+        current = Some(wide);
+    }
+    if let Some(wide) = current {
+        runs.push((wide, &value[start..]));
+    }
+    runs
+}
+
+/// The colour in force after `run`, given the one before it.
+fn colour_after(run: &str, mut active: [f32; 4], alpha: f32) -> [f32; 4] {
+    let mut chars = run.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '^' {
+            if let Some(code) = chars.peek().and_then(|next| color_code(*next, alpha)) {
+                active = code;
+                chars.next();
+            }
+        }
+    }
+    active
+}
+
 impl<'a> UiText<'a> {
     pub(in crate::ui) fn new(ui: &'a crate::ui::UiSnapshot, legacy: Option<&'a ProportionalFont>, w: u32, h: u32) -> Self {
-        Self { clean: ui.clean_font.as_deref(), legacy, w, h }
+        Self { clean: ui.clean_font.as_deref(), legacy, wide: None, w, h }
     }
 
     /// Render redesigned UI geometry with the original JKA small font.
     pub(in crate::ui) fn legacy_only(legacy: Option<&'a ProportionalFont>, w: u32, h: u32) -> Self {
-        Self { clean: None, legacy, w, h }
+        Self { clean: None, legacy, wide: None, w, h }
+    }
+
+    /// `legacy_only`, but characters the JKA font cannot have (Cyrillic in
+    /// translated or filtered chat) are drawn from the TrueType UI font.
+    pub(in crate::ui) fn legacy_with_wide(
+        ui: &'a crate::ui::UiSnapshot,
+        legacy: Option<&'a ProportionalFont>,
+        w: u32,
+        h: u32,
+    ) -> Self {
+        let wide = ui.clean_font.as_deref().filter(|font| !font.cyrillic.is_empty());
+        Self { clean: None, legacy, wide: wide.filter(|_| legacy.is_some()), w, h }
+    }
+
+    fn clean_width(font: &ProportionalFont, value: &str, px: f32) -> f32 {
+        let scale = px / f32::from(font.height.max(1));
+        let mut width = 0.0;
+        let mut chars = value.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '^' && chars.peek().is_some_and(|next| color_code(*next, 1.0).is_some()) {
+                chars.next();
+                continue;
+            }
+            width += f32::from(font.glyph_for(ch).horiz_advance.max(0)) * scale;
+        }
+        width
+    }
+
+    /// Draw with a TrueType font. `color` supplies the alpha and the base
+    /// colour; `start` is the colour in force at the first character.
+    #[allow(clippy::too_many_arguments)]
+    fn clean_draw(&self, out: &mut Vec<UiVertex>, font: &ProportionalFont, value: &str, x: f32, baseline: f32, px: f32, color: [f32; 4], start: [f32; 4]) {
+        let (w, h) = (self.w, self.h);
+        let scale = px / f32::from(font.height.max(1));
+        // Soft one-pixel drop shadow, then the glyphs.
+        let shadow = (px / 22.0).clamp(1.0, 2.0);
+        for pass in [true, false] {
+            let mut cursor = x;
+            let mut active = start;
+            let mut chars = value.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch == '^' {
+                    if let Some(code) = chars.peek().and_then(|next| color_code(*next, color[3])) {
+                        active = code;
+                        chars.next();
+                        continue;
+                    }
+                }
+                let glyph = font.glyph_for(ch);
+                if glyph.width > 0 && glyph.height > 0 && ch != ' ' {
+                    let offset = if pass { shadow } else { 0.0 };
+                    let tint = if pass { [0.0, 0.0, 0.0, color[3] * 0.55] } else { active };
+                    textured_rect_with_source(
+                        out,
+                        cursor + f32::from(glyph.horiz_offset) * scale + offset,
+                        baseline - glyph.baseline as f32 * scale + offset,
+                        f32::from(glyph.width) * scale,
+                        f32::from(glyph.height) * scale,
+                        [glyph.s, glyph.t],
+                        [glyph.s2, glyph.t2],
+                        tint,
+                        CLEAN_FONT_SOURCE,
+                        w,
+                        h,
+                    );
+                }
+                cursor += f32::from(glyph.horiz_advance.max(0)) * scale;
+            }
+        }
+    }
+
+    /// The wide font, when `value` needs it.
+    fn wide_for(&self, value: &str) -> Option<&'a ProportionalFont> {
+        self.wide.filter(|_| value.chars().any(is_wide))
     }
 
     fn legacy_scale(&self, font: &ProportionalFont, px: f32) -> f32 {
@@ -932,19 +1071,19 @@ impl<'a> UiText<'a> {
     /// Advance width of `value`, colour codes excluded.
     pub(in crate::ui) fn width(&self, value: &str, px: f32) -> f32 {
         if let Some(font) = self.clean {
-            let scale = px / f32::from(font.height.max(1));
-            let bytes = crate::cgame::text_to_jka_bytes(value);
-            let mut width = 0.0;
-            let mut index = 0;
-            while index < bytes.len() {
-                if bytes[index] == b'^' && index + 1 < bytes.len() && color_code(bytes[index + 1] as char, 1.0).is_some() {
-                    index += 2;
-                    continue;
-                }
-                width += f32::from(font.glyphs[bytes[index] as usize].horiz_advance.max(0)) * scale;
-                index += 1;
-            }
-            width
+            Self::clean_width(font, value, px)
+        } else if let (Some(font), Some(wide)) = (self.legacy, self.wide_for(value)) {
+            let scale = self.legacy_scale(font, px);
+            wide_runs(value)
+                .into_iter()
+                .map(|(is_wide, run)| {
+                    if is_wide {
+                        Self::clean_width(wide, run, px)
+                    } else {
+                        proportional_text_width(run, font, scale) * self.h.max(1) as f32 / 480.0
+                    }
+                })
+                .sum()
         } else if let Some(font) = self.legacy {
             proportional_text_width(value, font, self.legacy_scale(font, px)) * self.h.max(1) as f32 / 480.0
         } else {
@@ -972,43 +1111,20 @@ impl<'a> UiText<'a> {
     pub(in crate::ui) fn draw(&self, out: &mut Vec<UiVertex>, value: &str, x: f32, baseline: f32, px: f32, color: [f32; 4]) {
         let (w, h) = (self.w, self.h);
         if let Some(font) = self.clean {
-            let scale = px / f32::from(font.height.max(1));
-            let bytes = crate::cgame::text_to_jka_bytes(value);
-            // Soft one-pixel drop shadow, then the glyphs.
-            let shadow = (px / 22.0).clamp(1.0, 2.0);
-            for pass in [true, false] {
-                let mut cursor = x;
-                let mut active = color;
-                let mut index = 0;
-                while index < bytes.len() {
-                    let byte = bytes[index];
-                    if byte == b'^' && index + 1 < bytes.len() {
-                        if let Some(code) = color_code(bytes[index + 1] as char, color[3]) {
-                            active = code;
-                            index += 2;
-                            continue;
-                        }
-                    }
-                    let glyph = font.glyphs[byte as usize];
-                    if glyph.width > 0 && glyph.height > 0 && byte != b' ' {
-                        let offset = if pass { shadow } else { 0.0 };
-                        let tint = if pass { [0.0, 0.0, 0.0, color[3] * 0.55] } else { active };
-                        textured_rect_with_source(
-                            out,
-                            cursor + f32::from(glyph.horiz_offset) * scale + offset,
-                            baseline - glyph.baseline as f32 * scale + offset,
-                            f32::from(glyph.width) * scale,
-                            f32::from(glyph.height) * scale,
-                            [glyph.s, glyph.t],
-                            [glyph.s2, glyph.t2],
-                            tint,
-                            CLEAN_FONT_SOURCE,
-                            w,
-                            h,
-                        );
-                    }
-                    cursor += f32::from(glyph.horiz_advance.max(0)) * scale;
-                    index += 1;
+            self.clean_draw(out, font, value, x, baseline, px, color, color);
+        } else if let (Some(font), Some(wide)) = (self.legacy, self.wide_for(value)) {
+            // JKA font for what it has, the TrueType font for the rest.
+            let scale = self.legacy_scale(font, px);
+            let mut cursor = x;
+            let mut active = color;
+            for (is_wide, run) in wide_runs(value) {
+                if is_wide {
+                    self.clean_draw(out, wide, run, cursor, baseline, px, color, active);
+                    cursor += Self::clean_width(wide, run, px);
+                } else {
+                    proportional_text_uniform(out, run, font, cursor, baseline, scale, active, true, w, h);
+                    cursor += proportional_text_width(run, font, scale) * h.max(1) as f32 / 480.0;
+                    active = colour_after(run, active, color[3]);
                 }
             }
         } else if let Some(font) = self.legacy {
@@ -1033,6 +1149,24 @@ impl<'a> UiText<'a> {
 mod widescreen_font_tests {
     use super::*;
 
+    #[test]
+    fn wide_text_is_split_from_byte_text_and_keeps_its_colour() {
+        assert_eq!(wide_runs("Bob^7: ^2ты *** да"), [(false, "Bob^7: ^2"), (true, "ты"), (false, " *** "), (true, "да")]);
+        assert_eq!(wide_runs("plain"), [(false, "plain")]);
+        assert!(wide_runs("").is_empty());
+        let white = [1.0, 1.0, 1.0, 1.0];
+        assert_eq!(colour_after("Bob^7: ^2", white, 1.0), color_code('2', 1.0).unwrap());
+        assert_eq!(colour_after("no codes ^", white, 1.0), white);
+
+        let mut font = test_font();
+        assert!(font.wide_glyph('Ж').is_none());
+        font.cyrillic = vec![font.glyphs[0]; CYRILLIC_COUNT];
+        assert_eq!(font.wide_glyph('Ж').unwrap().horiz_advance, 9);
+        // Outside the block: drawn as `?`, never as a wrong byte glyph.
+        assert!(font.wide_glyph('你').is_none());
+        assert_eq!(UiText::clean_width(&font, "^1Жук 你", 12.0), 5.0 * 9.0);
+    }
+
     fn test_font() -> ProportionalFont {
         let mut glyphs = [ProportionalGlyph::default(); 256];
         for glyph in &mut glyphs {
@@ -1043,7 +1177,7 @@ mod widescreen_font_tests {
             glyph.s2 = 1.0;
             glyph.t2 = 1.0;
         }
-        ProportionalFont { glyphs, point_size: 12, height: 12 }
+        ProportionalFont { glyphs, point_size: 12, height: 12, cyrillic: Vec::new() }
     }
 
     fn x_bounds(out: &[UiVertex], w: u32) -> (f32, f32) {
@@ -1104,6 +1238,7 @@ mod centerprint_parity_tests {
             glyphs: [ProportionalGlyph::default(); 256],
             point_size: 24,
             height: 24,
+            cyrillic: Vec::new(),
         };
         font.glyphs[b'A' as usize] = ProportionalGlyph {
             width: 8,

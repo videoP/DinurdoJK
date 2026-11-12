@@ -31,6 +31,7 @@ libjpeg-turbo-rs = "=0.8.0"
 jka-assets = { path = "../jka-assets" }
 jka-audio = { path = "../jka-audio" }
 jka-client-services = { path = "../jka-client-services" }
+jka-llm = { path = "../jka-llm" }
 jka-render-core = { path = "../jka-render-core" }
 jka-river = { path = "../jka-river" }
 jka-studio = { path = "../jka-studio" }
@@ -66,7 +67,11 @@ dlss_wgpu = { version = "=6.0.0", optional = true }
 uuid = { version = "=1.26.1", optional = true }
 
 [features]
-default = []
+default = ["local-llm"]
+# In-process llama.cpp (CPU) for local chat translation, the chat filter and
+# quickRundown. Building it needs CMake and libclang; `--no-default-features`
+# builds the client without it and those features report that it is missing.
+local-llm = ["jka-llm/llama"]
 # Opt-in: `build.ps1 -Fast -Dlss` (see DLAA_VULKAN.md).
 nvidia-dlss = ["dep:dlss_wgpu", "dep:uuid"]
 

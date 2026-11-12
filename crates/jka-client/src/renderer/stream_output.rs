@@ -366,6 +366,7 @@ impl StreamOutput {
         };
 
         let mut snapshot = renderer.ui_state.clone();
+        crate::streamer::strip_local_only(&mut snapshot);
         redact_stream_snapshot(&mut snapshot, self.settings);
         let mut vertices = Vec::<UiVertex>::new();
         if !snapshot.video.skip_ui {

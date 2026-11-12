@@ -8,6 +8,7 @@ publish.workspace = true
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "tga", "hdr"] }
 encoding_rs = "=0.8.41"
 jka-assets = { path = "../jka-assets" }
+jka-llm = { path = "../jka-llm" }
 jka-movement = { path = "../jka-movement" }
 jka-protocol = { path = "../jka-protocol" }
 jka-render-core = { path = "../jka-render-core" }

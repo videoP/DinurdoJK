@@ -22,6 +22,8 @@ pub(in crate::app) struct ChatRecord {
     /// Received message this line shows (chat translation); `None` for local echoes.
     pub(in crate::app) chat_id: Option<u64>,
     pub(in crate::app) translation: Option<crate::app::chat_translation::ChatRecordTranslation>,
+    /// Set while the chat filter holds this line or has changed it.
+    pub(in crate::app) censor: Option<crate::app::chat_translation::ChatRecordCensor>,
 }
 
 /// One row in the classic transparent top-left console-notify timestamp ring.
@@ -556,13 +558,27 @@ impl App {
                         kind,
                         team,
                         demo: chat_from_demo,
-                        own: sender.is_some() && sender == own_client,
+                        own: match sender {
+                            Some(_) => sender == own_client,
+                            // No slot from the server: the line starts with
+                            // the player's own name.
+                            None => {
+                                let own_name = crate::logging::strip_jka_colors(&self.network.name);
+                                let own_name = own_name.trim();
+                                let line = crate::logging::strip_jka_colors(&text);
+                                !own_name.is_empty()
+                                    && line.trim_start().strip_prefix(own_name).is_some_and(|rest| rest.trim_start().starts_with(':'))
+                            }
+                        },
                         sender,
                         sender_name,
                         text: &text,
                         body_start,
                     });
-                    self.push_console_chat_line(text.clone(), console_kind, chat_id);
+                    // The chat filter may hold the text back until it has
+                    // been checked; the console row then starts out held too.
+                    let filtered_line = self.chat_llm_received(chat_id);
+                    self.push_console_chat_line(filtered_line.unwrap_or_else(|| text.clone()), console_kind, chat_id);
                     if self.chat_lines.len() >= crate::app::chat_anim::KEEP_LINES {
                         self.chat_lines.pop_front();
                     }
@@ -571,6 +587,10 @@ impl App {
                     // Keep raw server text in console/history/logs; clean only the
                     // dedicated chatbox presentation, as controlled by the cvar.
                     let display_text = clean_chatbox_colors(&text, self.clean_chatbox);
+                    let censor = self
+                        .chat_translation
+                        .message_ref(chat_id)
+                        .and_then(|message| message.record_censor(&display_text));
                     self.chat_lines.push_back(ChatRecord {
                         text: display_text,
                         team,
@@ -578,6 +598,7 @@ impl App {
                         demo_elapsed_ms,
                         chat_id: Some(chat_id),
                         translation: None,
+                        censor,
                     });
                     self.last_chat_refresh = Instant::now();
                     self.publish_transient_ui();

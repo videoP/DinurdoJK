@@ -1305,7 +1305,7 @@ mod widescreen_lagometer_tests {
             glyph.width = 8; glyph.height = 12; glyph.horiz_advance = 8;
             glyph.baseline = 10; glyph.s2 = 1.0; glyph.t2 = 1.0;
         }
-        let font = ProportionalFont { glyphs, point_size: 12, height: 12 };
+        let font = ProportionalFont { glyphs, point_size: 12, height: 12, cyrillic: Vec::new() };
         let item = crate::lagometer::Text {
             text: "100".into(), x: 620.0, y: 200.0, right: true,
         };

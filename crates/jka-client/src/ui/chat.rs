@@ -5,6 +5,37 @@ use crate::ui::{
     CHATBOX_FONT_HEIGHT, CHATBOX_FONT_SCALE, CHATBOX_Y,
 };
 
+const MARK_CENSORED: [f32; 3] = [0.86, 0.22, 0.24];
+const MARK_TRANSLATED: [f32; 3] = [0.24, 0.56, 0.96];
+
+/// Width taken by the marks for `flags`, for a mark of diameter `size`.
+pub(in crate::ui) fn chat_marks_width(flags: u8, size: f32) -> f32 {
+    f32::from((flags & (super::CHAT_FLAG_CENSORED | super::CHAT_FLAG_TRANSLATED)).count_ones() as u8) * (size * 1.25)
+}
+
+/// Marks before a chat line's sender: a red no-entry disc when the chat
+/// filter changed or withheld the message, a blue disc with two text bars
+/// when the line is a translation. Drawn left to right from `x`, centred
+/// on `center_y`.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::ui) fn draw_chat_marks(out: &mut Vec<UiVertex>, flags: u8, x: f32, center_y: f32, size: f32, alpha: f32, w: u32, h: u32) {
+    let radius = size * 0.5;
+    let white = [1.0, 1.0, 1.0, alpha];
+    let mut cx = x + radius;
+    if flags & super::CHAT_FLAG_CENSORED != 0 {
+        let [r, g, b] = MARK_CENSORED;
+        super::disc(out, cx, center_y, radius, 14, [r, g, b, alpha], w, h);
+        rect(out, cx - radius * 0.58, center_y - radius * 0.17, radius * 1.16, radius * 0.34, white, w, h);
+        cx += size * 1.25;
+    }
+    if flags & super::CHAT_FLAG_TRANSLATED != 0 {
+        let [r, g, b] = MARK_TRANSLATED;
+        super::disc(out, cx, center_y, radius, 14, [r, g, b, alpha], w, h);
+        rect(out, cx - radius * 0.55, center_y - radius * 0.36, radius * 1.1, radius * 0.24, white, w, h);
+        rect(out, cx - radius * 0.55, center_y + radius * 0.12, radius * 0.7, radius * 0.24, white, w, h);
+    }
+}
+
 pub(in crate::ui) fn wrap_fixed_chat_text(value: &str, max_columns: usize) -> String {
     let max_columns = max_columns.max(1);
     let bytes = crate::cgame::text_to_jka_bytes(value);
@@ -170,28 +201,36 @@ pub(in crate::ui) fn build_chat_history(
         }
         let text = wrap_proportional_text(&line.text, font, CHATBOX_FONT_SCALE, chat_width);
         let lines = text.bytes().filter(|&byte| byte == b'\n').count() + 1;
-        wrapped.push((text, lines, alpha));
+        wrapped.push((text, lines, alpha, line.flags));
     }
     if wrapped.is_empty() {
         return;
     }
 
-    while wrapped.len() > 1 && wrapped.iter().map(|(_, lines, _)| *lines).sum::<usize>() > max_lines
+    while wrapped.len() > 1 && wrapped.iter().map(|(_, lines, _, _)| *lines).sum::<usize>() > max_lines
     {
         wrapped.remove(0);
     }
-    if let Some((text, lines, _)) = wrapped.first_mut() {
+    if let Some((text, lines, _, _)) = wrapped.first_mut() {
         if *lines > max_lines {
             *text = clamp_wrapped_chat_lines(text, max_lines);
             *lines = max_lines;
         }
     }
-    let total_lines: usize = wrapped.iter().map(|(_, lines, _)| *lines).sum();
+    let total_lines: usize = wrapped.iter().map(|(_, lines, _, _)| *lines).sum();
     let line_step_virtual = CHATBOX_FONT_HEIGHT * CHATBOX_FONT_SCALE;
     let x = CHATBOX_X * w as f32 / 640.0;
     let mut baseline_y = (CHATBOX_Y - line_step_virtual * total_lines as f32) * h as f32 / 480.0;
 
-    for (value, lines, alpha) in wrapped {
+    for (value, lines, alpha, flags) in wrapped {
+        if flags != 0 {
+            // In the margin left of the name, so the classic layout and
+            // its wrapping stay exactly as they were.
+            let row = line_step_virtual * h as f32 / 480.0;
+            let size = row * 0.62;
+            let marks = chat_marks_width(flags, size);
+            draw_chat_marks(out, flags, (x - marks).max(0.0), baseline_y + row * 0.5, size, alpha, w, h);
+        }
         proportional_text_uniform(
             out,
             &value,

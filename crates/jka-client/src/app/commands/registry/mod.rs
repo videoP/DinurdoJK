@@ -218,6 +218,7 @@ mod cvar_prelude {
 }
 
 pub(crate) mod audio_cvars;
+pub(crate) mod chat_llm_cvars;
 pub(crate) mod chat_translate_cvars;
 mod bindings;
 mod buttons;
@@ -375,6 +376,7 @@ pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
         definitions.extend(anny_cvars::DEFINITIONS.iter());
         definitions.extend(killfeed_cvars::DEFINITIONS.iter());
         definitions.extend(chat_translate_cvars::DEFINITIONS.iter());
+        definitions.extend(chat_llm_cvars::DEFINITIONS.iter());
         definitions
     })
 }

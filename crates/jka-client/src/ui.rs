@@ -317,9 +317,18 @@ pub struct UiChatAnim {
     pub idle_ms: u32,
     /// Caret blink phase.
     pub caret: bool,
+    /// Free mouse cursor in physical pixels: a marked chat line under it
+    /// shows its received text. Local presentation only; the stream
+    /// snapshot never carries it (`streamer::strip_local_only`).
+    pub pointer: Option<[f32; 2]>,
 }
 
-#[derive(Debug, Clone)]
+/// `UiChatLine::flags`: the chat filter changed or withheld this message.
+pub const CHAT_FLAG_CENSORED: u8 = 1;
+/// `UiChatLine::flags`: this line shows a translation.
+pub const CHAT_FLAG_TRANSLATED: u8 = 2;
+
+#[derive(Debug, Clone, Default)]
 pub struct UiChatLine {
     pub text: String,
     pub alpha: f32,
@@ -327,6 +336,11 @@ pub struct UiChatLine {
     pub enter: f32,
     /// Received as `tchat` / `ltchat`, not guessed from the rendered text.
     pub team: bool,
+    /// `CHAT_FLAG_*` marks drawn before the sender's name.
+    pub flags: u8,
+    /// The line as received, shown while the cursor rests on it. Local
+    /// presentation only: removed from the stream snapshot before drawing.
+    pub original: Option<String>,
 }
 
 /// Classic idTech/OpenJK console notify line: a recent console print promoted

@@ -727,6 +727,7 @@ impl App {
             chat_player_completion: None,
             chat_lines: VecDeque::with_capacity(16),
             chat_translation: crate::app::chat_translation::ChatTranslation::new(presentation.chat_translate.clone()),
+            chat_llm: crate::app::chat_llm::ChatLlm::new(presentation.chat_llm.clone()),
             last_chat_refresh: Instant::now(),
             console_notify: VecDeque::with_capacity(64),
             last_console_notify_refresh: Instant::now(),
