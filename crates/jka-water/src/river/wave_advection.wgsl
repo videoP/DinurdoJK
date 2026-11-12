@@ -79,3 +79,35 @@ fn river_advected_height(alpha:f32,magnitude:f32,distance:f32,s:RiverWaveHeight)
     var power=0.0;if a>2.980233e-8 {power=pow(a,s.attenuation.w);}
     return (alpha*(power*s.camera.x))*smoothstep(s.camera.y,s.camera.y+50.0,distance);
 }
+
+// Non-Unreal rendering-only A/B. After a wave texture covers multiple texels
+// per screen pixel, it is too finely sampled to justify the four bracket
+// combinations. Preserve the three native pulse phases (and their fade) but
+// sample only the dominant angle/magnitude bracket: 3 fetches rather than 12.
+// All fragment derivatives are taken before any conditional texture sampling.
+// Mode 0 selects the original native 12-sample function body and mip range.
+// lod: x mode, y mip cutoff (r_riverMaterialLODCutoff; mip includes the bias).
+fn river_wave_fragment_lod(tex:texture_2d<f32>,tex_sampler:sampler,position:vec2<f32>,velocity:vec2<f32>,normal:vec3<f32>,time:f32,s:RiverAdvection,lod:vec2<f32>)->vec4<f32> {
+    let p=river_wave_plan(velocity,normal,time,s);
+    let uv0=(position-velocity*p.times.x)*s.brackets.w;
+    let uv1=(position-velocity*p.times.y)*s.brackets.w;
+    let uv2=(position-velocity*p.times.z)*s.brackets.w;
+    let dims=vec2<f32>(textureDimensions(tex,0));
+    let max_mip=f32(textureNumLevels(tex));
+    let mips=clamp(vec3<f32>(
+        river_wave_mip(dpdx(uv0),dpdy(uv0),dims),
+        river_wave_mip(dpdx(uv1),dpdy(uv1),dims),
+        river_wave_mip(dpdx(uv2),dpdy(uv2),dims)) + s.wave.y,
+        vec3<f32>(0.0),vec3<f32>(max_mip));
+    // Keep all four bracket combinations while there are visible texels.
+    // Cutoff 4 (patch original; default now 2) is roughly four source texels per pixel with the
+    // river's default mip bias 2; evaluated separately for each draw pixel.
+    if lod.x < 0.5 || max(max(mips.x,mips.y),mips.z) < lod.y {
+        return river_wave_sample(tex,tex_sampler,p,position,s.brackets.w,mips);
+    }
+    let bracket=select(0u,2u,p.angle_blend>=0.5)+select(0u,1u,p.magnitude_blend>=0.5);
+    let a=textureSampleLevel(tex,tex_sampler,river_wave_uv(p,position,s.brackets.w,bracket,0u),mips.x);
+    let b=textureSampleLevel(tex,tex_sampler,river_wave_uv(p,position,s.brackets.w,bracket,1u),mips.y);
+    let c=textureSampleLevel(tex,tex_sampler,river_wave_uv(p,position,s.brackets.w,bracket,2u),mips.z);
+    return a*p.weights.x+b*p.weights.y+c*p.weights.z;
+}

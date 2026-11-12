@@ -102,6 +102,7 @@ pub fn module() -> wgpu::naga::Module {
     source = source.replace("let up = normalize(vec3<f32>(-rippled.slope.x, 1.0, -rippled.slope.y));",
         "let slope = jka_lake_surface(world.xz).yz;\n    let up = normalize(vec3<f32>(-rippled.slope.x - slope.x, 1.0, -rippled.slope.y - slope.y));");
     source.push_str(include_str!("lake_deformation.wgsl"));
+    source.push_str(crate::underwater_optics::SHADER);
     source.push_str(include_str!("cheapwater.wgsl"));
     source = source.replace(
         "    ripples: vec4<f32>,",

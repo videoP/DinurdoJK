@@ -49,6 +49,43 @@ impl Controls {
     }
 }
 
+/// Developer drain (not Unreal): a circle that removes the water standing
+/// above `level` (or above the bed, whichever is higher) once per solver
+/// frame. Positions/heights are relative to the simulation origin, in cm.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Drain {
+    pub center: [f32; 2],
+    pub radius: f32,
+    pub level: f32,
+    /// Most depth one cell may lose per solver frame (cm); 0 is unlimited.
+    pub max_removal: f32,
+}
+
+/// Apply every drain to one cell after the sources and sinks. Water only
+/// leaves; a drain never adds water or changes velocity.
+pub fn drain(mut water: Water, geo: Geometry, position: [f32; 3], drains: &[Drain]) -> Water {
+    if geo.collider >= 1.0 - 1e-5 {
+        return water;
+    }
+    for d in drains {
+        let offset = [position[0] - d.center[0], position[1] - d.center[1]];
+        if offset[0] * offset[0] + offset[1] * offset[1] > d.radius * d.radius || water.depth <= 1e-5 {
+            continue;
+        }
+        let floor = d.level.max(geo.bottom);
+        let mut removal = water.height - floor;
+        if removal <= 0.0 {
+            continue;
+        }
+        if d.max_removal > 0.0 {
+            removal = removal.min(d.max_removal);
+        }
+        water.depth = (water.depth - removal).max(0.0);
+        water.height = geo.bottom + water.depth;
+    }
+    water
+}
+
 fn smoothstep(edge: f32, value: f32) -> f32 {
     let t = (value / edge).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -232,6 +269,26 @@ mod tests {
         );
         assert_eq!((result.height, result.depth), (80.0, 80.0));
         assert!((result.velocity[0] - 9.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn drain_removes_water_above_its_level_inside_the_circle_with_an_optional_cap() {
+        let geo = Geometry { bottom: 10.0, ..Geometry::default() };
+        let water = Water { height: 110.0, depth: 100.0, velocity: [5.0, 0.0] };
+        let floor = Drain { center: [0.0; 2], radius: 50.0, level: -1000.0, max_removal: 0.0 };
+        let drained = drain(water, geo, [10.0, 0.0, 0.0], &[floor]);
+        assert_eq!((drained.height, drained.depth, drained.velocity), (10.0, 0.0, [5.0, 0.0]));
+        // Outside the circle: untouched.
+        assert_eq!(drain(water, geo, [60.0, 0.0, 0.0], &[floor]), water);
+        // Overflow level: keeps the water up to it.
+        let spill = Drain { level: 80.0, ..floor };
+        assert_eq!(drain(water, geo, [0.0; 3], &[spill]).height, 80.0);
+        // Capped: at most max_removal per frame.
+        let capped = Drain { max_removal: 4.0, ..floor };
+        assert_eq!(drain(water, geo, [0.0; 3], &[capped]).depth, 96.0);
+        // Colliders are never drained.
+        let wall = Geometry { collider: 1.0, ..geo };
+        assert_eq!(drain(water, wall, [0.0; 3], &[floor]), water);
     }
 
     #[test]

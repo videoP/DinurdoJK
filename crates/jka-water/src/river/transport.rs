@@ -295,13 +295,15 @@ impl<'a> Field<'a> {
                 0.5 * (self.water(x + 1, y).velocity[0] + input.velocity[0]),
                 0.5 * (self.water(x, y + 1).velocity[1] + input.velocity[1]),
             ];
-            w.depth = self.sample(
-                [
-                    x as f32 - scale * velocity[0],
-                    y as f32 - scale * velocity[1],
-                ],
-                1,
-            );
+            if settings.advect_depth {
+                w.depth = self.sample(
+                    [
+                        x as f32 - scale * velocity[0],
+                        y as f32 - scale * velocity[1],
+                    ],
+                    1,
+                );
+            }
         }
         w.height = geo.bottom + w.depth;
         // This scratch function receives the newly advected depth, not the

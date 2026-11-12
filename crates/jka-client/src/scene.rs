@@ -1604,13 +1604,25 @@ pub struct PreparedRemapPlan {
     pub replacement_textures: Vec<TextureData>,
     pub replacement_texture_hashes: Vec<u64>,
     pub replacement_videos: Vec<materials::VideoSource>,
+    /// Per-source BSP shader remap results, aligned with base.material_debug.
+    /// The immutable base map intentionally retains only original shader info.
+    pub remap_diagnostics: Vec<Option<(String, bool)>>,
     pub warnings: Vec<String>,
 }
 
 impl PreparedRemapPlan {
+    /// Copy only diagnostics for a cold material rebind; no BSP or stage state
+    /// is touched. Used by both resident fast-paths and the full-upload fallback.
+    pub fn apply_remap_diagnostics(&self, target: &mut MaterialDebugInfo) {
+        for (entry, remap) in target.entries.iter_mut().zip(&self.remap_diagnostics) {
+            entry.remapped_to = remap.as_ref().map(|(name, _)| name.clone());
+            entry.remap_target_resolved = remap.as_ref().is_some_and(|(_, resolved)| *resolved);
+        }
+    }
     /// Rare fallback for material changes that generate physical geometry.
     pub fn into_full_map(self) -> PreparedMap {
         let mut map = (*self.base).clone();
+        self.apply_remap_diagnostics(&mut map.material_debug);
         map.batches = self.batches;
         map.pvs_batches = self.pvs_batches;
         map.inline_batches = self.inline_batches;
@@ -1900,6 +1912,13 @@ pub struct MaterialDebugEntry {
     /// Render recipe depends on vertex-lit/LM availability; this classification
     /// is a conservative candidate analysis, NOT proof of an applied collapse.
     pub stage_sequence: Vec<String>,
+    /// Effective shader redirect recorded during map preparation, exclusively
+    /// for cold-path Trace Inspector diagnostics. BSP entries retain their
+    /// *original* shader name because their shader-table index never changes.
+    pub remapped_to: Option<String>,
+    /// False when a requested R_RemapShader target was missing and the original
+    /// material was retained. True only when replacement stages were resolved.
+    pub remap_target_resolved: bool,
     /// Resolved stage/base/PBR image providers used by this material.
     pub image_sources: Vec<String>,
     /// Indexed source / decoded asset / fallback diagnosis captured on map load.

@@ -102,6 +102,120 @@ pub(in crate::renderer) fn inspector_texture_meta(texture: &TextureData) -> Insp
     }
 }
 
+/// Snapshot the already-prepared stage animations and their last GPU bind-
+/// group selection. This intentionally runs only for an explicit /trace: it
+/// does not inspect/re-resolve shader assets or add work to a render frame.
+fn shader_animation_trace(
+    bsp_shader: Option<&str>,
+    debug: Option<&scene::MaterialDebugEntry>,
+    prepared: &[&crate::renderer::WorldBatch],
+    textures: &[InspectorTextureMeta],
+    raw_time: f32,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("BSP SOURCE SHADER: {}", bsp_shader.unwrap_or("<unknown>")));
+    match debug.and_then(|entry| entry.remapped_to.as_deref()) {
+        Some(target) => {
+            lines.push(format!("REMAP DESTINATION: {target}"));
+            lines.push(format!("REMAP RESOLUTION: {}",
+                if debug.is_some_and(|entry| entry.remap_target_resolved) {
+                    "APPLIED (destination stages prepared)"
+                } else {
+                    "TARGET NOT FOUND (original stages retained)"
+                }));
+        }
+        None => lines.push("REMAP DESTINATION: <none; original material>".into()),
+    }
+    lines.push(format!("RENDERER ANIMATION CLOCK: {raw_time:.6} s (snapshot when trace was taken)"));
+    lines.push("STAGE NUMBERS BELOW ARE PREPARED GPU STAGES (not necessarily authored stages after lightmap folding).".into());
+
+    let mut animated_stages = 0;
+    for (draw_index, draw) in prepared.iter().enumerate() {
+        for (stage_index, stage) in std::iter::once(&draw.source)
+            .chain(draw.source.additive_companions.iter())
+            .enumerate()
+        {
+            let Some(definition) = stage.animation.as_ref() else { continue; };
+            animated_stages += 1;
+            let shader_time = jka_assets::shader::shader_time(
+                raw_time, stage.shader_time_offset, stage.shader_clamp_time,
+            );
+            let expected = definition.frame_index(shader_time);
+            // A fused stage should not be animated, because additive fusion
+            // explicitly excludes animMaps. Report this if that invariant is
+            // ever violated rather than claiming it has an independent binding.
+            let gpu_selected = (stage_index == 0)
+                .then(|| draw.animation.as_ref().map(|animation| animation.selected))
+                .flatten();
+            lines.push(format!(
+                "PREPARED DRAW {} / STAGE {}: animMap fps={:.6} frames={} mode={}",
+                draw_index + 1, stage_index + 1, definition.fps,
+                definition.frames.len(),
+                if definition.one_shot { "ONE-SHOT" } else { "LOOP" },
+            ));
+            lines.push(format!(
+                "  timeOffset={:.6} s clampTime={} effective shaderTime={shader_time:.6} s",
+                stage.shader_time_offset,
+                stage.shader_clamp_time.map_or_else(|| "<none>".to_owned(), |s| format!("{s:.6} s")),
+            ));
+            lines.push(format!(
+                "  CALCULATED FRAME: {expected}    GPU-BOUND FRAME: {}",
+                gpu_selected.map_or_else(|| "<not separately bound>".to_owned(), |f| f.to_string()),
+            ));
+            if let Some(selected) = gpu_selected {
+                if selected != expected {
+                    lines.push("  FRAME DIFFERENCE: calculated index and last installed GPU binding differ; the render thread can be one frame ahead/behind this snapshot".into());
+                }
+            } else if stage_index > 0 {
+                lines.push("  WARNING: animated additive companion was fused without its own frame binding".into());
+            } else if definition.frames.len() <= 1 {
+                lines.push("  NOTE: single-frame animation uses its static texture binding".into());
+            } else {
+                lines.push("  WARNING: no world animMap frame bindings were built for this stage".into());
+            }
+            if definition.frames.len() > 64 {
+                lines.push(format!("  FRAME LIST: first 64 plus calculated/bound ({} total)", definition.frames.len()));
+            }
+            for (frame_index, texture_index) in definition.frames.iter().copied().enumerate() {
+                if frame_index >= 64 && frame_index != expected && gpu_selected != Some(frame_index) {
+                    continue;
+                }
+                let selected_label = if gpu_selected == Some(frame_index) { " <GPU-BOUND>" } else { "" };
+                let expected_label = if frame_index == expected { " <CALCULATED>" } else { "" };
+                if let Some(meta) = textures.get(texture_index) {
+                    let provider = meta.source.as_deref()
+                        .map_or_else(|| "<not recorded; check missing/generated fallback>".to_owned(),
+                            |path| path.display().to_string());
+                    lines.push(format!(
+                        "  FRAME {frame_index}: {} [image #{texture_index}] {}x{} {} provider={}{}{}",
+                        meta.label, meta.width, meta.height,
+                        if meta.clamp { "CLAMP" } else { "REPEAT" },
+                        provider, selected_label, expected_label,
+                    ));
+                } else {
+                    lines.push(format!(
+                        "  FRAME {frame_index}: [image #{texture_index}] NOT IN UPLOADED TEXTURE TABLE{selected_label}{expected_label}",
+                    ));
+                }
+            }
+            if let Some(first) = definition.frames.first() {
+                if stage.texture != Some(*first) {
+                    lines.push(format!(
+                        "  WARNING: base binding image {:?} does not match frame 0 image #{}",
+                        stage.texture, first,
+                    ));
+                }
+            }
+        }
+    }
+    if animated_stages == 0 {
+        lines.push("ANIMMAP: no animated stages in the prepared draws for this face".into());
+    } else {
+        lines.push(format!("ANIMMAP STAGES: {animated_stages} (inspect GPU-BOUND vs CALCULATED and the frame providers above)"));
+    }
+    lines
+}
+
 /// Reconstruct the *exact* key used in world upload from the traced batch's
 /// original vertices (not its FFT-padded render bounds). Shader stages sharing
 /// the same face therefore find the same promotion decision.
@@ -704,6 +818,14 @@ impl Renderer {
                 && other.is_inline_entity == batch.is_inline_entity
         };
         let prepared: Vec<_> = world.coarse_batches.iter().filter(same_face).collect();
+        // Read the same clock used by advance_world_animations, not a new
+        // system timestamp or the (possibly fixed) unrelated post-FX clock.
+        let animation_trace = shader_animation_trace(
+            debug_entry.map(|entry| entry.name.as_str()), debug_entry,
+            &prepared, &world.inspector_textures,
+            self.scene_time.unwrap_or_else(|| self.started.elapsed().as_secs_f32()),
+        );
+        lines.extend(animation_trace.iter().map(|line| format!("ANIM TRACE: {line}")));
         let prepared_stages: usize = prepared.iter()
             .map(|b| if b.source.pipeline.legacy_srgb_three_stage { 3 }
                 else { 1 + b.source.additive_companions.len() }).sum();
@@ -1307,12 +1429,20 @@ impl Renderer {
             sections.insert(
                 0,
                 SurfaceInspectorSection {
-                    title: "SHADER SCRIPT".into(),
+                    title: if debug_entry.and_then(|entry| entry.remapped_to.as_ref()).is_some() {
+                        "ORIGINAL BSP SHADER SCRIPT (BEFORE REMAP)".into()
+                    } else {
+                        "SHADER SCRIPT".into()
+                    },
                     lines: definition_text.lines().map(str::to_owned).collect(),
                 },
             );
         }
 
+        sections.insert(0, SurfaceInspectorSection {
+            title: "SHADER REMAP / ANIMMAP".into(),
+            lines: animation_trace,
+        });
         let patch_report=world.patch_lod.describe(triangle_start);
         if let Some(report)=&patch_report {
             lines.extend(report.iter().cloned());

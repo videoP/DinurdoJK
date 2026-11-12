@@ -1898,7 +1898,7 @@ mod tests {
             [300.0, 100.0, -100.0],
             [-100.0, 100.0, 300.0],
         ];
-        let vertices = Arc::new(
+        let vertices: Arc<Vec<GpuVertex>> = Arc::new(
             positions
                 .into_iter()
                 .enumerate()

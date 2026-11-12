@@ -57,6 +57,16 @@ impl Field {
     pub fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
     }
+    /// The identity `from_samples` gives these samples, without uploading them.
+    pub fn identity_of(samples: &[WaterInfo]) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        for w in samples {
+            for v in [w.height, w.depth, w.flow_velocity[0], w.flow_velocity[1]] {
+                hash.update(v.to_le_bytes());
+            }
+        }
+        hash.finalize().into()
+    }
     pub fn from_samples(
         device: &wgpu::Device,
         dimensions: [u32; 2],

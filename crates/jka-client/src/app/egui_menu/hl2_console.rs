@@ -402,6 +402,7 @@ impl App {
                 let log_height = (ui.available_height() - 45.0).max(65.0);
                 let mut reveal_path = None;
                 let mut chat_action = None;
+                let mut toggle_chat = None;
                 // Egui is only the painter/window layout here. The classic
                 // ConsolePoint selection and Ctrl+C path own all text state.
                 // Individual selectable labels cannot select across virtual
@@ -499,7 +500,33 @@ impl App {
                                     ), 0.0, egui::Color32::from_rgb(68, 107, 146));
                                 }
                                 painter.galley(origin, galley.clone(), LABEL);
-                                if response.clicked() {
+                                let mut toggled_this_row = false;
+                                if let Some(id) = chat_id {
+                                    if let Some(checked) = self.console_chat_translate_checked(id) {
+                                        let edge = 13.0;
+                                        let square = egui::Rect::from_min_size(
+                                            egui::pos2(rect.right() - edge - 4.0, rect.center().y - edge * 0.5),
+                                            egui::vec2(edge, edge),
+                                        );
+                                        let toggle = ui.interact(square,
+                                            ui.id().with(("hl2_translate", index)), egui::Sense::click());
+                                        if checked {
+                                            painter.rect_filled(square, 1.0,
+                                                egui::Color32::from_rgba_unmultiplied(42, 150, 171, 70));
+                                        }
+                                        painter.rect_stroke(square, 1.0, egui::Stroke::new(1.0,
+                                            if checked { egui::Color32::from_rgb(109, 220, 230) } else { DIM }),
+                                            egui::StrokeKind::Inside);
+                                        painter.text(square.center(), egui::Align2::CENTER_CENTER, "Aa",
+                                            egui::FontId::monospace(9.0),
+                                            if checked { egui::Color32::from_rgb(109, 220, 230) } else { DIM });
+                                        if toggle.on_hover_text("Toggle automatic translation for this player").clicked() {
+                                            toggled_this_row = true;
+                                            toggle_chat = Some(id);
+                                        }
+                                    }
+                                }
+                                if !toggled_this_row && response.clicked() {
                                     if let Some(pointer) = response.interact_pointer_pos() {
                                         let point = galley_point(index, &galley, origin, pointer);
                                         self.begin_console_selection(point);
@@ -578,6 +605,9 @@ impl App {
                 }
                 if let Some(action) = chat_action {
                     self.apply_chat_menu_action(action);
+                }
+                if let Some(id) = toggle_chat {
+                    self.toggle_console_chat_translate(id);
                 }
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(">").monospace().color(DIM));

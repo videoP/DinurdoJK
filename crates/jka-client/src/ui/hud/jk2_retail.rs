@@ -694,7 +694,7 @@ mod tests {
         build_select_chrome(&mut vertices, &ui, 1280, 720);
         assert!(vertices.iter().all(|v| v.color == [255; 4]));
         ui.video.tint_hud = true;
-        ui.hud.as_mut().unwrap().gametype = crate::cgame::GT_FFA;
+        ui.hud.as_mut().unwrap().gametype = 0; // GT_FFA
         vertices.clear();
         build_select_chrome(&mut vertices, &ui, 1280, 720);
         assert!(vertices.iter().all(|v| v.color == [255; 4]));

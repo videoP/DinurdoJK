@@ -1292,8 +1292,13 @@ pub enum RenderCommand {
     RiverMaterial(crate::river_authoring::Id, crate::river_settings::Settings),
     RiverSource(crate::river_authoring::Id, crate::river_authoring::LiveControls),
     RiverRemove(crate::river_authoring::Id),
-    RiverSpawn(crate::river_authoring::Definition, std::sync::Arc<Vec<jka_assets::bsp::river::CollisionSurface>>),
+    RiverSpawn(crate::river_authoring::Definition, std::sync::Arc<jka_assets::bsp::river::RiverCollision>),
     RiverClear,
+    /// Every developer drain (spawndrain / River menu); applies to all rivers.
+    RiverDrains(Vec<crate::river_runtime::LocalDrain>),
+    /// `riverdump`: read back each live river, probe the column under `eye`
+    /// (map units) and write top-down PNGs into `directory`.
+    RiverDump { eye: [f32; 3], directory: std::path::PathBuf },
     SetPromotedOceanSettings(Vec<(usize, crate::ocean::OceanSettings)>),
     SetAuthoredOceans(Vec<crate::ocean::authoring::AuthoredOcean>),
     SetOceanTime(f32),

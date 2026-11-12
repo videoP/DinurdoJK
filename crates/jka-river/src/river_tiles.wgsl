@@ -1,6 +1,8 @@
 // Sparse river tile pool: per-tile bed commit, the camera presentation window
 // gather and the host CFS inlet. Not Unreal systems; see
 // jka_water::river::sparse. Pool index = slot * tile^2 + local_y * tile + local_x.
+// History (binding 3), commit normals (7) and gathered pool normals (12) come
+// from the r_riverStorageMode prelude (river_storage.rs).
 
 fn pool_index(slot: u32, tile: u32, lane: vec2<u32>) -> u32 {
     return slot * tile * tile + lane.y * tile + lane.x;
@@ -8,22 +10,23 @@ fn pool_index(slot: u32, tile: u32, lane: vec2<u32>) -> u32 {
 
 // ---- Bed commit: capture.wgsl stages 5/6 for one tile, then TileInit ----
 // The tile's square capture uses the river-wide cameras. Collision capture
-// has no dilation and a dry (zero) WaterInfo, exactly as the dense patch.
-// The border collider follows the virtual rectangle, not the tile.
+// has no dilation. Its WaterInfo height is dry (zero), exactly as the dense
+// patch, or with r_riverCaptureMode 1 the per-cell reachable-floor reference
+// (river_reach.rs). The border collider follows the virtual rectangle.
 struct Commit {
     cells: vec4<i32>,  // first cell xy, lattice cells xy
     slot: vec4<u32>,   // slot, tile size, capture resolution, Niagara reset (1) or TileInit (0)
-    contour_floor: vec4<f32>,  // contour floor (cm), unused x3
+    contour_floor: vec4<f32>,  // contour floor (cm), void threshold (cm), bed reference bound (1) or not (0), unused
     cameras: array<vec4<f32>, 5>, // local camera Z, +/- depth direction
 }
 @group(0) @binding(0) var<uniform> commit: Commit;
 @group(0) @binding(1) var depths: texture_2d_array<f32>;
 @group(0) @binding(2) var<storage, read_write> commit_geometry: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read_write> commit_history: array<f32>;
 @group(0) @binding(4) var<storage, read_write> commit_state_a: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> commit_state_b: array<vec4<f32>>;
 @group(0) @binding(6) var<storage, read_write> commit_surface: array<vec4<f32>>;
-@group(0) @binding(7) var<storage, read_write> commit_normals: array<vec4<f32>>;
+// Stage 6 WaterInfo height per tile cell (row-major, local cm), mode 1 only.
+@group(0) @binding(23) var<storage, read> commit_reference: array<f32>;
 
 fn capture_depth(cell: vec2<i32>, layer: i32) -> f32 {
     let last = i32(commit.slot.z) - 1;
@@ -52,12 +55,17 @@ fn commit_tile(@builtin(global_invocation_id) id: vec3<u32>) {
             values[layer] = max(commit.cameras[layer].x + commit.cameras[layer].y * capture_bilinear(uv, layer), floor_value);
         }
     }
-    // prepare_geometry with dilation radius 0 and dry WaterInfo height 0.
+    // prepare_geometry with dilation radius 0 and dry WaterInfo height 0,
+    // or the mode 1 reachable-floor reference.
+    var reference = 0.0;
+    if commit.contour_floor.z != 0.0 {
+        reference = commit_reference[id.y * tile + id.x];
+    }
     var top = max(-100000.0, values[3]);
     var under = max(-100000.0, values[4]);
     top = max(top, values[1]);
     under = min(under, values[2]);
-    if 0.0 - under <= 0.0 && under > values[0] && top > under && top > values[0] {
+    if reference - under <= 0.0 && under > values[0] && top > under && top > values[0] {
         top = values[0];
     }
     let at = commit.cells.xy + vec2<i32>(id.xy);
@@ -66,7 +74,9 @@ fn commit_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     var bottom = max(top, values[0]);
     // Void: nothing at all was captured in this column (every bed candidate
     // lies above the contour floor). It is a wall as tall as the capture.
-    if bottom <= floor_value {
+    // The threshold sits half the capture headroom above the floor: the
+    // empty-pixel reconstruction does not round exactly onto the floor.
+    if bottom <= commit.contour_floor.y {
         border = true;
         bottom = commit.cameras[0].x;
     }
@@ -74,23 +84,23 @@ fn commit_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     commit_geometry[i] = vec4<f32>(bottom, select(0.0, 1.0, border), 0.0, 0.0);
     if commit.slot.w != 0u {
         // A simulation's first tiles: Niagara reset zero grids and history.
-        commit_history[i] = 0.0;
+        commit_store_history(i, 0.0);
         commit_state_a[i] = vec4<f32>(0.0);
         commit_state_b[i] = vec4<f32>(0.0);
     } else {
         // Later tiles: a dense cell that stayed dry (sparse::TileInit).
-        commit_history[i] = bottom;
+        commit_store_history(i, bottom);
         commit_state_a[i] = vec4<f32>(bottom, 0.0, 0.0, 0.0);
         commit_state_b[i] = vec4<f32>(bottom, 0.0, 0.0, 0.0);
     }
     commit_surface[i] = vec4<f32>(0.0);
-    commit_normals[i] = vec4<f32>(0.0, 0.0, 1.0, 0.0);
+    commit_store_rest_normal(i);
 }
 
 // ---- Void walls for a dense prepared bed (same rule as commit_tile) ----
 struct VoidWalls {
     counts: vec4<u32>,  // cells, unused x3
-    heights: vec4<f32>, // contour floor, wall height, unused x2
+    heights: vec4<f32>, // void threshold (contour floor + margin), wall height, unused x2
 }
 @group(0) @binding(21) var<uniform> void_walls: VoidWalls;
 @group(0) @binding(22) var<storage, read_write> void_geometry: array<vec4<f32>>;
@@ -117,7 +127,6 @@ struct Window {
 @group(0) @binding(9) var<storage, read> window_slots: array<i32>;
 @group(0) @binding(10) var<storage, read> window_state: array<vec4<f32>>;
 @group(0) @binding(11) var<storage, read> window_pool_surface: array<vec4<f32>>;
-@group(0) @binding(12) var<storage, read> window_pool_normals: array<vec4<f32>>;
 @group(0) @binding(13) var window_out_state: texture_storage_2d_array<r32float, write>;
 @group(0) @binding(14) var<storage, read_write> window_out_surface: array<vec4<f32>>;
 @group(0) @binding(15) var<storage, read_write> window_out_normals: array<vec4<f32>>;
@@ -137,7 +146,7 @@ fn gather_window(@builtin(global_invocation_id) id: vec3<u32>) {
             let i = pool_index(u32(slot), window.table.z, lane);
             water = window_state[i];
             surface = window_pool_surface[i];
-            normal = window_pool_normals[i];
+            normal = window_pool_normal(i);
         }
     }
     water.x -= window.height.x;

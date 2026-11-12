@@ -52,6 +52,11 @@ pub(super) enum PlacementKind { Md3, Bmodel, Fx }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum EditSelection { Md3(usize), Bmodel(usize), Fx(usize) }
 
+/// Deferred selection in the Map Mods file browser. A dedicated Unload case
+/// distinguishes the radio option from an ordinary filename.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum EntFileChoice { Unload, Load(String) }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum EditDragMode { Move, YawPitch, Roll }
 
@@ -131,6 +136,17 @@ pub(super) struct ModelPlacementUi {
     pub bmodel_collision_dirty: bool,
     pub bmodel_collision_local: bool,
     pub ent_filename: String,
+    /// The file successfully loaded or saved in this map session. Unlike the
+    /// suggested filename, this controls the selected radio button and Save.
+    pub ent_loaded_file: Option<String>,
+    /// Cached on dialog open / explicit Refresh / successful Save, not rescanned
+    /// on every UI frame.
+    pub ent_files: Vec<String>,
+    pub ent_file_filter: String,
+    pub ent_pending_selection: Option<EntFileChoice>,
+    pub ent_save_as_open: bool,
+    pub ent_save_as_name: String,
+    pub ent_save_as_overwrite_confirm: bool,
     pub ent_overwrite: bool,
     pub ent_status: String,
     pub ent_dirty: bool,
@@ -207,7 +223,11 @@ impl Default for ModelPlacementUi {
             bmodel_pivot: [0.0; 3], bmodel_bounds: None,
             bmodel_placed: Vec::new(),
             bmodel_collision_dirty: true, bmodel_collision_local: false,
-            ent_filename: String::new(), ent_overwrite: false, ent_status: String::new(), ent_dirty: false,
+            ent_filename: String::new(), ent_loaded_file: None,
+            ent_files: Vec::new(), ent_file_filter: String::new(), ent_pending_selection: None,
+            ent_save_as_open: false, ent_save_as_name: String::new(),
+            ent_save_as_overwrite_confirm: false,
+            ent_overwrite: false, ent_status: String::new(), ent_dirty: false,
             edit_mode: false, editor_placing: false, hover: None, held: None, edit_undo: Vec::new(),
             edit_redo: Vec::new(), authored_remaps: Default::default(),
             editor_selected: None, bmodel_hover: None, editor_drag: None,

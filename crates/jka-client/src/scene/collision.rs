@@ -62,15 +62,17 @@ pub fn prepare_physics_collision(
     Ok(bsp_physics_collision_mesh(&bsp, &mesh))
 }
 
-/// Riverbed triangles for the developer river source: the current map's
-/// collision geometry (`jka_assets::bsp::river::collision_triangles`).
+/// Riverbed collision for the developer river source: the current map's
+/// collision surfaces (`jka_assets::bsp::river::collision_surfaces`) and,
+/// with `with_capture` (`r_riverCaptureMode 1`), its full capture geometry.
 /// Re-reads the BSP; callers cache the result per map.
 pub fn river_collision_triangles(
     root: &Path,
     game: Option<&Path>,
     source: &MapSource,
     allow_asset_overrides: bool,
-) -> Result<Vec<jka_assets::bsp::river::CollisionSurface>, String> {
+    with_capture: bool,
+) -> Result<jka_assets::bsp::river::RiverCollision, String> {
     let MapSource::Bsp(name) = source else {
         return Err("river sources need a compiled BSP map".into());
     };
@@ -82,7 +84,10 @@ pub fn river_collision_triangles(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("Map {asset_name} not found on the game/base asset search path"))?;
     let bsp = Bsp::parse(&asset.bytes).map_err(|error| error.to_string())?;
-    jka_assets::bsp::river::collision_surfaces(&bsp)
+    Ok(jka_assets::bsp::river::RiverCollision {
+        surfaces: jka_assets::bsp::river::collision_surfaces(&bsp)?,
+        capture: with_capture.then(|| jka_assets::bsp::river::capture_geometry(&bsp)).transpose()?,
+    })
 }
 
 pub(in crate::scene) fn bsp_physics_collision_mesh(

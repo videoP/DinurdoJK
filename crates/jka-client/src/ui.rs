@@ -370,6 +370,12 @@ pub struct UiScoreEntry {
     pub spectating_you: bool,
     /// DinurdoJK client-side mute: chat from this client is dropped locally.
     pub muted: bool,
+    /// Effective auto-translation state; None hides the checkbox (own player,
+    /// translation disabled, or non-live scoreboard).
+    pub translate_checked: Option<bool>,
+    /// User-selected source-language hint (ISO 639-1), not detected language.
+    /// None means Auto-detect and has no scoreboard label.
+    pub translate_source: Option<&'static str>,
     /// Current score leader; gets the crown over their name.
     pub crowned: bool,
     /// `model/skin`, for the avatar (`AvatarAtlas`).
@@ -633,8 +639,8 @@ pub struct ScoreboardMenuUi {
     pub detail: Option<String>,
 }
 
-/// Language hints offered in the scoreboard translation submenu; index 0 is
-/// automatic detection. The console menu offers every language.
+/// Source languages offered by the scoreboard picker (index 0 is auto).
+/// The console picker offers every supported source language.
 pub static SCOREBOARD_TRANSLATE_LANGUAGES: [(&str, &str); 12] = [
     ("", "AUTO-DETECT"),
     ("ru", "RUSSIAN"),
@@ -659,17 +665,15 @@ pub enum ScoreAction {
     ConfirmVoteKick,
     CancelVoteKick,
     ForceSpectate,
-    /// Opens the per-player chat translation submenu.
-    Translate,
-    TranslateAlways,
-    TranslateNever,
-    /// Clear the mode: follow the global setting.
+    /// Inline checkbox: direct per-player automatic translation toggle.
+    Translate(bool),
+    /// Clear an explicit rule and follow the global setting again.
     TranslateDefault,
-    /// Opens the language hint list.
-    TranslateLanguages,
-    /// Index into [`SCOREBOARD_TRANSLATE_LANGUAGES`].
-    TranslateHint(u8),
-    TranslateDone,
+    /// Direct language picker, showing the current source language.
+    TranslateLanguages(Option<&'static str>),
+    /// Index into [`SCOREBOARD_TRANSLATE_LANGUAGES`] and whether the
+    /// option is the player's currently selected source language.
+    TranslateHint(u8, bool),
 }
 
 impl ScoreAction {
@@ -682,15 +686,12 @@ impl ScoreAction {
             Self::ConfirmVoteKick => "YES, CALL KICK VOTE",
             Self::CancelVoteKick => "CANCEL",
             Self::ForceSpectate => "VOTE SPECTATE",
-            Self::Translate => "TRANSLATION...",
-            Self::TranslateAlways => "ALWAYS TRANSLATE",
-            Self::TranslateNever => "NEVER TRANSLATE",
-            Self::TranslateDefault => "USE CHAT SETTING",
-            Self::TranslateLanguages => "LANGUAGE HINT...",
-            Self::TranslateHint(index) => SCOREBOARD_TRANSLATE_LANGUAGES
+            Self::Translate(_) => "TRANSLATE",
+            Self::TranslateDefault => "USE GLOBAL CHAT SETTING",
+            Self::TranslateLanguages(source) => source.map_or("AUTO-DETECT", crate::chat_translation::lang::name),
+            Self::TranslateHint(index, _) => SCOREBOARD_TRANSLATE_LANGUAGES
                 .get(usize::from(index))
                 .map_or("AUTO-DETECT", |&(_, label)| label),
-            Self::TranslateDone => "DONE",
         }
     }
 }
@@ -700,6 +701,8 @@ impl ScoreAction {
 pub enum ScoreboardHit {
     /// A player row, by client number.
     Row(i32),
+    /// Opens the translation + language popup from a player row or spectator chip.
+    TranslateMenu(i32),
     /// An entry in the open player menu, by index into its `actions`.
     Action(usize),
     VoteYes,
@@ -1718,9 +1721,13 @@ pub struct UiSnapshot {
     pub console_status: String,
     pub console_lines: Vec<String>,
     pub console_line_kinds: Vec<crate::logging::ConsoleLineKind>,
+    /// Inline translation checkboxes aligned with the visible wrapped rows.
+    pub console_translate_checked: Vec<Option<bool>>,
     pub console_scroll: usize,
     pub console_size: ConsoleSize,
     pub console_hl2: bool,
+    /// An egui chat popup must render above the native classic console.
+    pub classic_console_chat_menu_open: bool,
     /// Character scale for console log and prompt; independent of HUD and popup UI.
     pub console_scale: f32,
     pub console_selection: Option<ConsoleSelection>,
@@ -1874,9 +1881,11 @@ impl Default for UiSnapshot {
             console_status: String::new(),
             console_lines: Vec::new(),
             console_line_kinds: Vec::new(),
+            console_translate_checked: Vec::new(),
             console_scroll: 0,
             console_size: ConsoleSize::Normal,
             console_hl2: false,
+            classic_console_chat_menu_open: false,
             console_scale: 1.0,
             console_selection: None,
             console_search_open: false,

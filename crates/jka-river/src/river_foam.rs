@@ -163,11 +163,62 @@ pub struct Field {
 pub struct FieldInputs<'a> {
     pub state: &'a [wgpu::Texture; 2],
     pub normal_grid: &'a wgpu::Texture,
+    /// The window's live block flags (river_blocks); None runs every cell.
+    pub blocks: Option<FoamBlocks<'a>>,
+}
+
+/// river_blocks' per-block live flags over the same cells as FoamGrid.
+pub struct FoamBlocks<'a> {
+    pub flags: &'a wgpu::Buffer,
+    pub grid: [u32; 2],
+}
+
+/// Block-culled stage 16 (not Unreal): cells whose block and all eight
+/// neighbouring blocks hold no water (river_blocks flags: no depth within a
+/// cell of the block) store zero instead of advecting. Foam within a block
+/// width (16 cells) of any water runs the full stage, so foam drifting off
+/// the wet edge and back is kept; only foam stranded farther out on dry bed
+/// or unloaded void is dropped.
+pub(crate) fn block_stage() -> String {
+    format!(
+        r#"
+@group(0) @binding(6) var<uniform> foam_blocks: vec4<u32>; // block grid xy
+@group(0) @binding(7) var<storage, read> foam_block_flags: array<u32>;
+@compute @workgroup_size(8,8)
+fn foam_stage_blocks(@builtin(global_invocation_id) id: vec3<u32>) {{
+    if any(id.xy >= textureDimensions(foam_output)) {{ return; }}
+    let block = vec2<i32>(id.xy / {block}u);
+    let grid = vec2<i32>(foam_blocks.xy);
+    var live = false;
+    for (var y = -1; y <= 1; y++) {{
+        for (var x = -1; x <= 1; x++) {{
+            let b = block + vec2<i32>(x, y);
+            if all(b >= vec2<i32>(0)) && all(b < grid) && foam_block_flags[b.y * grid.x + b.x] != 0u {{
+                live = true;
+            }}
+        }}
+    }}
+    if !live {{
+        textureStore(foam_output, id.xy, vec4<f32>(0.0));
+        return;
+    }}
+    river_foam_cell(id.xy);
+}}
+"#,
+        block = crate::river_blocks::BLOCK
+    )
 }
 
 impl Field {
     pub fn new(device: &wgpu::Device, inputs: FieldInputs<'_>, setup: &Setup) -> Result<Self, String> {
         let dimensions = setup.dimensions;
+        if let Some(blocks) = &inputs.blocks {
+            if blocks.grid != dimensions.map(|n| n.div_ceil(crate::river_blocks::BLOCK))
+                || blocks.flags.size() < u64::from(blocks.grid[0]) * u64::from(blocks.grid[1]) * 4
+            {
+                return Err("river foam block flags do not cover the foam grid".into());
+            }
+        }
         let limits = device.limits();
         let size = |t: &wgpu::Texture| [t.width(), t.height()];
         if dimensions.contains(&0)
@@ -215,9 +266,13 @@ impl Field {
             contents: &bytes,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        let source = match inputs.blocks {
+            Some(_) => foam_field::shader() + &block_stage(),
+            None => foam_field::shader(),
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("native river foam stages 4/16"),
-            source: wgpu::ShaderSource::Wgsl(foam_field::shader().into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let pipeline = |entry: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -229,7 +284,17 @@ impl Field {
                 cache: None,
             })
         };
-        let (init, stage) = (pipeline("init_foam"), pipeline("foam_stage"));
+        let (init, stage) = (
+            pipeline("init_foam"),
+            pipeline(if inputs.blocks.is_some() { "foam_stage_blocks" } else { "foam_stage" }),
+        );
+        let block_grid = inputs.blocks.as_ref().map(|blocks| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("river foam block grid"),
+                contents: bytemuck::cast_slice(&[blocks.grid[0], blocks.grid[1], 0, 0]),
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
+        });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Niagara FoamGrid/reader SF_Bilinear AM_Clamp"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -260,10 +325,14 @@ impl Field {
                     (4, wgpu::BindingResource::TextureView(&views[1 - f])),
                     (5, wgpu::BindingResource::Sampler(&sampler)),
                 ];
-                let entries: Vec<_> = resources
+                let mut entries: Vec<_> = resources
                     .into_iter()
                     .map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource })
                     .collect();
+                if let (Some(blocks), Some(grid)) = (&inputs.blocks, &block_grid) {
+                    entries.push(wgpu::BindGroupEntry { binding: 6, resource: grid.as_entire_binding() });
+                    entries.push(wgpu::BindGroupEntry { binding: 7, resource: blocks.flags.as_entire_binding() });
+                }
                 Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("native river Foam stage"),
                     layout: &stage.get_bind_group_layout(0),

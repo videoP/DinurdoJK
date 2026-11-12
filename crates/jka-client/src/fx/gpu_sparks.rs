@@ -107,7 +107,7 @@ pub struct GpuSparkSpawn {
     pub id: u64,
     pub generation: u64,
     pub class: FxClass,
-    pub shader: String,
+    pub shader: std::sync::Arc<str>,
     pub start_ms: i32,
     pub end_ms: i32,
     pub origin: [f32; 3],
@@ -376,7 +376,7 @@ mod pool_tests {
     fn spawn(id: u64, generation: u64) -> GpuSparkSpawn {
         GpuSparkSpawn {
             id, generation, class: FxClass::SaberImpact,
-            shader: "gfx/effects/sabers/orange_glow".to_owned(),
+            shader: "gfx/effects/sabers/orange_glow".into(),
             start_ms: 100, end_ms: 200, origin: [0.0; 3],
             velocity: [1.0, 0.0, 0.0], acceleration: [0.0; 3],
             start_rotation: 0.0, rotation_delta: 0.0,
@@ -447,7 +447,7 @@ mod gpu_layout_tests {
     fn gpu_spawn_converts_jka_coordinates_without_losing_flags() {
         let spark = GpuSparkSpawn {
             id: 1, generation: 0, class: FxClass::SaberImpact,
-            shader: "gfx/test".to_owned(), start_ms: 100, end_ms: 350,
+            shader: "gfx/test".into(), start_ms: 100, end_ms: 350,
             origin: [1.0, 2.0, 3.0], velocity: [4.0, 5.0, 6.0],
             acceleration: [7.0, 8.0, 9.0], start_rotation: 30.0,
             rotation_delta: 0.0, rgb_start: [1.0; 3], rgb_end: [0.0; 3],

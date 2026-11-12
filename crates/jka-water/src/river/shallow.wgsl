@@ -8,27 +8,35 @@
 // shallow_dense.wgsl (the native single rectangle) or shallow_sparse.wgsl
 // (resident tiles of a virtual rectangle; not an Unreal system). Both keep
 // the dense coordinates and edge policy, so these stage bodies are shared.
+// PreSim bottom history (binding 4), normals (6) and WaterInfo (8) are
+// reached through a storage prelude: shallow_storage_full.wgsl holds the
+// native buffers; the sparse r_riverStorageMode 1/2 preludes derive them.
 
 struct Parameters {
-    dimensions: vec4<u32>, // nx, ny, extrapolation radius, extrapolate into dry
+    dimensions: vec4<u32>, // nx, ny, extrapolation radius, flags: 1 extrapolate into dry, 2 no depth advection (not Unreal)
     stepping: vec4<f32>,   // dx (cm), dt (s), gravity (cm/s2), max velocity (cm/s)
     limits: vec4<f32>,     // Manning friction, velocity dissipation, max depth, integration depth max
     fade: vec4<f32>,       // shallow fade start/speed, advection multiplier, minimum advected depth
 }
 @group(0) @binding(0) var<uniform> params: Parameters;
 @group(0) @binding(2) var<storage, read> geometry: array<vec4<f32>>; // bottom, collider, collision vx/vy
-@group(0) @binding(4) var<storage, read_write> previous_bottom: array<f32>;
-@group(0) @binding(5) var<uniform> presentation: vec4<f32>; // radius, height cutoff, method, border
-@group(0) @binding(6) var<storage, read_write> output_normals: array<vec4<f32>>;
+struct RenderControls {
+    smoothing: vec4<f32>, // native: radius, height cutoff, method, border
+    // Not Unreal: x > 0.5 keeps a wet cell's render height at or above its
+    // own bed (pourovers otherwise ramp under the lip); yzw unused.
+    extension: vec4<f32>,
+}
+@group(0) @binding(5) var<uniform> presentation: RenderControls;
 @group(0) @binding(7) var<storage, read_write> output_surface: array<vec4<f32>>;
 
+// size_sink.w: 0 source, 1 sink (Unreal); 2 developer drain (not Unreal):
+// position xy centre, z level, size x radius, y max removal (cm/frame, 0 unlimited).
 struct SourceBox { position_angle: vec4<f32>, size_sink: vec4<f32> }
 struct Boundary {
     times: vec4<f32>,  // Engine.DeltaTime, sink rate, height-match amount, outside removal rate
     origin: vec4<f32>, // xyz first grid corner; w: optional CFS max source-cell rise per solver frame (cm)
-    flags: vec4<u32>,  // box count, match spline, unused, unused
+    flags: vec4<u32>,  // box count, match spline, 1: source boxes disabled (not Unreal), unused
 }
-@group(0) @binding(8) var<storage, read> water_info: array<vec4<f32>>; // local height, depth, flow XY
 @group(0) @binding(9) var<storage, read> source_boxes: array<SourceBox>;
 @group(0) @binding(10) var<uniform> boundary: Boundary;
 
@@ -41,7 +49,7 @@ fn snapshot_bottom(@builtin(global_invocation_id) id: vec3<u32>) {
     let at = invocation_cell(id);
     if !invocation_active(id, at) { return; }
     let i = index(at);
-    previous_bottom[i] = geometry[i].x;
+    store_previous_bottom(i, geometry[i].x);
 }
 
 // NiagaraDataInterfaceGrid2DCollection.ush::Basic1DCubic, not Catmull-Rom.
@@ -98,7 +106,7 @@ fn source_and_sink(@builtin(global_invocation_id) id: vec3<u32>) {
             let rotation_w = -cos(box.position_angle.w / 2.0);
             let rotated = local + cross(axis, local) * 2.0 * rotation_w
                 + cross(axis, cross(axis, local) * 2.0);
-            if sink == 0u && all(rotated >= -0.5 * box.size_sink.xyz) && all(rotated <= 0.5 * box.size_sink.xyz) {
+            if sink == 0u && (boundary.flags.z & 1u) == 0u && all(rotated >= -0.5 * box.size_sink.xyz) && all(rotated <= 0.5 * box.size_sink.xyz) {
                 let source_height = box.position_angle.z + 0.5 * box.size_sink.z;
                 if boundary.origin.w > 0.0 {
                     // Height+CFS: only add water up to the target level, at a
@@ -119,7 +127,7 @@ fn source_and_sink(@builtin(global_invocation_id) id: vec3<u32>) {
                 let distance = abs(rotated.y);
                 let radius = box.size_sink.x;
                 if distance <= radius {
-                    let info = water_info[index(at)];
+                    let info = water_info_at(index(at));
                     let target_height = select(geo.x, info.x, info.y > 1e-5);
                     let blend = smoothstep(0.0, radius, distance);
                     let goal = mix(target_height, water.x, blend);
@@ -129,6 +137,21 @@ fn source_and_sink(@builtin(global_invocation_id) id: vec3<u32>) {
                     water.w += 0.1 * boundary.times.y * (blend * water.w - water.w) * boundary.times.x;
                 }
             }
+        }
+    }
+    // Developer drains (boundary::drain): remove the water standing above the
+    // drain level inside the circle, optionally capped per solver frame.
+    if geo.y < 1.0 - 1e-5 {
+        for (var i = 0u; i < boundary.flags.x; i++) {
+            let box = source_boxes[i];
+            if u32(box.size_sink.w) != 2u { continue; }
+            let offset = position.xy - box.position_angle.xy;
+            if dot(offset, offset) > box.size_sink.x * box.size_sink.x || water.y <= 1e-5 { continue; }
+            var removal = water.x - max(box.position_angle.z, geo.x);
+            if removal <= 0.0 { continue; }
+            if box.size_sink.y > 0.0 { removal = min(removal, box.size_sink.y); }
+            water.y = max(water.y - removal, 0.0);
+            water.x = geo.x + water.y;
         }
     }
     write_water(at, water);
@@ -150,7 +173,7 @@ fn extrapolate_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
     let at = invocation_cell(id);
     if !invocation_active(id, at) { return; }
     var w = read_water(at);
-    if (w.y < 1e-5 && params.dimensions.w != 0u) || read_geometry(at).y > 1.0 - 1e-5 {
+    if (w.y < 1e-5 && (params.dimensions.w & 1u) != 0u) || read_geometry(at).y > 1.0 - 1e-5 {
         var distance = 65500.0;
         let radius = i32(params.dimensions.z);
         for (var x = -radius; x <= radius; x++) { for (var y = -radius; y <= radius; y++) {
@@ -184,10 +207,14 @@ fn advect_water(@builtin(global_invocation_id) id: vec3<u32>) {
         w.w = sample_cubic(vec2<f32>(at) - scale * vec2<f32>(vx, input.w), 3u);
         let velocity = 0.5 * (vec2<f32>(read_water(at + vec2<i32>(1, 0)).z,
                                        read_water(at + vec2<i32>(0, 1)).w) + input.zw);
-        w.y = sample_cubic(vec2<f32>(at) - scale * velocity, 1u);
+        // Flag 2 (Transport::advect_depth false): depth moves by the
+        // conservative UpdateDepth fluxes only.
+        if (params.dimensions.w & 2u) == 0u {
+            w.y = sample_cubic(vec2<f32>(at) - scale * velocity, 1u);
+        }
     }
     w.x = geo.x + w.y;
-    if abs(geo.x - previous_bottom[index(at)]) > params.stepping.x && w.y > 1e-5 {
+    if abs(geo.x - previous_bottom_at(index(at))) > params.stepping.x && w.y > 1e-5 {
         w = vec4<f32>(geo.x, 0.0, 0.0, 0.0);
     }
     write_water(at, w);
@@ -329,7 +356,7 @@ fn match_spline(@builtin(global_invocation_id) id: vec3<u32>) {
     let input = read_water(at);
     var water = input;
     if boundary.flags.y != 0u {
-        let info = water_info[index(at)];
+        let info = water_info_at(index(at));
         let bottom = read_geometry(at).x;
         water.y = max(input.y - params.stepping.y * boundary.times.w
             * (1.0 - smoothstep(0.0, 0.1, info.y)), 0.0);
@@ -347,7 +374,7 @@ fn prepare_surface(@builtin(global_invocation_id) id: vec3<u32>) {
     let at = invocation_cell(id);
     if !invocation_active(id, at) { return; }
     let input = read_water(at);
-    let border = i32(presentation.w);
+    let border = i32(presentation.smoothing.w);
     let maximum = vec2<i32>(params.dimensions.xy) - 1;
     let is_border = any(at < vec2<i32>(border)) || any(at > maximum - border);
     let extrap = !is_border && (read_geometry(at).y > 1.0 - 1e-5 || input.y < 1e-5);
@@ -355,9 +382,9 @@ fn prepare_surface(@builtin(global_invocation_id) id: vec3<u32>) {
     var depth = select(input.y, 0.0, extrap);
     var weight_height = select(1.0, 0.0, extrap);
     var weight_depth = weight_height;
-    let radius = i32(presentation.x);
+    let radius = i32(presentation.smoothing.x);
     let depth_radius = max(radius - 2, 1);
-    let method = select(i32(presentation.z), 3, presentation.y < 1e-8);
+    let method = select(i32(presentation.smoothing.z), 3, presentation.smoothing.y < 1e-8);
     for (var x = -radius; x <= radius; x++) { for (var y = -radius; y <= radius; y++) {
         // Exact source predicate: neither the center row nor column contributes.
         if x != 0 && y != 0 {
@@ -369,8 +396,8 @@ fn prepare_surface(@builtin(global_invocation_id) id: vec3<u32>) {
                 if extrap { weight = distance; }
                 else if method != 0 {
                     weight = 1.0 - smoothstep(0.0, f32(radius), distance);
-                    if method == 1 { weight *= 1.0 - smoothstep(0.0, presentation.y, abs(n.x - input.x)); }
-                    else if method == 2 { weight *= smoothstep(0.0, presentation.y, abs(n.x - input.x)); }
+                    if method == 1 { weight *= 1.0 - smoothstep(0.0, presentation.smoothing.y, abs(n.x - input.x)); }
+                    else if method == 2 { weight *= smoothstep(0.0, presentation.smoothing.y, abs(n.x - input.x)); }
                 }
                 height += n.x * weight;
                 weight_height += weight;
@@ -386,6 +413,11 @@ fn prepare_surface(@builtin(global_invocation_id) id: vec3<u32>) {
     if weight_depth > 1e-8 { depth /= weight_depth; }
     else if extrap { depth = input.y; }
     if is_border { depth = 0.0; }
+    // Bed clamp (extension, off = native): smoothing may not sink a wet cell's
+    // surface below the bed it covers.
+    if presentation.extension.x > 0.5 && !extrap {
+        height = max(height, read_geometry(at).x);
+    }
     var velocity = vec2<f32>(0.0);
     var weight = 0.0;
     // Source's radius-one velocity blur is for SimGridRT only.
@@ -413,6 +445,6 @@ fn compute_normals_and_reset(@builtin(global_invocation_id) id: vec3<u32>) {
         let magnitude = length(product);
         if magnitude >= 1e-5 { normal = product / magnitude; }
     }
-    output_normals[index(at)] = vec4<f32>(normal, 0.0);
+    store_normal(index(at), normal);
     write_water(at, vec4<f32>(read_geometry(at).x + input.y, input.yzw));
 }

@@ -107,9 +107,8 @@ struct Primitive {
     time_start: i32,
     time_end: i32,
     kill_time: i32,
-    shader: Option<String>,
-    /// Share the material name across every generated line segment.
-    line_shader: std::sync::Arc<str>,
+    /// Immutable registered name shared with draws, light candidates and GPU spawns.
+    shader: Arc<str>,
     source_effect: EffectId,
     origin: [f32; 3],
     origin2: [f32; 3],
@@ -165,7 +164,7 @@ pub enum FxDraw {
     /// RT_SPRITE: view-facing quad of half-extent `radius`.
     /// `shader_time` is refEntity_t::shaderTime in seconds: zero uses the
     /// global shader clock, otherwise stages run from that time (setShaderTime).
-    Sprite { shader_time: f32, origin: [f32; 3], radius: f32, rotation: f32, rgba: [u8; 4], shader: String },
+    Sprite { shader_time: f32, origin: [f32; 3], radius: f32, rotation: f32, rgba: [u8; 4], shader: Arc<str> },
     /// RT_SABER_GLOW: JKA's renderer-side chain of view-facing glow sprites.
     /// Keeping this as one primitive preserves the stock split between CGame's
     /// blade flicker and RB_SurfaceSaberGlow's own hilt pulse/randomness.
@@ -176,16 +175,16 @@ pub enum FxDraw {
         radius: f32,
         hilt_radius: f32,
         rgba: [u8; 4],
-        shader: String,
+        shader: Arc<str>,
     },
     /// RT_ORIENTED_QUAD: quad in axis[1]/axis[2] of half-extent `radius`.
-    OrientedQuad { shader_time: f32, origin: [f32; 3], axis: Axis, radius: f32, rotation: f32, rgba: [u8; 4], shader: String },
+    OrientedQuad { shader_time: f32, origin: [f32; 3], axis: Axis, radius: f32, rotation: f32, rgba: [u8; 4], shader: Arc<str> },
     /// Camera-facing (or velocity-aligned) quad with independent half extents
     /// and a texture sub-rectangle, for baked flipbook particles.
     /// `facing` places the quad in the plane perpendicular to it (custom facing).
     /// `ground`: world z of the floor under the effect. Sprites that reach
     /// it fade out towards it instead of being cut by a hard depth edge.
-    Billboard { origin: [f32; 3], half: [f32; 2], rotation: f32, uv: [f32; 4], rgba: [u8; 4], align: Option<[f32; 3]>, facing: Option<[f32; 3]>, ground: Option<f32>, pivot: [f32; 2], shader: String },
+    Billboard { origin: [f32; 3], half: [f32; 2], rotation: f32, uv: [f32; 4], rgba: [u8; 4], align: Option<[f32; 3]>, facing: Option<[f32; 3]>, ground: Option<f32>, pivot: [f32; 2], shader: Arc<str> },
     /// RT_LINE: view-facing strip of half-width `width` from start to end.
     Line { start: [f32; 3], end: [f32; 3], width: f32, rgba: [u8; 4], shader: std::sync::Arc<str> },
     /// Gameplay-independent grappling rope. Only two endpoints, a visual spring
@@ -199,10 +198,10 @@ pub enum FxDraw {
     /// material come from the EFX/trace; only cosmetic intermediate vertices
     /// are generated in the shader (24 steps, branching, core + corona).
     Lightning { start: [f32; 3], end: [f32; 3], width: f32, chaos: f32,
-        seed: f32, rgba: [u8; 4], shader: String },
+        seed: f32, rgba: [u8; 4], shader: Arc<str> },
     /// Arbitrary two-sided textured quad. OpenJK saber trails use exactly this
     /// shape to connect the current blade base/tip to the previous sample.
-    Quad { positions: [[f32; 3]; 4], uvs: [[f32; 2]; 4], rgba: [u8; 4], shader: String },
+    Quad { positions: [[f32; 3]; 4], uvs: [[f32; 2]; 4], rgba: [u8; 4], shader: Arc<str> },
     /// Arbitrary indexed two-sided mesh with per-vertex colour. This is used by
     /// smooth cosmetic FX that need more than a quad (for example enhanced
     /// saber melt relief) without adding a bespoke renderer hot path.
@@ -211,7 +210,7 @@ pub enum FxDraw {
         uvs: Vec<[f32; 2]>,
         rgba: Vec<[u8; 4]>,
         indices: Vec<u32>,
-        shader: String,
+        shader: Arc<str>,
     },
     /// Opaque, depth-writing relief mesh with real normals and no texture (vertex
     /// colour only). `lighting_origin` picks the BSP light-grid sample. Used by
@@ -224,7 +223,7 @@ pub enum FxDraw {
         lighting_origin: [f32; 3],
     },
     /// RT_CYLINDER: `start_radius` ring at start, `end_radius` ring at end.
-    Cylinder { start: [f32; 3], end: [f32; 3], axis: [f32; 3], start_radius: f32, end_radius: f32, rgba: [u8; 4], shader: String },
+    Cylinder { start: [f32; 3], end: [f32; 3], axis: [f32; 3], start_radius: f32, end_radius: f32, rgba: [u8; 4], shader: Arc<str> },
 }
 
 /// Origin class for RE_AddLightToScene-style transient lights.  This is
@@ -474,7 +473,7 @@ pub struct FxAutoLightCandidate {
     pub origin: [f32; 3],
     pub radius: f32,
     pub rgba: [u8; 4],
-    pub shader: String,
+    pub shader: Arc<str>,
     /// Original EFX lifetime; does not modify authored visual simulation.
     pub life_ms: i32,
     pub spot: Option<FxSpotLight>,
@@ -624,9 +623,10 @@ pub struct FxSystem {
     light_promotion: Arc<super::light_promotion::FxLightPromotionCatalog>,
     population_last_report: Option<std::time::Instant>,
     population_plays: HashMap<EffectId, u64>,
-    /// Shader-path interning on the FX worker: no owned shader per electricity
-    /// segment, and no duplicate backing strings across effect instances.
-    line_shaders: HashMap<String, Arc<str>>,
+    /// Names come from registered templates and live for this FX system's
+    /// registration lifetime. Frames share these bytes rather than copying them.
+    shader_names: HashMap<String, Arc<str>>,
+    empty_shader: Arc<str>,
 }
 
 impl Default for FxSystem {
@@ -670,7 +670,8 @@ impl FxSystem {
             light_promotion: Arc::new(super::light_promotion::FxLightPromotionCatalog::default()),
             population_last_report: None,
             population_plays: HashMap::new(),
-            line_shaders: HashMap::new(),
+            shader_names: HashMap::new(),
+            empty_shader: Arc::from(""),
         }
     }
 
@@ -1126,8 +1127,11 @@ impl FxSystem {
             return;
         }
         let effect = &self.effects[(id - 1) as usize];
-        let fx = effect.template.primitives[index].clone();
-        let links = effect.links.get(index).cloned().unwrap_or_default();
+        // Registration data stays immutable while the disjoint runtime fields
+        // below are updated. Only selected media and effect IDs need ownership.
+        let fx = &effect.template.primitives[index];
+        let empty_links = Links::default();
+        let links = effect.links.get(index).unwrap_or(&empty_links);
         let auto_light_profile = auto_light_driver
             .then_some(effect.template.auto_light)
             .flatten();
@@ -1283,12 +1287,12 @@ impl FxSystem {
         let pick = |list: &[EffectId], rng: &mut Rng| -> EffectId {
             if list.is_empty() { 0 } else { list[rng.irand(0, list.len() as i32 - 1) as usize] }
         };
-        let shader = (!fx.media.is_empty()).then(|| fx.media[rng.irand(0, fx.media.len() as i32 - 1) as usize].clone());
+        let shader = (!fx.media.is_empty()).then(|| fx.media[rng.irand(0, fx.media.len() as i32 - 1) as usize].as_str());
 
         match fx.kind {
             PrimType::Sound => {
                 if let Some(qpath) = shader {
-                    self.sounds.push(FxSound::auto(org, qpath));
+                    self.sounds.push(FxSound::auto(org, qpath.to_owned()));
                 }
                 return;
             }
@@ -1322,7 +1326,7 @@ impl FxSystem {
                             normal: normalize(ax[0]),
                             radius: size,
                             rotation: fx.rotation.get(rng),
-                            shader,
+                            shader: shader.to_owned(),
                             rgba: [
                                 (rgb_start[0].clamp(0.0, 1.0) * 255.0) as u8,
                                 (rgb_start[1].clamp(0.0, 1.0) * 255.0) as u8,
@@ -1370,17 +1374,15 @@ impl FxSystem {
         let length = (fx.length_start.get(rng), fx.length_end.get(rng), parm(fx.length_parm.get(rng), FX_LENGTH_SHIFT));
         let alpha = (fx.alpha_start.get(rng), fx.alpha_end.get(rng), parm(fx.alpha_parm.get(rng), FX_ALPHA_SHIFT));
         let rgb_parm = parm(fx.rgb_parm.get(rng), FX_RGB_SHIFT);
-        let line_shader: Arc<str> = if matches!(fx.kind, PrimType::Line | PrimType::Electricity | PrimType::Tail) {
-            if let Some(path) = shader.as_deref() {
-                if let Some(handle) = self.line_shaders.get(path) {
-                    Arc::clone(handle)
-                } else {
-                    let handle: Arc<str> = Arc::from(path);
-                    self.line_shaders.insert(path.to_owned(), Arc::clone(&handle));
-                    handle
-                }
-            } else { Arc::from("") }
-        } else { Arc::from("") };
+        let shader = if let Some(path) = shader.filter(|path| !path.is_empty()) {
+            if let Some(handle) = self.shader_names.get(path) {
+                Arc::clone(handle)
+            } else {
+                let handle: Arc<str> = Arc::from(path);
+                self.shader_names.insert(path.to_owned(), Arc::clone(&handle));
+                handle
+            }
+        } else { Arc::clone(&self.empty_shader) };
         let mut primitive = Primitive {
             visual_id: self.next_visual_id,
             gpu_id: None,
@@ -1393,7 +1395,6 @@ impl FxSystem {
             time_start: time,
             time_end: time + life,
             kill_time: time + life,
-            line_shader,
             source_effect: id,
             shader,
             origin: org,
@@ -1437,7 +1438,7 @@ impl FxSystem {
                 id: self.gpu_next_id,
                 generation: self.gpu_generation,
                 class: primitive.class,
-                shader: primitive.shader.clone().unwrap_or_default(),
+                shader: Arc::clone(&primitive.shader),
                 start_ms: primitive.time_start,
                 end_ms: primitive.time_end,
                 origin: primitive.origin,
@@ -1547,13 +1548,9 @@ fn update_primitive(
             }
         }
         _ => {
-            // Electricity subdivides each authored primitive into many lines.
-            // Never allocate a separate shader String for every segment.
-            let line_kind = matches!(prim.kind, PrimType::Line | PrimType::Electricity | PrimType::Tail);
-            let shader = if visible && !line_kind { prim.shader.clone().unwrap_or_default() } else { String::new() };
             let radius = percent(prim.size.2, prim.size.0, prim.size.1, FX_SIZE_SHIFT, rng);
             let rgba = rgba_at(prim, time, rng);
-            if visible && prim.shader.as_ref().is_some_and(|shader| !shader.is_empty()) {
+            if visible && !prim.shader.is_empty() {
                 if let Some(auto) = prim.auto_light {
                     let segment = if matches!(prim.kind, PrimType::Line | PrimType::Electricity) {
                         Some([prim.origin, prim.origin2])
@@ -1570,7 +1567,7 @@ fn update_primitive(
                         origin: light_origin,
                         radius,
                         rgba,
-                        shader: prim.shader.clone().unwrap_or_default(),
+                        shader: Arc::clone(&prim.shader),
                         life_ms: prim.time_end.saturating_sub(prim.time_start),
                         spot,
                         segment,
@@ -1588,7 +1585,7 @@ fn update_primitive(
                         if let Some(id) = prim.gpu_id {
                             out.gpu_sprite_draw_indices.push((out.draws.len(), id));
                         }
-                        out.draws.push(FxDraw::Sprite { shader_time, origin: prim.origin, radius, rotation: prim.rotation, rgba, shader });
+                        out.draws.push(FxDraw::Sprite { shader_time, origin: prim.origin, radius, rotation: prim.rotation, rgba, shader: Arc::clone(&prim.shader) });
                     }
                 }
                 PrimType::OrientedParticle => {
@@ -1603,7 +1600,7 @@ fn update_primitive(
                             radius,
                             rotation: prim.rotation,
                             rgba,
-                            shader,
+                            shader: Arc::clone(&prim.shader),
                         });
                     }
                 }
@@ -1619,19 +1616,19 @@ fn update_primitive(
                             width: radius.max(0.15), chaos: prim.elasticity,
                             seed: (prim.time_start as f32 * 0.127 + prim.origin[0] * 0.037
                                 + prim.origin[1] * 0.053 + prim.origin[2] * 0.019).fract().abs(),
-                            rgba, shader: prim.shader.clone().unwrap_or_default(),
+                            rgba, shader: Arc::clone(&prim.shader),
                         });
                     }
                 }
                 PrimType::Line => {
                     if visible {
-                        out.draws.push(FxDraw::Line { start: prim.origin, end: prim.origin2, width: radius, rgba, shader: prim.line_shader.clone() });
+                        out.draws.push(FxDraw::Line { start: prim.origin, end: prim.origin2, width: radius, rgba, shader: Arc::clone(&prim.shader) });
                     }
                 }
                 PrimType::Electricity => {
                     if visible {
                         for (start, end) in electricity_segments(prim.origin, prim.origin2, prim.elasticity, rng) {
-                            out.draws.push(FxDraw::Line { start, end, width: radius, rgba, shader: prim.line_shader.clone() });
+                            out.draws.push(FxDraw::Line { start, end, width: radius, rgba, shader: Arc::clone(&prim.shader) });
                         }
                     }
                 }
@@ -1641,7 +1638,7 @@ fn update_primitive(
                     let back = normalize(sub(prim.old_origin, prim.origin));
                     let end = add(prim.origin, scale(back, length));
                     if visible {
-                        out.draws.push(FxDraw::Line { start: prim.origin, end, width: radius, rgba, shader: prim.line_shader.clone() });
+                        out.draws.push(FxDraw::Line { start: prim.origin, end, width: radius, rgba, shader: Arc::clone(&prim.shader) });
                     }
                 }
                 PrimType::Cylinder => {
@@ -1657,7 +1654,7 @@ fn update_primitive(
                             start_radius: size2,
                             end_radius: radius,
                             rgba,
-                            shader,
+                            shader: Arc::clone(&prim.shader),
                         });
                     }
                 }
@@ -2036,6 +2033,110 @@ mod tests {
     const SHOT: &str = "Line\n{\n\torigin\t8 0 0\n\torigin2\t-80 0 0\n\tflags\tuseAlpha\n\twidth\n\t{\n\t\tstart\t1.5\n\t}\n\talpha\n\t{\n\t\tstart\t0.6\n\t}\n\tshader\n\t[\n\t\tgfx/effects/blaster_blob\n\t]\n}\nparticle\n{\n\torigin\t-5 0 0\n\tlife 100\n\tvelocity 100 0 0\n\tsize\n\t{\n\t\tstart\t2\n\t\tend 0\n\t\tflags linear\n\t}\n\tshader\n\t[\n\t\tgfx/effects/whiteGlow\n\t]\n}\n";
 
     #[test]
+    fn primitive_creation_preserves_seeded_media_ranges_and_link_selection() {
+        const PARTICLE: &str = "particle\n{\nlife 100 200\nrotation 0 90\nshader\n[\ngfx/test/a\ngfx/test/b\n]\n}\n";
+        let mut fx = FxSystem::new();
+        let id = fx.register("test/particle", &mut read_fixture(&[("effects/test/particle.efx", PARTICLE)]));
+        fx.effects[(id - 1) as usize].links[0] = Links {
+            death: vec![10, 11], impact: vec![20, 21], emitter: vec![30, 31], play: Vec::new(),
+        };
+        fx.adjust_time(1000);
+        fx.adjust_time(1016);
+        let axis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        fx.create_effect(id, 0, [0.0; 3], axis, 0, FxClass::General, false);
+        let first = &fx.active[0];
+        assert_eq!(first.shader.as_ref(), "gfx/test/a");
+        assert_eq!(first.time_end, 1016 + 194);
+        assert!((first.rotation - 19.116066).abs() < 0.00001);
+        assert_eq!((first.death_fx, first.impact_fx, first.emitter_fx), (11, 20, 31));
+
+        // Missing links must keep the old empty-list behavior and consume no
+        // random choices. Fixed seeded results catch changes to RNG ordering.
+        fx.effects[(id - 1) as usize].links.clear();
+        fx.create_effect(id, 0, [0.0; 3], axis, 0, FxClass::General, false);
+        let second = &fx.active[1];
+        assert_eq!(second.shader.as_ref(), "gfx/test/b");
+        assert_eq!(second.time_end, 1016 + 177);
+        assert!((second.rotation - 80.35009).abs() < 0.00001);
+        assert_eq!((second.death_fx, second.impact_fx, second.emitter_fx), (0, 0, 0));
+        assert_eq!(fx.rng.irand(0, i32::MAX - 1), 329_552_311);
+
+        // Spawned media must remain owned by the primitive after registration
+        // data is changed; only the temporary template/link copies were removed.
+        fx.effects[(id - 1) as usize].template.primitives[0].media.clear();
+        let frame = fx.frame();
+        assert_eq!(frame.draws.len(), 2);
+        for (draw, expected) in frame.draws.iter().zip(["gfx/test/a", "gfx/test/b"]) {
+            let FxDraw::Sprite { shader, .. } = draw else { panic!("expected particle") };
+            assert_eq!(shader.as_ref(), expected);
+        }
+    }
+
+    #[test]
+    fn untextured_primitives_reuse_empty_shader_storage() {
+        const EMPTY: &str = "particle\n{\nlife 100\n}\nline\n{\norigin2 40 0 0\n}\n";
+        let mut fx = FxSystem::new();
+        let id = fx.register("test/empty", &mut read_fixture(&[("effects/test/empty.efx", EMPTY)]));
+        fx.adjust_time(1000);
+        fx.adjust_time(1016);
+        for _ in 0..2 {
+            fx.play_effect_dir(id, [0.0; 3], [1.0, 0.0, 0.0]);
+        }
+        assert_eq!(fx.active.len(), 4);
+        assert!(fx.active.iter().all(|primitive|
+            Arc::ptr_eq(&primitive.shader, &fx.empty_shader)));
+        let frame = fx.frame();
+        assert_eq!(frame.draws.len(), 4);
+        for draw in &frame.draws {
+            match draw {
+                FxDraw::Sprite { shader, .. } => assert!(shader.is_empty()),
+                FxDraw::Line { shader, .. } => assert!(Arc::ptr_eq(shader, &fx.empty_shader)),
+                _ => panic!("expected untextured particle or line"),
+            }
+        }
+    }
+
+    #[test]
+    fn registered_shader_storage_is_shared_by_draws_lights_gpu_and_snapshots() {
+        const EFFECT: &str = "particle\n{\nlife 100\nshader\n[\ngfx/Effects/Shared\n]\n}\nline\n{\nlife 100\norigin2 40 0 0\nshader\n[\ngfx/Effects/Shared\n]\n}\n";
+        let mut fx = FxSystem::new();
+        let id = fx.register("test/shared", &mut read_fixture(&[("effects/test/shared.efx", EFFECT)]));
+        fx.adjust_time(1000);
+        fx.adjust_time(1016);
+        fx.set_gpu_staging(true);
+        fx.play_effect_dir(id, [0.0; 3], [1.0, 0.0, 0.0]);
+        let name = Arc::clone(&fx.active[0].shader);
+        assert!(fx.active.iter().all(|primitive| Arc::ptr_eq(&primitive.shader, &name)));
+        let snapshot = fx.frame();
+        assert_eq!(snapshot.draws.len(), 2);
+        assert_eq!(snapshot.auto_light_candidates.len(), 1);
+        assert!(Arc::ptr_eq(&snapshot.auto_light_candidates[0].shader, &name));
+        let gpu = &snapshot.gpu_sparks.as_ref().unwrap().spawns;
+        assert_eq!(gpu.len(), 1);
+        assert!(Arc::ptr_eq(&gpu[0].shader, &name));
+        let fallback = gpu[0].reference_draw_at(1032);
+        let FxDraw::Sprite { shader, .. } = &fallback else { panic!("GPU fallback sprite") };
+        assert!(Arc::ptr_eq(shader, &name));
+
+        fx.adjust_time(1032);
+        fx.play_effect_dir(id, [10.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        let next = fx.frame();
+        assert_eq!(next.draws.len(), 4);
+        for draw in snapshot.draws.iter().chain(next.draws.iter()) {
+            let copied = draw.clone(); // Presentation interpolation clones draws.
+            let shader = match &copied {
+                FxDraw::Sprite { shader, .. } | FxDraw::Line { shader, .. } => shader,
+                _ => panic!("expected sprite or line"),
+            };
+            assert!(Arc::ptr_eq(shader, &name));
+        }
+        drop(fx);
+        assert_eq!(name.as_ref(), "gfx/Effects/Shared", "snapshots retain the original spelling");
+        let FxDraw::Sprite { shader, .. } = &snapshot.draws[0] else { panic!("snapshot sprite") };
+        assert!(Arc::ptr_eq(shader, &name), "published snapshots outlive the FX system");
+    }
+
+    #[test]
     fn authored_decals_flush_once_with_shader_and_size() {
         const MARK: &str = "decal\n{\nlife 4000\nsize\n{\nstart 8\n}\nshader\n[\ngfx/damage/bullet_mrk\n]\n}\n";
         let mut fx = FxSystem::new();
@@ -2103,7 +2204,7 @@ mod tests {
     fn shared_fx_draw_stream_preserves_overrides_and_filtered_indices() {
         let sprite = |x: f32| FxDraw::Sprite {
             shader_time: 0.0, origin: [x, 0.0, 0.0], radius: 1.0,
-            rotation: 0.0, rgba: [255; 4], shader: "test".to_owned(),
+            rotation: 0.0, rgba: [255; 4], shader: "test".into(),
         };
         let shared = Arc::new(vec![sprite(1.0), sprite(2.0), sprite(3.0)]);
         let mut stream = FxDrawStream::from_parts(Some(Arc::clone(&shared)),
@@ -2246,7 +2347,8 @@ mod tests {
         let resumed = fx.frame();
         assert_eq!(resumed.draws.len(), 2, "cold PSO must restore CPU spark");
         let FxDraw::Sprite { origin, .. } = &resumed.draws[1] else { panic!("missing CPU sprite") };
-        assert!(origin[0] > 0.0, "CPU state must be rehydrated, not frozen at spawn");
+        assert!((origin[0] - (-5.0 + 100.0 * 0.048)).abs() < 0.0001,
+            "CPU handback must include all 48 ms since birth, including sleeping ticks");
         assert!(!fx.active.iter().find(|p| p.gpu_id == Some(spark_id)).unwrap().gpu_sleeping);
         fx.adjust_time(1200);
         assert!(fx.frame().draws.is_empty());
@@ -2548,10 +2650,10 @@ mod tests {
             fx.adjust_time(1032 + step * 16);
             fx.frame();
         }
-        let hit_sprites: Vec<_> = fx.active.iter().filter(|prim| prim.shader.as_deref() == Some("gfx/spark")).collect();
+        let hit_sprites: Vec<_> = fx.active.iter().filter(|prim| prim.shader.as_ref() == "gfx/spark").collect();
         assert_eq!(hit_sprites.len(), 1, "one impact effect spawned at the contact");
         assert!(hit_sprites[0].origin[2].abs() < 1.0, "impact effect plays at the trace endpoint");
-        assert!(!fx.active.iter().any(|prim| prim.shader.as_deref() == Some("gfx/x")), "impactKills removed the projectile");
+        assert!(!fx.active.iter().any(|prim| prim.shader.as_ref() == "gfx/x"), "impactKills removed the projectile");
     }
 
     const SMOKE: &str = "Particle
@@ -2608,7 +2710,7 @@ Particle
         fx.play_effect_dir(id, [dist, 0.0, 0.0], [0.0, 0.0, 1.0]);
         let frame = fx.frame();
         let count = |shader: &str| {
-            fx.active.iter().filter(|prim| prim.shader.as_deref() == Some(shader)).count()
+            fx.active.iter().filter(|prim| prim.shader.as_ref() == shader).count()
         };
         (count("gfx/smoke"), count("gfx/big"), frame.sounds.len())
     }
@@ -2652,7 +2754,7 @@ Particle
         for _ in 0..spawns {
             fx.play_effect_dir(id, [300.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
         }
-        let smoke = fx.active.iter().filter(|prim| prim.shader.as_deref() == Some("gfx/smoke")).count();
+        let smoke = fx.active.iter().filter(|prim| prim.shader.as_ref() == "gfx/smoke").count();
         assert!(fx.stats().dropped == 0 && smoke < MAX_ACTIVE);
         let mean = smoke as f32 / spawns as f32;
         assert!(mean > 4.95 && mean < 5.55, "mean {mean} should stay near the 5.23 expected density");
@@ -2694,7 +2796,7 @@ Particle
         fx.adjust_time(1000);
         fx.adjust_time(1016);
         fx.play_effect_dir(id, [0.0; 3], [0.0, 0.0, 1.0]);
-        let count = |shader: &str| fx.active.iter().filter(|prim| prim.shader.as_deref() == Some(shader)).count();
+        let count = |shader: &str| fx.active.iter().filter(|prim| prim.shader.as_ref() == shader).count();
         assert_eq!(count("gfx/wide"), 1, "scaled to zero but keeps the at-least-one guarantee");
         assert_eq!(count("gfx/fixed"), 10, "fixed counts are not scalable");
         assert_eq!(count("gfx/min"), 1, "min >= 1 keeps one spawn after scaling to zero");

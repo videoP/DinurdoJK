@@ -9,7 +9,9 @@ macro_rules! eprintln {
     ($($arg:tt)*) => { jka_render_core::log::write_line(true, format_args!($($arg)*)) };
 }
 
+mod river_audio_probe;
 pub mod river_authoring;
+pub mod river_blocks;
 pub mod river_capture;
 pub mod river_composite;
 pub mod river_discharge;
@@ -21,7 +23,9 @@ pub mod river_map;
 pub mod river_material;
 pub mod river_ocean;
 pub mod river_quadtree;
+pub mod river_reach;
 pub mod river_runtime;
+pub mod river_secondary;
 pub mod river_settings;
 pub mod river_slw;
 pub mod river_surface;

@@ -1958,10 +1958,10 @@ fn promoted_water_gpu_views_and_spray_validate() {
         let surfaces: Vec<_> = pools.iter().map(|p| p.surface).collect();
         ocean.set_enabled(&queue,true);
         ocean.set_surfaces(&queue,&surfaces);
-        ocean.set_promoted_surfaces(&device,&queue,&pools,&[]);
+        ocean.set_promoted_surfaces(&device,&queue,pools.iter(),&[]);
         let mut local = pools[0].settings(settings);
         local.authored.amplitude = 64.0;
-        ocean.set_promoted_surfaces(&device,&queue,&pools,&[(0,local)]);
+        ocean.set_promoted_surfaces(&device,&queue,pools.iter(),&[(0,local)]);
         let mut encoder = device.create_command_encoder(&Default::default());
         ocean.encode_frame(&queue,&mut encoder,1.0/60.0);
         let submission = queue.submit([encoder.finish()]);
@@ -1969,7 +1969,12 @@ fn promoted_water_gpu_views_and_spray_validate() {
             timeout:Some(std::time::Duration::from_secs(30)) }).unwrap();
         // Removing a pool or changing quality must release/rebuild just its
         // render view while retaining valid references to the shared FFT field.
-        ocean.set_promoted_surfaces(&device,&queue,&pools[1..],&[]);
+        let retained = ocean.render_bind_group_for(1).clone();
+        ocean.set_promoted_surfaces(&device,&queue,pools.iter().filter(|p| p.index != 0),&[]);
+        assert_eq!(ocean.render_bind_group_for(1), &retained);
+        assert_eq!(ocean.render_bind_group_for(0), ocean.render_bind_group_for(usize::MAX));
+        ocean.set_promoted_surfaces(&device,&queue,pools.iter().filter(|_| false),&[]);
+        assert_eq!(ocean.render_bind_group_for(1), ocean.render_bind_group_for(usize::MAX));
         assert!(block_on(scope.pop()).is_none(),"ocean views and spray pipeline must validate");
     });
 }

@@ -11,6 +11,9 @@ pub struct Settings {
     pub underwater_color: [f32; 3],
     pub underwater_visibility: f32,
     pub underwater_darkening: f32,
+    /// 0=original river visual (shared medium, no waterline tint),
+    /// 1=shared Blue Water spectral medium + waterline tint. Visual only.
+    pub underwater_optics: u8,
     /// Start of foam generation's depth gate, in map units. Full strength is
     /// derived using the native 150:500 ratio (60:200 map units).
     pub foam_minimum_depth: f32,
@@ -25,6 +28,7 @@ impl Default for Settings {
             underwater_color: jka_render_core::color::UNDERWATER_FOG_COLOR,
             underwater_visibility: 2304.0,
             underwater_darkening: 2304.0,
+            underwater_optics: 1,
             foam_minimum_depth: 60.0,
         }
     }
@@ -95,7 +99,28 @@ impl Settings {
                 let c = jka_render_core::color::linear_color(self.underwater_color);
                 [c[0], c[1], c[2], self.underwater_visibility * 2.5]
             },
-            [self.underwater_darkening * 2.5, 0.0, 0.0, 0.0],
+            [self.underwater_darkening * 2.5, f32::from(self.underwater_optics.min(1)), 0.0, 0.0],
         ]
+    }
+}
+
+#[cfg(test)]
+mod underwater_optics_tests {
+    use super::Settings;
+    #[test]
+    fn shared_defaults_on_and_keeps_existing_uniform_layout() {
+        let shared = Settings::default();
+        assert_eq!(shared.underwater_optics, 1);
+        assert_eq!(shared.uniform()[17][1], 1.0);
+        let mut original = shared;
+        original.underwater_optics = 0;
+        assert_eq!(original.uniform()[17][1], 0.0);
+        // Only the waterline tint changes: optical absorption and all
+        // hydraulic/foam parameter slots are the same in both modes.
+        let a = original.uniform();
+        let b = shared.uniform();
+        assert_eq!(&a[..17], &b[..17]);
+        assert_eq!(a[17][0], b[17][0]);
+        assert_eq!(a[17][2..], b[17][2..]);
     }
 }

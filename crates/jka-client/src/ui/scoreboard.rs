@@ -410,6 +410,30 @@ pub(crate) fn menu_layout(menu: &ScoreboardMenuUi, w: u32, h: u32) -> MenuLayout
     }
 }
 
+/// A compact "Aa" translation badge, not a checkbox. The same exact
+/// geometry is used for rendering and hit testing. A colored badge is ON;
+/// a dim one is OFF. Callers pass the actual 18-pixel icon origin (never a
+/// whole menu button width, which previously created a giant X/rectangle).
+fn translate_icon_bounds(x: f32, row: Bounds, s: f32) -> Bounds {
+    let edge = 18.0 * s;
+    [x, row[1] + (row[3] - edge) * 0.5, edge, edge]
+}
+
+fn draw_translate_icon(out: &mut Vec<UiVertex>, bounds: Bounds, checked: bool,
+    hovered: bool, txt: &UiText, w: u32, h: u32)
+{
+    let [x, y, edge, _] = bounds;
+    let tone = if checked { pal::ACCENT() } else { pal::TEXT_FAINT() };
+    if checked || hovered {
+        rect(out, x, y, edge, edge, pal::fade(tone, if checked { 0.25 } else { 0.12 }), w, h);
+    }
+    rect_outline(out, x, y, edge, edge, 1.0, if hovered { pal::TEXT() } else { tone }, w, h);
+    txt.draw_centered(out, "A", [x + edge * 0.08, y, edge * 0.62, edge], edge * 0.72,
+        if hovered { pal::TEXT() } else { tone });
+    txt.draw_centered(out, "a", [x + edge * 0.52, y + edge * 0.27, edge * 0.43, edge * 0.64],
+        edge * 0.48, if hovered { pal::TEXT() } else { tone });
+}
+
 /// What is under `pointer` (physical pixels). The open menu wins over rows.
 pub(crate) fn hit_test(board: &UiScoreboard, w: u32, h: u32, pointer: [f32; 2]) -> Option<ScoreboardHit> {
     if let Some(menu) = board.chrome.cursor.as_ref().and_then(|cursor| cursor.menu.as_ref()) {
@@ -433,6 +457,26 @@ pub(crate) fn hit_test(board: &UiScoreboard, w: u32, h: u32, pointer: [f32; 2]) 
     }
     if layout.stats_open {
         return None;
+    }
+    if board.chrome.cursor.is_some() {
+        for half in &layout.halves {
+            if let Some(&(_, name_x, name_width)) = half.slots.iter().find(|(slot, _, _)| *slot == Slot::Name) {
+                for &(row, index) in &half.rows {
+                    if let Some(entry) = board.entries.get(index).filter(|entry| entry.translate_checked.is_some()) {
+                        if contains(translate_icon_bounds(name_x + name_width - 24.0 * layout.s, row, layout.s), pointer) {
+                            return Some(ScoreboardHit::TranslateMenu(entry.client));
+                        }
+                    }
+                }
+            }
+        }
+        for &(chip, index) in &layout.spectators {
+            if let Some(entry) = board.entries.get(index).filter(|entry| entry.translate_checked.is_some()) {
+                if contains(translate_icon_bounds(chip[0] + 7.0 * layout.s, chip, layout.s), pointer) {
+                    return Some(ScoreboardHit::TranslateMenu(entry.client));
+                }
+            }
+        }
     }
     let row_hit = layout
         .halves
@@ -553,7 +597,11 @@ pub(in crate::ui) fn build_scoreboard(
                 let lit = hovered == Some(ScoreboardHit::Row(entry.client)) || menu_client == Some(entry.client);
                 rect(out, chip[0], chip[1], chip[2], chip[3], pal::fade(if lit { pal::ACCENT() } else { pal::TEXT() }, if lit { 0.18 } else { 0.05 }), w, h);
                 let size = px(size::SMALL);
-                let left = chip[0] + 8.0 * s;
+                let left = chip[0] + if entry.translate_checked.is_some() { 29.0 * s } else { 8.0 * s };
+                if let Some(checked) = entry.translate_checked {
+                    draw_translate_icon(out, translate_icon_bounds(chip[0] + 7.0 * s, chip, s), checked,
+                        hovered == Some(ScoreboardHit::TranslateMenu(entry.client)), &txt, w, h);
+                }
                 let right = chip[0] + chip[2] - 8.0 * s;
                 let name_line = [chip[0], chip[1] + 2.0 * s, chip[2], 19.0 * s];
                 let status_line = [chip[0], chip[1] + 21.0 * s, chip[2], 17.0 * s];
@@ -564,7 +612,8 @@ pub(in crate::ui) fn build_scoreboard(
                 let (ping, ping_color) = ping_readout(entry.ping);
                 let ping_text = if entry.ping < 0 { ping } else { format!("PING {ping}") };
                 txt.draw_right(out, &ping_text, right, txt.baseline_in(name_line, size), size, ping_color);
-                let room = (right - left - txt.width(&ping_text, size) - 8.0 * s).max(0.0);
+                let lang_reserved = if entry.translate_source.is_some() { 26.0 * s } else { 0.0 };
+                let room = (right - left - txt.width(&ping_text, size) - 8.0 * s - lang_reserved).max(0.0);
                 let mut chars = 24usize;
                 let mut name = truncate_jka_text(&entry.name, chars);
                 while chars > 0 && txt.width(&name, size) > room {
@@ -572,6 +621,13 @@ pub(in crate::ui) fn build_scoreboard(
                     name = truncate_jka_text(&entry.name, chars);
                 }
                 txt.draw(out, &name, left, txt.baseline_in(name_line, size), size, pal::fade(pal::TEXT(), 0.8));
+                if let Some(code) = entry.translate_source {
+                    let code = code.to_ascii_uppercase();
+                    let label_x = left + txt.width(&name, size) + 5.0 * s;
+                    if label_x + txt.width(&code, size) < right - txt.width(&ping_text, size) - 3.0 * s {
+                        txt.draw(out, &code, label_x, txt.baseline_in(name_line, size), size, pal::ACCENT());
+                    }
+                }
 
                 // Preserve the existing three-distinct-ping-samples heuristic:
                 // it is computed on receipt of scores, never inferred here.
@@ -662,16 +718,31 @@ pub(in crate::ui) fn build_scoreboard(
         }
         for (index, (&bounds, &action)) in popup.buttons.iter().zip(&menu.actions).enumerate() {
             let lit = hovered == Some(ScoreboardHit::Action(index));
+            let selected = matches!(action, ScoreAction::TranslateHint(_, true));
             let tone = match action {
                 ScoreAction::VoteKick | ScoreAction::ConfirmVoteKick | ScoreAction::ForceSpectate => pal::ROSE_LIGHT(),
                 _ => pal::ACCENT(),
             };
-            if lit {
-                rect(out, bounds[0], bounds[1], bounds[2], bounds[3], pal::fade(tone, 0.22), w, h);
+            if lit || selected {
+                rect(out, bounds[0], bounds[1], bounds[2], bounds[3],
+                    pal::fade(tone, if lit { 0.22 } else { 0.13 }), w, h);
                 rect(out, bounds[0], bounds[1], (3.0 * s).max(2.0), bounds[3], tone, w, h);
             }
+            // A right-edge mark identifies the chosen language at a glance.
+            if selected {
+                let mark = 5.0 * s;
+                rect(out, bounds[0] + bounds[2] - 17.0 * s,
+                    bounds[1] + (bounds[3] - mark) * 0.5, mark, mark,
+                    pal::ACCENT(), w, h);
+            }
             let size = px(size::CAPTION) * 1.1;
-            txt.draw(out, action.label(), bounds[0] + 14.0 * s, txt.baseline_in(bounds, size), size, if lit { pal::TEXT() } else { tone });
+            let is_translate = matches!(action, ScoreAction::Translate(_));
+            if let ScoreAction::Translate(checked) = action {
+                draw_translate_icon(out, translate_icon_bounds(bounds[0] + 12.0 * s, bounds, s),
+                    checked, lit, &txt, w, h);
+            }
+            txt.draw(out, action.label(), bounds[0] + if is_translate { 38.0 * s } else { 14.0 * s },
+                txt.baseline_in(bounds, size), size, if lit { pal::TEXT() } else { tone });
         }
     }
 }
@@ -777,12 +848,22 @@ fn draw_row(
                 let id_width = txt.width(&client_tag, id_size);
                 let mut chars = 32usize;
                 let mut name = truncate_jka_text(&entry.name, chars);
-                let room = (width - id_width - 18.0 * s).max(0.0);
+                // Reserve the trailing translation badge without moving the
+                // client number or player name. It never overlaps the avatar.
+                let icon_reserved = if entry.translate_checked.is_some() { 27.0 * s } else { 0.0 };
+                let lang_reserved = if entry.translate_source.is_some() { 31.0 * s } else { 0.0 };
+                let room = (width - id_width - 18.0 * s - icon_reserved - lang_reserved).max(0.0);
                 while chars > 6 && txt.width(&name, row) > room {
                     chars -= 2;
                     name = truncate_jka_text(&entry.name, chars);
                 }
                 let name_w = txt.width(&name, row);
+                if let Some(checked) = entry.translate_checked {
+                    draw_translate_icon(out,
+                        translate_icon_bounds(x + width - 24.0 * s, [rx, ry, rw, rh], s), checked,
+                        board.chrome.cursor.as_ref().and_then(|cursor| cursor.hovered)
+                            == Some(ScoreboardHit::TranslateMenu(entry.client)), txt, w, h);
+                }
                 let id_x = x + 6.0 * s;
                 txt.draw(out, &client_tag, id_x, ry + (rh + txt.cap(id_size)) * 0.5, id_size, pal::TEXT_FAINT());
                 let name_x = id_x + id_width + 6.0 * s;
@@ -794,6 +875,18 @@ fn draw_row(
                 }
                 // Badges follow the name.
                 let mut badge_x = name_x + name_w + 8.0 * s;
+                // The label is purely the configured *source hint*, never
+                // auto-detected or inferred from player nationality.
+                if let Some(code) = entry.translate_source {
+                    let code = code.to_ascii_uppercase();
+                    let small = size::SMALL * s;
+                    let code_width = txt.width(&code, small);
+                    if badge_x + code_width <= x + width - icon_reserved - 3.0 * s {
+                        txt.draw(out, &code, badge_x, ry + (rh + txt.cap(small)) * 0.5,
+                            small, pal::ACCENT());
+                        badge_x += code_width + 6.0 * s;
+                    }
+                }
                 let mut badge = |out: &mut Vec<UiVertex>, width_px: f32, draw: &dyn Fn(&mut Vec<UiVertex>, f32)| {
                     draw(out, badge_x);
                     badge_x += width_px + 6.0 * s;
@@ -1013,6 +1106,8 @@ mod tests {
             siege_icon: None,
             spectating_you: false,
             muted: false,
+            translate_checked: None,
+            translate_source: None,
             crowned: false,
             model: String::new(),
             model_fallback: String::new(),
@@ -1181,6 +1276,36 @@ mod tests {
     }
 
     #[test]
+    fn language_code_is_only_an_explicit_source_hint() {
+        let mut entry = entry(4, 0, 0);
+        assert!(entry.translate_source.is_none()); // Auto-detect has no badge
+        entry.translate_source = Some("es");
+        assert_eq!(entry.translate_source.map(str::to_ascii_uppercase).as_deref(), Some("ES"));
+        let mut board = board(vec![entry.clone()], false);
+        board.entries[0].translate_source = None;
+        let original_slots = board_layout(&board, 1920, 1080).halves[0].slots.clone();
+        board.entries[0].translate_source = Some("es");
+        let labeled_slots = board_layout(&board, 1920, 1080).halves[0].slots.clone();
+        // Label is drawn next to the name; scoreboard columns never move.
+        assert_eq!(original_slots, labeled_slots);
+    }
+
+    #[test]
+    fn translation_icon_hits_only_its_bounds_not_the_name() {
+        let mut board = board(vec![entry(4, 0, 1)], false);
+        board.entries[0].translate_checked = Some(true);
+        board.chrome.cursor = Some(ScoreboardCursorUi { pointer: None, hovered: None, menu: None });
+        let layout = board_layout(&board, 1920, 1080);
+        let half = &layout.halves[0];
+        let &(_, name_x, width) = half.slots.iter().find(|(slot, _, _)| *slot == Slot::Name).unwrap();
+        let icon = translate_icon_bounds(name_x + width - 24.0 * layout.s, half.rows[0].0, layout.s);
+        assert_eq!(hit_test(&board, 1920, 1080, [icon[0] + 3.0, icon[1] + 3.0]),
+            Some(ScoreboardHit::TranslateMenu(4)));
+        assert_eq!(hit_test(&board, 1920, 1080, [icon[0] - 3.0, icon[1] + 3.0]),
+            Some(ScoreboardHit::Row(4)));
+    }
+
+    #[test]
     fn open_menu_takes_clicks_before_rows() {
         let mut board = board((0..4).map(|i| entry(i, 0, i)).collect(), false);
         let row = board_layout(&board, 1920, 1080).halves[0].rows[0].0;
@@ -1193,16 +1318,25 @@ mod tests {
     }
 
     #[test]
-    fn translation_menu_has_room_for_rule_detail() {
+    fn translation_picker_layout_keeps_actions_clickable() {
         let menu = ScoreboardMenuUi {
             client: 4, name: "Acrobat".into(), anchor: [400, 300],
-            actions: vec![ScoreAction::TranslateAlways, ScoreAction::TranslateNever],
-            confirm_kick: false, title: Some("Acrobat".into()),
-            detail: Some("chat setting, AUTO".into()),
+            actions: vec![ScoreAction::Translate(true), ScoreAction::TranslateHint(0, false),
+                ScoreAction::TranslateHint(3, true)],
+            confirm_kick: false, title: Some("TRANSLATE - Acrobat".into()),
+            detail: Some("ON | FROM: Spanish".into()),
         };
         let layout = menu_layout(&menu, 1920, 1080);
         assert!(layout.title[3] > 36.0 * scale(1080));
         assert!(layout.buttons[0][1] >= layout.title[1] + layout.title[3]);
+        let badge = translate_icon_bounds(layout.buttons[0][0] + 12.0, layout.buttons[0], scale(1080));
+        assert!(badge[2] <= 18.0 * scale(1080));
+        assert!(badge[0] + badge[2] < layout.buttons[0][0] + layout.buttons[0][2]);
+        let mut board = board(vec![entry(4, 0, 0)], false);
+        board.chrome.cursor = Some(ScoreboardCursorUi { pointer: None, hovered: None, menu: Some(menu) });
+        for (i, button) in layout.buttons.iter().enumerate() {
+            assert_eq!(hit_test(&board, 1920, 1080, center(*button)), Some(ScoreboardHit::Action(i)));
+        }
     }
 
     #[test]

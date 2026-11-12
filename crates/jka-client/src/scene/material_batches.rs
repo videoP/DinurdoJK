@@ -1035,6 +1035,8 @@ pub(in crate::scene) fn build_material_debug_entry(
         authored_stage_count: definition.map_or(material.stages.len(), |d| d.stages.len()),
         resolved_stage_count: material.stages.len(),
         stage_audit_class: stage_audit_class(material),
+        remapped_to: None,
+        remap_target_resolved: false,
         stage_sequence: material.stages.iter().map(|stage| format!(
             "{:?} / {:?} / rgb={:?} / alpha={:?} / tc={:?} / mods={} / glow={} / depth_equal={} / depth_write={} / alpha_cutoff={}",
             stage.texture, stage.blend, stage.rgb_gen, stage.alpha_gen,

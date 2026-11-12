@@ -141,7 +141,7 @@ fn particle_frame(particles: &[Particle], renderers: &[jka_emotes::effects::Rend
         if a.0 != b.0 || a.1 != b.1 {
             continue;
         }
-        let shader = renderers[a.0 as usize].shader.clone();
+        let shader = std::sync::Arc::<str>::from(renderers[a.0 as usize].shader.as_str());
         let rgba = std::array::from_fn(|i| ((a.5[i] as u16 + b.5[i] as u16) / 2) as u8);
         out.draws.push(FxDraw::Line { start: a.3, end: b.3, width: (a.4 + b.4) * 0.5, rgba, shader: shader.into() });
     }
@@ -184,6 +184,6 @@ fn sprite(p: &Particle, r: &jka_emotes::effects::Renderer, origin: [f32; 3], dir
         // Flat custom-facing decals (ripples, rings) lie on the floor by design.
         ground: facing.is_none().then_some(ground),
         pivot: r.pivot,
-        shader: r.shader.clone(),
+        shader: r.shader.as_str().into(),
     }
 }

@@ -373,6 +373,35 @@ fn shitter_blade_surface(batch: Batch) -> Option<DynamicModelSurface> {
     })
 }
 
+/// Frame-local shader identity. Borrow repeated spellings from the immutable
+/// draw source, normalize each spelling once, and use integer batch keys.
+/// The cache expires with this tessellation call, so remaps resolve next frame.
+#[derive(Default)]
+struct FrameMaterials<'a> {
+    spellings: HashMap<&'a str, usize>,
+    normalized: HashMap<String, usize>,
+    stages: Vec<Vec<FxMaterial>>,
+}
+
+impl<'a> FrameMaterials<'a> {
+    fn resolve(&mut self, shader: &'a str, materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>) -> usize {
+        if let Some(&index) = self.spellings.get(shader) {
+            return index;
+        }
+        let normalized = shader.to_ascii_lowercase();
+        let index = if let Some(&index) = self.normalized.get(&normalized) {
+            index
+        } else {
+            let index = self.stages.len();
+            self.stages.push(materials(shader));
+            self.normalized.insert(normalized, index);
+            index
+        };
+        self.spellings.insert(shader, index);
+        index
+    }
+}
+
 /// Build per-shader/per-stage FX surfaces for this view. `materials` resolves
 /// every renderable stage of a shader. This matters for stock JKA effects such
 /// as `gfx/effects/sabers/saberBlur`, whose glow and hot core are two additive
@@ -396,8 +425,8 @@ fn tessellate_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
     draws: &D, view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
 ) -> Vec<DynamicModelSurface> {
-    let mut batches: HashMap<(String, usize, usize), (FxMaterial, Batch)> = HashMap::new();
-    let mut material_cache: HashMap<String, Vec<FxMaterial>> = HashMap::new();
+    let mut batches: HashMap<(usize, usize, usize), (FxMaterial, Batch)> = HashMap::new();
+    let mut material_cache = FrameMaterials::default();
     let mut lit_surfaces: Vec<DynamicModelSurface> = Vec::new();
     let mut shitter_blades = Batch::default();
     for (draw_index, draw) in draws.iter().enumerate() {
@@ -411,20 +440,18 @@ fn tessellate_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             | FxDraw::Quad { shader, .. }
             | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. }
-            | FxDraw::Billboard { shader, .. } => shader.as_str(),
+            | FxDraw::Billboard { shader, .. } => shader.as_ref(),
             FxDraw::Line { shader, .. } | FxDraw::Rope { shader, .. } => shader.as_ref(),
             FxDraw::LitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
             }
         };
-        let shader_key = shader.to_ascii_lowercase();
-        let stages = material_cache
-            .entry(shader_key.clone())
-            .or_insert_with(|| materials(shader));
+        let shader_index = material_cache.resolve(shader, materials);
+        let stages = &material_cache.stages[shader_index];
         for (stage_index, mat) in stages.iter().enumerate() {
             let entry = batches
-                .entry((shader_key.clone(), stage_index, frame_slot(draw, view, mat)))
+                .entry((shader_index, stage_index, frame_slot(draw, view, mat)))
                 .or_insert_with(|| (mat.clone(), Batch::default()));
             append_draw(draw, view, mat, &mut entry.1);
         }
@@ -492,8 +519,8 @@ fn tessellate_workers_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
         return tessellate_impl::<FILTER, D>(draws, view, materials, visible);
     }
 
-    let mut groups: HashMap<(String, usize, usize), (FxMaterial, Vec<usize>)> = HashMap::new();
-    let mut material_cache: HashMap<String, Vec<FxMaterial>> = HashMap::new();
+    let mut groups: HashMap<(usize, usize, usize), (FxMaterial, Vec<usize>)> = HashMap::new();
+    let mut material_cache = FrameMaterials::default();
     let mut lit_surfaces: Vec<DynamicModelSurface> = Vec::new();
     let mut shitter_blades = Batch::default();
 
@@ -508,20 +535,18 @@ fn tessellate_workers_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             | FxDraw::Quad { shader, .. }
             | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. }
-            | FxDraw::Billboard { shader, .. } => shader.as_str(),
+            | FxDraw::Billboard { shader, .. } => shader.as_ref(),
             FxDraw::Line { shader, .. } | FxDraw::Rope { shader, .. } => shader.as_ref(),
             FxDraw::LitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
             }
         };
-        let shader_key = shader.to_ascii_lowercase();
-        let stages = material_cache
-            .entry(shader_key.clone())
-            .or_insert_with(|| materials(shader));
+        let shader_index = material_cache.resolve(shader, materials);
+        let stages = &material_cache.stages[shader_index];
         for (stage_index, mat) in stages.iter().enumerate() {
             groups
-                .entry((shader_key.clone(), stage_index, frame_slot(draw, view, mat)))
+                .entry((shader_index, stage_index, frame_slot(draw, view, mat)))
                 .or_insert_with(|| (mat.clone(), Vec::new()))
                 .1
                 .push(draw_index);
@@ -641,14 +666,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
     draws: &D, view: &FxView,
     materials: &mut dyn FnMut(&str) -> Vec<FxMaterial>, visible: &[bool],
 ) -> Vec<DynamicModelSurface> {
-    // Give each unique shader one integer key for this frame. At 100k+ FX
-    // lines, lowercasing/cloning the shader string into every batch-key lookup
-    // was considerably more CPU work than building the GPU instances.
-    // Preserve case-insensitive shader identity while only allocating on
-    // first sight of a distinct spelling.
-    let mut shader_indices: HashMap<&str, usize> = HashMap::new();
-    let mut normalized_indices: HashMap<String, usize> = HashMap::new();
-    let mut shader_materials: Vec<Vec<FxMaterial>> = Vec::new();
+    let mut material_cache = FrameMaterials::default();
     let mut cpu_batches: HashMap<(usize, usize, usize), (FxMaterial, Batch)> = HashMap::new();
     // The two procedural classes each need a different vertex count/pipeline.
     // Rope is distinct from Force Lightning: it never enters lightning's
@@ -668,29 +686,15 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             | FxDraw::Quad { shader, .. }
             | FxDraw::Mesh { shader, .. }
             | FxDraw::Cylinder { shader, .. }
-            | FxDraw::Billboard { shader, .. } => shader.as_str(),
+            | FxDraw::Billboard { shader, .. } => shader.as_ref(),
             FxDraw::Line { shader, .. } | FxDraw::Rope { shader, .. } => shader.as_ref(),
             FxDraw::LitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
             }
         };
-        let shader_index = if let Some(&index) = shader_indices.get(shader) {
-            index
-        } else {
-            let normalized = shader.to_ascii_lowercase();
-            let index = if let Some(&index) = normalized_indices.get(&normalized) {
-                index
-            } else {
-                let index = shader_materials.len();
-                shader_materials.push(materials(shader));
-                normalized_indices.insert(normalized, index);
-                index
-            };
-            shader_indices.insert(shader, index);
-            index
-        };
-        let stages = &shader_materials[shader_index];
+        let shader_index = material_cache.resolve(shader, materials);
+        let stages = &material_cache.stages[shader_index];
 
         for (stage_index, mat) in stages.iter().enumerate() {
             // Compact sprite instances have fixed 0..1 UVs. Animated stages
@@ -1291,13 +1295,10 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
             let v1 = batch.vertex(positions[1], uvs[1], color);
             let v2 = batch.vertex(positions[2], uvs[2], color);
             let v3 = batch.vertex(positions[3], uvs[3], color);
-            // Saber/FX shaders commonly specify cull twosided. Dynamic FX
-            // batches do not currently carry shader cull state, so emit the
-            // reverse winding as well, matching the existing two-sided FX path.
+            // Batch::triangle already emits both windings. Adding reversed
+            // triangles here would blend each half of the quad twice.
             batch.triangle(v0, v1, v3);
             batch.triangle(v3, v1, v2);
-            batch.triangle(v3, v1, v0);
-            batch.triangle(v2, v1, v3);
         }
         FxDraw::Mesh { positions, uvs, rgba, indices, .. } => {
             if positions.is_empty() || positions.len() != uvs.len() || positions.len() != rgba.len() {
@@ -1548,7 +1549,7 @@ mod tests {
         let bolt = FxDraw::Lightning {
             start: [100.0, 0.0, 8.0], end: [100.0, 512.0, 8.0],
             width: 2.0, chaos: 3.0, seed: 0.42, rgba: [180, 200, 255, 255],
-            shader: "force/test".to_owned(),
+            shader: "force/test".into(),
         };
         let surfaces = tessellate_gpu_particles(&[bolt], &view(),
             &mut |_| vec![white(FxBlend::AddAlpha)]);
@@ -1959,6 +1960,57 @@ mod tests {
     }
 
     #[test]
+    fn repeated_shader_spellings_keep_masks_stages_and_frame_local_materials() {
+        let draws: Vec<_> = (0..129).map(|index| FxDraw::Sprite {
+            shader_time: 0.25, origin: [100.0 + index as f32, 0.0, 0.0],
+            radius: 2.0, rotation: index as f32, rgba: [255, 128, 64, 128],
+            shader: if index == 0 { "hidden" }
+                else if index % 2 == 0 { "fx/shared" } else { "FX/Shared" }.into(),
+        }).collect();
+        let mut visible = vec![true; draws.len()];
+        visible[0] = false;
+        for revision in 0..2 {
+            let mut reference = None;
+            for mode in 0..3 {
+                let mut lookups = Vec::new();
+                let mut materials = |name: &str| {
+                    lookups.push(name.to_owned());
+                    [FxBlend::Alpha, FxBlend::AddAlpha].into_iter().map(|blend| FxMaterial {
+                        // Force the GPU path's CPU fallback so every backend's
+                        // authored UV and geometry output can be compared.
+                        tc_mods: vec![jka_assets::shader::TcMod::Scroll(0.25, -0.5)],
+                        authored_glow: revision == 1,
+                        ..white(blend)
+                    }).collect()
+                };
+                let surfaces = match mode {
+                    0 => tessellate_masked(&draws, &view(), &mut materials, &visible),
+                    1 => tessellate_workers_masked(&draws, &view(), &mut materials, &visible),
+                    _ => tessellate_gpu_particles_masked(&draws, &view(), &mut materials, &visible),
+                };
+                assert_eq!(lookups, ["FX/Shared"], "resolve the first visible spelling once");
+                assert_eq!(surfaces.len(), 2, "both authored stages must remain separate");
+                for surface in &surfaces {
+                    assert_eq!(surface.vertices.len(), 128 * 4);
+                    assert_eq!(surface.indices.len(), 128 * 12);
+                    assert_eq!(surface.authored_glow, revision == 1,
+                        "material resolution must not survive into the next frame");
+                }
+                let signature: Vec<_> = surfaces.iter().map(|surface| (
+                    surface.alpha_mode as u8,
+                    bytemuck::cast_slice::<_, u8>(surface.vertices.as_slice()).to_vec(),
+                    surface.indices.as_ref().clone(),
+                )).collect();
+                if let Some(expected) = &reference {
+                    assert_eq!(&signature, expected, "mode {mode} changed stage geometry or ordering");
+                } else {
+                    reference = Some(signature);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn gpu_particle_path_preserves_sprite_basis_and_material() {
         let draws = [FxDraw::Sprite { shader_time: 0.0,
             origin: [100.0, 0.0, 0.0],
@@ -2123,13 +2175,23 @@ mod tests {
             rgba: [255, 64, 0, 255],
             shader: "gfx/effects/sabers/saberBlur".into(),
         }];
-        let surfaces = tessellate(&draws, &view(), &mut |_| vec![
-            white(FxBlend::Add),
-            FxMaterial { rgb_vertex: false, ..white(FxBlend::Add) },
-        ]);
-        assert_eq!(surfaces.len(), 2, "one surface per renderable shader stage");
-        assert!(surfaces.iter().all(|surface| surface.indices.len() == 12));
-        assert!(surfaces.iter().any(|surface| surface.vertices[2].uv == [0.5, 0.0]));
+        for mode in 0..3 {
+            let mut materials = |_: &str| vec![
+                white(FxBlend::Add),
+                FxMaterial { rgb_vertex: false, ..white(FxBlend::Add) },
+            ];
+            let surfaces = match mode {
+                0 => tessellate(&draws, &view(), &mut materials),
+                1 => tessellate_workers(&draws, &view(), &mut materials),
+                _ => tessellate_gpu_particles(&draws, &view(), &mut materials),
+            };
+            assert_eq!(surfaces.len(), 2, "one surface per renderable shader stage");
+            for surface in &surfaces {
+                assert_eq!(surface.indices.as_slice(), [0, 1, 3, 0, 3, 1, 3, 1, 2, 3, 2, 1],
+                    "mode {mode}: each face needs one front and one back winding");
+            }
+            assert!(surfaces.iter().any(|surface| surface.vertices[2].uv == [0.5, 0.0]));
+        }
     }
 
     #[test]

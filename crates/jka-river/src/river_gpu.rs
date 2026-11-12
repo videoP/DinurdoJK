@@ -192,14 +192,45 @@ pub struct Simulation {
     parameters: Parameters,
     uniform: wgpu::Buffer,
     boundary_uniform: wgpu::Buffer,
+    /// RenderControls (binding 5): native smoothing plus the bed clamp.
+    presentation: wgpu::Buffer,
     stage_template: Uniform,
     boundary_template: BoundaryUniform,
+    /// Native source/sink boxes, then up to MAX_DRAINS developer drains.
+    boxes: wgpu::Buffer,
+    base_boxes: u32,
     #[cfg(any(test, feature = "test-support"))]
     trace: Option<(wgpu::Device, Vec<(Kernel, wgpu::Texture)>)>,
     bytes: u64,
 }
 
+/// `RenderControls` in shallow.wgsl: the native render-height smoothing
+/// (radius, height cutoff, method, border) and the bed clamp extension.
+pub fn render_control_words(render: jka_water::river::Presentation, bed_clamp: bool) -> [f32; 8] {
+    [
+        render.half_width as f32,
+        render.height_cutoff,
+        render.smoothing_method as f32,
+        render.border_width as f32,
+        if bed_clamp { 1.0 } else { 0.0 },
+        0.0,
+        0.0,
+        0.0,
+    ]
+}
+
 impl Simulation {
+    /// Live render-height controls (PostSim ExtrapolateRenderHeight inputs).
+    pub fn set_render_controls(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, words: &[f32; 8]) {
+        use wgpu::util::DeviceExt;
+        let upload = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("river render controls upload"),
+            contents: bytemuck::cast_slice(words),
+            usage: wgpu::BufferUsages::COPY_SRC,
+        });
+        encoder.copy_buffer_to_buffer(&upload, 0, &self.presentation, 0, 32);
+    }
+
     pub fn new(
         device: &wgpu::Device,
         dimensions: [u32; 2],
@@ -450,7 +481,7 @@ impl Simulation {
                 dimensions[0],
                 dimensions[1],
                 t.extrapolation_half_width,
-                u32::from(t.extrapolate_into_dry),
+                crate::river_tiles::transport_flags(t),
             ],
             stepping: [p.dx, p.dt, p.gravity, p.max_velocity],
             limits: [
@@ -473,13 +504,8 @@ impl Simulation {
         });
         let presentation = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("UE river presentation controls"),
-            contents: bytemuck::cast_slice(&[
-                render.half_width as f32,
-                render.height_cutoff,
-                render.smoothing_method as f32,
-                render.border_width as f32,
-            ]),
-            usage: wgpu::BufferUsages::UNIFORM,
+            contents: bytemuck::cast_slice(&render_control_words(render, false)),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let boundary_template = BoundaryUniform {
             times: [
@@ -539,14 +565,14 @@ impl Simulation {
             })
             .flat_map(f32::to_le_bytes)
             .collect();
-        if volumes.is_empty() {
-            volumes.resize(32, 0);
-        }
+        // Room for the developer drains after the native boxes (set_drains).
+        volumes.resize((boundary.boxes.len() + crate::river_tiles::MAX_DRAINS) * 32, 0);
         let boxes = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("UE river source and sink box arrays"),
             contents: &volumes,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
+        let base_boxes = boundary.boxes.len() as u32;
         let initial_upload = if let InitialWater::Samples(water) = initial_water {
             let bytes_per_row = (dimensions[0] * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
                 * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -739,9 +765,12 @@ impl Simulation {
             history_needs_snapshot: false,
             parameters: p,
             uniform,
+            presentation,
             boundary_uniform: boundary_params,
             stage_template,
             boundary_template,
+            boxes,
+            base_boxes,
             #[cfg(any(test, feature = "test-support"))]
             trace: None,
             bytes: count * 100 + 128 + box_bytes,
@@ -877,8 +906,21 @@ impl Simulation {
     /// Existing inlet-box storage stays bound in either mode; the native loop
     /// count and rise cap are copied with the next solver frame's parameters.
     pub fn set_height_source(&mut self, enabled: bool, rise_limit_cm: f32) {
-        self.boundary_template.flags[0] = u32::from(enabled);
+        // Flag z bit 0 disables the native source boxes; the box count also
+        // covers the drains that follow them.
+        self.boundary_template.flags[2] = u32::from(!enabled);
         self.boundary_template.origin[3] = rise_limit_cm;
+    }
+
+    /// Replace the developer drains (simulation-local cm; at most
+    /// MAX_DRAINS). Takes effect with the next solver frame.
+    pub fn set_drains(&mut self, queue: &wgpu::Queue, drains: &[jka_water::river::boundary::Drain]) {
+        let drains = &drains[..drains.len().min(crate::river_tiles::MAX_DRAINS)];
+        if !drains.is_empty() {
+            let words: Vec<f32> = drains.iter().flat_map(crate::river_tiles::drain_box_words).collect();
+            queue.write_buffer(&self.boxes, u64::from(self.base_boxes) * 32, bytemuck::cast_slice(&words));
+        }
+        self.boundary_template.flags[0] = self.base_boxes + drains.len() as u32;
     }
 
     /// Reuse inlet resources when tuning Q or toggling modes. The hydraulic

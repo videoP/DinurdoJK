@@ -6,7 +6,7 @@
 - Read the affected types, callers, neighboring modules, and existing caches before changing an implementation. Inspect the working tree first and preserve unrelated work.
 - For parity work, identify the applicable game/mod behavior and reference implementation. Use OpenJK, TaystJK, and applicable JK2MV/MVSDK sources; if they disagree, state which behavior this path must preserve instead of mixing them silently.
 - Keep durable repository rules here. Add a nested `AGENTS.md` only for rules specific to that subtree, and read applicable nested files before editing there. A file under `Development Docs/Patch20` does not govern sibling source trees under `crates/`.
-- Keep task findings, measurements, and investigation order in audit documents, not in permanent instructions. See [RUST_AUDIT.md](RUST_AUDIT.md) for the November 11, 2026 handoff review; recheck findings against current code before acting on them.
+- Keep task findings, measurements, and investigation order in audit documents, not in permanent instructions. See [RUST_AUDIT.md](<Development Docs/RUST_AUDIT.md>) for the November 11, 2026 handoff review; recheck findings against current code before acting on them.
 
 ## Build artifact policy
 
@@ -49,5 +49,6 @@
 
 - Documentation-only and read-only audit tasks do not require compilation. For source changes, use the necessary focused verification under the build/cache policy above; honor explicit task-specific no-build requests and report unrun checks.
 - Keep each cleanup small enough to review and validate independently. Prefer existing focused tests; add regression coverage for meaningful behavior or ownership risks rather than tests that only mirror the implementation. Do not run successive build/check/test/Clippy variants without a reason.
+- Update all callers and test fixtures, including ignored tests, when changing signatures, struct fields, or ownership types. A test-name filter selects what runs; it does not avoid compiling the rest of the unit-test target.
 - In this checkout, edit files directly when the task calls for changes. Produce incremental patches or ZIPs when requested or when working from an archive without checkout access; packaging is not a default requirement.
 - Report the problem, changed files, preserved behavior, verification actually performed, and unresolved risks. An allocation removed in source is not automatically a demonstrated frame-time improvement.

@@ -21,6 +21,7 @@ pub mod lake_ripples;
 pub mod reflection_tiles;
 pub mod map_environment;
 pub mod underwater;
+pub mod underwater_optics;
 pub mod caustics;
 pub mod rain_heights;
 #[path = "../../../vendor/blue-water-sea-and-sky/sky/src/environment.rs"]

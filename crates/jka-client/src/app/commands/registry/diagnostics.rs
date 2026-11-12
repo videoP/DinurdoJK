@@ -700,8 +700,7 @@ commands! {
         CommandResult::Handled
     }
 
-    cmd_riversource ["riversource", ] ("riversource [height above ground] [patch radius] [source width] [cells] [simulation speed] [CFS|level|discharge:<CFS>]", "Developer test: pour water in at the crosshair using the native Unreal river solver (simulation-first, no spline). Defaults come from Video > River > New river defaults. Optional CFS caps supply while filling toward the target level; level selects unlimited held-water-level mode. Simulation speed is the fast-solve rate and automatically returns to 1x after steady-flow detection. Draws the ported Single Layer Water body with sky and screen-space reflections; foam uses textures/japro/river_foam_detail. 'riverclear' removes all patches.", CommandScope::Always) |self, command| {
-        use jka_movement::{TraceQuery, TraceWorld, ENTITY_NONE};
+    cmd_spawnriver ["spawnriver", "riversource"] ("spawnriver [height above ground] [patch radius] [source width] [cells] [simulation speed] [CFS|level|discharge:<CFS>]", "Developer test: pour water in at the crosshair using the native Unreal river solver (simulation-first, no spline). Defaults come from Video > River > New river defaults. Optional CFS caps supply while filling toward the target level; level selects unlimited held-water-level mode. Simulation speed is the fast-solve rate and automatically returns to 1x after steady-flow detection. Draws the ported Single Layer Water body with sky and screen-space reflections; foam uses textures/japro/river_foam_detail. 'spawndrain' adds drains; 'riverclear' removes all rivers and drains.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         let defaults=self.river_editor.defaults;
         let parsed=(||->Result<crate::river_authoring::SourceParameters,String> {
@@ -722,21 +721,9 @@ commands! {
             };
             Ok(crate::river_authoring::SourceParameters {height:number(1,defaults.height)?,radius:number(2,defaults.radius)?,width:number(3,defaults.width)?,cells:cells as u32,speed:number(5,defaults.speed)?,mode,discharge_cfs})
         })();
-        let params=match parsed {Ok(p)=>p,Err(error)=>{self.push_console_line(format!("^1riversource: {error}"));return CommandResult::Handled;}};
-        if let Err(error)=params.at([0.0;3]).validate() {self.push_console_line(format!("^1riversource: {error}"));return CommandResult::Handled;}
-        // World-only trace from the view (OpenJK SOLID | TERRAIN).
-        let start = crate::scene::jka_position(self.camera.position.to_array());
-        let direction = crate::scene::jka_position(self.camera.forward().to_array());
-        let end = std::array::from_fn(|axis| start[axis] + direction[axis] * 131_072.0);
-        let Some(world) = self.map_collision.as_mut() else {
-            self.push_console_line("^3riversource: no map collision loaded".to_owned());
-            return CommandResult::Handled;
-        };
-        let trace = world.trace(TraceQuery { start, mins: [0.0; 3], maxs: [0.0; 3], end, pass_entity: ENTITY_NONE, mask: 0x1 | 0x1000 });
-        if trace.fraction >= 1.0 || trace.start_solid != 0 {
-            self.push_console_line("^3riversource: aim at the ground".to_owned());
-            return CommandResult::Handled;
-        }
+        let params=match parsed {Ok(p)=>p,Err(error)=>{self.push_console_line(format!("^1spawnriver: {error}"));return CommandResult::Handled;}};
+        if let Err(error)=params.at([0.0;3]).validate() {self.push_console_line(format!("^1spawnriver: {error}"));return CommandResult::Handled;}
+        let Some(trace) = self.river_crosshair_trace("spawnriver") else { return CommandResult::Handled; };
         if crate::river_runtime::debug_mode() >= 2 {
             self.push_console_line(format!(
                 "[RIVER DBG HIT] normal=({:.3},{:.3},{:.3}) flags=0x{:x} contents=0x{:x} trace_fraction={:.5} {}",
@@ -745,21 +732,16 @@ commands! {
                 if trace.normal[2] < 0.6 { "WARNING: steep/vertical face, not a floor" } else { "floor-like face" }
             ));
         }
-        let key = format!("{:?}", self.initial_source);
-        if self.river_collision.as_ref().is_none_or(|(k, _)| *k != key) {
-            self.push_console_line("riversource: reading map collision (first use on this map)...".to_owned());
-            match crate::scene::river_collision_triangles(&self.base, self.game.as_deref(), &self.initial_source, self.video.allow_asset_overrides) {
-                Ok(triangles) => self.river_collision = Some((key, std::sync::Arc::new(triangles))),
-                Err(error) => {
-                    self.push_console_line(format!("^1riversource: {error}"));
-                    return CommandResult::Handled;
-                }
+        let collision = match self.river_collision() {
+            Ok(collision) => collision,
+            Err(error) => {
+                self.push_console_line(format!("^1spawnriver: {error}"));
+                return CommandResult::Handled;
             }
-        }
-        let collision = std::sync::Arc::clone(&self.river_collision.as_ref().unwrap().1);
+        };
         let source = params.at(trace.end);
         if let Err(error) = source.validate() {
-            self.push_console_line(format!("^1riversource: {error}"));
+            self.push_console_line(format!("^1spawnriver: {error}"));
             return CommandResult::Handled;
         }
         let definition=self.river_editor.add(source,self.video.river_settings);
@@ -774,10 +756,55 @@ commands! {
         CommandResult::Handled
     }
 
-    cmd_riverclear ["riverclear", ] ("riverclear", "Remove all developer river patches placed with riversource.", CommandScope::Always) |self, _command| {
+    cmd_spawndrain ["spawndrain", ] ("spawndrain [radius] [overflow height|floor] [max CFS|unlimited]", "Developer river drain at the crosshair (not Unreal): water inside the radius (map units) leaves every river. 'floor' (default) empties the cells; a number is an overflow drain that holds water at that height above the crosshair point. Max CFS caps the removal rate per simulated second. Defaults come from Video > River > Drains, which also edits placed drains live. 'riverclear' removes rivers and drains.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        let defaults = self.river_editor.drain_defaults;
+        let parsed = (|| -> Result<crate::river_authoring::DrainParameters, String> {
+            let radius = match words.get(1) {
+                Some(w) => w.parse::<f32>().map_err(|_| format!("invalid radius: {w}"))?,
+                None => defaults.radius,
+            };
+            let overflow_height = match words.get(2) {
+                Some(w) if w.eq_ignore_ascii_case("floor") => None,
+                Some(w) => Some(w.parse::<f32>().map_err(|_| format!("overflow height must be a number or 'floor': {w}"))?),
+                None => defaults.overflow_height,
+            };
+            let max_cfs = match words.get(3) {
+                Some(w) if w.eq_ignore_ascii_case("unlimited") => None,
+                Some(w) => Some(w.parse::<f32>().map_err(|_| format!("max CFS must be a number or 'unlimited': {w}"))?),
+                None => defaults.max_cfs,
+            };
+            Ok(crate::river_authoring::DrainParameters { radius, overflow_height, max_cfs })
+        })();
+        let params = match parsed { Ok(p) => p, Err(error) => { self.push_console_line(format!("^1spawndrain: {error}")); return CommandResult::Handled; } };
+        let Some(trace) = self.river_crosshair_trace("spawndrain") else { return CommandResult::Handled; };
+        let drain = params.at(trace.end);
+        if let Err(error) = drain.validate() {
+            self.push_console_line(format!("^1spawndrain: {error}"));
+            return CommandResult::Handled;
+        }
+        self.river_editor.add_drain(drain);
+        self.push_console_line(format!(
+            "Drain at ({:.0} {:.0} {:.0}), radius {:.0}, {}, {}",
+            trace.end[0], trace.end[1], trace.end[2], drain.radius,
+            drain.level.map_or("floor drain".to_owned(), |z| format!("overflow at z {z:.0}")),
+            drain.max_cfs.map_or("unlimited flow".to_owned(), |q| format!("max {q} CFS")),
+        ));
+        self.send_river_drains();
+        CommandResult::Handled
+    }
+
+    cmd_riverdump ["riverdump", ] ("riverdump", "River diagnostics (sparse rivers): read the solver back once (brief GPU stall), print the bed/water of the column at your view position, water volume and void-wall/pit counts, and write top-down PNGs to screenshots/ (river-dump-*: bed grey, water blue, walls red, void walls magenta, unwalled void pits yellow, source green, drains orange, you white). A second dump also writes river-diff-* (red = water left, green = water arrived) and the volume change.", CommandScope::Always) |self, _command| {
+        let eye = crate::scene::jka_position(self.camera.position.to_array());
+        let directory = self.game_write_path("screenshots");
+        self.render_command(RenderCommand::RiverDump { eye, directory });
+        CommandResult::Handled
+    }
+
+    cmd_riverclear ["riverclear", ] ("riverclear", "Remove all developer rivers (spawnriver) and drains (spawndrain).", CommandScope::Always) |self, _command| {
         self.river_editor.clear();
         self.render_command(RenderCommand::RiverClear);
-        self.push_console_line("riverclear: removed river patches".to_owned());
+        self.push_console_line("riverclear: removed rivers and drains".to_owned());
         CommandResult::Handled
     }
 

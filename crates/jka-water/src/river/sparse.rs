@@ -164,6 +164,24 @@ impl Residency {
         Ok((slot, true))
     }
 
+    /// Make a tile non-resident (sparse tile eviction; not Unreal). The last
+    /// slot moves into the freed one so slots stay dense: returns the freed
+    /// slot and, when another tile moved, (its old slot, the tile).
+    pub fn swap_remove(&mut self, tile: [i32; 2]) -> Option<(u32, Option<(u32, [i32; 2])>)> {
+        let i = self.table_index(tile)?;
+        let slot = u32::try_from(self.table[i]).ok()?;
+        self.table[i] = -1;
+        let last = self.slots.len() as u32 - 1;
+        self.slots.swap_remove(slot as usize);
+        if slot == last {
+            return Some((slot, None));
+        }
+        let moved = self.slots[slot as usize];
+        let j = self.table_index(moved).expect("resident tile is inside the lattice");
+        self.table[j] = slot as i32;
+        Some((slot, Some((last, moved))))
+    }
+
     pub fn slot_count(&self) -> usize {
         self.slots.len()
     }
@@ -293,6 +311,22 @@ mod tests {
             assert_eq!(r.index(r.cell(i)), Some(i));
         }
         assert_eq!(r.table(), &[1, -1, -1, -1, -1, 0]);
+    }
+
+    #[test]
+    fn swap_remove_keeps_slots_dense() {
+        let lattice = Lattice::new(8, [4, 4]).unwrap();
+        let mut r = Residency::new(lattice);
+        for t in [[0, 0], [1, 0], [2, 0], [3, 0]] {
+            r.insert(t).unwrap();
+        }
+        assert_eq!(r.swap_remove([1, 0]), Some((1, Some((3, [3, 0])))));
+        assert_eq!(r.slot([3, 0]), Some(1));
+        assert_eq!(r.slot([1, 0]), None);
+        assert_eq!(r.swap_remove([2, 0]), Some((2, None)));
+        assert_eq!(r.slot_tiles(), &[[0, 0], [3, 0]]);
+        assert_eq!(r.swap_remove([2, 0]), None);
+        assert_eq!(r.insert([1, 0]).unwrap(), (2, true));
     }
 
     #[test]

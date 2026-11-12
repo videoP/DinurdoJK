@@ -54,7 +54,7 @@ fn studio_demo_follow_submits_saber_after_seek_and_pause() {
     for time in [0.0, 1.1, 1.5, 2.5, 1.1, 1.1] {
         let frame = source.sample(&clip, time, key, None, key, &video,
             Default::default(), Default::default(), &[], false, false, None, [1280, 720], false,
-            false, Instant::now()).unwrap();
+            false, Default::default(), Instant::now()).unwrap();
         let ps = source.playback.presented_player_state().unwrap();
         assert_eq!(ps.field_i32("weapon"), Some(3), "fixture must wield a saber");
         assert_eq!(ps.field_i32("saberHolstered"), Some(0));
@@ -105,7 +105,7 @@ fn studio_saber_swing_probe() {
         let time = tick as f64 / fps;
         let frame = source.sample(&clip, time, key, None, key, &video,
             Default::default(), Default::default(), &[], true, false, None,
-            [1600, 900], false, false, now).unwrap();
+            [1600, 900], false, false, Default::default(), now).unwrap();
         if time < start { continue; }
         let debug = source.playback.player_presenter.viewer_anim_debug().expect("viewer must be posed");
         let ps = source.playback.presented_player_state().unwrap();
@@ -167,7 +167,7 @@ fn studio_saber_direction_blend_probe() {
     key.source = StudioCameraSource::Demo { pov: StudioDemoPov::Free, client: -1 };
     source.sample(&clip, 0.0, key, None, key, &Default::default(),
         Default::default(), Default::default(), &[], false, false, None,
-        [1600,900], false, false, Instant::now()).unwrap();
+        [1600,900], false, false, Default::default(), Instant::now()).unwrap();
     let ps = source.playback.presented_player_state().unwrap();
     let mut entity = crate::cgame::presented_player_state_entity(ps).unwrap();
     entity.angles = [0.0;3];
@@ -252,7 +252,7 @@ fn studio_fixed_camera_edits_render_outside_recorded_pvs() {
         key.position = scene::jka_position(position); key.yaw = yaw; key.pitch = -pitch; key.fov = 86.0;
         let frame = source.sample(&clip, 0.0, key, None, key, &Default::default(),
             Default::default(), Default::default(), &[], false, false, None,
-            [1280, 720], false, false, Instant::now()).unwrap();
+            [1280, 720], false, false, Default::default(), Instant::now()).unwrap();
         assert_eq!(frame.camera.position.to_array(), position);
         assert!((frame.camera.yaw.to_degrees()-yaw).abs()<0.0001);
         assert!((frame.camera.pitch.to_degrees()-pitch).abs()<0.0001);
@@ -286,7 +286,7 @@ fn studio_scene_observer_faces_chat_icon_in_all_fx_modes() {
             };
             let frame = source.sample(&clip, 0.0, key, None, key, &video,
                 Default::default(), Default::default(), &[], false, false, Some(observer),
-                [1280, 720], false, false, Instant::now()).unwrap();
+                [1280, 720], false, false, Default::default(), Instant::now()).unwrap();
             assert_eq!(frame.camera.position.to_array(), scene::render_position(observer.position));
             assert_ne!(frame.shot_camera.position, frame.camera.position);
             assert!(frame.area_mask.is_none(), "recorded area mask cannot cull the observer view");
@@ -315,7 +315,7 @@ fn studio_scene_observer_faces_chat_icon_in_all_fx_modes() {
     // Leaving Scene view must restore the authored first-person presentation.
     source.sample(&clip, 0.0, key, None, key, &Default::default(),
         Default::default(), Default::default(), &[], false, false, None,
-        [1280, 720], false, false, Instant::now()).unwrap();
+        [1280, 720], false, false, Default::default(), Instant::now()).unwrap();
     assert!(source.playback.studio_presentation_view.is_none());
     assert_eq!(source.playback.demo_hidden_view_client, Some(0));
 }

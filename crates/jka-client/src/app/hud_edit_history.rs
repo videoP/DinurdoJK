@@ -7,6 +7,7 @@ use crate::extensions::HudPlacement;
 use crate::ui::HudLayout;
 
 #[derive(Clone, PartialEq)]
+#[cfg_attr(test, derive(Debug))]
 pub(in crate::app) struct HudEditState {
     pub layout: HudLayout,
     pub extension_placements: BTreeMap<String, HudPlacement>,

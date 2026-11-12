@@ -703,7 +703,7 @@ pub struct App {
     map_collision: Option<CollisionWorld>,
     /// Developer river source: collision triangles of the map they came from.
     river_editor: crate::river_authoring::Editor,
-    river_collision: Option<(String, std::sync::Arc<Vec<jka_assets::bsp::river::CollisionSurface>>)>, 
+    river_collision: Option<(String, std::sync::Arc<jka_assets::bsp::river::RiverCollision>)>,
     /// Drawn/markable world surfaces for OpenJK-style R_MarkFragments marks.
     map_mark_surfaces: Option<std::sync::Arc<jka_assets::bsp::MarkSurfaces>>,
     /// The map's `misc_model_static` props (client-placed MD3s, jaPRO cgame).

@@ -29,6 +29,7 @@ fn inactive_targets_shrink_and_reenable_at_viewport_size() {
                     temporal,
                     clouds,
                     Default::default(),
+                    (64, 32),
                 )
             };
             for _ in 0..2 {
@@ -112,6 +113,7 @@ fn depth_resolve_rebinds_replaced_targets_without_rebuilding_pipeline() {
                     false,
                     false,
                     Default::default(),
+                    (width, 8),
                 )
             };
             let original = make_targets(8);

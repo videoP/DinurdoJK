@@ -2852,20 +2852,20 @@ impl OceanGpu {
 
     /// Rebuild only when the map/selection/amplitude changes. Failed selections
     /// are remembered so unsupported pools do not retry every render frame.
-    pub fn configure_coastal(
+    pub fn configure_coastal<'a>(
         &mut self, device: &wgpu::Device, queue: &wgpu::Queue,
         enabled: bool, pool: u8,
         atlas: Option<&std::sync::Arc<jka_assets::bsp::bathymetry::Atlas>>,
-        promoted: &[appearance::PromotedOcean], overrides: &[(usize, OceanSettings)],
+        promoted: impl Iterator<Item = &'a appearance::PromotedOcean> + Clone, overrides: &[(usize, OceanSettings)],
     ) {
         let enabled = enabled && self.settings.backend != 3
             && !(self.settings.blue_water_coast && matches!(self.settings.backend,1|2));
         let pointer=atlas.map_or(0,|a|std::sync::Arc::as_ptr(a) as usize);
         if !enabled && self.coastal.is_none() {return;}
-        let mut candidates:Vec<_>=promoted.iter().filter(|p|pool==0 || p.index+1==pool as usize).collect();
+        let candidates=promoted.filter(|p|pool==0 || p.index+1==pool as usize);
         let amplitude=|p:&appearance::PromotedOcean|overrides.iter().find(|(slot,_)|*slot==p.index)
             .map_or(p.heuristic.amplitude,|(_,s)|s.authored.amplitude);
-        let signature=candidates.iter().fold(0u32,|h,p| {
+        let signature=candidates.clone().fold(0u32,|h,p| {
             let wavelength=overrides.iter().find(|(slot,_)|*slot==p.index)
                 .map_or(p.heuristic.wavelength,|(_,s)|s.authored.wavelength);
             h.wrapping_mul(31)^amplitude(p).to_bits()^wavelength.to_bits()
@@ -2876,6 +2876,8 @@ impl OceanGpu {
         self.coastal=None;
         queue.write_buffer(&self.coastal_render.params,16,bytemuck::cast_slice(&[0u32]));
         if !enabled || pointer==0 {return;}
+        // Sorting needs storage only when the coastal selection actually changes.
+        let mut candidates: Vec<_> = candidates.collect();
         if pool==0 {
             candidates.sort_by_key(|p| std::cmp::Reverse(atlas.map_or(0,|a| a.grids.iter()
                 .filter(|g|g.slot as usize==p.index)
@@ -2939,11 +2941,11 @@ impl OceanGpu {
         }
     }
 
-    pub fn set_promoted_surfaces(
+    pub fn set_promoted_surfaces<'a>(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        descriptors: &[appearance::PromotedOcean],
+        descriptors: impl Iterator<Item = &'a appearance::PromotedOcean> + Clone,
         overrides: &[(usize, OceanSettings)],
     ) {
         let desired_settings = |p: &appearance::PromotedOcean| {
@@ -2956,11 +2958,11 @@ impl OceanGpu {
                 local.is_some(),
             )
         };
-        if self.promoted_surfaces.len() == descriptors.len()
+        if self.promoted_surfaces.len() == descriptors.clone().count()
             && self
                 .promoted_surfaces
                 .iter()
-                .zip(descriptors)
+                .zip(descriptors.clone())
                 .all(|(s, p)| {
                     let (settings, manual) = desired_settings(p);
                     s.descriptor == *p && s.settings == settings && s.manual == manual
@@ -4745,7 +4747,7 @@ mod ocean_fft_heading_tests {
                         source_deformation: None, source_alpha: None,
                         swell_direction: Some(swell) };
                     ocean.set_surfaces(&queue, &[pool.surface]);
-                    ocean.set_promoted_surfaces(&device, &queue, &[pool], &[]);
+                    ocean.set_promoted_surfaces(&device, &queue, std::iter::once(&pool), &[]);
                 }
                 let read = |ocean: &mut OceanGpu, layer: u32| -> Vec<f32> {
                     let mut encoder = device.create_command_encoder(&Default::default());

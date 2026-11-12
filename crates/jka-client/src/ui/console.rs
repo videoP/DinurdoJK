@@ -731,6 +731,18 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
             }
         }
         super::text::console_text_sized(out, line, 20.0, line_y, char_width, line_step, CON_TEXT(), w, h);
+        // The left gutter holds a compact translate glyph on the first wrapped row
+        // of a recognized chat message. It doesn't steal any text columns.
+        if let Some(checked) = ui.console_translate_checked.get(absolute_line).copied().flatten() {
+            let edge = 12.0_f32.min(line_step - 2.0).max(7.0);
+            let x = 4.0;
+            let y = line_y + (line_step - edge) * 0.5;
+            if checked { rect(out, x, y, edge, edge, with_alpha(CON_CYAN(), 0.45), w, h); }
+            rect_outline(out, x, y, edge, edge, 1.0, if checked { CON_CYAN() } else { CON_TEXT() }, w, h);
+            console_plain_sized(out, "A", x + 2.0, y + 1.0,
+                (edge - 4.0).max(4.0), (edge - 2.0).max(4.0),
+                if checked { CON_CYAN() } else { CON_TEXT() }, w, h);
+        }
 
         // Trusted engine-authored local paths get conventional hyperlink
         // treatment. Draw this *after* the normal colored console text so a

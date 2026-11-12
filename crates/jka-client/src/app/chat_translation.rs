@@ -92,12 +92,18 @@ pub(in crate::app) enum RuleMode {
 }
 
 impl RuleMode {
-    fn label(self) -> &'static str {
+    /// The checkbox reflects actual automatic behavior. A default player
+    /// follows the global mode, while an explicit rule overrides it.
+    pub(in crate::app) fn checked(self, global: Mode) -> bool {
         match self {
-            Self::Default => "Chat setting",
-            Self::Always => "Always",
-            Self::Never => "Never",
+            Self::Always => true,
+            Self::Never => false,
+            Self::Default => global == Mode::Auto,
         }
+    }
+
+    pub(in crate::app) fn toggled(self, global: Mode) -> Self {
+        if self.checked(global) { Self::Never } else { Self::Always }
     }
 }
 
@@ -249,9 +255,10 @@ fn console_text(display: Display, message: &ChatMessage, unicode: bool) -> Optio
 fn plan(settings: &ct::Settings, message: &ChatMessage, ask: Ask, hint: Option<&'static str>) -> Result<Request, String> {
     let line = match message.body_start {
         Some(start) => message.text.chars().skip(start).collect::<String>(),
-        // Without a known body only an explicit request may send the line,
-        // name included.
-        None if ask == Ask::Manual => message.text.clone(),
+        // An unsplittable named chat line must never send the player's name
+        // to the provider, even when translated manually from the console.
+        // Anonymous lines retain the legacy explicit-translate fallback.
+        None if ask == Ask::Manual && message.sender_name.is_empty() => message.text.clone(),
         None => return Err("sender and message could not be separated".to_owned()),
     };
     let body = crate::cgame::text_to_jka_bytes(&line);
@@ -332,15 +339,84 @@ pub(in crate::app) fn hud_chat_text(display: Display, record: &ChatRecord) -> (S
     }
 }
 
+/// Only identify a sender if their *actual displayed name* is the unambiguous
+/// prefix of a chat command. Names can include colons, so match against the
+/// complete current client name, not the first `:` in an arbitrary line.
+/// The explicit delimiters also prevent matching Bob to Bobby.
+fn chat_prefix_matches_sender(text: &str, body_start: Option<usize>, name: &str) -> bool {
+    let name = crate::logging::strip_jka_colors(name).trim().to_ascii_lowercase();
+    if name.is_empty() { return false; }
+    let prefix: String = match body_start {
+        Some(start) => text.chars().take(start).collect(),
+        None => text.to_owned(),
+    };
+    let prefix = crate::logging::strip_jka_colors(&prefix).trim_start().to_ascii_lowercase();
+    let ordinary = format!("{name}: ");
+    let team = format!("({name}): ");
+    // For messages with a known body boundary also support the server's
+    // located-chat format, where `<location>` follows the player name.
+    prefix.starts_with(&ordinary) || prefix.starts_with(&team)
+        || body_start.is_some() && (prefix.starts_with(&format!("{name}<"))
+            || prefix.starts_with(&format!("({name})<")))
+}
+
+/// Derive the missing body offset for legacy `chat`/`tchat` commands that
+/// omitted the `\x19` separator. This is only used *after* an unambiguous
+/// live client name matched the displayed prefix. Count raw characters, not
+/// visible glyphs, so JKA ^N colour codes remain in the prefix.
+fn chat_body_start_for_named_sender(text: &str, name: &str) -> Option<usize> {
+    let name = crate::logging::strip_jka_colors(name).trim().to_ascii_lowercase();
+    if name.is_empty() { return None; }
+    let mut visible = String::new();
+    let mut raw_indices = Vec::new();
+    let mut chars = text.chars().enumerate().peekable();
+    while let Some((i, ch)) = chars.next() {
+        if ch == '^' && chars.peek().is_some_and(|(_, next)| next.is_ascii_digit()) {
+            chars.next();
+        } else {
+            visible.push(ch);
+            raw_indices.push(i);
+        }
+    }
+    let visible_lower = visible.to_ascii_lowercase();
+    let prefix_len = [format!("{name}: "), format!("({name}): ")].into_iter()
+        .find(|pattern| visible_lower.starts_with(pattern))?
+        .chars().count();
+    // A message with no body is not a recognized speaker line.
+    raw_indices.get(prefix_len).copied()
+}
+
 impl App {
     /// Called for every chat line that reaches the chat box, before its
     /// console print so the console row can carry the id.
     pub(in crate::app) fn record_chat_message(&mut self, chat: ReceivedChat<'_>) -> u64 {
-        let state = &mut self.chat_translation;
-        let sender_label = crate::logging::strip_jka_colors(&chat.sender_name).trim().to_owned();
+        // Legacy/mod servers sometimes omit the numeric client argument.
+        // Resolve the *displayed chat prefix* against current CS_PLAYERS, not
+        // the potentially stale scoreboard. Ambiguous names get no rule UI.
+        let fallback = if chat.sender.is_none()
+            && chat.kind != crate::cgame::ChatKind::Voice
+        {
+            self.game_session.as_ref().and_then(|session| {
+                let mut matching = session.client_game.player_id_list().into_iter()
+                    .filter(|(_, _, name, _)| chat_prefix_matches_sender(chat.text, chat.body_start, name));
+                let first = matching.next()?;
+                matching.next().is_none().then_some((first.0 as i32, first.2))
+            })
+        } else { None };
+        let sender = chat.sender.or_else(|| fallback.as_ref().map(|(slot, _)| *slot));
+        let sender_display = fallback.as_ref().map_or(chat.sender_name.as_str(), |(_, name)| name.as_str());
+        // A server can provide the sender's slot but omit the 0x19 chat
+        // separator. Recover the body boundary for *both* known senders and
+        // name-matched fallback senders; otherwise manual translation sends
+        // `Name: message` instead of only `message`.
+        let body_start = chat.body_start.or_else(|| chat_body_start_for_named_sender(chat.text, sender_display));
+        let sender_label = crate::logging::strip_jka_colors(sender_display).trim().to_owned();
         let sender_name = sender_label.to_ascii_lowercase();
+        let own = chat.own || sender.is_some_and(|slot| self.net.as_ref()
+            .is_some_and(|net| net.session().client_num() == slot));
+        let state = &mut self.chat_translation;
         // Someone else now holds the slot: its rule no longer applies.
-        if let Some(slot) = chat.sender {
+        if let Some(slot) = sender {
             if state.rules.get(&slot).is_some_and(|rule| rule.name != sender_name) {
                 state.rules.remove(&slot);
             }
@@ -354,12 +430,12 @@ impl App {
             kind: chat.kind,
             team: chat.team,
             demo: chat.demo,
-            own: chat.own,
-            sender: chat.sender,
+            own,
+            sender,
             sender_name,
             sender_label,
             text: chat.text.to_owned(),
-            body_start: chat.body_start,
+            body_start,
             state: TranslationState::None,
             show_original: false,
             console_shown: chat.text.to_owned(),
@@ -631,53 +707,86 @@ impl App {
             let decoded = text::decode(&text::strip_color_bytes(&crate::cgame::text_to_jka_bytes(&message.text)), state.settings.codepage);
             action = Some(ChatMenuAction::Copy(decoded));
         }
-        let rule_target = message.sender.is_some()
-            && !message.sender_name.is_empty()
-            && !message.own
-            && message.kind != crate::cgame::ChatKind::Voice;
+        let rule_target = self.console_chat_translate_checked(id).is_some();
         if rule_target && !off {
             ui.separator();
             let (mode, source) = state.rule_for(message).map_or((RuleMode::Default, None), |rule| (rule.mode, rule.source));
-            // Use the same per-player choices as the scoreboard's
-            // TRANSLATION... menu, without maintaining another rule path.
-            // The action is applied after the console UI frame, so all
-            // menus (including the classic console popup) share the handler.
-            ui.menu_button(format!("Translation: {}", message.sender_label), |ui| {
-                let mode_text = match mode {
-                    RuleMode::Default => "Chat setting",
-                    RuleMode::Always => "Always",
-                    RuleMode::Never => "Never",
-                };
-                ui.label(egui::RichText::new(format!(
-                    "{mode_text}, {}", source.map_or("Auto-detect", lang::name)
-                )).weak());
-                ui.separator();
-                if mode != RuleMode::Always && ui.button("Always translate").clicked() {
-                    action = Some(ChatMenuAction::Rule(id, RuleChange::Mode(RuleMode::Always)));
-                }
-                if mode != RuleMode::Never && ui.button("Never translate").clicked() {
-                    action = Some(ChatMenuAction::Rule(id, RuleChange::Mode(RuleMode::Never)));
-                }
-                if mode != RuleMode::Default && ui.button("Use chat setting").clicked() {
-                    action = Some(ChatMenuAction::Rule(id, RuleChange::Mode(RuleMode::Default)));
-                }
-                ui.menu_button("Language hint", |ui| {
-                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                        if ui.selectable_label(source.is_none(), "Auto-detect").clicked() {
-                            action = Some(ChatMenuAction::Rule(id, RuleChange::Source(None)));
-                        }
-                        for language in lang::LANGUAGES {
-                            if ui.selectable_label(source == Some(language.code), language.name).clicked() {
-                                action = Some(ChatMenuAction::Rule(id, RuleChange::Source(Some(language.code))));
-                            }
-                        }
-                    });
-                }).response.on_hover_text(
-                    "A hint used when detection is unsure; a clear detection of another language still wins."
+            ui.label(egui::RichText::new(&message.sender_label).strong());
+            let checked = mode.checked(state.settings.mode);
+            ui.horizontal(|ui| {
+                let text = egui::RichText::new("A/a").monospace().strong().color(
+                    if checked { egui::Color32::from_rgb(109, 220, 230) }
+                    else { egui::Color32::from_rgb(159, 164, 166) }
                 );
+                let response = ui.add(egui::Button::new(text).selected(checked))
+                    .on_hover_text("Toggle automatic translation for this player");
+                ui.label("Translate this player");
+                if response.clicked() {
+                    action = Some(ChatMenuAction::Rule(id,
+                        RuleChange::Mode(mode.toggled(state.settings.mode))));
+                }
             });
+            if mode != RuleMode::Default && ui.small_button("Use global chat setting").clicked() {
+                action = Some(ChatMenuAction::Rule(id, RuleChange::Mode(RuleMode::Default)));
+            }
+            ui.menu_button(source.map_or("Auto-detect", lang::name), |ui| {
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    if ui.selectable_label(source.is_none(), "Auto-detect").clicked() {
+                        action = Some(ChatMenuAction::Rule(id, RuleChange::Source(None)));
+                    }
+                    for language in lang::LANGUAGES {
+                        if ui.selectable_label(source == Some(language.code), language.name).clicked() {
+                            action = Some(ChatMenuAction::Rule(id, RuleChange::Source(Some(language.code))));
+                        }
+                    }
+                });
+            }).response.on_hover_text(
+                "Source language when detection is uncertain. Clear detection still takes priority."
+            );
+            if mode == RuleMode::Default {
+                ui.label(egui::RichText::new("Following global chat setting").weak().small());
+            }
+        } else if !off && !rule_target {
+            // A translated line is not necessarily attributable to a current
+            // player (e.g. old scrollback or servers that omit client IDs).
+            // Don't silently hide the controls without explaining why.
+            ui.separator();
+            ui.label(egui::RichText::new("Player translation settings unavailable")
+                .weak().small()).on_hover_text("No verified current player for this message");
         }
         action
+    }
+
+    /// A sender checkbox is shown only on eligible, still-recognized chat rows.
+    /// The returned value includes the effective global automatic setting.
+    pub(in crate::app) fn console_chat_translate_checked(&self, id: u64) -> Option<bool> {
+        let state = &self.chat_translation;
+        if state.settings.mode == Mode::Off { return None; }
+        let message = state.message(id)?;
+        let slot = message.sender?;
+        if message.sender_name.is_empty() || message.own
+            || message.kind == crate::cgame::ChatKind::Voice { return None; }
+        // Console history can outlive a client in the same slot. Never let a
+        // checkbox on an old message change a different player's rule.
+        let name = self.game_session.as_ref()?
+            .client_game.client_name(usize::try_from(slot).ok()?)?;
+        if crate::logging::strip_jka_colors(&name).trim().to_ascii_lowercase() != message.sender_name {
+            return None;
+        }
+        Some(state.rule_for(message).map_or(RuleMode::Default, |rule| rule.mode)
+            .checked(state.settings.mode))
+    }
+
+    /// Reused by inline icons and the context menus, without duplicating rules.
+    pub(in crate::app) fn toggle_console_chat_translate(&mut self, id: u64) {
+        let Some(message) = self.chat_translation.message(id) else { return };
+        let Some(slot) = message.sender else { return };
+        if self.console_chat_translate_checked(id).is_none() { return; }
+        let name = message.sender_label.clone();
+        let mode = self.chat_translation.rule(slot, &name).0;
+        let next = mode.toggled(self.chat_translation.settings.mode);
+        self.change_chat_translation_rule(slot, &name, RuleChange::Mode(next));
+        self.publish_ui();
     }
 
     pub(in crate::app) fn apply_chat_menu_action(&mut self, action: ChatMenuAction) {
@@ -697,10 +806,12 @@ impl App {
                 }
             }
             ChatMenuAction::Rule(id, change) => {
+                if self.console_chat_translate_checked(id).is_none() { return; }
                 let Some(message) = self.chat_translation.message(id) else { return };
                 let Some(slot) = message.sender else { return };
                 let name = message.sender_label.clone();
                 self.change_chat_translation_rule(slot, &name, change);
+                self.publish_ui();
                 // Picking "Always" on a message translates it now as well.
                 if change == RuleChange::Mode(RuleMode::Always) {
                     if let Some(message) = self.chat_translation.message_mut(id) {
@@ -757,10 +868,37 @@ impl App {
         }
     }
 
+    /// Click the compact translation checkbox in the classic console's
+    /// left margin. Derive the logical row from the same wrap layout as text
+    /// selection; do not mistake a continuation row for a new message.
+    pub(in crate::app) fn click_classic_console_translate_checkbox(
+        &mut self, w: u32, h: u32, x: f64, y: f64,
+    ) -> bool {
+        if self.console_hl2 || self.overlay != OverlayMode::Console || !(3.0..18.0).contains(&x) {
+            return false;
+        }
+        let Some((row, _)) = crate::ui::console_text_hit(
+            w, h, self.console_size, self.console_scale, 20.0, y,
+        ) else { return false; };
+        let id = {
+            let layout = self.console_wrap_layout();
+            let capacity = crate::ui::console_visible_line_capacity(w, h, self.console_size, self.console_scale);
+            let max_scroll = layout.rows.len().saturating_sub(capacity.max(1));
+            let end = layout.rows.len().saturating_sub(self.console_scroll.min(max_scroll));
+            let start = end.saturating_sub(capacity);
+            layout.rows.get(start + row).filter(|segment| segment.start_col == 0)
+                .and_then(|segment| self.console_chat_ids.get(segment.line).copied().flatten())
+        };
+        let Some(id) = id.filter(|&id| self.console_chat_translate_checked(id).is_some()) else { return false; };
+        self.toggle_console_chat_translate(id);
+        true
+    }
+
     /// Classic console right-click: open the chat menu for that row.
     pub(in crate::app) fn open_console_chat_menu(&mut self, line: usize) {
         let id = self.console_chat_ids.get(line).copied().flatten().filter(|&id| self.chat_translation.has_message(id));
         self.chat_translation.console_menu = id.map(|id| (id, self.cursor_position));
+        self.publish_ui();
         self.egui_repaint_requested = true;
     }
 
@@ -783,6 +921,7 @@ impl App {
                 ..
             } => {
                 self.chat_translation.console_menu = None;
+                self.publish_ui();
                 self.egui_repaint_requested = true;
                 true
             }
@@ -804,6 +943,7 @@ impl App {
         let Some((id, (x, y))) = self.chat_translation.console_menu else { return };
         if !self.classic_console_chat_menu_open() || !self.chat_translation.has_message(id) {
             self.chat_translation.console_menu = None;
+            self.publish_ui();
             return;
         }
         let points = ctx.pixels_per_point().max(0.1);
@@ -824,8 +964,10 @@ impl App {
         if let Some(action) = action {
             self.chat_translation.console_menu = None;
             self.apply_chat_menu_action(action);
+            self.publish_ui();
         } else if clicked_outside {
             self.chat_translation.console_menu = None;
+            self.publish_ui();
         }
     }
 
@@ -912,6 +1054,39 @@ mod tests {
     }
 
     #[test]
+    fn resolves_server_chat_without_sender_id_using_unambiguous_prefix() {
+        assert!(chat_prefix_matches_sender("Padawan^7: ^2hola", None, "Padawan"));
+        assert!(chat_prefix_matches_sender("(Padawan)^7: ^5hola", None, "^5Padawan"));
+        assert!(chat_prefix_matches_sender("P:ad^7: ^2hello", None, "P:ad"));
+        assert!(!chat_prefix_matches_sender("Padawan2: hello", None, "Padawan"));
+        assert!(!chat_prefix_matches_sender("server says Padawan: hello", None, "Padawan"));
+        assert!(!chat_prefix_matches_sender("Padawan", None, "Padawan"));
+        assert_eq!(chat_body_start_for_named_sender("Padawan^7: ^2hola", "Padawan"), Some("Padawan^7: ^2".chars().count()));
+        assert_eq!(chat_body_start_for_named_sender("(Padawan)^7: ^5hola", "^5Padawan"), Some("(Padawan)^7: ^5".chars().count()));
+        assert_eq!(chat_body_start_for_named_sender("P:ad^7: ^2hello", "P:ad"), Some("P:ad^7: ^2".chars().count()));
+        assert_eq!(chat_body_start_for_named_sender("Padawan2: hello", "Padawan"), None);
+    }
+
+    #[test]
+    fn named_sender_without_server_separator_translates_only_chat_body() {
+        // Some mod servers supply a numeric sender ID but omit JKA's 0x19
+        // boundary. The sender name is already known from that client slot.
+        for (line, name, body) in [
+            ("Padawan^7: ^2hola amigos", "Padawan", "hola amigos"),
+            ("(Padawan)^7: ^5hola equipo", "^5Padawan", "hola equipo"),
+            ("P:ad^7: ^2buenos días", "P:ad", "buenos días"),
+        ] {
+            let start = chat_body_start_for_named_sender(line, name);
+            let chat = message(line, start);
+            let request = plan(&english(), &chat, Ask::Manual, Some("es")).unwrap();
+            assert_eq!(request.text, body);
+        }
+        // A named sender with an unrecognized prefix must not fall back to
+        // translating their name as part of the message.
+        assert!(plan(&english(), &message("Padawan: hola", None), Ask::Manual, None).is_err());
+    }
+
+    #[test]
     fn only_the_body_is_sent() {
         let line = crate::cgame::bytes_to_lossless_ascii("Ivan^7: ^2Привет всем, как дела?".as_bytes());
         let start = "Ivan^7: ^2".len();
@@ -931,8 +1106,15 @@ mod tests {
         // Without a separable body nothing is sent automatically...
         assert!(plan(&english(), &message(&russian, None), Ask::Auto, None).is_err());
         assert!(plan(&english(), &message(&russian, None), Ask::Rule, None).is_err());
-        // ...but an explicit request may send the whole line.
-        assert_eq!(plan(&english(), &message(&russian, None), Ask::Manual, None).unwrap().text, "Привет всем, как дела?");
+        // ...and even a manual request must not send an unseparated named
+        // chat line (potentially including that player's name).
+        assert!(plan(&english(), &message(&russian, None), Ask::Manual, None).is_err());
+        // Explicit translation of a genuinely anonymous line remains possible.
+        let mut anonymous = message(&russian, None);
+        anonymous.sender = None;
+        anonymous.sender_name.clear();
+        anonymous.sender_label.clear();
+        assert_eq!(plan(&english(), &anonymous, Ask::Manual, None).unwrap().text, "Привет всем, как дела?");
     }
 
     #[test]
@@ -946,6 +1128,16 @@ mod tests {
         assert_eq!(console_text(Display::Translated, &done, true).unwrap(), "Bob^7: ^2привет ^9[en>ru]");
         done.show_original = true;
         assert!(console_text(Display::Translated, &done, true).is_none());
+    }
+
+    #[test]
+    fn translation_checkbox_follows_global_mode_until_overridden() {
+        assert!(!RuleMode::Default.checked(Mode::Manual));
+        assert!(RuleMode::Default.checked(Mode::Auto));
+        assert_eq!(RuleMode::Default.toggled(Mode::Manual), RuleMode::Always);
+        assert_eq!(RuleMode::Default.toggled(Mode::Auto), RuleMode::Never);
+        assert_eq!(RuleMode::Always.toggled(Mode::Manual), RuleMode::Never);
+        assert_eq!(RuleMode::Never.toggled(Mode::Auto), RuleMode::Always);
     }
 
     #[test]

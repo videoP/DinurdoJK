@@ -105,6 +105,7 @@ fn zero_settings_do_not_request_sunlight_work() {
     let pending = Pending {
         rx,
         cancelled: Arc::clone(&signal),
+        started: Instant::now(),
     };
     drop(pending);
     assert!(signal.load(Ordering::Relaxed));

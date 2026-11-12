@@ -51,13 +51,13 @@ fn river_map_radiance(d:vec3<f32>,roughness:f32)->vec3<f32> {
     let time = river_view.time.x;
     var foam = RiverFoam(vec3<f32>(0.0, 0.0, 1.0), 0.0, 0.0, 0.0, 0.0, vec3<f32>(0.0));
     if river_view.time.y > 0.5 {
-        foam = river_live_grid_foam(sim_grid, normals_rt, normal_sampler, foam_rt, foam_rt_sampler, foam_detail, foam_detail_sampler,
-            input.uv, world_xy, time, river_foam_advection(), river_foam_settings());
+        foam = river_live_grid_foam_lod(sim_grid, normals_rt, normal_sampler, foam_rt, foam_rt_sampler, foam_detail, foam_detail_sampler,
+            input.uv, world_xy, time, river_foam_advection(), river_foam_settings(), river_view.material_lod.xy);
     }
     // FoamOpacity 1 (live instance); the normal gate takes the simulation mask.
-    let graph_normal = river_live_grid_normal(sim_grid, normals_rt, normal_sampler, ocean_detail, ocean_sampler, input.uv, world_xy, time,
+    let graph_normal = river_live_grid_normal_lod(sim_grid, normals_rt, normal_sampler, ocean_detail, ocean_sampler, input.uv, world_xy, time,
         river_motion(river_view.time.z), river_wpo_advection(), river_detail_advection(), river_wave_height(),
-        foam.normal, foam.total, river_foam_settings().shading.x, masks.simulation_mask);
+        foam.normal, foam.total, river_foam_settings().shading.x, masks.simulation_mask, river_view.material_lod.xy);
     if masks.material_mask < 0.3333 {
         discard;
     }

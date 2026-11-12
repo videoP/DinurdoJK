@@ -749,14 +749,14 @@ pub fn profile_saber_blade_draws(
             radius: (radius * 1.5).max(5.5),
             rotation: 0.0,
             rgba: glow_soft,
-            shader: glow_shader.to_owned(),
+            shader: glow_shader.into(),
         });
         draws.push(FxDraw::Sprite { shader_time: 0.0,
             origin: tip,
             radius: radius * 0.9,
             rotation: 0.0,
             rgba: glow_soft,
-            shader: glow_shader.to_owned(),
+            shader: glow_shader.into(),
         });
     } else {
         // UI_DoSaber submits one RT_SABER_GLOW. Its renderer-side hilt pulse
@@ -768,7 +768,7 @@ pub fn profile_saber_blade_draws(
             radius,
             hilt_radius: 5.5 + rng.flrand(0.0, 1.0) * 0.25,
             rgba: glow_full,
-            shader: glow_shader.to_owned(),
+            shader: glow_shader.into(),
         });
     }
     if modern_sabers || matches!(saber_core_mode, 0 | 2) {
@@ -2104,7 +2104,7 @@ impl WeaponFx {
                     radius: NUMBER_SIZE / 2.0,
                     rotation: 0.0,
                     rgba: [rgb[0], rgb[1], rgb[2], alpha],
-                    shader: format!("gfx/2d/numbers/{}", NAMES[digits[count - 1 - i]]),
+                    shader: format!("gfx/2d/numbers/{}", NAMES[digits[count - 1 - i]]).into(),
                 });
             }
         }
@@ -2242,7 +2242,7 @@ impl WeaponFx {
                 positions,
                 uvs: shard.spec.uvs,
                 rgba: [255, 255, 255, (alpha * 255.0) as u8],
-                shader: "gfx/misc/test_crackle".to_owned(),
+                shader: "gfx/misc/test_crackle".into(),
             });
         }
         self.collision_world = world;
@@ -2483,7 +2483,7 @@ impl WeaponFx {
                         uvs: Vec::with_capacity(live * 4),
                         rgba: Vec::with_capacity(live * 4),
                         indices: Vec::with_capacity(live * 12),
-                        shader: segment.shader.to_owned(),
+                        shader: segment.shader.into(),
                     }));
                     trail_meshes.len() - 1
                 });
@@ -2568,7 +2568,7 @@ impl WeaponFx {
                         origin: spec.start,
                         radius: spec.size1 + (spec.size2 - spec.size1) * t,
                         rgba: [byte(spec.rgb[0]), byte(spec.rgb[1]), byte(spec.rgb[2]), 255],
-                        shader: spec.shader.to_owned(),
+                        shader: spec.shader.into(),
                         life_ms: life,
                         spot: None,
                         segment: Some([spec.start, spec.end]),
@@ -2596,7 +2596,7 @@ impl WeaponFx {
                 radius: puff.radius * (1.0 - c) + 8.0,
                 rotation: puff.rotation,
                 rgba: [rgb[0], rgb[1], rgb[2], 0],
-                shader: puff.shader.to_owned(),
+                shader: puff.shader.into(),
             });
             true
         });
@@ -2740,7 +2740,7 @@ impl WeaponFx {
                     uvs: batch.uvs,
                     rgba: batch.rgba,
                     indices: batch.indices,
-                    shader: shader.to_owned(),
+                    shader: shader.into(),
                 });
             }
         }
@@ -2952,7 +2952,7 @@ impl WeaponFx {
             radius: size,
             rotation,
             rgba: [255, 255, 255, 179],
-            shader: charge.shader.to_owned(),
+            shader: charge.shader.into(),
         });
     }
 
@@ -3091,7 +3091,7 @@ impl WeaponFx {
                     radius: 10.0,
                     rotation: 0.0,
                     rgba: [255; 4],
-                    shader: (*shader).to_owned(),
+                    shader: (*shader).into(),
                 });
             }
             PlayerFxRequest::GripPuffs { origin } => {
@@ -3443,7 +3443,7 @@ impl WeaponFx {
             true
         });
         for (shader, (positions, uvs, rgba, indices)) in batches {
-            frame.draws.push(FxDraw::Mesh { positions, uvs, rgba, indices, shader });
+            frame.draws.push(FxDraw::Mesh { positions, uvs, rgba, indices, shader: shader.into() });
         }
     }
 
@@ -3505,7 +3505,7 @@ impl WeaponFx {
                     uvs: batch.uvs,
                     rgba: batch.rgba,
                     indices: batch.indices,
-                    shader: shader.to_owned(),
+                    shader: shader.into(),
                 });
             }
         }
@@ -3671,14 +3671,14 @@ impl WeaponFx {
                 radius: (radius * 1.5).max(5.5),
                 rotation: 0.0,
                 rgba: glow_soft,
-                shader: glow_shader.to_owned(),
+                shader: glow_shader.into(),
             });
             self.immediate_draws.push(FxDraw::Sprite { shader_time: 0.0,
                 origin: tip,
                 radius: radius * 0.9,
                 rotation: 0.0,
                 rgba: glow_soft,
-                shader: glow_shader.to_owned(),
+                shader: glow_shader.into(),
             });
         } else {
             // CG_DoSaber submits exactly one RT_SABER_GLOW. The renderer owns
@@ -3693,7 +3693,7 @@ impl WeaponFx {
                 radius,
                 hilt_radius,
                 rgba: glow_full,
-                shader: glow_shader.to_owned(),
+                shader: glow_shader.into(),
             });
         }
 
@@ -5234,7 +5234,7 @@ mod tests {
         match &fx.immediate_draws[0] {
             FxDraw::Sprite { origin, radius, rotation, rgba, shader, .. } => {
                 assert_eq!(*origin, muzzle);
-                assert_eq!(shader, "gfx/effects/greenFrontFlash");
+                assert_eq!(shader.as_ref(), "gfx/effects/greenFrontFlash");
                 assert!((1.5..3.0).contains(radius));
                 assert!((0.0..360.0).contains(rotation));
                 assert_eq!(*rgba, [255, 255, 255, 179]);
@@ -5257,7 +5257,7 @@ mod tests {
     fn fx_sprite_interpolation_tracks_ids_and_smooths_birth_death() {
         let sprite = |x: f32| FxDraw::Sprite {
             shader_time: 0.0, origin: [x, 0.0, 0.0], radius: 5.0,
-            rotation: 0.0, rgba: [255, 255, 255, 200], shader: "steam".to_owned(),
+            rotation: 0.0, rgba: [255, 255, 255, 200], shader: "steam".into(),
         };
         let previous: HashMap<u64, FxDraw> = [(10, sprite(0.0)), (11, sprite(2.0))].into();
         let mut frame = FxFrame::default();
@@ -5562,7 +5562,7 @@ mod tests {
 
     fn mesh_of(frame: &FxFrame, shader: &str) -> Option<(Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<[u8; 4]>)> {
         frame.draws.iter().find_map(|draw| match draw {
-            FxDraw::Mesh { positions, uvs, rgba, shader: name, .. } if name == shader => {
+            FxDraw::Mesh { positions, uvs, rgba, shader: name, .. } if name.as_ref() == shader => {
                 Some((positions.clone(), uvs.clone(), rgba.clone()))
             }
             _ => None,
@@ -5751,7 +5751,7 @@ mod tests {
         assert!(classic.draws.iter().any(|draw| matches!(
             draw,
             FxDraw::SaberGlow { shader, hilt_radius, .. }
-                if shader == "gfx/effects/sabers/red_glow"
+                if shader.as_ref() == "gfx/effects/sabers/red_glow"
                     && (5.5..=5.75).contains(hilt_radius)
         )));
         assert!(classic.draws.iter().any(|draw| matches!(
@@ -5759,7 +5759,7 @@ mod tests {
             FxDraw::Line { shader, .. } if shader.as_ref() == "gfx/effects/sabers/red_line"
         )));
         assert!(classic.draws.iter().all(|draw| match draw {
-            FxDraw::SaberGlow { shader, .. } => shader == "gfx/effects/sabers/red_glow",
+            FxDraw::SaberGlow { shader, .. } => shader.as_ref() == "gfx/effects/sabers/red_glow",
             FxDraw::Line { shader, .. } => shader.as_ref() == "gfx/effects/sabers/red_line",
             _ => false,
         }));
@@ -6006,7 +6006,7 @@ mod tests {
                 Some((positions, uvs, rgba, shader, indices)),
             _ => None,
         }).expect("second sample should emit a saber trail mesh");
-        assert_eq!(quad.3, "gfx/effects/sabers/saberBlur");
+        assert_eq!(quad.3.as_ref(), "gfx/effects/sabers/saberBlur");
         assert_eq!(quad.0.len(), 4, "one live segment = one quad");
         assert_eq!(quad.4[..], [0, 1, 3, 3, 1, 2, 3, 1, 0, 2, 1, 3]);
         assert_eq!(quad.2[0][..3], [0, 64, 255]);

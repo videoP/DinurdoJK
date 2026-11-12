@@ -2152,6 +2152,10 @@ impl ApplicationHandler<UserEvent> for App {
 
         if self.studio_navigation_window_event(&event) { return; }
         if self.scoreboard_cursor_window_event(&event) { return; }
+        // The classic console's translation popup is egui drawn over native
+        // WGPU. Route its mouse and Escape events before console selection or
+        // gameplay binds consume them.
+        if self.route_console_chat_menu_event(&event) { return; }
 
         // The native Shader Remaps page takes pointer input and, while one of
         // its text fields is focused, *every* key (Escape just unfocuses), so
@@ -2877,7 +2881,11 @@ impl ApplicationHandler<UserEvent> for App {
                     .as_ref()
                     .map(|window| window.inner_size())
                     .unwrap_or_default();
-                if self.click_console_suggest(
+                if self.click_classic_console_translate_checkbox(
+                    size.width, size.height, self.cursor_position.0, self.cursor_position.1,
+                ) {
+                    self.console_selecting = false;
+                } else if self.click_console_suggest(
                     size.width,
                     size.height,
                     self.cursor_position.0,

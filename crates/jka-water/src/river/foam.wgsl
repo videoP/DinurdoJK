@@ -53,3 +53,27 @@ fn river_live_grid_foam(fluid_tex:texture_2d<f32>,normal_tex:texture_2d<f32>,nor
     let field=river_foam_field(foam_field,field_sampler,uv).r;
     return river_foam_present(field,detail,length(fluid.zw),s);
 }
+
+// Screen-space foam A/B: keep the native bicubic filter when a field cell
+// covers at least one screen pixel; bilinear when foam varies subpixel.
+// The original filtered field remains the mode 0 reference.
+fn river_foam_field_lod(tex:texture_2d<f32>,clamped_sampler:sampler,uv:vec2<f32>,lod:vec2<f32>)->vec4<f32> {
+    let dims=vec2<f32>(textureDimensions(tex,0));
+    let dx=dpdx(uv)*dims;
+    let dy=dpdy(uv)*dims;
+    let pixel_cells=max(length(dx),length(dy));
+    // Cutoff 4 = 1.5 cells per pixel; the slider shifts it in mips, floored at 1 cell/pixel.
+    if lod.x >= 1.5 && log2(max(pixel_cells,1e-8)) >= max(lod.y-3.415,0.0) {
+        return textureSampleLevel(tex,clamped_sampler,uv,0.0);
+    }
+    return river_foam_field(tex,clamped_sampler,uv);
+}
+// Same authored foam graph, with wave and field LOD. Mode 1 changes wave
+// samples only; mode 2 adds adaptive foam-field reconstruction.
+fn river_live_grid_foam_lod(fluid_tex:texture_2d<f32>,normal_tex:texture_2d<f32>,normal_sampler:sampler,foam_field:texture_2d<f32>,field_sampler:sampler,foam_detail:texture_2d<f32>,detail_sampler:sampler,uv:vec2<f32>,world_xy:vec2<f32>,time:f32,advection:RiverAdvection,s:RiverFoamSettings,material_lod:vec2<f32>)->RiverFoam {
+    let fluid=river_live_field(fluid_tex,uv);
+    let base=textureSampleLevel(normal_tex,normal_sampler,uv,0.0).xyz;
+    let detail=river_wave_fragment_lod(foam_detail,detail_sampler,world_xy,fluid.zw,base,time,advection,material_lod);
+    let field=river_foam_field_lod(foam_field,field_sampler,uv,material_lod).r;
+    return river_foam_present(field,detail,length(fluid.zw),s);
+}

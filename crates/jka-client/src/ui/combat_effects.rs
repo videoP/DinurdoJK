@@ -280,14 +280,14 @@ mod tests {
             let x = i as f32 * 0.001;
             *uv = ([x, 0.1], [x + 0.0005, 0.9]);
         }
-        let contains_icon = |out: &[UiVertex], index: usize| {
-            let uv = ui.icon_uv(index).0;
-            out.iter().any(|v| v.uv == uv)
-        };
         for (mode, mask, insert) in [(0, true, true), (1, false, false), (2, true, false)] {
             ui.crosshair.scope_mode = mode;
             let mut out = Vec::new();
             build_combat_hud_vertices(&mut out, &ui, None, 1920, 1080);
+            let contains_icon = |out: &[UiVertex], index: usize| {
+                let uv = ui.icon_uv(index).0;
+                out.iter().any(|v| v.uv == uv)
+            };
             assert_eq!(contains_icon(&out, ICON_COMBAT_BASE), mask, "mask for scope={mode}");
             assert_eq!(contains_icon(&out, ICON_COMBAT_BASE+1), insert, "insert for scope={mode}");
             assert!(contains_icon(&out, ICON_COMBAT_BASE+2), "ammo ticks for scope={mode}");

@@ -20,6 +20,37 @@ enum TraceAction {
     Remap(String),
 }
 
+/// Remap the authored shader *identity*, not the texture selected by one of
+/// its stages. MD3 surfaces often use an embedded `name.tga` shader whose
+/// primary stage samples a completely different image (`lava_tube.jpg` here).
+/// The original embedded shader also remains the remap source after a live
+/// redirect; the effective shader is the destination, not a new source.
+fn traced_remap_source(entry: &SurfaceInspectorInfo) -> Option<String> {
+    let md3_shader = entry.sections.iter()
+        .find(|section| section.title == "MD3 SHADER SOURCE / RESOLUTION")
+        .and_then(|section| {
+            // A customShader replaces the MD3 surface shader for this draw.
+            // A remap of the embedded name would not affect that override.
+            ["CUSTOM SHADER OVERRIDE: ", "EMBEDDED SHADER: "]
+                .into_iter()
+                .find_map(|prefix| section.lines.iter()
+                    .find_map(|line| line.strip_prefix(prefix)))
+        });
+    let bsp_shader = entry.sections.iter()
+        .find(|section| section.title == "SHADER REMAP / ANIMMAP")
+        .and_then(|section| section.lines.iter()
+            .find_map(|line| line.strip_prefix("BSP SOURCE SHADER: ")))
+        .filter(|shader| !shader.starts_with('<'));
+    let material = entry.summary.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("SHADER")
+            || key.eq_ignore_ascii_case("MATERIAL"))
+        .map(|(_, name)| name.as_str());
+    let source = md3_shader.or(bsp_shader).or(material)
+        .or_else(|| (entry.kind == "WORLD SURFACE").then_some(entry.title.as_str()))?;
+    let source = crate::scene::canonical_shader_name(source);
+    (!source.is_empty() && !source.starts_with('<')).then_some(source)
+}
+
 impl App {
     pub(super) fn egui_trace_menu(&mut self, root: &mut egui::Ui) {
         let mut actions = Vec::new();
@@ -85,12 +116,7 @@ impl App {
 
         let can_act = self.local_server.is_some();
         let entity_num = entry.hit_entity_num;
-        let traced_shader = entry.summary.iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("MATERIAL") || key.eq_ignore_ascii_case("SHADER"))
-            .map(|(_, name)| crate::scene::canonical_shader_name(name))
-            .or_else(|| (entry.kind == "WORLD SURFACE")
-                .then(|| crate::scene::canonical_shader_name(&entry.title)))
-            .filter(|name| !name.is_empty());
+        let traced_shader = traced_remap_source(entry);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
             let enabled = can_act && entity_num.is_some();
@@ -206,5 +232,83 @@ impl App {
             }
             Err(error) => self.push_console_line(format!("^1trace use: {error}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn trace(kind: &str, material: &str, section_title: &str, details: &[&str]) -> SurfaceInspectorInfo {
+        SurfaceInspectorInfo {
+            kind: kind.into(),
+            title: "ENTITY #1023".into(),
+            summary: vec![("MATERIAL".into(), material.into())],
+            sections: vec![SurfaceInspectorSection {
+                title: section_title.into(),
+                lines: details.iter().map(|s| (*s).into()).collect(),
+            }],
+            lines: Vec::new(),
+            hit_entity_num: Some(1023),
+            hit_inline_model: None,
+        }
+    }
+
+    #[test]
+    fn md3_remap_selected_uses_embedded_shader_not_resolved_image() {
+        let entry = trace("ENTITY MODEL", "models/map_objects/taspir/lava_tube.jpg",
+            "MD3 SHADER SOURCE / RESOLUTION", &[
+                "MD3 MODEL: models/map_objects/taspir/lava_tube.md3",
+                "MD3 SURFACE: mesh01",
+                "EMBEDDED SHADER: models/map_objects/taspir/lava_tube_3_1.tga",
+                "EFFECTIVE SHADER: models/map_objects/taspir/lava_tube_3_1",
+                "RESOLVED TEXTURE: models/map_objects/taspir/lava_tube.jpg",
+            ]);
+        let source = traced_remap_source(&entry).unwrap();
+        assert_eq!(source, "models/map_objects/taspir/lava_tube_3_1");
+
+        let mut remaps = crate::scene::ShaderRemapState::default();
+        assert!(remaps.apply(&source, "textures/test/replacement", None));
+        assert_eq!(remaps.effective_name("models/map_objects/taspir/lava_tube_3_1.tga"),
+            "textures/test/replacement");
+    }
+
+    #[test]
+    fn md3_remap_selected_keeps_original_after_a_redirect() {
+        let entry = trace("ENTITY MODEL", "textures/test/replacement.jpg",
+            "MD3 SHADER SOURCE / RESOLUTION", &[
+                "EMBEDDED SHADER: models/map_objects/taspir/lava_tube_3_1.tga",
+                "EFFECTIVE SHADER: textures/test/replacement",
+            ]);
+        assert_eq!(traced_remap_source(&entry).as_deref(),
+            Some("models/map_objects/taspir/lava_tube_3_1"));
+    }
+
+    #[test]
+    fn md3_custom_shader_override_uses_the_active_override() {
+        let entry = trace("ENTITY MODEL", "textures/test/override_image.jpg",
+            "MD3 SHADER SOURCE / RESOLUTION", &[
+                "CUSTOM SHADER OVERRIDE: gfx/effects/personal_shield",
+                "EMBEDDED SHADER: models/map_objects/taspir/lava_tube_3_1.tga",
+                "EFFECTIVE SHADER: models/map_objects/taspir/lava_tube_3_1",
+            ]);
+        assert_eq!(traced_remap_source(&entry).as_deref(),
+            Some("gfx/effects/personal_shield"));
+    }
+
+    #[test]
+    fn world_remap_selected_preserves_bsp_source_and_implicit_fallback() {
+        let bsp = trace("WORLD SURFACE", "textures/current_image.jpg",
+            "SHADER REMAP / ANIMMAP", &[
+                "BSP SOURCE SHADER: textures/yavin/ground_1",
+                "REMAP DESTINATION: textures/current_image",
+            ]);
+        assert_eq!(traced_remap_source(&bsp).as_deref(),
+            Some("textures/yavin/ground_1"));
+
+        let implicit = trace("ENTITY MODEL", "models/map_objects/door.jpg",
+            "RENDER GEOMETRY", &["Texture: models/map_objects/door.jpg"]);
+        assert_eq!(traced_remap_source(&implicit).as_deref(),
+            Some("models/map_objects/door"));
     }
 }

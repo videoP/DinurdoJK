@@ -49,6 +49,7 @@ struct FarUniform {
     lattice: [i32; 4],
     lod: [f32; 4],
     window: [f32; 4],
+    format: [u32; 4],
 }
 
 /// `RiverFarInstance` in river_far.wgsl (80 bytes).
@@ -116,6 +117,8 @@ pub struct FarInputs<'a> {
     pub table: &'a wgpu::Buffer,
     pub surface: &'a wgpu::Buffer,
     pub normals: &'a wgpu::Buffer,
+    /// `normals` holds one octahedral word per cell (r_riverStorageMode 2).
+    pub normals_packed: bool,
     pub lattice: jka_water::river::sparse::Lattice,
     pub dx_cm: f32,
     /// Lattice corner XY and river Z, cm.
@@ -367,6 +370,7 @@ impl FarMesh {
             lattice: [lattice.dimensions()[0] as i32, lattice.dimensions()[1] as i32, lattice.tiles()[0] as i32, lattice.shift() as i32],
             lod: [self.lod_scale as f32, if view.lod_morphing { 1.0 } else { 0.0 }, self.num_quads_lod0 as f32, lattice.tile() as f32],
             window,
+            format: [u32::from(inputs.normals_packed), 0, 0, 0],
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
         if self.group.as_ref().is_none_or(|(g, _)| *g != inputs.pool_generation) {
@@ -413,7 +417,7 @@ mod tests {
         wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
             .validate(&module)
             .unwrap_or_else(|e| panic!("river surface shader validates: {e:?}"));
-        for entry in ["vs", "fs", "fs_composite", "vs_far", "fs_far", "fs_composite_far"] {
+        for entry in ["vs", "vs_block", "fs", "fs_composite", "fs_river_wire", "fs_river_wire_masked", "vs_far", "fs_far", "fs_composite_far", "fs_far_wire", "fs_far_wire_full"] {
             assert!(module.entry_points.iter().any(|e| e.name == entry), "missing entry point {entry}");
         }
     }

@@ -89,7 +89,7 @@ const AGGRESSIVE_LINE_MAX_OUTER_HALF_ANGLE_DEG: f32 = 12.0;
 #[derive(Clone, Debug)]
 struct ProjectileLightDriver {
     kind: PrimType,
-    shader: String,
+    shader: Arc<str>,
     score: i16,
     radius: f32,
     rgba: [u8; 4],
@@ -335,7 +335,7 @@ where
                             .max(midpoint(primitive.size_end.min, primitive.size_end.max).abs())
                             .max(1.0);
                         let driver = ProjectileLightDriver {
-                            kind: primitive.kind, shader: media.clone(), score: profile.score + semantic,
+                            kind: primitive.kind, shader: Arc::from(media.as_str()), score: profile.score + semantic,
                             radius, rgba,
                         };
                         if best.as_ref().is_none_or(|(rank, _)| score > *rank) {
@@ -815,12 +815,7 @@ impl FxLightPromoter {
                 // nested impacts). Only merge nondirectional *point* sources
                 // with similar hue and radius. Never fold distinct beams,
                 // projectors, or unrelated nearby red/blue lights together.
-                level == 2
-                    && existing.light.spot.is_none() && light.spot.is_none()
-                    && existing.light.segment.is_none() && light.segment.is_none()
-                    && distance_sq <= CROSS_EFFECT_POINT_MERGE_DISTANCE.powi(2)
-                    && radii_compatible(existing.light.radius, light.radius)
-                    && colors_compatible(existing.light.rgb, light.rgb)
+                level == 2 && matching_point_lights(&existing.light, &light)
             }) {
                 crate::fx::diagnostics::add(crate::fx::diagnostics::PROMOTION_MERGED, 1);
                 existing.visual_size += candidate.radius.abs().min(32.0);
@@ -888,8 +883,15 @@ impl FxLightPromoter {
                 if pending.len() >= MAX_PROMOTED_LIGHTS { break; }
                 if pending.iter().filter(|existing| existing.class != FxClass::DirectBeam)
                     .count() >= budget { break; }
-                if !pending.iter().any(|present| present.effect == *effect
-                    && distance_squared(present.light.origin, light.origin) <= 48.0 * 48.0)
+                if !pending.iter().any(|present| {
+                    if present.effect == *effect {
+                        distance_squared(present.light.origin, light.origin) <= 48.0 * 48.0
+                    } else {
+                        // The live merge may already represent this held source
+                        // under a different effect ID. Do not add it back.
+                        present.line.is_none() && matching_point_lights(&present.light, light)
+                    }
+                })
                     && pending.iter().filter(|present| present.effect == *effect
                         && distance_squared(present.light.origin, light.origin)
                             <= EFFECT_NEIGHBORHOOD_RADIUS * EFFECT_NEIGHBORHOOD_RADIUS)
@@ -1036,6 +1038,14 @@ fn radii_compatible(a: f32, b: f32) -> bool {
         && a.min(b) / a.max(b) >= 0.5
 }
 
+fn matching_point_lights(a: &FxLight, b: &FxLight) -> bool {
+    a.spot.is_none() && b.spot.is_none()
+        && a.segment.is_none() && b.segment.is_none()
+        && distance_squared(a.origin, b.origin) <= CROSS_EFFECT_POINT_MERGE_DISTANCE.powi(2)
+        && radii_compatible(a.radius, b.radius)
+        && colors_compatible(a.rgb, b.rgb)
+}
+
 fn colors_compatible(a: [f32; 3], b: [f32; 3]) -> bool {
     let a_peak = a.into_iter().fold(0.0_f32, f32::max);
     let b_peak = b.into_iter().fold(0.0_f32, f32::max);
@@ -1175,7 +1185,7 @@ mod promotion_level_tests {
     fn candidate() -> FxAutoLightCandidate {
         FxAutoLightCandidate { effect: 7, class: FxClass::General, score: 0, kind: PrimType::Particle,
             origin: [1.0, 2.0, 3.0], radius: 4.0, rgba: [255; 4],
-            shader: "gfx/effects/testglow".to_owned(), life_ms: 10,
+            shader: "gfx/effects/testglow".into(), life_ms: 10,
             spot: None, segment: None }
     }
 
@@ -1447,8 +1457,30 @@ mod promotion_level_tests {
         b.effect = 80;
         b.origin[0] += 8.0;
         assert_eq!(promoter.promote(&[a.clone(), b.clone()], &mut |_| Vec::new(), 1000, 2).len(), 1);
+        assert_eq!(promoter.promote(&[], &mut |_| Vec::new(), 1010, 2).len(), 1,
+            "retained short-lived lights must preserve cross-effect merging without live candidates");
         b.origin[0] += 100.0;
         assert_eq!(promoter.promote(&[a, b], &mut |_| Vec::new(), 1040, 2).len(), 2);
+    }
+
+    #[test]
+    fn differently_colored_retained_point_lights_stay_separate() {
+        let mut catalog = FxLightPromotionCatalog::default();
+        catalog.materials.insert(scene::canonical_shader_name("gfx/effects/testglow"),
+            Some(MaterialLightAnalysis { static_emission: true, score: 6, texture_color: [1.0; 3],
+                rgb_vertex: true, rgb_const: [1.0; 3], alpha_vertex: false,
+                alpha_const: 1.0, blend: FxBlend::Add }));
+        let mut promoter = FxLightPromoter::default();
+        promoter.set_catalog(Arc::new(catalog));
+        let mut red = candidate();
+        red.rgba = [255, 0, 0, 255];
+        let mut blue = red.clone();
+        blue.effect = 80;
+        blue.origin[0] += 8.0;
+        blue.rgba = [0, 0, 255, 255];
+        assert_eq!(promoter.promote(&[red, blue], &mut |_| Vec::new(), 1000, 2).len(), 2);
+        assert_eq!(promoter.promote(&[], &mut |_| Vec::new(), 1010, 2).len(), 2,
+            "proximity alone must not collapse held lights with different colors");
     }
 
     #[test]

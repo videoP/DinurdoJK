@@ -208,6 +208,7 @@ mod tests {
         let widget = PlacedHudWidget {
             widget: HudWidget { key: "test/rect".into(), name: "Rect".into(),
                 width: 50.0, height: 40.0, anchor: Default::default(),
+                default_offset: [0.0; 2],
                 commands: vec![HudCommand::Rect { x: 2.0, y: 3.0, w: 20.0, h: 10.0, color: [1.0; 4] }] },
             placement: HudPlacement { x: 30.0, y: 25.0, scale: 2.0, visible: true },
         };
@@ -220,7 +221,7 @@ mod tests {
     fn image_widget(commands: Vec<HudCommand>, anchor: crate::extensions::HudAnchor) -> PlacedHudWidget {
         PlacedHudWidget {
             widget: HudWidget { key: "t/i".into(), name: "I".into(), width: 100.0, height: 50.0,
-                anchor, commands },
+                anchor, default_offset: [0.0; 2], commands },
             placement: HudPlacement::for_anchor(anchor),
         }
     }

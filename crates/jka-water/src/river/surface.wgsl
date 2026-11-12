@@ -38,10 +38,15 @@ fn river_surface_masks(depth:f32,opacity:f32,uv:vec2<f32>,dimensions:vec2<f32>,i
 // Fragment-only selected live texture path. Advection's footprint uses original
 // fluid velocity derivatives, not its bracketed/projected/scaled velocities.
 // Both FFT RGB samples stay linear, without a normal-map decode or early normalize.
-fn river_live_grid_normal(fluid_tex:texture_2d<f32>,normal_tex:texture_2d<f32>,normal_sampler:sampler,detail_tex:texture_2d<f32>,detail_sampler:sampler,uv:vec2<f32>,world_xy:vec2<f32>,time:f32,motion:RiverMotion,wpo_advection:RiverAdvection,detail_advection:RiverAdvection,height:RiverWaveHeight,foam_normal:vec3<f32>,total_foam:f32,foam_opacity:f32,opacity_mask:f32)->vec3<f32> {
+fn river_live_grid_normal_lod(fluid_tex:texture_2d<f32>,normal_tex:texture_2d<f32>,normal_sampler:sampler,detail_tex:texture_2d<f32>,detail_sampler:sampler,uv:vec2<f32>,world_xy:vec2<f32>,time:f32,motion:RiverMotion,wpo_advection:RiverAdvection,detail_advection:RiverAdvection,height:RiverWaveHeight,foam_normal:vec3<f32>,total_foam:f32,foam_opacity:f32,opacity_mask:f32,material_lod:vec2<f32>)->vec3<f32> {
     let fluid=river_live_field(fluid_tex,uv);
     let base=textureSampleLevel(normal_tex,normal_sampler,uv,0.0).xyz;
-    let wpo=river_wave_fragment(detail_tex,detail_sampler,world_xy,fluid.zw,base,time,wpo_advection).xyz;
-    let detail=river_wave_fragment(detail_tex,detail_sampler,world_xy,fluid.zw,base,time,detail_advection).xyz;
+    let wpo=river_wave_fragment_lod(detail_tex,detail_sampler,world_xy,fluid.zw,base,time,wpo_advection,material_lod).xyz;
+    let detail=river_wave_fragment_lod(detail_tex,detail_sampler,world_xy,fluid.zw,base,time,detail_advection,material_lod).xyz;
     return river_surface_normal(base,wpo,detail,length(fluid.zw),motion,height,foam_normal,total_foam,foam_opacity,opacity_mask);
+}
+
+// Reference compatibility entry point used by independent shader tests.
+fn river_live_grid_normal(fluid_tex:texture_2d<f32>,normal_tex:texture_2d<f32>,normal_sampler:sampler,detail_tex:texture_2d<f32>,detail_sampler:sampler,uv:vec2<f32>,world_xy:vec2<f32>,time:f32,motion:RiverMotion,wpo_advection:RiverAdvection,detail_advection:RiverAdvection,height:RiverWaveHeight,foam_normal:vec3<f32>,total_foam:f32,foam_opacity:f32,opacity_mask:f32)->vec3<f32> {
+    return river_live_grid_normal_lod(fluid_tex,normal_tex,normal_sampler,detail_tex,detail_sampler,uv,world_xy,time,motion,wpo_advection,detail_advection,height,foam_normal,total_foam,foam_opacity,opacity_mask,vec2<f32>(0.0,4.0));
 }

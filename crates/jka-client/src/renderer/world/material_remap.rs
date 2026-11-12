@@ -11,7 +11,7 @@ use crate::renderer::{
     instantiate_portal_draw_plans, material_uniform,
     visible_batches_by_cluster, sky_reachability_by_cluster, weather, Arc, Auto4CollapseCache, Auto4CollapseWorker,
     Auto4GeometryState, DrawBatch, DrawClass, DrawIndexedIndirectArgs, GpuCullRecord,
-    MaterialFragmentKey, Renderer, UniformArena, UniformSlot,
+    MaterialFragmentKey, Renderer, UniformArena, UniformSlot, inspector_texture_meta,
     WorldAnimationFrame, WorldBatch, WorldGpu, WorldUploadTimings, AUTO_DETAIL_ENABLED_BIT,
     PLANAR_REFLECTION_SLOTS,
 };
@@ -566,6 +566,12 @@ impl Renderer {
             world.remap_texture_hashes = map.base.texture_hashes.iter().copied()
                 .chain(map.replacement_texture_hashes.iter().copied()).collect();
             world.animated_batches = None;
+            // Live material rebinding must update the trace's cold metadata as
+            // well as the GPU bindings. The base map's debug entries and image
+            // table still refer to the original BSP material otherwise.
+            map.apply_remap_diagnostics(&mut world.material_debug);
+            world.inspector_textures.truncate(base_texture_count);
+            world.inspector_textures.extend(map.replacement_textures.iter().map(inspector_texture_meta));
             let needs_pipelines = world.pipeline_variants.values().any(|variant|
                 world.coarse_batches.iter().any(|batch| !variant.pipelines.contains_key(&batch.source.pipeline)));
             if needs_pipelines { self.rebuild_world_pipelines(); }
@@ -844,6 +850,9 @@ impl Renderer {
             .any(|batch| batch.source.force_sight_only);
         world.has_glass_primary = world.coarse_batches.iter().any(|b| b.source.glass_primary);
         world.material_debug = map.base.material_debug.clone();
+        map.apply_remap_diagnostics(&mut world.material_debug);
+        world.inspector_textures.truncate(base_texture_count);
+        world.inspector_textures.extend(map.replacement_textures.iter().map(inspector_texture_meta));
         let mut sun_textures=map.base.textures.as_ref().clone();
         sun_textures.extend(map.replacement_textures.iter().cloned());
         let new_sun_geometry = remapped_sun_geometry(world, map, Arc::new(sun_textures));

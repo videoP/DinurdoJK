@@ -2189,12 +2189,21 @@ hides_native_hud = ['health', 'speedometer']
     }
 
     #[test]
+    #[ignore = "requires ups-hud fixtures; set DJK_UPS_HUD_EXTENSION to the extension directory"]
     fn bundled_ups_speedometer_runs_and_draws() {
         let (tx, _rx) = mpsc::channel();
         let worker = Worker::new(PathBuf::from("unused"), None, tx);
-        let manifest: Manifest = toml::from_str(include_str!("../extensions/ups-hud/extension.toml")).unwrap();
+        // Optional shipped assets must not prevent unrelated unit tests from
+        // compiling in a source checkout without the extension bundle.
+        let directory = std::env::var_os("DJK_UPS_HUD_EXTENSION").map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("extensions/ups-hud"));
+        let manifest_text = fs::read_to_string(directory.join("extension.toml"))
+            .expect("ups-hud extension.toml fixture");
+        let script = fs::read_to_string(directory.join("main.rhai"))
+            .expect("ups-hud main.rhai fixture");
+        let manifest: Manifest = toml::from_str(&manifest_text).unwrap();
         assert!(NativeHudMask::from_names(&manifest.hides_native_hud).unwrap().contains(NativeHud::Speedometer));
-        let mut active = worker.compile("ups-hud", include_str!("../extensions/ups-hud/main.rhai")).unwrap();
+        let mut active = worker.compile("ups-hud", &script).unwrap();
         active.callback("on_update", None).unwrap(); // no player yet
         let mut ps = PlayerState::default();
         ps.set_field_bits("velocity[0]", 600.0_f32.to_bits());

@@ -329,7 +329,7 @@ mod tests {
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let mut ocean = BlueWaterOcean::new(&device);
             let mut encoder = device.create_command_encoder(&Default::default());
-            ocean.encode(&queue, &mut encoder, 1.0 / 48.0, 48.0, super::super::BlueWaterWaves::default(),[[0.0;4],[0.0,0.0,1.0,0.0]], 0);
+            ocean.encode(&queue, &mut encoder, 1.0 / 48.0, 48.0, super::super::BlueWaterWaves::default(),[[0.0;4],[0.0,0.0,1.0,0.0]], 0, [0, 0], [1.0, 1.0]);
             let n = ocean.field.resolution();
             let read = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Blue Water adapter readback"),

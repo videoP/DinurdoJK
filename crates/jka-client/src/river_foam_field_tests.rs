@@ -397,6 +397,7 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) {
         FieldInputs {
             state: &state,
             normal_grid: &normal_grid,
+            blocks: None,
         },
         &setup,
     )
@@ -464,6 +465,7 @@ pub fn check(device: &wgpu::Device, queue: &wgpu::Queue) {
         FieldInputs {
             state: &state,
             normal_grid: &normal_grid,
+            blocks: None,
         },
         &bad,
     )
@@ -502,6 +504,7 @@ pub fn check_simulation(
         FieldInputs {
             state: simulation.state_textures(),
             normal_grid,
+            blocks: None,
         },
         &setup,
     )

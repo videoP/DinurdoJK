@@ -39,6 +39,8 @@ use std::{
 };
 
 const MAX_MD3_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PROP_INDEX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PROP_INDEX_ENTRIES: usize = 1024;
 const EF_NODRAW: i32 = 1 << 8;
 const EF_DEAD: i32 = 1 << 1;
 /// bg_public.h: authoritative spawn protection flag consumed by CG_Player.
@@ -224,6 +226,19 @@ fn force_shockwave_surface(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PropIndexKey {
+    mesh: usize,
+    section: usize,
+    two_sided: bool,
+}
+
+struct CachedPropIndices {
+    // Retain the source so a cached pointer key cannot alias a later allocation.
+    _mesh: Arc<jka_emotes::prop_mesh::Mesh>,
+    indices: Arc<Vec<u32>>,
+}
+
 pub struct EntityPresenter {
     assets: AssetSearchPath,
     pbr: bool,
@@ -295,6 +310,8 @@ pub struct EntityPresenter {
     shield_hits: HashMap<u16, ShieldHit>,
     material_clock: std::time::Instant,
     imported_props: HashMap<String,Arc<jka_emotes::prop_mesh::Mesh>>,
+    prop_indices: HashMap<PropIndexKey, CachedPropIndices>,
+    prop_index_bytes: usize,
     prop_gpu_vertices:HashMap<String,Arc<Vec<crate::renderer::Ghoul2GpuVertex>>>,
     prop_normals:HashMap<String,Option<Arc<TextureData>>>,
     ue_materials:HashMap<String,Option<Arc<jka_ue_assets::material::Program>>>,
@@ -601,6 +618,8 @@ impl EntityPresenter {
             shield_hits: HashMap::new(),
             material_clock: std::time::Instant::now(),
             imported_props:HashMap::new(),
+            prop_indices: HashMap::new(),
+            prop_index_bytes: 0,
             prop_gpu_vertices:HashMap::new(),
             prop_normals:HashMap::new(),
             ue_materials:HashMap::new(),
@@ -1873,12 +1892,60 @@ impl EntityPresenter {
         };
         self.ue_materials.insert(shader.into(),program.clone());program
     }
+    fn prop_section_indices(
+        &mut self,
+        mesh: &Arc<jka_emotes::prop_mesh::Mesh>,
+        section_index: usize,
+        two_sided: bool,
+    ) -> Arc<Vec<u32>> {
+        let key = PropIndexKey {
+            mesh: Arc::as_ptr(mesh) as usize,
+            section: section_index,
+            two_sided,
+        };
+        if let Some(cached) = self.prop_indices.get(&key) {
+            return Arc::clone(&cached.indices);
+        }
+        let section = &mesh.sections[section_index];
+        let source = &mesh.indices[section.first..section.end];
+        let mut indices = Vec::with_capacity(source.len() * if two_sided { 2 } else { 1 });
+        for tri in source.chunks_exact(3) {
+            indices.extend([tri[0], tri[2], tri[1]]);
+        }
+        if two_sided {
+            // Reverse the transformed front faces without cloning their buffer.
+            for tri in source.chunks_exact(3) {
+                indices.extend([tri[1], tri[2], tri[0]]);
+            }
+        }
+        let bytes = indices.capacity() * std::mem::size_of::<u32>();
+        let indices = Arc::new(indices);
+        // Oversized sections still share one buffer across this call's stages.
+        // Entry count also bounds metadata for empty or very small sections.
+        if bytes <= MAX_PROP_INDEX_BYTES {
+            if self.prop_index_bytes.saturating_add(bytes) > MAX_PROP_INDEX_BYTES
+                || self.prop_indices.len() >= MAX_PROP_INDEX_ENTRIES
+            {
+                self.prop_indices.clear();
+                self.prop_index_bytes = 0;
+            }
+            self.prop_indices.insert(key, CachedPropIndices {
+                _mesh: Arc::clone(mesh), indices: Arc::clone(&indices),
+            });
+            self.prop_index_bytes += bytes;
+        }
+        indices
+    }
+
     fn present_imported_prop(&mut self,entity_num:u16,path:&str,origin:[f32;3],axis:[[f32;3];3],rgba:[f32;4],pose:Option<&[jka_assets::ghoul2::Matrix3x4]>)->Result<Vec<DynamicModelSurface>,String>{
         let mesh=if let Some(mesh)=self.imported_props.get(path){mesh.clone()}else{
             let mesh=if let Some(mesh)=crate::emotes::prepared_prop_mesh(path){mesh}else{
             let bytes=self.assets.read(path,32*1024*1024).map_err(|e|e.to_string())?.ok_or("missing skeletal prop")?.bytes;
             Arc::new(jka_emotes::prop_mesh::Mesh::parse(&bytes)?)};
-            if self.imported_props.values().map(|m|m.vertices.len()*std::mem::size_of::<jka_emotes::prop_mesh::Vertex>()+m.indices.len()*4).sum::<usize>()>64*1024*1024{self.imported_props.clear();self.prop_gpu_vertices.clear();self.prop_normals.clear();}
+            if self.imported_props.values().map(|m|m.vertices.len()*std::mem::size_of::<jka_emotes::prop_mesh::Vertex>()+m.indices.len()*4).sum::<usize>()>64*1024*1024{
+                self.imported_props.clear();self.prop_gpu_vertices.clear();self.prop_normals.clear();
+                self.prop_indices.clear();self.prop_index_bytes=0;
+            }
             self.imported_props.insert(path.into(),mesh.clone());mesh
         };
         if pose.is_some_and(|p|p.len()!=mesh.bones.len()){return Err("prop animation/skeleton mismatch".into());}
@@ -1892,7 +1959,7 @@ impl EntityPresenter {
         let bones=Arc::new((0..mesh.bones.len()).map(|i|{
             let m=pose.map(|p|p[i]).unwrap_or([[1.,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.]]);crate::renderer::Ghoul2GpuBone{row0:m[0],row1:m[1],row2:m[2]}
         }).collect::<Vec<_>>());
-        for section in &mesh.sections {
+        for (section_index, section) in mesh.sections.iter().enumerate() {
             let program=self.ue_material(&section.shader);
             let definition=jka_assets::shader::find_shader(&self.shaders,&section.shader).cloned();
             let normal=definition.as_ref().and_then(Shader::primary).and_then(|s|s.normal_map.clone());
@@ -1901,6 +1968,8 @@ impl EntityPresenter {
                 let normal=self.load_texture_arc(&name,false).map(|n|{let mut n=(*n).clone();n.srgb=false;Arc::new(n)});
                 self.prop_normals.insert(name,normal.clone());normal
             });
+            let two_sided=definition.as_ref().is_some_and(|s|s.cull.eq_ignore_ascii_case("none")||s.cull.eq_ignore_ascii_case("twosided"));
+            let indices=self.prop_section_indices(&mesh,section_index,two_sided);
             for (stage,material) in self.fx_material_stages(&section.shader).into_iter().enumerate(){
             let color=material.float_vertex_color(rgba);let mut tinted=vertices.clone();for v in &mut tinted{v.color=color;for modifier in &material.tc_mods{v.uv=crate::fx::draw::modified_uv(v.uv,v.position,*modifier,seconds-material.shader_time_offset);}}
             if let Some(program)=&program {
@@ -1910,15 +1979,12 @@ impl EntityPresenter {
                     vertex.color=std::array::from_fn(|i|value[i]*rgba[i]);
                 }
             }
-            let mut indices=Vec::new();for tri in mesh.indices[section.first..section.end].chunks_exact(3){indices.extend([tri[0],tri[2],tri[1]]);}
-            if definition.as_ref().is_some_and(|s|s.cull.eq_ignore_ascii_case("none")||s.cull.eq_ignore_ascii_case("twosided")){let front=indices.clone();for tri in front.chunks_exact(3){indices.extend([tri[2],tri[1],tri[0]]);}}
-            let indices=Arc::new(indices);
             let gpu=if stage==0&&material.tc_mods.is_empty()&&program.is_none(){normal.as_ref().map(|normal|{
                 let vertices=self.prop_gpu_vertices.entry(path.into()).or_insert_with(||Arc::new(mesh.vertices.iter().map(|v|crate::renderer::Ghoul2GpuVertex{position:v.position,normal:v.normal,uv:v.uv,bone_indices:v.bones.map(|n|n as u32),weights:v.weights,weight_count:4,jiggle_region:u32::MAX,jiggle_weight:0.,jiggle_coord:4.}).collect())).clone();
                 crate::renderer::Ghoul2GpuSkinning{ foliage_wind: false,mesh_key:Arc::from(format!("{path}#native{}",section.first)),vertices,indices:indices.clone(),bones:bones.clone(),heat_bone:0,axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:Default::default(),source_material:Some(crate::renderer::SourceMaterialParams{normal_map:Some(normal.clone()),phong_boost:0.15,phong_exponent:32.,phong_fresnel:[0.,0.5,1.],rimlight_boost:0.,rimlight_exponent:1.,half_lambert:false})}
             })}else{None};
             let masked=definition.as_ref().and_then(|s|s.stages.get(stage)).is_some_and(|s|!s.alpha_test.is_empty());
-            draws.push(DynamicModelSurface{geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true, portal_only: false,vertices:Arc::new(tinted),indices,lighting_origin:if program.as_ref().is_some_and(|p|p.unlit){None}else{Some(origin)},rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture,alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{material.blend.custom_shader_alpha_mode()},authored_glow:material.authored_glow||program.as_ref().is_some_and(|p|p.unlit)});
+            draws.push(DynamicModelSurface{geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true, portal_only: false,vertices:Arc::new(tinted),indices:Arc::clone(&indices),lighting_origin:if program.as_ref().is_some_and(|p|p.unlit){None}else{Some(origin)},rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture,alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{material.blend.custom_shader_alpha_mode()},authored_glow:material.authored_glow||program.as_ref().is_some_and(|p|p.unlit)});
         }}Ok(draws)
     }
 
@@ -4367,8 +4433,8 @@ models/map_objects/factory/glass_b
             "map $whiteimage\nblendFunc GL_ZERO GL_ONE")).unwrap();
         let visible = jka_assets::shader::parse(&shader_def("visible",
             "map $whiteimage\nblendFunc GL_ONE GL_ONE")).unwrap();
-        presenter.shaders.extend(clear);
-        presenter.shaders.extend(visible);
+        Arc::make_mut(&mut presenter.shaders).extend(clear);
+        Arc::make_mut(&mut presenter.shaders).extend(visible);
         let original = Arc::clone(&presenter.md3_models["synthetic.md3"].model);
         let origin = [0.0; 3];
         let axis = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
@@ -4437,6 +4503,77 @@ models/map_objects/factory/glass_b
         let mut presenter=EntityPresenter::new(AssetSearchPath::open(&fixture.0).unwrap(),false).unwrap();presenter.md3_models.insert("models/fnemote/test.md3".into(),model);
         let draws=presenter.present_static_md3(0,"models/fnemote/test.md3",[0.;3],[[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]],[1.;4],0).unwrap();
         assert_eq!(draws.len(),2);assert_eq!(draws[0].vertices[0].color,[0.2,0.3,0.4,1.]);assert!(draws[1].authored_glow);assert_eq!(draws[1].vertices[0].color,[0.1,0.,0.,1.]);
+    }
+
+    #[test]
+    fn imported_prop_indices_reuse_across_stages_poses_and_cull_changes() {
+        let fixture = crate::cvar_compatibility::Fixture::new();
+        std::fs::create_dir_all(fixture.0.join("models/fnemote")).unwrap();
+        std::fs::create_dir_all(fixture.0.join("shaders")).unwrap();
+        let shader = "models/fnemote/topology";
+        std::fs::write(fixture.0.join("shaders/topology.shader"), format!(
+            "{shader}\n{{\ncull twosided\n{{\nmap $whiteimage\nrgbGen const ( 0.2 0.3 0.4 )\n}}\n{{\nmap $whiteimage\nblendFunc add\nglow\n}}\n}}\n"
+        )).unwrap();
+        let vertices: Vec<_> = (0..4).map(|i| serde_json::json!({
+            "position":[i,0,0], "normal":[0,0,1], "uv":[0,0],
+            "bones":[0,0,0,0], "weights":[1,0,0,0]
+        })).collect();
+        let mesh = serde_json::json!({
+            "version":1,"bones":["Root"],"vertices":vertices,"indices":[0,1,2,0,2,3],
+            "sections":[{"first":0,"end":3,"shader":shader},{"first":3,"end":6,"shader":shader}]
+        });
+        let path = "models/fnemote/topology.djk_prop";
+        std::fs::write(fixture.0.join(path), serde_json::to_vec(&mesh).unwrap()).unwrap();
+        let mut presenter = EntityPresenter::new(AssetSearchPath::open(&fixture.0).unwrap(), false).unwrap();
+        let axis = [[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]];
+        let first = presenter.present_imported_prop(0, path, [0.;3], axis, [1.;4], None).unwrap();
+        assert_eq!(first.len(), 4, "two material stages per section");
+        assert_eq!(first[0].indices.as_slice(), [0,2,1,1,2,0]);
+        assert_eq!(first[2].indices.as_slice(), [0,3,2,2,3,0]);
+        assert!(Arc::ptr_eq(&first[0].indices, &first[1].indices));
+        assert!(Arc::ptr_eq(&first[2].indices, &first[3].indices));
+        assert!(!Arc::ptr_eq(&first[0].indices, &first[2].indices));
+        assert_eq!(first[0].vertices[0].color, [0.2,0.3,0.4,1.]);
+        assert!(first[1].authored_glow);
+
+        let pose = [[[1.,0.,0.,5.],[0.,1.,0.,6.],[0.,0.,1.,7.]]];
+        let animated = presenter.present_imported_prop(1, path, [10.,20.,30.], axis, [0.5;4], Some(&pose)).unwrap();
+        assert_ne!(first[0].vertices[0].position, animated[0].vertices[0].position);
+        assert!(Arc::ptr_eq(&first[0].indices, &animated[0].indices));
+        assert!(Arc::ptr_eq(&first[2].indices, &animated[2].indices));
+
+        Arc::make_mut(&mut presenter.shaders).get_mut(shader).unwrap().cull = "back".into();
+        let one_sided = presenter.present_imported_prop(0, path, [0.;3], axis, [1.;4], None).unwrap();
+        assert_eq!(one_sided[0].indices.as_slice(), [0,2,1]);
+        assert!(!Arc::ptr_eq(&first[0].indices, &one_sided[0].indices));
+        assert_eq!(first[0].indices.as_slice(), [0,2,1,1,2,0], "published draws remain unchanged");
+        Arc::make_mut(&mut presenter.shaders).get_mut(shader).unwrap().cull = "twosided".into();
+        let restored = presenter.present_imported_prop(0, path, [0.;3], axis, [1.;4], None).unwrap();
+        assert!(Arc::ptr_eq(&first[0].indices, &restored[0].indices));
+    }
+
+    #[test]
+    fn imported_prop_index_cache_is_bounded_and_retained_indices_survive_eviction() {
+        let (_fixture, mut presenter) = synthetic_md3_presenter();
+        let vertices: Vec<_> = (0..3).map(|i| serde_json::json!({
+            "position":[i,0,0], "normal":[0,0,1], "uv":[0,0],
+            "bones":[0,0,0,0], "weights":[1,0,0,0]
+        })).collect();
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version":1,"bones":["Root"],"vertices":vertices,"indices":[0,1,2],
+            "sections":[{"first":0,"end":3,"shader":"solid"}]
+        })).unwrap();
+        let mut retained = None;
+        for _ in 0..=MAX_PROP_INDEX_ENTRIES {
+            let mesh = Arc::new(jka_emotes::prop_mesh::Mesh::parse(&bytes).unwrap());
+            let indices = presenter.prop_section_indices(&mesh, 0, false);
+            if retained.is_none() { retained = Some(indices); }
+            assert!(presenter.prop_indices.len() <= MAX_PROP_INDEX_ENTRIES);
+            assert!(presenter.prop_index_bytes <= MAX_PROP_INDEX_BYTES);
+        }
+        assert_eq!(presenter.prop_indices.len(), 1, "full cache evicts before storing another asset");
+        assert_eq!(retained.unwrap().as_slice(), [0,2,1]);
+        assert_eq!(presenter.prop_index_bytes, 3 * std::mem::size_of::<u32>());
     }
 
     #[test]
@@ -4517,7 +4654,7 @@ models/map_objects/factory/glass_b
         let (_fixture, mut presenter) = synthetic_md3_presenter();
         presenter.set_md3_geometry_cache(true);
         let shader_name = "models/map_objects/yavin/plant_b";
-        presenter.shaders.extend(jka_assets::shader::parse(&format!(
+        Arc::make_mut(&mut presenter.shaders).extend(jka_assets::shader::parse(&format!(
             "{shader_name}\n{{\ncull twosided\n{{\nmap $whiteimage\nalphaFunc GE128\nrgbGen lightingDiffuse\n}}\n}}\n"
         )).unwrap());
         let original = Arc::clone(&presenter.md3_models["synthetic.md3"]);
@@ -4564,7 +4701,7 @@ models/map_objects/factory/glass_b
         let a2 = presenter.md3_geometry(&asset, surface, 7, 0, 0, axis, origin, 1.0, [0.3; 4], 0.0);
         assert!(Arc::ptr_eq(&a.0, &a2.0));
         assert_ne!(a.0[0].color, b.0[0].color);
-        let view = presenter.present_view_md3(7, "synthetic.md3", origin, axis).unwrap();
+        let view = presenter.present_view_md3(7, "synthetic.md3", origin, axis, 1.0).unwrap();
         let world = presenter.present_static_md3(7, "synthetic.md3", origin, axis, [1.0; 4], 0).unwrap();
         assert_eq!(view[0].vertices[0].depth_hack, 1.0);
         assert_eq!(world[0].vertices[0].depth_hack, 0.0);

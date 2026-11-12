@@ -32,7 +32,8 @@ struct RiverView {
     distortion: vec4<f32>,      // SingleLayerWater.DistortionParams
     sun_direction: vec4<f32>,   // DirectionalLightDirection (toward the light)
     sun_illuminance: vec4<f32>, // rgb DirectionalLightColor * pi; w 1 = Blue Water ambient
-    time: vec4<f32>,            // material Time, foam detail present, Engine.DeltaTime
+    time: vec4<f32>,            // material Time, foam detail present, Engine.DeltaTime, bed clamp (not Unreal)
+    material_lod: vec4<f32>,    // x: render-only per-fragment A/B (0 native, 1 waves, 2 waves+foam); y: mip cutoff
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -239,20 +240,82 @@ struct RiverOut {
     @location(2) @interpolate(flat) eye_water: vec4<f32>, // surface, bed, wet flag
 };
 
+// Bed clamp, vertex half (not Unreal; river_view.time.w). Mesh vertices sit
+// between cells and average them, so at a pourover the vertex between the
+// upper and lower water dips under the lip. Where the wet cells around a
+// vertex differ by more than one cell width (steeper than 45 degrees), lift it
+// to the highest of them: the sheet then falls in front of the lip.
+// Samples are cell-centred zero-load loads, as river_live_field's.
+fn river_lip_lift(a: vec4<f32>, b: vec4<f32>, c: vec4<f32>, d: vec4<f32>, bilinear_height: f32, dx: f32) -> f32 {
+    if river_view.time.w < 0.5 { return 0.0; }
+    var high = -3.0e38;
+    var low = 3.0e38;
+    for (var i = 0; i < 4; i++) {
+        var s = a;
+        if i == 1 { s = b; } else if i == 2 { s = c; } else if i == 3 { s = d; }
+        if s.y > 1e-8 {
+            high = max(high, s.x);
+            low = min(low, s.x);
+        }
+    }
+    if high > low + dx { return max(high - bilinear_height, 0.0); }
+    return 0.0;
+}
+fn river_window_lip_lift(uv: vec2<f32>) -> f32 {
+    let dimensions = vec2<f32>(textureDimensions(sim_grid, 0));
+    let position = uv * dimensions - vec2<f32>(0.5);
+    let cell = vec2<i32>(floor(position));
+    let f = position - vec2<f32>(cell);
+    let a = river_zero_load(sim_grid, cell);
+    let b = river_zero_load(sim_grid, cell + vec2<i32>(1, 0));
+    let c = river_zero_load(sim_grid, cell + vec2<i32>(0, 1));
+    let d = river_zero_load(sim_grid, cell + vec2<i32>(1, 1));
+    let bilinear = mix(mix(a, b, f.x), mix(c, d, f.x), f.y).x;
+    return river_lip_lift(a, b, c, d, bilinear, body.grid.x / max(body.grid.z, 1.0));
+}
+
 // Live-grid WPO: SimGridRT height plus the advected FFT wave height on the
 // reset grid mesh (unrotated actor: local Z is world Z).
 @vertex fn vs(@location(0) position: vec3<f32>, @location(3) uv: vec2<f32>) -> RiverOut {
+    return river_window_vertex(position, uv);
+}
+
+// The window grid as instanced blocks of river_blocks (only blocks that can
+// show water). Each vertex is rebuilt exactly as grid_mesh.wgsl
+// create_vertices writes it; corners past the grid edge clamp onto it, so
+// those quads collapse to zero area.
+@group(1) @binding(15) var<storage, read> river_blocks: array<u32>;
+const RIVER_BLOCK: u32 = 16u;
+// r_riverAdaptiveMesh's templates offset their indices by
+// template * RIVER_BLOCK_VERTICES (river_blocks.rs); the block list holds
+// one bucket of every block per template. A's template is bucket 0.
+const RIVER_BLOCK_VERTICES: u32 = (RIVER_BLOCK + 1u) * (RIVER_BLOCK + 1u);
+@vertex fn vs_block(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance: u32) -> RiverOut {
+    let cells = vec2<u32>(body.grid.zw + vec2<f32>(0.5));
+    let blocks = (cells + vec2<u32>(RIVER_BLOCK - 1u)) / RIVER_BLOCK;
+    let bucket = vertex_id / RIVER_BLOCK_VERTICES;
+    let vertex = vertex_id % RIVER_BLOCK_VERTICES;
+    let packed = river_blocks[bucket * blocks.x * blocks.y + instance];
+    let block = vec2<u32>(packed & 0xFFFFu, packed >> 16u);
+    let local = vec2<u32>(vertex % (RIVER_BLOCK + 1u), vertex / (RIVER_BLOCK + 1u));
+    let corner = min(block * RIVER_BLOCK + local, cells);
+    let uv = vec2<f32>(corner) / vec2<f32>(cells);
+    let position = vec3<f32>((uv - vec2<f32>(0.5)) * body.grid.xy, 0.0);
+    return river_window_vertex(position, uv);
+}
+
+fn river_window_vertex(position: vec3<f32>, uv: vec2<f32>) -> RiverOut {
     let up = vec3<f32>(0.0, 0.0, 1.0);
     let camera_distance = distance(body.origin.xyz + position, river_view.eye.xyz);
     let world = body.origin.xyz + river_live_grid_wpo(sim_grid, normals_rt, normal_sampler, ocean_detail, ocean_sampler, uv,
         body.origin.xy + position.xy, camera_distance, river_view.time.x, position, up, river_motion(river_view.time.z),
-        river_wpo_advection(), river_wave_height(), false);
+        river_wpo_advection(), river_wave_height(), false) + up * river_window_lip_lift(uv);
     let map = world / RIVER_CM_PER_UNIT;
     var out: RiverOut;
     out.clip = camera.view_proj * vec4<f32>(map.x, map.z, -map.y, 1.0);
     out.uv = uv;
     out.world = world;
-    out.eye_water = river_eye_water();
+    out.eye_water = river_eye_water_at(river_view.eye.xyz);
     return out;
 }
 
@@ -294,13 +357,13 @@ fn river_to_view(v: vec3<f32>) -> vec3<f32> {
     let time = river_view.time.x;
     var foam = RiverFoam(vec3<f32>(0.0, 0.0, 1.0), 0.0, 0.0, 0.0, 0.0, vec3<f32>(0.0));
     if river_view.time.y > 0.5 {
-        foam = river_live_grid_foam(sim_grid, normals_rt, normal_sampler, foam_rt, foam_rt_sampler, foam_detail, foam_detail_sampler,
-            input.uv, world_xy, time, river_foam_advection(), river_foam_settings());
+        foam = river_live_grid_foam_lod(sim_grid, normals_rt, normal_sampler, foam_rt, foam_rt_sampler, foam_detail, foam_detail_sampler,
+            input.uv, world_xy, time, river_foam_advection(), river_foam_settings(), river_view.material_lod.xy);
     }
     // FoamOpacity 1 (live instance); the normal gate takes the simulation mask.
-    let graph_normal = river_live_grid_normal(sim_grid, normals_rt, normal_sampler, ocean_detail, ocean_sampler, input.uv, world_xy, time,
+    let graph_normal = river_live_grid_normal_lod(sim_grid, normals_rt, normal_sampler, ocean_detail, ocean_sampler, input.uv, world_xy, time,
         river_motion(river_view.time.z), river_wpo_advection(), river_detail_advection(), river_wave_height(),
-        foam.normal, foam.total, river_foam_settings().shading.x, masks.simulation_mask);
+        foam.normal, foam.total, river_foam_settings().shading.x, masks.simulation_mask, river_view.material_lod.xy);
     if masks.material_mask < 0.3333 {
         discard;
     }

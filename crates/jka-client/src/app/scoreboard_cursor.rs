@@ -48,22 +48,46 @@ fn plain_name(name: &str) -> String {
 
 /// Context menu actions: only a live spectator can follow a playing target.
 /// Mute and voting remain available to ordinary players.
-fn score_actions(own: bool, spectating: bool, playable: bool, muted: bool, live: bool, japro: bool, translate: bool) -> Vec<ScoreAction> {
+fn score_actions(own: bool, spectating: bool, playable: bool, muted: bool, live: bool, japro: bool,
+    translate: Option<(bool, Option<&'static str>, bool)>) -> Vec<ScoreAction> {
     if own { return Vec::new(); }
     let mut actions = Vec::new();
     if spectating && playable {
         actions.push(ScoreAction::Follow);
     }
     actions.push(if muted { ScoreAction::Unmute } else { ScoreAction::Mute });
-    // Per-player chat translation rules need live client slots.
-    if translate && live {
-        actions.push(ScoreAction::Translate);
+    // Show the checkbox and source selector immediately in the player popup;
+    // neither requires opening a second "Translation..." submenu.
+    if live {
+        if let Some((checked, source, overridden)) = translate {
+            actions.push(ScoreAction::Translate(checked));
+            actions.push(ScoreAction::TranslateLanguages(source));
+            if overridden { actions.push(ScoreAction::TranslateDefault); }
+        }
     }
     if live {
         actions.push(ScoreAction::VoteKick);
         if japro { actions.push(ScoreAction::ForceSpectate); }
     }
     actions
+}
+
+/// This is the single-step picker shown by clicking the inline Aa icon.
+/// Keep its action list declarative so the model and renderer share one order.
+fn translation_picker_actions(checked: bool, source: Option<&'static str>, overridden: bool) -> Vec<ScoreAction> {
+    let mut actions = Vec::with_capacity(14);
+    actions.push(ScoreAction::Translate(checked));
+    for (index, &(code, _)) in crate::ui::SCOREBOARD_TRANSLATE_LANGUAGES.iter().enumerate() {
+        actions.push(ScoreAction::TranslateHint(index as u8, (if code.is_empty() { None } else { Some(code) }) == source));
+    }
+    if overridden {
+        actions.push(ScoreAction::TranslateDefault);
+    }
+    actions
+}
+
+fn is_translation_picker(menu: &ScoreboardMenuUi) -> bool {
+    menu.actions.iter().any(|action| matches!(action, ScoreAction::TranslateHint(_, _)))
 }
 
 impl App {
@@ -223,6 +247,13 @@ impl App {
         let hit = self.scoreboard_hit(pointer);
         let menu = self.scoreboard_cursor.menu.take();
         match hit {
+            Some(ScoreboardHit::TranslateMenu(client)) => {
+                // The icon opens the language picker directly, rather than
+                // silently toggling a rule and requiring a second menu.
+                if menu.as_ref().is_none_or(|open| open.client != client || !is_translation_picker(open)) {
+                    self.scoreboard_cursor.menu = self.score_translation_picker_for(client, pointer);
+                }
+            }
             Some(ScoreboardHit::Action(index)) => {
                 if let Some((menu, action)) = menu.and_then(|m| m.actions.get(index).copied().map(|a| (m, a))) {
                     self.apply_score_action(menu, action);
@@ -260,6 +291,11 @@ impl App {
         let playable = self.scoreboard.as_ref().is_some_and(|board| {
             board.entries.iter().any(|entry| entry.client == client && entry.team != 3)
         });
+        let global = self.chat_translation.settings.mode;
+        let (rule, source) = self.chat_translation.rule(client, &name);
+        let translate = (global != crate::chat_translation::Mode::Off).then_some((
+            rule.checked(global), source, rule != RuleMode::Default,
+        ));
         let actions = score_actions(
             Some(client) == own,
             self.is_spectating_live(),
@@ -267,7 +303,7 @@ impl App {
             self.muted_clients.contains_key(&client),
             session.live,
             self.active_server_mod() == crate::net::mod_support::ServerMod::Japro,
-            self.chat_translation.settings.mode != crate::chat_translation::Mode::Off,
+            translate,
         );
         (!actions.is_empty()).then(|| ScoreboardMenuUi {
             client,
@@ -280,30 +316,36 @@ impl App {
         })
     }
 
-    /// The per-player translation submenu, titled with the current rule.
-    fn translation_score_menu(&self, menu: ScoreboardMenuUi) -> ScoreboardMenuUi {
-        let (mode, source) = self.chat_translation.rule(menu.client, &menu.name);
-        let mut actions = Vec::new();
-        if mode != RuleMode::Always { actions.push(ScoreAction::TranslateAlways); }
-        if mode != RuleMode::Never { actions.push(ScoreAction::TranslateNever); }
-        if mode != RuleMode::Default { actions.push(ScoreAction::TranslateDefault); }
-        actions.push(ScoreAction::TranslateLanguages);
-        actions.push(ScoreAction::TranslateDone);
-        let mode_text = match mode {
-            RuleMode::Default => "chat setting",
-            RuleMode::Always => "always",
-            RuleMode::Never => "never",
-        };
-        let plain = crate::logging::strip_jka_colors(&menu.name);
-        let detail = format!("{mode_text}, {}", source.map_or("auto".to_owned(), str::to_ascii_uppercase));
-        ScoreboardMenuUi { actions, confirm_kick: false, title: Some(plain), detail: Some(detail), ..menu }
+    /// A click on the Aa icon goes straight to a single popup with the ON/OFF
+    /// action and every language choice (including Auto-detect). No submenu.
+    fn score_translation_picker_for(&self, client: i32, pointer: [f32; 2]) -> Option<ScoreboardMenuUi> {
+        let menu = self.score_menu_for(client, pointer)?;
+        if !self.score_target_is_current(&menu, false)
+            || !menu.actions.iter().any(|action| matches!(action, ScoreAction::Translate(_)))
+        {
+            return None;
+        }
+        let (mode, source) = self.chat_translation.rule(client, &menu.name);
+        let checked = mode.checked(self.chat_translation.settings.mode);
+        let actions = translation_picker_actions(checked, source, mode != RuleMode::Default);
+        let title = format!("TRANSLATE - {}", crate::logging::strip_jka_colors(&menu.name));
+        let source_label = source.map_or("Auto-detect", crate::chat_translation::lang::name);
+        let detail = format!("{}  |  FROM: {}", if checked { "ON" } else { "OFF" }, source_label);
+        Some(ScoreboardMenuUi { actions, title: Some(title), detail: Some(detail), ..menu })
     }
 
     /// Rule changes apply to the player still in the slot; otherwise nothing.
     fn change_score_translation_rule(&mut self, menu: ScoreboardMenuUi, change: RuleChange) {
         if self.score_target_is_current(&menu, false) {
             self.change_chat_translation_rule(menu.client, &menu.name, change);
-            self.scoreboard_cursor.menu = Some(self.translation_score_menu(menu));
+            // Keep the user in the picker after changing an option so its
+            // source selection and ON/OFF state update without another click.
+            let anchor = [menu.anchor[0] as f32, menu.anchor[1] as f32];
+            self.scoreboard_cursor.menu = if is_translation_picker(&menu) {
+                self.score_translation_picker_for(menu.client, anchor)
+            } else {
+                self.score_menu_for(menu.client, anchor)
+            };
         } else {
             self.push_console_line("^3Translation:^7 player left or changed slots");
         }
@@ -354,27 +396,23 @@ impl App {
                     self.forward_command_to_server(&crate::vote::forcespec_vote(client));
                 }
             }
-            ScoreAction::Translate => {
-                self.scoreboard_cursor.menu = Some(self.translation_score_menu(menu));
+            ScoreAction::Translate(_) => {
+                let mode = self.chat_translation.rule(menu.client, &menu.name).0;
+                self.change_score_translation_rule(menu,
+                    RuleChange::Mode(mode.toggled(self.chat_translation.settings.mode)));
             }
-            ScoreAction::TranslateAlways => self.change_score_translation_rule(menu, RuleChange::Mode(RuleMode::Always)),
-            ScoreAction::TranslateNever => self.change_score_translation_rule(menu, RuleChange::Mode(RuleMode::Never)),
             ScoreAction::TranslateDefault => self.change_score_translation_rule(menu, RuleChange::Mode(RuleMode::Default)),
-            ScoreAction::TranslateLanguages => {
-                let actions = (0..crate::ui::SCOREBOARD_TRANSLATE_LANGUAGES.len())
-                    .map(|index| ScoreAction::TranslateHint(index as u8))
-                    .collect();
-                let title = format!("{plain} usually writes:");
-                self.scoreboard_cursor.menu = Some(ScoreboardMenuUi { actions, title: Some(title), detail: None, ..menu });
+            ScoreAction::TranslateLanguages(_) => {
+                self.scoreboard_cursor.menu = self.score_translation_picker_for(client,
+                    [menu.anchor[0] as f32, menu.anchor[1] as f32]);
             }
-            ScoreAction::TranslateHint(index) => {
+            ScoreAction::TranslateHint(index, _) => {
                 let code = crate::ui::SCOREBOARD_TRANSLATE_LANGUAGES
                     .get(usize::from(index))
                     .map(|&(code, _)| code)
                     .filter(|code| !code.is_empty());
                 self.change_score_translation_rule(menu, RuleChange::Source(code));
             }
-            ScoreAction::TranslateDone => {}
         }
     }
 
@@ -488,6 +526,16 @@ impl App {
         let spectating = self.stats_spectating();
         for entry in &mut board.entries {
             entry.muted = self.muted_clients.contains_key(&entry.client);
+            let (rule, source) = self.chat_translation.rule(entry.client, &entry.name);
+            // The source-language badge reflects the user's explicit hint,
+            // independent of the global automatic-translation switch.
+            entry.translate_source = source;
+            entry.translate_checked = if self.chat_translation.settings.mode != crate::chat_translation::Mode::Off
+                && self.game_session.as_ref().is_some_and(|session| session.live)
+                && self.net.as_ref().is_some_and(|net| net.session().client_num() != entry.client)
+            {
+                Some(rule.checked(self.chat_translation.settings.mode))
+            } else { None };
             entry.crowned = leaders.contains(&entry.client);
             entry.h2h = if spectating { None } else { self.match_stats.head_to_head(entry.client) };
             let info = self.game_session.as_ref()
@@ -544,18 +592,32 @@ mod tests {
     #[test]
     fn spectator_popup_follows_active_players_but_not_spectators_or_self() {
         use super::{score_actions, ScoreAction};
-        assert_eq!(score_actions(false, true, true, false, true, false, false),
+        assert_eq!(score_actions(false, true, true, false, true, false, None),
             vec![ScoreAction::Follow, ScoreAction::Mute, ScoreAction::VoteKick]);
-        assert_eq!(score_actions(false, true, false, false, true, false, false),
+        assert_eq!(score_actions(false, true, false, false, true, false, None),
             vec![ScoreAction::Mute, ScoreAction::VoteKick]);
-        assert_eq!(score_actions(true, true, true, false, true, true, true), Vec::new());
-        assert_eq!(score_actions(false, false, true, false, true, false, false),
+        assert_eq!(score_actions(true, true, true, false, true, true, Some((false, None, false))), Vec::new());
+        assert_eq!(score_actions(false, false, true, false, true, false, None),
             vec![ScoreAction::Mute, ScoreAction::VoteKick]);
-        assert_eq!(score_actions(false, true, true, true, true, true, false),
+        assert_eq!(score_actions(false, true, true, true, true, true, None),
             vec![ScoreAction::Follow, ScoreAction::Unmute, ScoreAction::VoteKick, ScoreAction::ForceSpectate]);
-        assert_eq!(score_actions(false, false, true, false, true, false, true),
-            vec![ScoreAction::Mute, ScoreAction::Translate, ScoreAction::VoteKick]);
-        assert_eq!(score_actions(false, false, true, false, false, false, true), vec![ScoreAction::Mute]);
+        assert_eq!(score_actions(false, false, true, false, true, false, Some((true, None, false))),
+            vec![ScoreAction::Mute, ScoreAction::Translate(true), ScoreAction::TranslateLanguages(None), ScoreAction::VoteKick]);
+        assert_eq!(score_actions(false, false, true, false, false, false, Some((true, None, false))), vec![ScoreAction::Mute]);
+    }
+
+    #[test]
+    fn clicking_the_icon_can_select_a_language_in_one_popup() {
+        use super::{translation_picker_actions, ScoreAction};
+        let actions = translation_picker_actions(false, Some("es"), true);
+        assert_eq!(actions[0], ScoreAction::Translate(false));
+        assert_eq!(actions[1], ScoreAction::TranslateHint(0, false));
+        assert_eq!(actions[4], ScoreAction::TranslateHint(3, true));
+        assert_eq!(actions.last(), Some(&ScoreAction::TranslateDefault));
+        assert_eq!(actions.iter().filter(|a| matches!(a, ScoreAction::TranslateHint(_, true))).count(), 1);
+        let auto = translation_picker_actions(true, None, false);
+        assert_eq!(auto[1], ScoreAction::TranslateHint(0, true));
+        assert!(!auto.contains(&ScoreAction::TranslateDefault));
     }
 
     #[test]

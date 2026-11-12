@@ -90,11 +90,10 @@ fn cheapwater_underwater(input: VertexOut, up: vec3<f32>, view: vec3<f32>) -> ve
     let reflection = env_radiance(sky_atlas, sky_sampler, sky_env, direction,
         clamp(lake.appearance.x, 0.08, 1.0)) * jka_water_sky_admission(input.world.xz);
     // Same spectral ratios, exponential falloff and depth darkening as Hybrid.
-    let ratios = vec3<f32>(38.0/7.5, 38.0/22.0, 1.0);
-    let attenuation = exp2(-4.321928 * ratios * length(input.world-camera.position)
-        / max(lake.underwater_fog.w, 0.025));
-    let ambient = lake.underwater_fog.rgb * exp2(-4.321928 * ratios
-        * max(input.world.y-camera.position.y, 0.0) / max(lake.underwater.y, 0.025));
+    let attenuation = jka_underwater_spectral_transmission(
+        length(input.world-camera.position), max(lake.underwater_fog.w, 0.025));
+    let ambient = lake.underwater_fog.rgb * jka_underwater_spectral_transmission(
+        max(input.world.y-camera.position.y, 0.0), max(lake.underwater.y, 0.025));
     return vec4<f32>(transmitted * (1.0-fresnel)
         + (reflection * attenuation + ambient * (1.0-attenuation)) * fresnel, 1.0);
 }

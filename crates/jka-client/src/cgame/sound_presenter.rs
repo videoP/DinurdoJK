@@ -283,6 +283,38 @@ pub(crate) fn prepare_sound_event(
     }
 }
 
+/// Local simulated-water contact sounds. Like OpenJK PM_WaterEvents,
+/// only transitions from dry to wet (and back) cause entry/exit sounds.
+/// Missing async samples never masquerade as a dry result.
+#[derive(Default)]
+struct RiverFootContact {
+    previous: Option<bool>,
+    last_sound: Option<std::time::Instant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RiverFootSound { Enter, Leave }
+
+impl RiverFootContact {
+    fn update(&mut self, foot_wet: Option<bool>, bsp_foot_wet: bool,
+        discontinuity: bool, now: std::time::Instant) -> Option<RiverFootSound>
+    {
+        if discontinuity {
+            self.previous = foot_wet;
+            self.last_sound = None;
+            return None;
+        }
+        let current = foot_wet?;
+        let previous = self.previous.replace(current)?;
+        if previous == current || bsp_foot_wet ||
+            self.last_sound.is_some_and(|last| now.duration_since(last) < std::time::Duration::from_millis(350)) {
+            return None;
+        }
+        self.last_sound = Some(now);
+        Some(if current { RiverFootSound::Enter } else { RiverFootSound::Leave })
+    }
+}
+
 pub struct SoundPresenter {
     emote_warmup: Option<std::sync::mpsc::Receiver<SoundDecodeResult>>,
     assets: SoundAssets,
@@ -294,6 +326,7 @@ pub struct SoundPresenter {
     eal_debug_mode: u8,
     underwater_mode: u8,
     listener_submerged: bool,
+    river_foot_contact: RiverFootContact,
     /// Authored BSP/server oceans; ordinary waterbrush contents are queried
     /// from the authoritative collision world by the session.
     underwater_oceans: Vec<([f32; 3], [f32; 3], f32)>,
@@ -398,6 +431,7 @@ impl SoundPresenter {
             eal_debug_mode: 0,
             underwater_mode: 2,
             listener_submerged: false,
+            river_foot_contact: RiverFootContact::default(),
             underwater_oceans: Vec::new(),
             offline_restore_backend: None,
             offline_capture_active: false,
@@ -1009,6 +1043,23 @@ impl SoundPresenter {
 
     pub fn underwater_enabled(&self) -> bool { self.underwater_mode != 0 }
 
+    /// Client-only counterpart of JKA EV_WATER_TOUCH / EV_WATER_LEAVE.
+    /// BSP-liquid events remain server-authoritative; never double-play when
+    /// the player's foot is already inside a normal water volume. Splash
+    /// sounds work even with s_underwater 0 (that cvar controls only filtering).
+    pub fn update_river_foot_contact(&mut self, foot_wet: Option<bool>,
+        bsp_foot_wet: bool, player_origin: [f32; 3], player: u16, discontinuity: bool)
+    {
+        let transition = self.river_foot_contact.update(foot_wet, bsp_foot_wet,
+            discontinuity, std::time::Instant::now());
+        let Some(transition) = transition else { return; };
+        let sound = match transition {
+            RiverFootSound::Enter => "sound/player/watr_in.wav",
+            RiverFootSound::Leave => "sound/player/watr_out.wav",
+        };
+        self.play_fx_sound(sound, player_origin, player, CHAN_AUTO);
+    }
+
     pub fn set_underwater_oceans(&mut self, oceans: &[crate::ocean::authoring::AuthoredOcean]) {
         self.underwater_oceans.clear();
         self.underwater_oceans.extend(oceans.iter().map(|o| (o.mins, o.maxs, o.height)));
@@ -1275,6 +1326,7 @@ impl SoundPresenter {
         self.pain_times.clear();
         self.item_pickup_until.clear();
         self.last_local_equipped_weapon = None;
+        self.river_foot_contact = RiverFootContact::default();
         self.announcer = Announcer::default();
         self.map_music = None;
         self.music_mult = 1.0;
@@ -3443,5 +3495,34 @@ mod thunder_selection_tests {
             .map(|event| thunder_sample_index(1_700_000_000_000_000_000 + event))
             .collect();
         assert_eq!(selected, (0..5).collect());
+    }
+}
+
+#[cfg(test)]
+mod river_foot_audio_tests {
+    use super::*;
+    #[test]
+    fn only_real_contact_transitions_play_jka_water_sounds() {
+        let mut state = RiverFootContact::default();
+        let time = std::time::Instant::now();
+        let later = |ms| time + std::time::Duration::from_millis(ms);
+        assert_eq!(state.update(Some(false), false, false, time), None);
+        assert_eq!(state.update(None, false, false, later(1)), None);
+        assert_eq!(state.update(Some(true), false, false, later(2)), Some(RiverFootSound::Enter));
+        assert_eq!(state.update(Some(true), false, false, later(3)), None);
+        assert_eq!(state.update(Some(false), false, false, later(400)), Some(RiverFootSound::Leave));
+        assert_eq!(state.update(Some(true), false, false, later(500)), None); // ripple debounce
+    }
+    #[test]
+    fn ignores_bsp_overlap_and_teleports() {
+        let mut state = RiverFootContact::default();
+        let time = std::time::Instant::now();
+        let later = |ms| time + std::time::Duration::from_millis(ms);
+        assert_eq!(state.update(Some(false), false, false, time), None);
+        assert_eq!(state.update(Some(true), true, false, later(400)), None);
+        assert_eq!(state.update(Some(false), false, true, later(800)), None);
+        assert_eq!(state.update(Some(true), false, false, later(1200)), Some(RiverFootSound::Enter));
+        assert_eq!(state.update(None, false, true, later(1400)), None);
+        assert_eq!(state.update(Some(true), false, false, later(1600)), None);
     }
 }

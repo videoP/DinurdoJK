@@ -601,7 +601,7 @@ mod tests {
     fn centerview_is_a_registered_local_input_command() {
         let def = command_registry().find("CENTERVIEW").expect("centerview registered");
         assert_eq!(def.scope, CommandScope::Always);
-        assert_eq!(def.game_command, None);
+        assert!(def.game_command.is_none());
         assert_eq!(crate::console::find_command("centerview", false).unwrap().name, "centerview");
     }
 

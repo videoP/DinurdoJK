@@ -834,6 +834,8 @@ impl App {
                                 siege_icon: None,
                                 spectating_you: false,
                                 muted: false,
+                                translate_checked: None,
+                                translate_source: None,
                                 crowned: false,
                                 model: String::new(),
                                 model_fallback: String::new(),

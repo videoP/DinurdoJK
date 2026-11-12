@@ -1,6 +1,6 @@
 //! Local patch identity, independent materials and source-edit transactions.
 use crate::{
-    river_runtime::{LocalSource, SourceMode},
+    river_runtime::{LocalDrain, LocalSource, SourceMode},
     river_settings::Settings,
 };
 
@@ -89,6 +89,41 @@ impl SourceParameters {
     }
 }
 
+/// Drain controls (spawndrain / River menu): everything is live.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DrainParameters {
+    pub radius: f32,
+    /// None: floor drain (empties). Some(h): overflow drain holding water at
+    /// h map units above the placement point.
+    pub overflow_height: Option<f32>,
+    /// None: unlimited. Some(q): at most q cubic feet per simulated second.
+    pub max_cfs: Option<f32>,
+}
+impl Default for DrainParameters {
+    fn default() -> Self {
+        Self { radius: 32.0, overflow_height: None, max_cfs: None }
+    }
+}
+impl DrainParameters {
+    pub fn at(self, center: [f32; 3]) -> LocalDrain {
+        LocalDrain {
+            center,
+            radius: self.radius,
+            level: self.overflow_height.map(|h| center[2] + h),
+            max_cfs: self.max_cfs,
+        }
+    }
+    pub fn from_drain(d: LocalDrain) -> Self {
+        Self { radius: d.radius, overflow_height: d.level.map(|z| z - d.center[2]), max_cfs: d.max_cfs }
+    }
+}
+
+pub struct DrainEntry {
+    pub id: Id,
+    pub name: String,
+    pub drain: LocalDrain,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Definition {
     pub id: Id,
@@ -107,6 +142,10 @@ pub struct Editor {
     pub entries: Vec<Entry>,
     pub selected: Option<Id>,
     pub defaults: SourceParameters,
+    /// Drains apply to every river; edits are live.
+    pub drains: Vec<DrainEntry>,
+    pub selected_drain: Option<Id>,
+    pub drain_defaults: DrainParameters,
     next_id: Id,
 }
 impl Default for Editor {
@@ -115,6 +154,9 @@ impl Default for Editor {
             entries: Vec::new(),
             selected: None,
             defaults: SourceParameters::default(),
+            drains: Vec::new(),
+            selected_drain: None,
+            drain_defaults: DrainParameters::default(),
             next_id: 1,
         }
     }
@@ -141,6 +183,20 @@ impl Editor {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.selected = None;
+        self.drains.clear();
+        self.selected_drain = None;
+    }
+    pub fn add_drain(&mut self, drain: LocalDrain) -> Id {
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).expect("river IDs exhausted");
+        let number = self.drains.len() + 1;
+        self.drains.push(DrainEntry { id, name: format!("Drain {number}"), drain });
+        self.selected_drain = Some(id);
+        id
+    }
+    /// The drains every river receives (RenderCommand::RiverDrains).
+    pub fn drain_list(&self) -> Vec<LocalDrain> {
+        self.drains.iter().map(|d| d.drain).collect()
     }
     pub fn entry_mut(&mut self, id: Id) -> Option<&mut Entry> {
         self.entries.iter_mut().find(|e| e.definition.id == id)

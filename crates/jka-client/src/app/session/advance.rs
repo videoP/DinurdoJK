@@ -413,9 +413,21 @@ impl GameSession {
         let audio_started = Instant::now();
         if !self.suppress_audio {
             let audio_eye = scene::jka_position(sample.eye_position);
+            let sound_present = self.sound_presenter.is_some();
             let bsp_submerged = self.sound_presenter.as_ref().is_some_and(|s| s.underwater_enabled())
                 && self.player_presenter.audio_listener_in_bsp_water(audio_eye);
+            // OpenJK PM_WaterEvents uses the player's bottom hull (-24) for
+            // EV_WATER_TOUCH, not the ear. Sample just above the sole to
+            // account for the usual ground-plane contact offset.
+            let foot = [sample.native_origin[0], sample.native_origin[1], sample.native_origin[2] - 22.0];
+            let river_contact = sound_present.then(|| crate::river_runtime::listener_water_contact(audio_eye, foot)).flatten();
+            let river_submerged = river_contact.is_some_and(|water| water.eye);
+            let bsp_foot_wet = river_contact.is_some() && self.player_presenter.audio_listener_in_bsp_water(foot);
             if let Some(sound) = &mut self.sound_presenter {
+                sound.update_river_foot_contact(river_contact.map(|water| water.foot), bsp_foot_wet,
+                    sample.native_origin, sample.client_num as u16,
+                    sample.teleported || self.seeking_demo || sample.following
+                        || !crate::river_runtime::audio_rivers_present());
                 sound.update_loops(
                     &self.client_game,
                     &self.siege_classes,
@@ -438,7 +450,7 @@ impl GameSession {
                     },
                     &self.presented_entities,
                     followed_entity.as_ref(),
-                    bsp_submerged,
+                    bsp_submerged || river_submerged,
                 );
                 // TaystJK CG_Init invokes CG_StartMusic(qfalse) from the
                 // initial CS_MUSIC gamestate. Live sessions previously never

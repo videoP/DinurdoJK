@@ -235,8 +235,10 @@ fn sink(entity: &Entity, models: &[Model], entity_index: usize) -> Result<Sink, 
 /// brushes (exact brush-plane clipping, so caulk/nodraw faces count), solid
 /// curved patches (eight segments per quadratic span, as the coastal
 /// bathymetry samples them) and solid triangle soups. Liquid and clip-only
-/// brushes are not bed. A face is kept only if it can be ground:
-///  - its outward normal points up (a ceiling's underside never is), and
+/// brushes are not bed. A face is kept only if it can be ground or a wall:
+///  - its outward normal points up (a ceiling's underside never is), or,
+///    for patches and triangle soups, it is steeper than 60 degrees
+///    (`CollisionSurface::wall`: zero-thickness walls), and
 ///  - for patches and triangle soups only, the point one unit in front of it
 ///    is in a playable BSP cluster (maps compiled without vis skip this).
 ///    Solid brush tops are kept even when buried in a ceiling or the sky:
@@ -253,19 +255,26 @@ fn sink(entity: &Entity, models: &[Model], entity_index: usize) -> Result<Sink, 
 pub struct CollisionSurface {
     pub triangle: [[f32; 3]; 3],
     pub solid_bottom_z: Option<f32>,
+    /// Steep patch/triangle-soup face (steeper than 60 degrees). A vertical
+    /// patch has no thickness and no area seen from above, so the riverbed
+    /// capture widens it into a wall slab instead of using the triangle.
+    pub wall: bool,
 }
 
-/// Preserve the original unclassified triangle API for generic/map captures.
+/// Preserve the original unclassified triangle API for generic/map captures
+/// (ground only; wall faces need the river capture's slab widening).
 pub fn collision_triangles(bsp: &Bsp) -> Result<Vec<[[f32; 3]; 3]>, String> {
-    Ok(collision_surfaces(bsp)?.into_iter().map(|s| s.triangle).collect())
+    Ok(collision_surfaces(bsp)?.into_iter().filter(|s| !s.wall).map(|s| s.triangle).collect())
 }
 
 /// Detailed developer-river collision, built once per map and reused by each
 /// `riversource` placement without touching collision on the render loop.
 pub fn collision_surfaces(bsp: &Bsp) -> Result<Vec<CollisionSurface>, String> {
-    use super::{brush_side_polygon, patch_vertex, SurfaceKind, CONTENTS_SOLID, CONTENTS_TERRAIN, SURF_SKY};
+    use super::{brush_side_polygon, CONTENTS_SOLID, CONTENTS_TERRAIN, SURF_SKY};
     const LIQUIDS: u32 = super::bathymetry::CONTENTS_WATER | 0x0000_0002 | 0x0002_0000;
     const UP: f32 = 1e-3;
+    /// |normal z| below this (steeper than 60 degrees) makes a mesh face a wall.
+    const STEEP: f32 = 0.5;
     let solid = |contents: u32| contents & (CONTENTS_SOLID | CONTENTS_TERRAIN) != 0 && contents & LIQUIDS == 0;
     let world = bsp.models.first().ok_or("BSP has no world model")?;
     let extent = world.mins.iter().chain(&world.maxs).map(|v| v.abs()).fold(1024.0, f32::max) * 2.0;
@@ -302,6 +311,7 @@ pub fn collision_surfaces(bsp: &Bsp) -> Result<Vec<CollisionSurface>, String> {
                 out.push(CollisionSurface {
                     triangle: [polygon[0], polygon[k - 1], polygon[k]],
                     solid_bottom_z: None,
+                    wall: false,
                 });
             }
         }
@@ -313,6 +323,30 @@ pub fn collision_surfaces(bsp: &Bsp) -> Result<Vec<CollisionSurface>, String> {
             }
         }
     }
+    solid_mesh_triangles(bsp, world, |p, n| {
+        // Steep faces (walls, columns, curved corners) block the water
+        // like brush walls do; shallower up-facing faces are ground and
+        // shallower down-facing ones (ceilings, undersides) are skipped.
+        let wall = n[2].abs() < STEEP;
+        if (wall || n[2] > UP) && in_air(&p, n) {
+            out.push(CollisionSurface { triangle: p, solid_bottom_z: None, wall });
+        }
+    })?;
+    Ok(out)
+}
+
+/// Every solid, non-sky world patch (eight segments per quadratic span) and
+/// triangle-soup triangle, with its unit normal oriented by the authored
+/// vertex normals as bathymetry does. Degenerate triangles are skipped.
+/// Planar faces are brush sides and are not visited.
+fn solid_mesh_triangles(
+    bsp: &Bsp,
+    world: &Model,
+    mut emit: impl FnMut([[f32; 3]; 3], [f32; 3]),
+) -> Result<(), String> {
+    use super::{patch_vertex, SurfaceKind, CONTENTS_SOLID, CONTENTS_TERRAIN, SURF_SKY};
+    const LIQUIDS: u32 = super::bathymetry::CONTENTS_WATER | 0x0000_0002 | 0x0002_0000;
+    let solid = |contents: u32| contents & (CONTENTS_SOLID | CONTENTS_TERRAIN) != 0 && contents & LIQUIDS == 0;
     for id in world.surfaces.clone() {
         let surface = bsp.surfaces.get(id).ok_or("invalid world surface index")?;
         let shader = bsp.shaders.get(surface.shader).ok_or("invalid surface shader")?;
@@ -320,7 +354,6 @@ pub fn collision_surfaces(bsp: &Bsp) -> Result<Vec<CollisionSurface>, String> {
             continue;
         }
         let verts = bsp.vertices.get(surface.vertices.clone()).ok_or("invalid surface vertices")?;
-        // Orient each triangle by its authored vertex normals, as bathymetry does.
         let mut push = |v: [super::Vertex; 3]| {
             let p = v.map(|v| v.position);
             let e1: [f32; 3] = std::array::from_fn(|a| p[1][a] - p[0][a]);
@@ -334,10 +367,7 @@ pub fn collision_surfaces(bsp: &Bsp) -> Result<Vec<CollisionSurface>, String> {
             if len < 1e-6 {
                 return;
             }
-            let n = n.map(|c| c / len);
-            if n[2] > UP && in_air(&p, n) {
-                out.push(CollisionSurface { triangle: p, solid_bottom_z: None });
-            }
+            emit(p, n.map(|c| c / len));
         };
         match surface.kind {
             SurfaceKind::Patch => {
@@ -372,7 +402,166 @@ pub fn collision_surfaces(bsp: &Bsp) -> Result<Vec<CollisionSurface>, String> {
             SurfaceKind::Planar | SurfaceKind::Flare => {}
         }
     }
+    Ok(())
+}
+
+/// One solid world brush for the BSP-aware river capture
+/// (`r_riverCaptureMode 1`). Unlike `CollisionSurface`, the whole convex
+/// volume is kept: its real per-XY underside comes from its planes, never
+/// from the lowest point of the brush.
+#[derive(Clone, Debug)]
+pub struct CaptureBrush {
+    /// Outward planes: the brush is where `dot(normal, p) <= distance` for all.
+    pub planes: Vec<([f32; 3], f32)>,
+    pub mins: [f32; 3],
+    pub maxs: [f32; 3],
+    /// Convex XY footprint, counter-clockwise.
+    pub footprint: Vec<[f32; 2]>,
+    /// Its up- and down-facing side triangles in `CaptureGeometry::brush_faces`.
+    pub faces: std::ops::Range<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureFace {
+    pub triangle: [[f32; 3]; 3],
+    /// Outward normal points up (top); otherwise down (underside).
+    pub up: bool,
+    pub sky: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MeshFace {
+    Up,
+    Down,
+    /// Steeper than 60 degrees; zero thickness and no area from above.
+    Wall,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureMesh {
+    pub triangle: [[f32; 3]; 3],
+    pub face: MeshFace,
+}
+
+/// Collision for `r_riverCaptureMode 1`, built once per map beside the
+/// legacy `collision_surfaces` (which mode 0 keeps using unchanged). Same
+/// solid/liquid screening and patch tessellation, but faces of every
+/// orientation are kept: bridge undersides, ceilings and tunnel roofs too.
+#[derive(Clone, Debug, Default)]
+pub struct CaptureGeometry {
+    pub brushes: Vec<CaptureBrush>,
+    pub brush_faces: Vec<CaptureFace>,
+    pub meshes: Vec<CaptureMesh>,
+}
+
+/// One map's river collision, read once per map: the legacy surfaces and,
+/// once a river was placed with `r_riverCaptureMode 1`, the capture geometry.
+#[derive(Clone, Debug, Default)]
+pub struct RiverCollision {
+    pub surfaces: Vec<CollisionSurface>,
+    pub capture: Option<CaptureGeometry>,
+}
+
+pub fn capture_geometry(bsp: &Bsp) -> Result<CaptureGeometry, String> {
+    use super::{brush_side_polygon, CONTENTS_SOLID, CONTENTS_TERRAIN, SURF_SKY};
+    const LIQUIDS: u32 = super::bathymetry::CONTENTS_WATER | 0x0000_0002 | 0x0002_0000;
+    const UP: f32 = 1e-3;
+    const STEEP: f32 = 0.5;
+    let solid = |contents: u32| contents & (CONTENTS_SOLID | CONTENTS_TERRAIN) != 0 && contents & LIQUIDS == 0;
+    let world = bsp.models.first().ok_or("BSP has no world model")?;
+    let extent = world.mins.iter().chain(&world.maxs).map(|v| v.abs()).fold(1024.0, f32::max) * 2.0;
+    let mut out = CaptureGeometry::default();
+    let mut outline = Vec::new();
+    for id in world.brushes.clone() {
+        let brush = bsp.brushes.get(id).ok_or("invalid world brush index")?;
+        let contents = bsp.shaders.get(brush.shader).ok_or("invalid brush shader")?.contents;
+        if !solid(contents) {
+            continue;
+        }
+        let first_face = out.brush_faces.len();
+        let mut planes = Vec::with_capacity(brush.sides.len());
+        let mut mins = [f32::INFINITY; 3];
+        let mut maxs = [f32::NEG_INFINITY; 3];
+        outline.clear();
+        for side in brush.sides.clone() {
+            let bside = bsp.brush_sides.get(side).ok_or("invalid brush side")?;
+            let flags = bsp.shaders.get(bside.shader).map_or(0, |s| s.surface_flags);
+            let plane = bsp.planes.get(bside.plane).ok_or("invalid brush plane")?;
+            planes.push((plane.normal, plane.distance));
+            let polygon = brush_side_polygon(bsp, brush, side, extent).map_err(|e| e.to_string())?;
+            for point in &polygon {
+                for axis in 0..3 {
+                    mins[axis] = mins[axis].min(point[axis]);
+                    maxs[axis] = maxs[axis].max(point[axis]);
+                }
+                outline.push([point[0], point[1]]);
+            }
+            let up = plane.normal[2] > UP;
+            if polygon.len() < 3 || !(up || plane.normal[2] < -UP) {
+                continue;
+            }
+            for k in 2..polygon.len() {
+                out.brush_faces.push(CaptureFace {
+                    triangle: [polygon[0], polygon[k - 1], polygon[k]],
+                    up,
+                    sky: flags & SURF_SKY != 0,
+                });
+            }
+        }
+        let footprint = convex_hull(&mut outline);
+        if footprint.len() < 3 || (0..3).any(|a| !(mins[a] < maxs[a])) {
+            out.brush_faces.truncate(first_face);
+            continue;
+        }
+        let faces = u32::try_from(first_face).map_err(|_| "too many river capture faces")?
+            ..u32::try_from(out.brush_faces.len()).map_err(|_| "too many river capture faces")?;
+        out.brushes.push(CaptureBrush { planes, mins, maxs, footprint, faces });
+    }
+    let in_air = |points: &[[f32; 3]], normal: [f32; 3]| -> bool {
+        let Some(vis) = bsp.visibility.as_ref() else { return true };
+        let n = points.len() as f32;
+        let probe = std::array::from_fn(|a| points.iter().map(|p| p[a]).sum::<f32>() / n + normal[a]);
+        vis.cluster_at(probe).is_some()
+    };
+    solid_mesh_triangles(bsp, world, |p, n| {
+        // Unlike mode 0, undersides stay: a patch bridge's lower face is the
+        // ceiling the river passes beneath. Faces into the void still go.
+        if !in_air(&p, n) {
+            return;
+        }
+        let face = if n[2].abs() < STEEP {
+            MeshFace::Wall
+        } else if n[2] > 0.0 {
+            MeshFace::Up
+        } else {
+            MeshFace::Down
+        };
+        out.meshes.push(CaptureMesh { triangle: p, face });
+    })?;
     Ok(out)
+}
+
+/// Andrew's monotone chain; counter-clockwise without repeated points.
+fn convex_hull(points: &mut [[f32; 2]]) -> Vec<[f32; 2]> {
+    points.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    let cross = |o: [f32; 2], a: [f32; 2], b: [f32; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let push = |hull: &mut Vec<[f32; 2]>, start: usize, p: [f32; 2]| {
+        while hull.len() >= start + 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 1e-6 {
+            hull.pop();
+        }
+        hull.push(p);
+    };
+    let mut hull: Vec<[f32; 2]> = Vec::with_capacity(points.len() + 1);
+    for &p in points.iter() {
+        push(&mut hull, 0, p);
+    }
+    hull.pop();
+    let start = hull.len();
+    for &p in points.iter().rev() {
+        push(&mut hull, start, p);
+    }
+    hull.pop();
+    hull
 }
 
 /// Read map-local entities only. No server state, simulation, bake loading, or

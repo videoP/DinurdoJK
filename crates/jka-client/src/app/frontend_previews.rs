@@ -1239,7 +1239,7 @@ impl App {
                     ],
                     uvs: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
                     rgba: [shade, shade, shade, 255],
-                    shader: "$whiteimage".to_owned(),
+                    shader: "$whiteimage".into(),
                 });
             }
         }
@@ -1252,7 +1252,7 @@ impl App {
             ],
             uvs: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
             rgba: [255, 255, 255, 255],
-            shader: shader_name.clone(),
+            shader: shader_name.as_str().into(),
         });
         let view = crate::fx::draw::FxView::from_camera(&self.asset_preview_camera());
         let presenter = self

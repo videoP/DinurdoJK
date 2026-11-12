@@ -5,7 +5,7 @@
 //! per-stage CPU references; it is the test oracle for sparse storage, not a
 //! replacement solver. Dense and tiled storage run identical arithmetic.
 
-use super::boundary::{self, Controls, SourceBox, WaterInfo};
+use super::boundary::{self, Controls, Drain, SourceBox, WaterInfo};
 use super::sparse::TileInit;
 use super::stages::{self, DepthStencil, VelocityStencil};
 use super::transport::{Field, Storage};
@@ -27,6 +27,8 @@ pub struct Inputs<'a> {
     pub geometry: &'a [Geometry],
     pub water_info: &'a [WaterInfo],
     pub boxes: &'a [SourceBox],
+    /// Developer drains (not Unreal), applied after the sources and sinks.
+    pub drains: &'a [Drain],
     pub controls: Controls,
     pub transport: Transport,
     pub presentation: Presentation,
@@ -96,6 +98,19 @@ pub fn frame(
     substeps: u32,
     engine_delta: f32,
 ) -> Result<(), &'static str> {
+    frame_observed(inputs, state, p, substeps, engine_delta, &mut |_, _| {})
+}
+
+/// `frame` with `observe(stage, water)` called after every stage (each
+/// substep separately), e.g. for a per-stage volume budget (`riverdump`).
+pub fn frame_observed(
+    inputs: &Inputs<'_>,
+    state: &mut State,
+    p: Parameters,
+    substeps: u32,
+    engine_delta: f32,
+    observe: &mut dyn FnMut(&'static str, &[Water]),
+) -> Result<(), &'static str> {
     let s = inputs.storage;
     let n = s.len();
     if inputs.geometry.len() != n
@@ -121,9 +136,11 @@ pub fn frame(
             controls.grid_min[1] + (y as f32 + 0.5) * dx,
             controls.grid_min[2],
         ];
-        boundary::apply(state.water[i], geo[i], inputs.water_info[i], position, inputs.boxes, controls)
+        let water = boundary::apply(state.water[i], geo[i], inputs.water_info[i], position, inputs.boxes, controls);
+        boundary::drain(water, geo[i], position, inputs.drains)
     });
     state.water = water;
+    observe("source/sink/drains", &state.water);
     if let Some(inlet) = inputs.inlet {
         let cells = inlet_cells(inputs, inlet);
         if cells > 0 {
@@ -145,6 +162,7 @@ pub fn frame(
         let depth = input.depth.max(0.0).min(p.max_depth);
         Water { height: geo[i].bottom + depth, depth, ..input }
     });
+    observe("inlet + distribute overlap", &state.water);
     let t = inputs.transport;
     for _ in 0..substeps {
         let next = {
@@ -152,16 +170,19 @@ pub fn frame(
             each(s, |_, x, y| f.extrapolate_velocity(x, y, t))
         };
         state.water = next;
+        observe("extrapolate velocity", &state.water);
         let next = {
             let f = Field::with_storage(s, &state.water, geo)?;
             each(s, |i, x, y| f.advect(x, y, state.previous_bottom[i], p, t))
         };
         state.water = next;
+        observe("advect", &state.water);
         let next = {
             let f = Field::with_storage(s, &state.water, geo)?;
             each(s, |_, x, y| f.extrapolate_height(x, y, t))
         };
         state.water = next;
+        observe("extrapolate height", &state.water);
         let next = {
             let f = Field::with_storage(s, &state.water, geo)?;
             each(s, |_, x, y| {
@@ -181,6 +202,7 @@ pub fn frame(
             })
         };
         state.water = next;
+        observe("update velocity", &state.water);
         let next = {
             let f = Field::with_storage(s, &state.water, geo)?;
             each(s, |_, x, y| {
@@ -199,10 +221,12 @@ pub fn frame(
             })
         };
         state.water = next;
+        observe("update depth", &state.water);
         let next = each(s, |i, _, _| {
             boundary::match_spline(state.water[i], geo[i], inputs.water_info[i], p.dt, controls)
         });
         state.water = next;
+        observe("match spline", &state.water);
     }
     let (water, surface): (Vec<_>, Vec<_>) = {
         let f = Field::with_storage(s, &state.water, geo)?;
@@ -210,12 +234,14 @@ pub fn frame(
     };
     state.water = water;
     state.surface = surface;
+    observe("present", &state.water);
     let (water, normals): (Vec<_>, Vec<_>) = {
         let f = Field::with_storage(s, &state.water, geo)?;
         each(s, |_, x, y| f.normal_and_reset(x, y, dx)).into_iter().unzip()
     };
     state.water = water;
     state.normals = normals;
+    observe("normals/reset", &state.water);
     state.history_needs_snapshot = true;
     Ok(())
 }

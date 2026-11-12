@@ -1687,7 +1687,13 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::RiverMaterial(id,settings)) => {
                         if let Some(river)=renderer.live_rivers.iter().find(|r|r.id==id) {river.set_settings(&renderer.queue,settings);}
                     }
-                    Ok(RenderCommand::RiverRemove(id)) => {renderer.live_rivers.retain(|r|r.id!=id);}
+                    Ok(RenderCommand::RiverRemove(id)) => {
+                        renderer.live_rivers.retain(|r|r.id!=id);
+                        if renderer.live_rivers.is_empty() {
+                            if let Some(surface) = &mut renderer.river_surface { surface.reset_audio_probe(); }
+                        }
+                        crate::river_runtime::set_audio_rivers_present(!renderer.live_rivers.is_empty());
+                    }
                     Ok(RenderCommand::RiverSource(id, controls)) => {
                         if let Some(river) = renderer.live_rivers.iter_mut().find(|r| r.id == id) {
                             let error = river.set_live_controls(&renderer.device, &renderer.queue, controls).err();
@@ -1700,6 +1706,12 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::RiverClear) => {
                         renderer.clear_live_rivers();
+                    }
+                    Ok(RenderCommand::RiverDrains(drains)) => {
+                        renderer.set_river_drains(drains);
+                    }
+                    Ok(RenderCommand::RiverDump { eye, directory }) => {
+                        renderer.dump_live_rivers(eye, &directory);
                     }
                     Ok(RenderCommand::SetPromotedOceanSettings(settings)) => {
                         renderer.promoted_ocean_overrides = settings;

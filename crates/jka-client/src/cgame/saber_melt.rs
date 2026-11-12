@@ -961,7 +961,7 @@ impl SaberMelt {
                 radius: 0.8,
                 rotation: 0.0,
                 rgba: [255, 190, 90, 255],
-                shader: "gfx/effects/whiteGlow".to_owned(),
+                shader: "gfx/effects/whiteGlow".into(),
             });
         }
     }
@@ -1405,7 +1405,7 @@ fn emit_chunk(surface: &Surface, key: (i32, i32), chunk: &Chunk, now: i32, detai
             uvs: vec![[0.5, 0.5]; skin_verts.len()],
             rgba: skin_verts.iter().map(|v| [v.glow[0], v.glow[1], v.glow[2], 255]).collect(),
             indices,
-            shader: "$melt_glow".to_owned(),
+            shader: "$melt_glow".into(),
         });
     }
 }
@@ -1516,7 +1516,7 @@ mod tests {
         let mut lights = Vec::new();
         melt.emit(2500, [200.0, 0.0, 50.0], &mut draws, &mut lights);
         assert!(draws.iter().any(|d| matches!(d, FxDraw::LitMesh { .. })));
-        assert!(draws.iter().any(|d| matches!(d, FxDraw::Mesh { shader, .. } if shader == "$melt_glow")));
+        assert!(draws.iter().any(|d| matches!(d, FxDraw::Mesh { shader, .. } if shader.as_ref() == "$melt_glow")));
         assert!(!lights.is_empty());
         for d in &draws {
             if let FxDraw::LitMesh { positions, normals, rgba, indices, .. } = d {

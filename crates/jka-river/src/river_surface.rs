@@ -79,11 +79,21 @@ pub fn shader_source() -> String {
         SHADER,
         crate::river_composite::TRACE_SHADER,
         crate::river_composite::SHADER,
+        blue_water_gpu::underwater_optics::SHADER,
         include_str!("river_underwater.wgsl"),
+        jka_water::river::NORMAL_CODEC,
         include_str!("river_far.wgsl"),
+        &jka_water::river::secondary::library(),
+        include_str!("river_spray.wgsl"),
     ]
     .join("\n")
 }
+
+/// M_SimpleSpray's noise (linear RGBA) in an asset pack; see
+/// scripts/ue-river-spray-textures.py.
+pub const SPRAY_NOISE_TEXTURE: &str = "textures/japro/river_spray_noise";
+/// M_SimpleSpray's normal map (linear RGB, Z rebuilt from XY).
+pub const SPRAY_NORMALS_TEXTURE: &str = "textures/japro/river_spray_normals";
 
 pub fn compose() -> Result<wgpu::naga::Module, String> {
     blue_water_clouds::shaders::compose(&shader_source(), "jka-client/river_surface.wgsl", &[])
@@ -100,8 +110,10 @@ pub struct ViewUniform {
     pub distortion: [f32; 4],
     pub sun_direction: [f32; 4],
     pub sun_illuminance: [f32; 4],
-    /// Material Time, foam detail present (1/0), Engine.DeltaTime, unused.
+    /// Material Time, foam detail present (1/0), Engine.DeltaTime, bed clamp.
     pub time: [f32; 4],
+    /// Runtime fragment material LOD (x = 0 original, 1 wave, 2 wave + foam; y = mip cutoff).
+    pub material_lod: [f32; 4],
 }
 
 impl ViewUniform {
@@ -151,6 +163,7 @@ impl ViewUniform {
                 if blue_water_ambient { 1.0 } else { 0.0 },
             ],
             time: [time, if foam { 1.0 } else { 0.0 }, delta, 0.0],
+            material_lod: [0.0; 4],
         }
     }
 }
@@ -160,21 +173,29 @@ impl ViewUniform {
 /// samples); the scene copy per target size. Per-frame work is the FFT, one
 /// uniform write and the copy pass.
 pub struct RiverSurface {
-    module: wgpu::ShaderModule,
-    body_layout: wgpu::BindGroupLayout,
+    pub(super) module: wgpu::ShaderModule,
+    pub(super) body_layout: wgpu::BindGroupLayout,
     /// Group 1 of the water-mesh quadtree tiles (river_far.wgsl).
     far_layout: wgpu::BindGroupLayout,
     far_pipeline: Option<wgpu::RenderPipeline>,
     far_composite: Option<wgpu::RenderPipeline>,
     far_wire: Option<wgpu::RenderPipeline>,
-    frame_layout: wgpu::BindGroupLayout,
-    env_layout: wgpu::BindGroupLayout,
+    /// r_riverWire 1: every water-mesh tile, dry parts included.
+    far_wire_full: Option<wgpu::RenderPipeline>,
+    pub(super) frame_layout: wgpu::BindGroupLayout,
+    pub(super) env_layout: wgpu::BindGroupLayout,
     pipeline: Option<((wgpu::TextureFormat, u32), wgpu::RenderPipeline)>,
     composite: Option<wgpu::RenderPipeline>,
     submerged: Option<wgpu::RenderPipeline>,
+    audio_probe: Option<crate::river_audio_probe::AudioProbe>,
+    /// r_riverWire 0: the live window blocks, masked as the water draws.
     wire: Option<wgpu::RenderPipeline>,
-    sky_layout: wgpu::BindGroupLayout,
-    sky_group: wgpu::BindGroup,
+    /// r_riverWire 1: the whole window grid mesh, unmasked.
+    wire_full: Option<wgpu::RenderPipeline>,
+    /// Window block culling (river_blocks): compute pipelines, block indices.
+    blocks: crate::river_blocks::Pipelines,
+    pub(super) sky_layout: wgpu::BindGroupLayout,
+    pub(super) sky_group: wgpu::BindGroup,
     hzb: Option<crate::river_composite::DepthPyramid>,
     /// BasePassRendering.cpp: bilinear clamp, as the classic field is sampled.
     ambient_sampler: wgpu::Sampler,
@@ -193,13 +214,21 @@ pub struct RiverSurface {
     foam_rt_sampler: wgpu::Sampler,
     view: wgpu::Buffer,
     copy: Option<SceneCopy>,
-    frame: Option<wgpu::BindGroup>,
+    pub(super) frame: Option<wgpu::BindGroup>,
     /// Bound when Blue Water is off; the shader reads the classic field then.
-    inert_env: wgpu::BindGroup,
+    pub(super) inert_env: wgpu::BindGroup,
     /// Without post or MSAA the scene is the swapchain, which cannot be copied.
     pub warned_unsampleable: bool,
     /// Material Time / FFT system age / foam world time, seconds since creation.
     pub clock: f64,
+    /// Group 6 of the whitewater sprites: particles, noise, normals, sampler.
+    spray_layout: wgpu::BindGroupLayout,
+    spray_pipeline: Option<wgpu::RenderPipeline>,
+    /// M_SimpleSpray textures; neutral 1x1 stand-ins until loaded (noise 0.7
+    /// = no distortion, flat normal).
+    spray_textures: (wgpu::TextureView, wgpu::TextureView),
+    spray_sampler: wgpu::Sampler,
+    spray_generation: u32,
 }
 
 fn entry(binding: u32, ty: wgpu::BindingType) -> wgpu::BindGroupLayoutEntry {
@@ -248,6 +277,12 @@ impl RiverSurface {
                 entry(7, texture(true)),
                 entry(8, sampler(Filtering)),
                 entry(9, uniform()),
+                // vs_block's live block list (river_blocks).
+                entry(15, wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                }),
             ],
         });
         let storage = || wgpu::BindingType::Buffer {
@@ -348,6 +383,53 @@ impl RiverSurface {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let spray_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("river whitewater sprites"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: storage(),
+                    count: None,
+                },
+                entry(1, texture(true)),
+                entry(2, texture(true)),
+                entry(3, sampler(Filtering)),
+            ],
+        });
+        let neutral = |label: &'static str, texel: [f32; 4]| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba32Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            queue.write_texture(
+                texture.as_image_copy(),
+                bytemuck::cast_slice(&texel),
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(16), rows_per_image: Some(1) },
+                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            );
+            texture.create_view(&Default::default())
+        };
+        let material = jka_water::river::secondary::material::NOISE_CENTRE;
+        let spray_textures = (
+            neutral("river spray noise stand-in", [material, material, material, 1.0]),
+            neutral("river spray normals stand-in", [0.5, 0.5, 1.0, 1.0]),
+        );
+        let spray_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("river spray material"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
         Ok(Self {
             module,
             body_layout,
@@ -355,12 +437,16 @@ impl RiverSurface {
             far_pipeline: None,
             far_composite: None,
             far_wire: None,
+            far_wire_full: None,
             frame_layout,
             env_layout,
             pipeline: None,
             composite: None,
             submerged: None,
+            audio_probe: None,
             wire: None,
+            wire_full: None,
+            blocks: crate::river_blocks::Pipelines::new(device),
             sky_layout,
             sky_group,
             hzb: None,
@@ -378,6 +464,11 @@ impl RiverSurface {
             inert_env,
             warned_unsampleable: false,
             clock: 0.0,
+            spray_layout,
+            spray_pipeline: None,
+            spray_textures,
+            spray_sampler,
+            spray_generation: 0,
         })
     }
 
@@ -416,9 +507,9 @@ impl RiverSurface {
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &self.module,
-                entry_point: Some("vs"),
+                entry_point: Some("vs_block"),
                 compilation_options: Default::default(),
-                buffers: &[Some(crate::river_grid_mesh::vertex_layout())],
+                buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &self.module,
@@ -457,9 +548,9 @@ impl RiverSurface {
             layout: Some(&layout),
             vertex: wgpu::VertexState {
                 module: &self.module,
-                entry_point: Some("vs"),
+                entry_point: Some("vs_block"),
                 compilation_options: Default::default(),
-                buffers: &[Some(crate::river_grid_mesh::vertex_layout())],
+                buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &self.module,
@@ -513,16 +604,19 @@ impl RiverSurface {
         }));
         // A line polygon pipeline is created only on devices that enable the
         // same wireframe feature used by the rest of r_showtris.
-        self.wire = device.features().contains(wgpu::Features::POLYGON_MODE_LINE).then(|| {
+        let lines = device.features().contains(wgpu::Features::POLYGON_MODE_LINE);
+        let wire = |label: &str, vertex: &str, buffers: &[Option<wgpu::VertexBufferLayout<'_>>], fragment: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("river displaced mesh wireframe"), layout: Some(&layout),
-                vertex: wgpu::VertexState { module: &self.module, entry_point: Some("vs"), compilation_options: Default::default(), buffers: &[Some(crate::river_grid_mesh::vertex_layout())] },
-                fragment: Some(wgpu::FragmentState { module: &self.module, entry_point: Some("fs_river_wire"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::COLOR })] }),
+                label: Some(label), layout: Some(&layout),
+                vertex: wgpu::VertexState { module: &self.module, entry_point: Some(vertex), compilation_options: Default::default(), buffers },
+                fragment: Some(wgpu::FragmentState { module: &self.module, entry_point: Some(fragment), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::COLOR })] }),
                 primitive: wgpu::PrimitiveState { polygon_mode: wgpu::PolygonMode::Line, cull_mode: None, ..Default::default() },
                 depth_stencil: Some(wgpu::DepthStencilState { format: depth_format, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
                 multisample: wgpu::MultisampleState { count: samples, ..Default::default() }, multiview_mask: None, cache: None,
             })
-        });
+        };
+        self.wire = lines.then(|| wire("river displaced mesh wireframe", "vs_block", &[], "fs_river_wire_masked"));
+        self.wire_full = lines.then(|| wire("river full grid wireframe", "vs", &[Some(crate::river_grid_mesh::vertex_layout())], "fs_river_wire"));
         // Water-mesh quadtree tiles: the same pass states, group 1 = pool.
         let far_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("river water mesh"),
@@ -577,25 +671,108 @@ impl RiverSurface {
             false,
             wgpu::CompareFunction::Equal,
         ));
-        self.far_wire = device.features().contains(wgpu::Features::POLYGON_MODE_LINE).then(|| {
+        let far_wire = |label: &str, fragment: &str| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("river water mesh wireframe"),
+                label: Some(label),
                 layout: Some(&far_layout),
                 vertex: wgpu::VertexState { module: &self.module, entry_point: Some("vs_far"), compilation_options: Default::default(), buffers: &[Some(crate::river_far::vertex_layout())] },
-                fragment: Some(wgpu::FragmentState { module: &self.module, entry_point: Some("fs_far_wire"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::COLOR })] }),
+                fragment: Some(wgpu::FragmentState { module: &self.module, entry_point: Some(fragment), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::COLOR })] }),
                 primitive: wgpu::PrimitiveState { polygon_mode: wgpu::PolygonMode::Line, cull_mode: None, ..Default::default() },
                 depth_stencil: Some(wgpu::DepthStencilState { format: depth_format, depth_write_enabled: Some(false), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
                 multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
                 multiview_mask: None,
                 cache: None,
             })
+        };
+        self.far_wire = lines.then(|| far_wire("river water mesh wireframe", "fs_far_wire"));
+        self.far_wire_full = lines.then(|| far_wire("river water mesh full wireframe", "fs_far_wire_full"));
+        // Whitewater sprites: BLEND_Translucent, two-sided, depth-tested
+        // against the scene and the river, no depth write.
+        let spray_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("river whitewater sprites"),
+            bind_group_layouts: &[
+                Some(camera_layout),
+                Some(&self.body_layout),
+                Some(shadow_receiver_layout),
+                Some(&self.frame_layout),
+                Some(&self.env_layout),
+                Some(&self.sky_layout),
+                Some(&self.spray_layout),
+            ],
+            immediate_size: 0,
         });
+        self.spray_pipeline = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("river whitewater sprites"),
+            layout: Some(&spray_layout),
+            vertex: wgpu::VertexState { module: &self.module, entry_point: Some("vs_spray"), compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState {
+                module: &self.module,
+                entry_point: Some("fs_spray"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
+                        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Zero, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+                    }),
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(depth_compare),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+            multiview_mask: None,
+            cache: None,
+        }));
         self.pipeline = Some(((format, samples), pipeline));
+    }
+
+    /// M_SimpleSpray's noise and normal textures (loaded once per renderer).
+    /// Rivers rebuild their sprite groups on their next frame.
+    pub fn set_spray_textures(&mut self, noise: wgpu::TextureView, normals: wgpu::TextureView) {
+        self.spray_textures = (noise, normals);
+        self.spray_generation += 1;
+    }
+
+    /// Changes whenever the sprite textures do; see `set_spray_textures`.
+    pub fn spray_generation(&self) -> u32 {
+        self.spray_generation
+    }
+
+    /// A river's whitewater sprite group over its particle buffer.
+    pub fn spray_group(&self, device: &wgpu::Device, particles: &wgpu::Buffer) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("river whitewater sprites"),
+            layout: &self.spray_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: particles.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.spray_textures.0) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&self.spray_textures.1) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.spray_sampler) },
+            ],
+        })
+    }
+
+    /// The river's whitewater sprites: one instanced draw of every particle;
+    /// hidden ones are clipped in the vertex shader.
+    pub fn draw_spray<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
+        let (Some(pipeline), Some(frame), Some(body), Some(spray)) = (&self.spray_pipeline, &self.frame, river.body_group(), river.spray_group()) else { return; };
+        pass.set_pipeline(pipeline);
+        self.bind_patch(pass, camera, shadow_receiver, environment, frame, body);
+        pass.set_bind_group(6, spray, &[]);
+        pass.draw(0..6, 0..jka_water::river::secondary::PARTICLE_COUNT);
     }
 
     /// r_showtris river bit: the water mesh tiles, coloured by LOD level.
     pub fn draw_wire_far<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
-        if let Some(pipeline) = &self.far_wire {
+        let pipeline = if crate::river_blocks::wire_mode() == 1 { &self.far_wire_full } else { &self.far_wire };
+        if let Some(pipeline) = pipeline {
             self.draw_far_with(pass, pipeline, camera, shadow_receiver, environment, river);
         }
     }
@@ -791,6 +968,7 @@ impl RiverSurface {
         ambient: &ClassicAmbient,
         foam_rt: &wgpu::Texture,
         authored: &wgpu::Buffer,
+        blocks: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         use wgpu::util::DeviceExt;
         let origin = origin_cm.map(|v| v as f32);
@@ -854,6 +1032,10 @@ impl RiverSurface {
                     binding: 9,
                     resource: authored.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: blocks.as_entire_binding(),
+                },
             ],
         })
     }
@@ -880,9 +1062,7 @@ impl RiverSurface {
         pass.set_bind_group(3, frame, &[]);
         pass.set_bind_group(4, environment.unwrap_or(&self.inert_env), &[]);
         pass.set_bind_group(5, &self.sky_group, &[]);
-        pass.set_vertex_buffer(0, river.mesh.vertices.slice(..));
-        pass.set_index_buffer(river.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..river.mesh.geometry.index_count(), 0, 0..1);
+        self.draw_blocks(pass, river);
     }
     pub fn draw_composite<'a>(
         &'a self,
@@ -904,9 +1084,7 @@ impl RiverSurface {
         pass.set_bind_group(3, frame, &[]);
         pass.set_bind_group(4, environment.unwrap_or(&self.inert_env), &[]);
         pass.set_bind_group(5, &self.sky_group, &[]);
-        pass.set_vertex_buffer(0, river.mesh.vertices.slice(..));
-        pass.set_index_buffer(river.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..river.mesh.geometry.index_count(), 0, 0..1);
+        self.draw_blocks(pass, river);
     }
 
     pub fn draw_submerged<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
@@ -916,13 +1094,57 @@ impl RiverSurface {
         pass.draw(0..3, 0..1);
     }
 
+    /// Invalidate a pending listener probe on river/map replacement.
+    pub fn reset_audio_probe(&mut self) { self.audio_probe = None; }
+
+    /// Audio samples share the exact visible water-height classifier, with a
+    /// separate listener location and no synchronous GPU readback.
+    pub fn encode_audio_probe(
+        &mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder, camera_layout: &wgpu::BindGroupLayout,
+        shadow_layout: &wgpu::BindGroupLayout, camera: &wgpu::BindGroup,
+        shadow: &wgpu::BindGroup, environment: Option<&wgpu::BindGroup>,
+        rivers: &[crate::river_runtime::LiveRiver],
+    ) {
+        if let Some(probe) = &mut self.audio_probe { probe.poll(device); }
+        let Some(sample) = crate::river_runtime::audio_listener_probe() else { return; };
+        if self.audio_probe.is_none() && self.frame.is_some() {
+            self.audio_probe = Some(crate::river_audio_probe::AudioProbe::new(device, self, camera_layout, shadow_layout));
+        }
+        if let Some(mut probe) = self.audio_probe.take() {
+            probe.encode(queue, encoder, self, camera, shadow, environment, rivers, sample);
+            self.audio_probe = Some(probe);
+        }
+    }
+
+    /// r_showtris river bit. r_riverWire 0: the live blocks, masked as the
+    /// water draws; 1: the whole grid mesh, unmasked.
     pub fn draw_wire<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
-        let (Some(pipeline), Some(frame), Some(body)) = (&self.wire, &self.frame, river.body_group()) else { return; };
+        let full = crate::river_blocks::wire_mode() == 1;
+        let (Some(pipeline), Some(frame), Some(body)) = (if full { &self.wire_full } else { &self.wire }, &self.frame, river.body_group()) else { return; };
         pass.set_pipeline(pipeline);
         self.bind_patch(pass, camera, shadow_receiver, environment, frame, body);
-        pass.set_vertex_buffer(0, river.mesh.vertices.slice(..));
-        pass.set_index_buffer(river.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..river.mesh.geometry.index_count(), 0, 0..1);
+        if full {
+            pass.set_vertex_buffer(0, river.mesh.vertices.slice(..));
+            pass.set_index_buffer(river.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..river.mesh.geometry.index_count(), 0, 0..1);
+        } else {
+            self.draw_blocks(pass, river);
+        }
+    }
+
+    /// The window grid's live blocks (river_blocks), instanced through vs_block.
+    fn draw_blocks<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, river: &'a crate::river_runtime::LiveRiver) {
+        let Some(cull) = river.block_cull() else { return };
+        pass.set_index_buffer(self.blocks.indices.slice(..), wgpu::IndexFormat::Uint32);
+        // B: one record per template (empty buckets draw nothing).
+        for record in 0..cull.records() {
+            pass.draw_indexed_indirect(&cull.args, record * 5 * std::mem::size_of::<u32>() as u64);
+        }
+    }
+
+    pub fn block_pipelines(&self) -> &crate::river_blocks::Pipelines {
+        &self.blocks
     }
 
     fn bind_patch<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, frame: &'a wgpu::BindGroup, body: &'a wgpu::BindGroup) {

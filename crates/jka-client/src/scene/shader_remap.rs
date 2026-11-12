@@ -107,6 +107,14 @@ fn offset_material_textures(material: &mut SurfaceMaterial, base: usize) {
         if let StageTexture::Image(index) = &mut stage.texture {
             *index += base;
         }
+        // AnimMap frames use the same temporary texture table as stage.texture.
+        // Every frame must be rebased when remaps append that table after the
+        // original BSP images; otherwise subsequent frames bind stock textures.
+        if let Some(animation) = &mut stage.animation {
+            for index in &mut animation.frames {
+                *index += base;
+            }
+        }
         offset_index(&mut stage.enhancements.normal_texture, base);
         offset_index(&mut stage.enhancements.roughness_texture, base);
         offset_index(&mut stage.enhancements.height_texture, base);
@@ -114,6 +122,7 @@ fn offset_material_textures(material: &mut SurfaceMaterial, base: usize) {
         offset_index(&mut stage.enhancements.specular_texture, base);
         offset_index(&mut stage.enhancements.emissive_texture, base);
     }
+    offset_index(&mut material.baked_shadow_texture, base);
     if let Some(skybox) = &mut material.skybox {
         for texture in skybox {
             *texture += base;
@@ -427,6 +436,16 @@ pub(crate) fn apply_shader_remaps_in_place(
     map.inline_batches = inline_batches;
     map.inline_models = inline_models;
 
+    // Preserve exact source -> target resolution for Trace Inspector. The BSP
+    // shader-table index still names the *source*, while the uploaded stages
+    // may belong entirely to the target. This is a cold remap-only update:
+    // no extra strings, lookups, or branches in world draw submission.
+    for entry in &mut map.material_debug.entries {
+        let target = state.redirects.get(&canonical_shader_name(&entry.name));
+        entry.remapped_to = target.cloned();
+        entry.remap_target_resolved = target.is_some_and(|name| replacements.contains_key(name));
+    }
+
     if let Some(visibility) = &map.visibility {
         map.portal_draw_plan = super::visibility::build_prepared_portal_draw_plan(
             &map.batches,
@@ -556,6 +575,10 @@ pub(crate) fn prepare_remap_plan(
     rverbose!(1, "[SHADER REMAP] material-only CPU plan {:.2} ms; {} coarse / {} PVS / {} inline stages (no PreparedMap clone)",
         started.elapsed().as_secs_f64() * 1000.0, coarse.len(), full.len(), inline.len());
     if reuse_portal { rverbose!(2, "[SHADER REMAP] AUTO4 geometries reused; existing merged members remain compatible"); }
+    let remap_diagnostics = base.material_debug.entries.iter().map(|entry| {
+        state.redirects.get(&canonical_shader_name(&entry.name))
+            .map(|target| (target.clone(), replacements.contains_key(target)))
+    }).collect();
     Ok(PreparedRemapPlan {
         base,
         batches: coarse,
@@ -566,6 +589,7 @@ pub(crate) fn prepare_remap_plan(
         replacement_textures: textures.images,
         replacement_texture_hashes: texture_hashes,
         replacement_videos: textures.videos,
+        remap_diagnostics,
         warnings: textures.warnings,
     })
 }
@@ -660,6 +684,52 @@ pub(crate) fn apply_reverse_lightmap_collapse_in_place(map: &mut PreparedMap) ->
 #[cfg(test)]
 mod inline_batch_range_tests {
     use super::*;
+
+    #[test]
+    fn remapped_animmap_frames_use_the_replacement_texture_suffix() {
+        use jka_assets::shader::{AlphaGen, RgbGen, TcGen};
+        let stage = materials::MaterialStage {
+            texture: StageTexture::Image(23),
+            animation: Some(materials::MaterialAnimation {
+                fps: 2.0,
+                frames: vec![23, 24, 25, 26],
+                one_shot: false,
+            }),
+            enhancements: materials::StageEnhancements {
+                normal_texture: Some(27),
+                ..Default::default()
+            },
+            blend: None,
+            alpha_cutoff: 0.0,
+            opacity: 1.0,
+            color: [1.0; 3],
+            rgb_gen: RgbGen::Identity,
+            alpha_gen: AlphaGen::Identity,
+            tc_gen: TcGen::Base,
+            tc_mods: Vec::new(),
+            depth_write: false,
+            depth_equal: false,
+            depth_test_disabled: false,
+            glow: true,
+        };
+        let mut material = SurfaceMaterial {
+            stages: vec![stage],
+            baked_shadow_texture: Some(28),
+            ..Default::default()
+        };
+
+        // The offending trace had base image 251 but frame indices 23..26.
+        offset_material_textures(&mut material, 228);
+        let stage = &material.stages[0];
+        assert_eq!(stage.texture, StageTexture::Image(251));
+        assert_eq!(stage.animation.as_ref().unwrap().frames, [251, 252, 253, 254]);
+        assert_eq!(stage.enhancements.normal_texture, Some(255));
+        assert_eq!(material.baked_shadow_texture, Some(256));
+        assert_eq!(stage.animation.as_ref().unwrap().frame_index(0.0), 0);
+        assert_eq!(stage.animation.as_ref().unwrap().frame_index(0.5), 1);
+        assert_eq!(stage.animation.as_ref().unwrap().frame_index(1.0), 2);
+        assert_eq!(stage.animation.as_ref().unwrap().frame_index(1.5), 3);
+    }
 
     #[test]
     fn shader_remap_stage_count_changes_update_each_inline_model_range() {

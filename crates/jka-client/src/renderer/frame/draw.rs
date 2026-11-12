@@ -367,6 +367,12 @@ impl Renderer {
         {
             self.refresh_water_boxes(camera.position);
         }
+        // Live rivers need a copyable scene (compact post path); switch the
+        // plan when the first river appears or the last one goes.
+        if self.live_rivers.is_empty() == self.plan_has_rivers {
+            self.plan_has_rivers = !self.live_rivers.is_empty();
+            self.rebuild_frame_plan();
+        }
         // Underwater-only DOF forces the linear-depth prepass and full post only
         // below the surface; switch the plan when the camera crosses it.
         if self.dof_mode == DofMode::UnderwaterOnly && self.depth_of_field_strength > 0.001 {
@@ -1824,18 +1830,10 @@ impl Renderer {
         // query, so the resolve after the last render pass knows to run.
         let mut ocean_query_encoded = false;
         let ocean_sun = self.active_sun();
-        let ocean_scene_context = self.world.as_ref().map(|world| {
-            (
-                world.sky_average,
-                world.primary_skybox.is_some(),
-                world.ocean_surfaces.clone(),
-                Arc::clone(&world.ocean_masks),
-                world.promoted_oceans.clone(),
-                world.ocean_sky_regions.iter().enumerate()
-                    .map(|(slot, region)| if self.ocean_extension_active(slot) { *region } else { None })
-                    .collect::<Vec<_>>(),
-            )
-        });
+        // Only these small values must survive the mutable live-river call.
+        // Borrow geometry and masks in each consumer's scope instead.
+        let ocean_environment = self.world.as_ref()
+            .map(|world| (world.sky_average, world.primary_skybox.is_some()));
         // The FFT cascade generation and the wind-foam transport are their own
         // frame interval: they run whether or not any water is on screen, so
         // they must be measurable separately from the surface draw
@@ -1856,11 +1854,11 @@ impl Renderer {
                 .write_encoder_timestamp(&mut encoder, GpuPass::OceanSim, false);
         }
         if render_ocean && !ocean_sim_hidden && self.ocean_settings.interaction {
-            if let Some((_, _, surfaces, masks, _, _)) = ocean_scene_context.as_ref() {
+            if let Some(world) = self.world.as_ref() {
                 let empty = crate::ocean::OceanSurface { plane_height: 0.0, minimum: [0.0;2], maximum: [0.0;2] };
                 let mut bodies = [(empty, None); crate::ocean::OCEAN_MAX_SURFACES * 2];
                 let mut body_count = 0;
-                for (i, surface) in surfaces.iter().enumerate() {
+                for (i, surface) in world.ocean_surfaces.iter().enumerate() {
                     let centre = [(surface.minimum[0]+surface.maximum[0])*0.5,
                         surface.plane_height, (surface.minimum[1]+surface.maximum[1])*0.5];
                     if !self.authored_oceans.iter().any(|(a,_)| a.contains_render_point(centre)) && body_count < bodies.len() {
@@ -1877,25 +1875,37 @@ impl Renderer {
                     }
                 }
                 self.ocean_interaction.encode_frame(&self.queue, &mut encoder, frame_delta,
-                    self.ocean_settings.updates_per_second, camera.position, &bodies[..body_count], masks);
+                    self.ocean_settings.updates_per_second, camera.position, &bodies[..body_count], &world.ocean_masks);
             }
         }
         if competitive_mask & probe::NATIVE_OCEAN == 0 {
+        let mut sky_regions = [None; crate::ocean::OCEAN_MAX_SURFACES];
+        if self.ocean.is_some() {
+            if let Some(world) = self.world.as_ref() {
+                for (slot, (selected, region)) in sky_regions.iter_mut()
+                    .zip(&world.ocean_sky_regions).enumerate() {
+                    if self.ocean_extension_active(slot) { *selected = *region; }
+                }
+            }
+        }
         if let Some(ocean) = &mut self.ocean {
-            if let Some((sky_average, has_skybox, surfaces, masks, promoted, sky_regions)) = ocean_scene_context.as_ref() {
-                ocean.set_sky_extension(&self.queue, self.ocean_sky_extend, self.ocean_sky_infinite, sky_regions);
-                ocean.set_masks(&self.queue, masks);
+            if let Some(world) = self.world.as_ref() {
+                ocean.set_sky_extension(&self.queue, self.ocean_sky_extend, self.ocean_sky_infinite, &sky_regions);
+                ocean.set_masks(&self.queue, &world.ocean_masks);
                 ocean.set_environment(
                     &self.queue,
                     ocean_sun.direction,
                     ocean_sun.color,
                     ocean_sun.intensity,
-                    *sky_average,
-                    *has_skybox,
+                    world.sky_average,
+                    world.primary_skybox.is_some(),
                 );
-                let fallback: Vec<_> = surfaces
+                // World upload and OceanGpu both cap this list at OCEAN_MAX_SURFACES.
+                let empty = crate::ocean::OceanSurface { plane_height: 0.0, minimum: [0.0; 2], maximum: [0.0; 2] };
+                let mut fallback = [empty; crate::ocean::OCEAN_MAX_SURFACES];
+                let mut fallback_count = 0;
+                for (selected, surface) in fallback.iter_mut().zip(world.ocean_surfaces
                     .iter()
-                    .copied()
                     .filter(|s| {
                         let centre = [
                             (s.minimum[0] + s.maximum[0]) * 0.5,
@@ -1906,13 +1916,16 @@ impl Renderer {
                             .authored_oceans
                             .iter()
                             .any(|(a, _)| a.contains_render_point(centre))
-                    })
-                    .collect();
-                ocean.set_surfaces(&self.queue, &fallback);
-                let promoted: Vec<_> = promoted.iter().filter(|p| fallback.contains(&p.surface)).cloned().collect();
+                    })) {
+                    *selected = *surface;
+                    fallback_count += 1;
+                }
+                let fallback = &fallback[..fallback_count];
+                ocean.set_surfaces(&self.queue, fallback);
+                let promoted = world.promoted_oceans.iter().filter(|p| fallback.contains(&p.surface));
                 ocean.configure_coastal(&self.device, &self.queue, self.coastal_enabled,
-                    self.coastal_pool, self.coastal_atlas.as_ref(), &promoted, &self.promoted_ocean_overrides);
-                ocean.set_promoted_surfaces(&self.device, &self.queue, &promoted, &self.promoted_ocean_overrides);
+                    self.coastal_pool, self.coastal_atlas.as_ref(), promoted.clone(), &self.promoted_ocean_overrides);
+                ocean.set_promoted_surfaces(&self.device, &self.queue, promoted, &self.promoted_ocean_overrides);
                 if matches!(self.ocean_settings.backend,1|2) {
                     let maps=if self.ocean_settings.blue_water_coast {
                         self.upstream_shore_source.as_ref().and_then(|s|s.request(self.ocean_settings.blue_water_waves.direction.to_radians()))
@@ -1951,7 +1964,7 @@ impl Renderer {
             self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::RiverSim, true);
         }
         for (authored, ocean) in &mut self.authored_oceans {
-            if let Some((sky_average, has_skybox, _, _, _, _)) = ocean_scene_context.as_ref() {
+            if let Some((sky_average, has_skybox)) = ocean_environment.as_ref() {
                 ocean.set_environment(
                     &self.queue,
                     ocean_sun.direction,
@@ -6785,6 +6798,10 @@ impl Renderer {
                         water.draw_composite(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
                         water.draw_composite_far(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
                     }
+                    // Whitewater sprites (r_riverWhitewater) over the finished water.
+                    for river in &self.live_rivers {
+                        water.draw_spray(&mut pass, &self.camera_bind_group, &self.shadow_resources.receiver_bind_group, environment, river);
+                    }
                 }
                 if copyable && self.live_rivers.iter().any(|river| river.contains_eye_xy(camera)) {
                     // Reuse the same copy allocation. The nearest depth now
@@ -9033,9 +9050,12 @@ impl Renderer {
         // cannot cover either of them. In particular, the HL2 console must be
         // above the gameplay HUD even when SMAA, HDR, streaming or CRT defers
         // the native UI. Keep the existing order for all other egui pages and
-        // for the classic (native WGPU) console.
+        // for the classic (native WGPU) console, except when its chat
+        // context popup is open. That popup is also egui; otherwise the
+        // native console paints over it and makes the menu appear missing.
         let egui_over_native_ui = self.egui_active && (self.ui_state.loading.is_some()
-            || (self.ui_state.mode == ui::OverlayMode::Console && self.ui_state.console_hl2));
+            || self.ui_state.mode == ui::OverlayMode::Console
+                && (self.ui_state.console_hl2 || self.ui_state.classic_console_chat_menu_open));
         if !egui_over_native_ui {
             if legacy_hdr_ui {
                 let perf_ui_call_started = perf_timing.then(Instant::now);

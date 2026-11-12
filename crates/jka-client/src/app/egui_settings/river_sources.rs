@@ -1,6 +1,6 @@
 //! Selection and source controls for independent local river patches.
 use super::{theme, App};
-use crate::river_authoring::{Id, SourceParameters};
+use crate::river_authoring::{DrainParameters, Id, SourceParameters};
 use crate::river_runtime::SourceMode;
 
 impl App {
@@ -115,9 +115,10 @@ impl App {
         } else {
             self.river_editor.defaults = params;
             if theme::ghost_button(ui, "PLACE AT CROSSHAIR").clicked() {
-                self.cmd_riversource("riversource");
+                self.cmd_spawnriver("spawnriver");
             }
         }
+        self.egui_river_drains(ui);
         theme::section(
             ui,
             "SHARED SCENE",
@@ -125,15 +126,157 @@ impl App {
         );
     }
 
-    fn rebuild_river(&mut self, id: Id) {
+    /// Drain selector and controls. Drains are shared by every river and all
+    /// of their settings apply live (no rebuild; water is kept).
+    fn egui_river_drains(&mut self, ui: &mut egui::Ui) {
+        theme::section(
+            ui,
+            "DRAINS",
+            "Drains remove water from every river (not an Unreal feature). Without a drain, water only accumulates. All drain settings apply live.",
+        );
+        let label = self
+            .river_editor
+            .selected_drain
+            .and_then(|id| self.river_editor.drains.iter().find(|d| d.id == id))
+            .map(|d| d.name.as_str())
+            .unwrap_or("New drain defaults")
+            .to_owned();
+        theme::row(
+            ui,
+            "Drain",
+            "Select a placed drain or edit the defaults for the next one.",
+            theme::Reset::None,
+            |ui| {
+                egui::ComboBox::from_id_salt("river_drain_target")
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.river_editor.selected_drain, None, "New drain defaults");
+                        for entry in &self.river_editor.drains {
+                            let p = entry.drain.center;
+                            ui.selectable_value(
+                                &mut self.river_editor.selected_drain,
+                                Some(entry.id),
+                                format!("{} ({:.0}, {:.0}, {:.0})", entry.name, p[0], p[1], p[2]),
+                            );
+                        }
+                    });
+            },
+        );
+        let selected = self
+            .river_editor
+            .selected_drain
+            .filter(|id| self.river_editor.drains.iter().any(|d| d.id == *id));
+        let mut params = match selected.and_then(|id| self.river_editor.drains.iter_mut().find(|d| d.id == id)) {
+            Some(entry) => {
+                theme::row(ui, "Name", "Name this drain for the selector.", theme::Reset::None, |ui| {
+                    ui.text_edit_singleline(&mut entry.name);
+                });
+                let p = entry.drain.center;
+                theme::hint(ui, &format!("Drain at {:.0}, {:.0}, {:.0}", p[0], p[1], p[2]), theme::TEXT_FAINT());
+                DrainParameters::from_drain(entry.drain)
+            }
+            None => self.river_editor.drain_defaults,
+        };
+        let before = params;
+        drain_controls(ui, &mut params);
+        match selected {
+            Some(id) => {
+                if params != before {
+                    let mut changed = false;
+                    if let Some(entry) = self.river_editor.drains.iter_mut().find(|d| d.id == id) {
+                        let updated = params.at(entry.drain.center);
+                        if updated.validate().is_ok() {
+                            entry.drain = updated;
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.send_river_drains();
+                    }
+                }
+                if theme::ghost_button(ui, "REMOVE DRAIN").clicked() {
+                    self.river_editor.drains.retain(|d| d.id != id);
+                    self.river_editor.selected_drain = None;
+                    self.send_river_drains();
+                }
+            }
+            None => {
+                self.river_editor.drain_defaults = params;
+                if theme::ghost_button(ui, "PLACE DRAIN AT CROSSHAIR").clicked() {
+                    self.cmd_spawndrain("spawndrain");
+                }
+            }
+        }
+    }
+
+    /// World-only trace from the view (OpenJK SOLID | TERRAIN) for placing
+    /// rivers and drains. Prints why and returns None when nothing is hit.
+    pub(in crate::app) fn river_crosshair_trace(&mut self, verb: &str) -> Option<jka_movement::TraceResult> {
+        use jka_movement::{TraceQuery, TraceWorld, ENTITY_NONE};
+        let start = crate::scene::jka_position(self.camera.position.to_array());
+        let direction = crate::scene::jka_position(self.camera.forward().to_array());
+        let end = std::array::from_fn(|axis| start[axis] + direction[axis] * 131_072.0);
+        let Some(world) = self.map_collision.as_mut() else {
+            self.push_console_line(format!("^3{verb}: no map collision loaded"));
+            return None;
+        };
+        let trace = world.trace(TraceQuery { start, mins: [0.0; 3], maxs: [0.0; 3], end, pass_entity: ENTITY_NONE, mask: 0x1 | 0x1000 });
+        if trace.fraction >= 1.0 || trace.start_solid != 0 {
+            self.push_console_line(format!("^3{verb}: aim at the ground"));
+            return None;
+        }
+        Some(trace)
+    }
+
+    /// Send every drain to the render thread (all rivers share them).
+    pub(in crate::app) fn send_river_drains(&mut self) {
+        let drains = self.river_editor.drain_list();
+        self.render_command(crate::renderer::RenderCommand::RiverDrains(drains));
+    }
+
+    /// The current map's river collision, read on first use and again when
+    /// `r_riverCaptureMode 1` first needs the capture geometry.
+    pub(in crate::app) fn river_collision(
+        &mut self,
+    ) -> Result<std::sync::Arc<jka_assets::bsp::river::RiverCollision>, String> {
         let key = format!("{:?}", self.initial_source);
-        let Some(collision) = self
+        let with_capture = jka_river::river_reach::capture_mode() == 1;
+        if let Some((_, cached)) = self
             .river_collision
             .as_ref()
-            .filter(|(k, _)| *k == key)
-            .map(|(_, c)| std::sync::Arc::clone(c))
-        else {
+            .filter(|(k, c)| *k == key && (!with_capture || c.capture.is_some()))
+        {
+            return Ok(std::sync::Arc::clone(cached));
+        }
+        self.push_console_line(if with_capture {
+            "spawnriver: reading map collision and capture geometry...".to_owned()
+        } else {
+            "spawnriver: reading map collision (first use on this map)...".to_owned()
+        });
+        let collision = std::sync::Arc::new(crate::scene::river_collision_triangles(
+            &self.base,
+            self.game.as_deref(),
+            &self.initial_source,
+            self.video.allow_asset_overrides,
+            with_capture,
+        )?);
+        self.river_collision = Some((key, std::sync::Arc::clone(&collision)));
+        Ok(collision)
+    }
+
+    fn rebuild_river(&mut self, id: Id) {
+        let key = format!("{:?}", self.initial_source);
+        if self.river_collision.as_ref().is_none_or(|(k, _)| *k != key) {
             return;
+        }
+        let collision = match self.river_collision() {
+            Ok(collision) => collision,
+            Err(error) => {
+                if let Some(entry) = self.river_editor.entry_mut(id) {
+                    entry.error = Some(error);
+                }
+                return;
+            }
         };
         let Some(entry) = self.river_editor.entry_mut(id) else {
             return;
@@ -152,6 +295,66 @@ impl App {
         self.render_command(crate::renderer::RenderCommand::RiverSpawn(
             definition, collision,
         ));
+    }
+}
+
+fn drain_controls(ui: &mut egui::Ui, p: &mut DrainParameters) {
+    theme::row(
+        ui,
+        "Drain radius",
+        "Radius of the drain circle, in map units. Every cell whose centre is inside drains (at least one cell).",
+        theme::Reset::None,
+        |ui| {
+            ui.add(egui::DragValue::new(&mut p.radius).speed(1.0).range(1.0..=4096.0));
+        },
+    );
+    theme::row(
+        ui,
+        "Drain type",
+        "Floor drain empties the water inside its circle. Overflow drain only removes water above its height, so it holds a pond at that level (a spillway).",
+        theme::Reset::None,
+        |ui| {
+            if ui.selectable_label(p.overflow_height.is_none(), "Floor drain").clicked() {
+                p.overflow_height = None;
+            }
+            if ui.selectable_label(p.overflow_height.is_some(), "Overflow").clicked() {
+                p.overflow_height.get_or_insert(32.0);
+            }
+        },
+    );
+    if let Some(height) = &mut p.overflow_height {
+        theme::row(
+            ui,
+            "Overflow height",
+            "Water level the overflow drain holds, in map units above its placement point.",
+            theme::Reset::None,
+            |ui| {
+                ui.add(egui::DragValue::new(height).speed(1.0).range(-4096.0..=16384.0));
+            },
+        );
+    }
+    theme::row(
+        ui,
+        "Limit flow (CFS)",
+        "Unchecked, the drain removes all the water it can reach each solver frame. Checked, it removes at most the given volume per simulated second.",
+        theme::Reset::None,
+        |ui| {
+            let mut enabled = p.max_cfs.is_some();
+            if ui.checkbox(&mut enabled, "Enable").changed() {
+                p.max_cfs = enabled.then_some(100.0);
+            }
+        },
+    );
+    if let Some(cfs) = &mut p.max_cfs {
+        theme::row(
+            ui,
+            "Max flow (CFS)",
+            "Cubic feet of water per simulated second, spread over the drain's cells.",
+            theme::Reset::None,
+            |ui| {
+                ui.add(egui::DragValue::new(cfs).speed(1.0).range(0.01..=1_000_000.0).max_decimals(2).suffix(" ft³/s"));
+            },
+        );
     }
 }
 

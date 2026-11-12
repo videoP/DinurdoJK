@@ -3,10 +3,11 @@
 // rectangle (params.dimensions) with its zero-outside and clamp policies;
 // only square tiles of it are resident. See jka_water::river::sparse.
 // Storage index = slot * tile^2 + local_y * tile + local_x for every per-cell
-// buffer (state, geometry, history, WaterInfo, surface and normals).
+// buffer (state, geometry, history, WaterInfo, surface and normals; the
+// storage prelude decides which of the last four exist).
 struct Tiles {
     table: vec4<u32>, // table width, table height (tiles), tile size, log2 tile size
-    counts: vec4<u32>, // dispatched slots, unused, unused, unused
+    counts: vec4<u32>, // dispatched slots, first-frame reset history (storage modes 1/2), unused, unused
 }
 @group(0) @binding(1) var<storage, read> water: array<vec4<f32>>; // height, depth, vx, vy
 @group(0) @binding(3) var<storage, read_write> output_water: array<vec4<f32>>;
@@ -15,14 +16,6 @@ struct Tiles {
 @group(0) @binding(14) var<storage, read> slot_tiles: array<vec2<i32>>;
 @group(0) @binding(15) var<storage, read_write> occupancy: array<atomic<u32>>;
 
-// One workgroup layer per resident slot: dispatch (tile/8, tile/8, slots).
-fn invocation_cell(id: vec3<u32>) -> vec2<i32> {
-    let slot = min(id.z, max(tiles.counts.x, 1u) - 1u);
-    return slot_tiles[slot] * i32(tiles.table.z) + vec2<i32>(id.xy);
-}
-fn invocation_active(id: vec3<u32>, at: vec2<i32>) -> bool {
-    return id.z < tiles.counts.x && all(id.xy < vec2<u32>(tiles.table.z)) && in_bounds(at);
-}
 
 fn in_bounds(at: vec2<i32>) -> bool {
     return all(at >= vec2<i32>(0)) && all(at < vec2<i32>(params.dimensions.xy));
@@ -79,24 +72,4 @@ fn bilinear(unit: vec2<f32>, channel: u32) -> f32 {
     let bottom = a + f.x * (b - a);
     let top = c + f.x * (d - c);
     return bottom + f.y * (top - bottom);
-}
-
-// Per-slot occupancy after a frame: any cell that is not dry, still water at
-// its bed. The host keeps a guard ring of resident tiles around these.
-var<workgroup> group_occupied: atomic<u32>;
-@compute @workgroup_size(8, 8)
-fn tile_occupancy(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) lane: u32) {
-    if lane == 0u { atomicStore(&group_occupied, 0u); }
-    workgroupBarrier();
-    let at = invocation_cell(id);
-    if invocation_active(id, at) {
-        let i = index(at);
-        if any(water[i] != vec4<f32>(geometry[i].x, 0.0, 0.0, 0.0)) {
-            atomicOr(&group_occupied, 1u);
-        }
-    }
-    workgroupBarrier();
-    if lane == 0u && atomicLoad(&group_occupied) != 0u && id.z < tiles.counts.x {
-        atomicOr(&occupancy[id.z], 1u);
-    }
 }

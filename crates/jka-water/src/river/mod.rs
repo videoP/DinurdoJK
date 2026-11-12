@@ -20,6 +20,7 @@ pub mod frame_reference;
 pub mod grid_mesh;
 pub mod material;
 pub mod ocean;
+pub mod secondary;
 pub mod slw;
 pub mod sparse;
 pub mod stages;
@@ -30,10 +31,64 @@ pub mod water_info;
 pub mod wave_advection;
 
 /// Stages 6..14 over the native single dense rectangle.
-pub const SHALLOW_SHADER: &str = concat!(include_str!("shallow.wgsl"), include_str!("shallow_dense.wgsl"));
+pub const SHALLOW_SHADER: &str = concat!(
+    include_str!("shallow.wgsl"),
+    include_str!("shallow_storage_full.wgsl"),
+    include_str!("shallow_dense.wgsl"),
+);
 /// The same stage bodies over resident tiles of a virtual rectangle
 /// (`sparse`), plus the per-slot occupancy kernel. Not an Unreal system.
-pub const SPARSE_SHALLOW_SHADER: &str = concat!(include_str!("shallow.wgsl"), include_str!("shallow_sparse.wgsl"));
+/// Native pool storage (r_riverStorageMode 0).
+pub const SPARSE_SHALLOW_SHADER: &str = concat!(
+    include_str!("shallow.wgsl"),
+    include_str!("shallow_storage_full.wgsl"),
+    include_str!("shallow_sparse.wgsl"),
+    include_str!("shallow_sparse_slots.wgsl"),
+);
+/// The sparse stages driven by a GPU slot worklist and indirect dispatch
+/// (the tile schedule A/B). Same stage bodies and addressing; not Unreal.
+pub const SPARSE_WORKLIST_SHALLOW_SHADER: &str = concat!(
+    include_str!("shallow.wgsl"),
+    include_str!("shallow_storage_full.wgsl"),
+    include_str!("shallow_sparse.wgsl"),
+    include_str!("shallow_sparse_worklist.wgsl"),
+);
+/// Octahedral 2x16 snorm normal codec of the packed sparse pool
+/// (r_riverStorageMode 2): `river_pack_normal` / `river_unpack_normal`.
+pub const NORMAL_CODEC: &str = include_str!("normal_codec.wgsl");
+/// Sparse stages with derived history and WaterInfo (r_riverStorageMode 1),
+/// plus the workgroup-memory stage variants (shallow_sparse_shared.wgsl).
+pub const SPARSE_LEAN_SHALLOW_SHADER: &str = concat!(
+    include_str!("shallow.wgsl"),
+    include_str!("shallow_storage_lean.wgsl"),
+    include_str!("shallow_sparse.wgsl"),
+    include_str!("shallow_sparse_slots.wgsl"),
+    include_str!("shallow_sparse_shared.wgsl"),
+);
+pub const SPARSE_LEAN_WORKLIST_SHALLOW_SHADER: &str = concat!(
+    include_str!("shallow.wgsl"),
+    include_str!("shallow_storage_lean.wgsl"),
+    include_str!("shallow_sparse.wgsl"),
+    include_str!("shallow_sparse_worklist.wgsl"),
+    include_str!("shallow_sparse_shared.wgsl"),
+);
+/// Mode 1 plus packed normals (r_riverStorageMode 2).
+pub const SPARSE_PACKED_SHALLOW_SHADER: &str = concat!(
+    include_str!("shallow.wgsl"),
+    include_str!("shallow_storage_packed.wgsl"),
+    include_str!("normal_codec.wgsl"),
+    include_str!("shallow_sparse.wgsl"),
+    include_str!("shallow_sparse_slots.wgsl"),
+    include_str!("shallow_sparse_shared.wgsl"),
+);
+pub const SPARSE_PACKED_WORKLIST_SHALLOW_SHADER: &str = concat!(
+    include_str!("shallow.wgsl"),
+    include_str!("shallow_storage_packed.wgsl"),
+    include_str!("normal_codec.wgsl"),
+    include_str!("shallow_sparse.wgsl"),
+    include_str!("shallow_sparse_worklist.wgsl"),
+    include_str!("shallow_sparse_shared.wgsl"),
+);
 
 /// Selected transport settings from the main river asset's cached shader.
 #[derive(Clone, Copy, Debug)]
@@ -42,6 +97,12 @@ pub struct Transport {
     pub extrapolate_into_dry: bool,
     pub advection_multiplier: f32,
     pub minimum_advection_depth: f32,
+    /// Unreal also advects water depth semi-Lagrangian in AdvectWater, on
+    /// top of UpdateDepth's conservative face fluxes. That advection is not
+    /// mass-conserving: converging/decelerating flow (a cascade landing in a
+    /// basin) deletes water every substep, so ponds stall below the source
+    /// level. false (not Unreal) moves depth by the fluxes only.
+    pub advect_depth: bool,
 }
 
 impl Default for Transport {
@@ -51,6 +112,7 @@ impl Default for Transport {
             extrapolate_into_dry: false,
             advection_multiplier: 1.0,
             minimum_advection_depth: 0.001,
+            advect_depth: true,
         }
     }
 }

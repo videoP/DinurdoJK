@@ -18,6 +18,10 @@ impl App {
         let d = crate::river_settings::Settings::default();
         let mut changed = false;
         theme::section(ui, "UNDERWATER", "Hybrid-style submerged presentation for this river. r_showtris 128 shows the displaced grid, including dry cells.");
+        theme::row(ui, "Underwater optics A/B", "Both modes share spectral optics: A keeps the original appearance; B adds a subtle waterline tint (default). This does not change s_underwater audio.", theme::Reset::None, |ui| {
+            changed |= ui.selectable_value(&mut s.underwater_optics, 0, "A · Original").changed();
+            changed |= ui.selectable_value(&mut s.underwater_optics, 1, "B · Shared").changed();
+        });
         color_row(ui, "Underwater color", "Fog tint below the solved water surface (sRGB).", theme::Reset::None, &mut s.underwater_color, &mut changed);
         ocean_slider_d(ui, "Underwater visibility", "Distance in map units at which blue transmission falls to five percent. Red and green fade sooner, as in Hybrid ocean.", &mut s.underwater_visibility, d.underwater_visibility, 1.0..=65536.0, &mut changed);
         ocean_slider_d(ui, "Underwater darkening depth", "Downwelling-light depth distance in map units; larger values darken more slowly.", &mut s.underwater_darkening, d.underwater_darkening, 1.0..=65536.0, &mut changed);
@@ -188,7 +192,82 @@ impl App {
             1.0..=50000.0,
             &mut changed,
         );
+        theme::section(ui, "POUROVERS (A/B)", "Drawn water surface over ledges and drops, for all rivers, live. The simulation is unchanged. Console: r_riverSmoothing, r_riverSmoothingCutoff, r_riverBedClamp.");
+        theme::row(ui, "Surface smoothing", "Unreal's render-height smoothing. Unreal default ramps the surface across drops, so it can dip under a ledge. Edge-preserving ignores neighbours beyond the height cutoff and keeps drops sharp. None and Blur are for comparison.", theme::Reset::None, |ui| {
+            let current = crate::river_runtime::smoothing_method();
+            for (method, label) in [(2u8, "Unreal default"), (1, "Edge-preserving"), (3, "Blur"), (0, "None")] {
+                if theme::chip(ui, label, current == method).clicked() && current != method {
+                    let _ = self.set_console_cvar("r_riverSmoothing", &method.to_string());
+                }
+                ui.add_space(3.0);
+            }
+        });
+        {
+            let mut cutoff = crate::river_runtime::smoothing_cutoff_cm() / jka_water::river::CENTIMETRES_PER_MAP_UNIT;
+            let mut cutoff_changed = false;
+            ocean_slider_d(ui, "Smoothing height cutoff", "Map units (Unreal SmoothingHeightCutoff; 200 = 5 m). Edge-preserving ignores neighbours this much higher or lower; Unreal default weights them fully at this difference. Small values with Edge-preserving keep pourovers crisp.", &mut cutoff, 200.0, 0.0..=1000.0, &mut cutoff_changed);
+            if cutoff_changed {
+                let _ = self.set_console_cvar("r_riverSmoothingCutoff", &cutoff.to_string());
+            }
+        }
+        {
+            let mut clamp = crate::river_runtime::bed_clamp();
+            if ui.checkbox(&mut clamp, "Bed clamp (pourover fix)").on_hover_text("Not an Unreal feature. Keeps the drawn water on or above the bed it covers, and lifts mesh vertices on drops steeper than 45 degrees to the upper water, so the water falls in front of a ledge instead of sliding under it.").changed() {
+                let _ = self.set_console_cvar("r_riverBedClamp", if clamp { "1" } else { "0" });
+            }
+        }
+        {
+            let mut spray = crate::river_runtime::whitewater();
+            if ui.checkbox(&mut spray, "Whitewater spray").on_hover_text("Unreal's river secondary emitter: spray sprites where the surface bends sharply over drops in fast water. Uses the foam minimum depth. Console: r_riverWhitewater.").changed() {
+                let _ = self.set_console_cvar("r_riverWhitewater", if spray { "1" } else { "0" });
+            }
+        }
+        theme::section(ui, "NEAR WATER MESH (A/B)", "Renderer-only mesh density; the hydraulic simulation stays at the original resolution.");
+        {
+            let mut adaptive = jka_river::river_blocks::adaptive();
+            if ui.checkbox(&mut adaptive, "Adaptive water mesh (B)")
+                .on_hover_text("Off: one vertex per solver cell everywhere. On: each 16x16-cell block gets its mesh from how turbulent its water is (surface bends, steps and flow speed), not from distance. Turbulent water keeps your tile resolution; calmer water uses fewer triangles. It never adds triangles. Banks stay at least 4-cell. Blocks hold their detail briefly so they do not flicker. No solver changes. Console: r_riverAdaptiveMesh.")
+                .changed() {
+                let _ = self.set_console_cvar("r_riverAdaptiveMesh", if adaptive { "1" } else { "0" });
+            }
+            let mut sensitivity = jka_river::river_blocks::sensitivity();
+            if ui.add_enabled(adaptive, egui::Slider::new(&mut sensitivity, 0.0..=8.0).text("Turbulence sensitivity"))
+                .on_hover_text("Higher: more of the river keeps the full tile resolution. Lower: more water uses the coarse meshes. Console: r_riverMeshTurbulence.")
+                .changed() {
+                let _ = self.set_console_cvar("r_riverMeshTurbulence", &format!("{sensitivity:.2}"));
+            }
+            theme::hint(ui, "Use r_showtris 128 to see the mesh and r_gpuTimings 1 for GPU comparison.", theme::TEXT_FAINT());
+        }
         theme::section(ui, "SURFACE DETAIL", "Flow-advected wave detail.");
+        {
+            let mut mode = i32::from(crate::river_runtime::material_lod());
+            ui.horizontal(|ui| {
+                ui.label("Fragment detail (A/B)");
+                egui::ComboBox::from_id_salt("river_fragment_detail_lod")
+                    .selected_text(match mode {
+                        0 => "0 — Original",
+                        1 => "1 — Adaptive waves",
+                        _ => "2 — Adaptive waves + foam",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut mode, 0, "0 — Original");
+                        ui.selectable_value(&mut mode, 1, "1 — Adaptive waves");
+                        ui.selectable_value(&mut mode, 2, "2 — Adaptive waves + foam");
+                    });
+            });
+            if mode != i32::from(crate::river_runtime::material_lod()) {
+                let _ = self.set_console_cvar("r_riverMaterialLOD", &mode.to_string());
+            }
+            let mut cutoff = crate::river_runtime::material_lod_cutoff();
+            let slider = ui.add_enabled(
+                mode != 0,
+                egui::Slider::new(&mut cutoff, 0.0..=8.0).step_by(0.25).text("Cheap-path cutoff (mips)"),
+            );
+            if slider.on_hover_text("Lower = the cheap path starts on nearer water. 0 = all river pixels, 2 = default, 4 = original patch (far/grazing only). Watch for seams as you lower it.").changed() {
+                let _ = self.set_console_cvar("r_riverMaterialLODCutoff", &format!("{cutoff}"));
+            }
+            ui.small("Screen-space texture-footprint LOD; fragment work only, no solver or mesh changes. Console: r_riverMaterialLOD.");
+        }
         ocean_slider_d(
             ui,
             "Detail normal strength",
@@ -276,6 +355,9 @@ impl App {
         }
     }
     fn commit_river_defaults(&mut self, s: crate::river_settings::Settings) {
+        if s.underwater_optics != self.video.river_settings.underwater_optics {
+            let _ = self.set_console_cvar("r_riverUnderwaterOptics", &s.underwater_optics.to_string());
+        }
         if s.foam_minimum_depth != self.video.river_settings.foam_minimum_depth {
             let _ = self.set_console_cvar("r_riverFoamMinimumDepth", &s.foam_minimum_depth.to_string());
         }

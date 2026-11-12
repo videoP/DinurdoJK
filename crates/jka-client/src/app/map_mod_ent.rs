@@ -2,10 +2,105 @@
 //! This editor imports additive MD3/inline/FX placements and startup shader remaps;
 //! external .ent edits to baked BSP entities require a full entity editor.
 use super::*;
-use super::egui_model_placement::{BmodelPlacement, FxPlacement, ModelPlacement, bmodel_pivot};
+use super::egui_model_placement::{BmodelPlacement, EntFileChoice, FxPlacement, ModelPlacement, ModelPlacementUi, bmodel_pivot};
 use jka_assets::bsp::{Bsp, Entity, MAX_FILE_BYTES};
 use jka_assets::pk3::AssetSearchPath;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+#[path = "map_mod_layout.rs"]
+mod layout;
+
+/// A bounded, non-symlink-following snapshot of .ent files in the active
+/// fs_game's writable mapmods directory (including e.g. mapmods/mp/).
+fn list_ent_files(root: &Path) -> Result<Vec<String>, String> {
+    if !root.exists() { return Ok(Vec::new()); }
+    let mut files = Vec::new();
+    let mut dirs = vec![(root.to_owned(), 0usize)];
+    while let Some((dir, depth)) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let ty = entry.file_type().map_err(|e| e.to_string())?;
+            if ty.is_dir() && depth < 8 {
+                dirs.push((entry.path(), depth + 1));
+            } else if ty.is_file() {
+                let relative = entry.path().strip_prefix(root).map_err(|e| e.to_string())?
+                    .to_string_lossy().replace('\\', "/");
+                if clean_ent_name(&relative).is_ok() {
+                    files.push(relative);
+                    if files.len() > 2048 {
+                        return Err("mapmods contains over 2048 .ent files; narrow the folder before refreshing".into());
+                    }
+                }
+            }
+        }
+    }
+    files.sort_by_key(|s| s.to_ascii_lowercase());
+    Ok(files)
+}
+
+fn suggested_copy_name(current: &str) -> String {
+    let stem = current.strip_suffix(".ent").unwrap_or(current);
+    format!("{stem}_copy.ent")
+}
+
+/// Restrict every child region to its Taffy rectangle. Text input, clipping,
+/// scrolling and focus remain owned by egui.
+fn region<R>(root: &mut egui::Ui, id: &str, rect: egui::Rect,
+    content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    root.scope_builder(egui::UiBuilder::new().id_salt(id).max_rect(rect)
+        .layout(egui::Layout::top_down(egui::Align::Min)), |ui| {
+        ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+        content(ui)
+    }).inner
+}
+
+
+/// Reset only locally staged .ent state. The renderer's authored shader remaps
+/// are restored separately by the caller (outside the mutable state borrow).
+fn clear_ent_staging(state: &mut ModelPlacementUi) -> std::collections::BTreeMap<String, String> {
+    let remaps = std::mem::take(&mut state.authored_remaps);
+    state.ent_loaded_file = None;
+    state.ent_filename = clean_map_name(&state.map_label)
+        .map(|stem| format!("{stem}.ent")).unwrap_or_default();
+    state.ent_pending_selection = None;
+    state.ent_save_as_open = false;
+    state.ent_save_as_overwrite_confirm = false;
+    state.ent_dirty = false;
+    state.placed.clear();
+    state.bmodel_placed.clear();
+    state.fx_placed.clear();
+    state.placed_draws = Arc::new(Vec::new());
+    state.fx_draws = Arc::new(Vec::new());
+    state.fx_runtime = None;
+    state.placed_dirty = true;
+    state.bmodel_collision_dirty = true;
+    // An undo after unloading must not resurrect the contents of a
+    // previously selected file (or its authored remaps).
+    state.edit_undo.clear();
+    state.edit_redo.clear();
+    state.active = state.edit_mode;
+    state.editor_placing = false;
+    state.editor_selected = None;
+    state.editor_drag = None;
+    state.editor_mouse_owned = None;
+    state.editor_keys_owned.clear();
+    state.held = None;
+    state.hover = None;
+    state.hover_since = None;
+    state.bmodel_hover = None;
+    state.bmodel_selection = None;
+    state.fx_held = None;
+    state.fx_hover = None;
+    state.fx_selection = None;
+    state.selection = None;
+    state.bounds = None;
+    state.rotating = false;
+    state.preview_rotation = None;
+    state.hit_valid = false;
+    state.preview_key = None;
+    state.preview_draws = Arc::new(Vec::new());
+    remaps
+}
 
 const MAX_ENT_BYTES: usize = 16 * 1024 * 1024;
 
@@ -272,7 +367,69 @@ impl App {
         if self.model_placement.ent_filename.is_empty() {
             self.model_placement.ent_filename = format!("{map_name}.ent");
         }
+        self.model_placement.ent_pending_selection = None;
+        self.model_placement.ent_save_as_open = false;
+        self.refresh_map_mod_files();
         self.set_overlay(OverlayMode::MapMods);
+    }
+    fn refresh_map_mod_files(&mut self) {
+        match list_ent_files(&self.game_write_path("mapmods")) {
+            Ok(mut files) => {
+                // Put variants of the active map first, but do not hide the
+                // rest of the directory. Other-map files are rejected by
+                // import's BSP entity validation, never silently loaded.
+                let stem = clean_map_name(&self.model_placement.map_label).unwrap_or("");
+                let exact = format!("{stem}.ent");
+                let underscore = format!("{stem}_");
+                let dash = format!("{stem}-");
+                files.sort_by_key(|name| {
+                    let related = name == &exact || name.starts_with(underscore.as_str()) ||
+                        name.starts_with(dash.as_str());
+                    (!related, name.to_ascii_lowercase())
+                });
+                self.model_placement.ent_files = files;
+            }
+            Err(error) => self.model_placement.ent_status = format!("FILE LIST FAILED: {error}"),
+        }
+    }
+    /// Import from a clicked file only. Restore the previous active filename
+    /// if the file is invalid, missing, or belongs to a different BSP.
+    fn load_map_mod_file(&mut self, name: &str) -> Result<String, String> {
+        let name = clean_ent_name(name)?.to_owned();
+        let previous = std::mem::replace(&mut self.model_placement.ent_filename, name);
+        match self.import_map_mod() {
+            Ok(message) => Ok(message),
+            Err(error) => {
+                self.model_placement.ent_filename = previous;
+                Err(error)
+            }
+        }
+    }
+    /// Unload the editor-local .ent without touching its disk contents or the
+    /// original BSP entities. Clear live instances and FX immediately rather
+    /// than waiting for the next placement-renderer update.
+    fn unload_map_mod(&mut self) -> String {
+        let previous_file = self.model_placement.ent_loaded_file.clone();
+        let previous_remaps = clear_ent_staging(&mut self.model_placement);
+        for source in previous_remaps.keys() {
+            self.local_remap_shader(source, source);
+        }
+        let message = previous_file.map_or_else(
+            || "No .ent loaded; local placements cleared. Files on disk were not changed.".to_owned(),
+            |name| format!("Unloaded {name}. Original BSP entities preserved; file on disk unchanged."),
+        );
+        self.model_placement.status = message.clone();
+        message
+    }
+    /// Save As only switches the active file after a completed export.
+    fn save_map_mod_as(&mut self, name: &str, overwrite: bool) -> Result<String, String> {
+        let name = clean_ent_name(name)?.to_owned();
+        let previous_name = std::mem::replace(&mut self.model_placement.ent_filename, name);
+        let previous_overwrite = std::mem::replace(&mut self.model_placement.ent_overwrite, overwrite);
+        let result = self.export_map_mod();
+        self.model_placement.ent_overwrite = previous_overwrite;
+        if result.is_err() { self.model_placement.ent_filename = previous_name; }
+        result
     }
     fn export_map_mod(&mut self) -> Result<String, String> {
         let base = self.map_mod_base_entities()?;
@@ -310,6 +467,7 @@ impl App {
         }
         if had_old { let _ = std::fs::remove_file(&backup); }
         self.model_placement.ent_dirty = false;
+        self.model_placement.ent_loaded_file = Some(self.model_placement.ent_filename.clone());
         Ok(format!("Exported {} MD3 + {} BMODEL + {} FX + {} shader remaps with BSP entities to {}",
             self.model_placement.placed.len(), self.model_placement.bmodel_placed.len(),
             self.model_placement.fx_placed.len(), self.model_placement.authored_remaps.len(), path.display()))
@@ -423,6 +581,7 @@ impl App {
         self.model_placement.preview_draws = Arc::new(Vec::new());
         self.ensure_inline_instance_capacity();
         self.model_placement.ent_dirty = false;
+        self.model_placement.ent_loaded_file = Some(self.model_placement.ent_filename.clone());
         // Show a compact warning in the dialog and preserve per-entity errors in
         // the console, including which original .ent entity index was skipped.
         for warning in skipped_models.iter().take(64) {
@@ -442,100 +601,301 @@ impl App {
             path.display(), skipped_notice))
     }
     pub(super) fn egui_map_mods(&mut self, root: &mut egui::Ui) {
-        let mut action = None;
+        use super::egui_theme as theme;
+        use super::egui_model_placement::EditSelection;
+
+        enum FileAction {
+            Unload,
+            Load(String),
+            Save,
+            SaveAs { filename: String, overwrite: bool },
+        }
+        let mut file_action = None;
+        let mut refresh = false;
         let mut close = false;
         let mut edit = false;
         let mut exit_edit = false;
         let mut shader_editor = false;
-        let mut undo = false;
-        let mut redo = false;
         let mut duplicate = false;
         let mut delete = false;
         let mut selected_transform = None;
-        egui::Window::new("MAP MODS · .ENT IMPORT / EXPORT")
+
+        egui::Window::new("MAP MODS")
             .id(egui::Id::new("map_mod_ent_dialog"))
-            .default_width(610.0).resizable(true).collapsible(false)
+            .default_size([950.0, 645.0])
+            .min_width(760.0).min_height(530.0)
+            .resizable(true).collapsible(false)
             .show(root.ctx(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("MAP MODS");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("CLOSE").clicked() { close = true; }
+                let avail = ui.available_size_before_wrap();
+                let width = avail.x.max(755.0);
+                let height = avail.y.max(525.0);
+                let (workspace, _) = ui.allocate_exact_size(
+                    egui::vec2(width, height), egui::Sense::hover());
+                let panels = layout::compute(workspace);
+                let painter = ui.painter();
+                for pane in [panels.files, panels.editor] {
+                    painter.rect_filled(pane, theme::CORNER, theme::SURFACE_ALT());
+                    painter.rect_stroke(pane, theme::CORNER,
+                        egui::Stroke::new(1.0, theme::LINE()), egui::StrokeKind::Inside);
+                }
+                painter.rect_filled(panels.footer, theme::CORNER, theme::SURFACE());
+
+                region(ui, "mapmod-header", panels.header.shrink(6.0), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("MAP MODS");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("CLOSE").clicked() { close = true; }
+                        });
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("MAP  {}", self.model_placement.map_label));
+                        ui.separator();
+                        if self.model_placement.ent_dirty {
+                            ui.colored_label(theme::WARNING(), "UNSAVED CHANGES");
+                        } else {
+                            ui.colored_label(theme::TEXT_DIM(), "No unsaved local edits");
+                        }
                     });
                 });
-                ui.label(format!("BSP: {}", self.model_placement.map_label));
-                ui.label(format!("Staged: {} MD3 / {} BMODEL / {} FX / {} authored shader remaps",
-                    self.model_placement.placed.len(), self.model_placement.bmodel_placed.len(),
-                    self.model_placement.fx_placed.len(), self.model_placement.authored_remaps.len()));
-                ui.label(if self.model_placement.ent_dirty { "UNSAVED LOCAL CHANGES" } else { "No unsaved local changes" });
-                if let Some(selected) = self.model_placement.editor_selected {
-                    use super::egui_model_placement::EditSelection;
-                    let detail = match selected {
-                        EditSelection::Md3(i) => self.model_placement.placed.get(i)
-                            .map(|p| (format!("MD3 #{i}: {}", p.qpath), p.origin, p.angles, Some(p.scale))),
-                        EditSelection::Bmodel(i) => self.model_placement.bmodel_placed.get(i)
-                            .map(|p| (format!("BMODEL #{i}: *{}", p.model), p.hit, p.angles, None)),
-                        EditSelection::Fx(i) => self.model_placement.fx_placed.get(i)
-                            .map(|p| (format!("FX #{i}: {}", p.effect), p.origin, p.angles, None)),
-                    };
-                    if let Some((name, mut position, mut angles, mut scale)) = detail {
-                        ui.separator();
-                        ui.strong(format!("SELECTED: {name}"));
-                        let mut changed = false;
-                        ui.horizontal(|ui| {
-                            ui.label("Position");
-                            for i in 0..3 {
-                                ui.label(["X", "Y", "Z"][i]);
-                                changed |= ui.add(egui::DragValue::new(&mut position[i]).speed(1.0)).changed();
+
+                // Left pane: real files, not a free-form import text field. A
+                // checked radio means this file was successfully loaded/saved.
+                region(ui, "mapmod-files", panels.files.shrink(12.0), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("MAPMOD FILES");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("REFRESH").clicked() { refresh = true; }
+                        });
+                    });
+                    ui.add(egui::TextEdit::singleline(&mut self.model_placement.ent_file_filter)
+                        .desired_width(f32::INFINITY).hint_text("Filter .ent files..."));
+                    ui.add_space(3.0);
+                    ui.label(egui::RichText::new(format!("{} .ent file(s)  ·  click to load",
+                        self.model_placement.ent_files.len())).small().color(theme::TEXT_DIM()));
+                    ui.separator();
+                    let mut requested = None;
+                    let nothing_loaded = self.model_placement.ent_loaded_file.is_none();
+                    if ui.add(egui::RadioButton::new(nothing_loaded, "None (unload .ent)"))
+                        .on_hover_text("Remove loaded placements, effects and authored remaps from this map. Does not delete the .ent file or BSP entities.")
+                        .clicked() && (!nothing_loaded || self.model_placement.ent_dirty) {
+                        requested = Some(EntFileChoice::Unload);
+                    }
+                    ui.separator();
+                    let filter = self.model_placement.ent_file_filter.trim().to_ascii_lowercase();
+                    let visible_height = (panels.files.height() - 187.0).max(125.0);
+                    egui::ScrollArea::vertical().id_salt("mapmod-file-list")
+                        .auto_shrink([false, false]).max_height(visible_height).show(ui, |ui| {
+                            let mut count = 0;
+                            for name in &self.model_placement.ent_files {
+                                if !filter.is_empty() && !name.to_ascii_lowercase().contains(&filter) { continue; }
+                                count += 1;
+                                let loaded = self.model_placement.ent_loaded_file.as_deref() == Some(name.as_str());
+                                let response = ui.add(egui::RadioButton::new(loaded, name.as_str()));
+                                if response.clicked() && !loaded { requested = Some(EntFileChoice::Load(name.clone())); }
+                            }
+                            if count == 0 {
+                                ui.add_space(8.0);
+                                ui.weak(if filter.is_empty() {
+                                    "No .ent files here yet. Save As to create one."
+                                } else { "No matching files." });
                             }
                         });
-                        ui.horizontal(|ui| {
-                            ui.label("Rotation");
-                            for i in 0..3 {
-                                ui.label(["P", "Y", "R"][i]);
-                                changed |= ui.add(egui::DragValue::new(&mut angles[i]).speed(0.5).suffix("°")).changed();
-                            }
-                        });
-                        if let Some(value) = scale.as_mut() {
-                            ui.horizontal(|ui| {
-                                ui.label("Scale");
-                                changed |= ui.add(egui::DragValue::new(value).speed(0.02).range(0.01..=100.0)).changed();
+                    if let Some(choice) = requested {
+                        if self.model_placement.ent_dirty {
+                            self.model_placement.ent_pending_selection = Some(choice);
+                        } else {
+                            file_action = Some(match choice {
+                                EntFileChoice::Unload => FileAction::Unload,
+                                EntFileChoice::Load(name) => FileAction::Load(name),
                             });
                         }
-                        if changed { selected_transform = Some((selected, position, angles, scale)); }
-                        ui.horizontal(|ui| {
-                            if ui.button("DUPLICATE SELECTED").clicked() { duplicate = true; }
-                            if ui.button("DELETE SELECTED").clicked() { delete = true; }
-                        });
                     }
-                }
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("EDIT PLACEMENTS").clicked() { edit = true; }
-                    if ui.button("SHADER REMAPS").clicked() { shader_editor = true; }
-                    if ui.button("UNDO").clicked() { undo = true; }
-                    if ui.button("REDO").clicked() { redo = true; }
-                    if self.model_placement.edit_mode && ui.button("EXIT MAP EDITING").clicked() { exit_edit = true; }
+                    ui.separator();
+                    ui.label(egui::RichText::new("LOCATION").small().color(theme::TEXT_DIM()));
+                    ui.add(egui::Label::new(egui::RichText::new(
+                        self.game_write_path("mapmods").display().to_string()).small())
+                        .wrap());
                 });
-                ui.separator();
-                ui.label("File name (relative to mapmods/):");
-                ui.add(egui::TextEdit::singleline(&mut self.model_placement.ent_filename)
-                    .desired_width(480.0).hint_text("mp/ffa3.ent"));
-                let root_dir = self.game_write_path("mapmods");
-                ui.small(format!("Folder: {}", root_dir.display()));
-                ui.horizontal(|ui| {
-                    if ui.button("IMPORT .ENT (replace local placements)").clicked() { action = Some(false); }
-                    if ui.button("EXPORT .ENT").clicked() { action = Some(true); }
+
+                // Right pane: editing operations and a single unambiguous
+                // Save/Save As workflow. Scrolling is egui; sizing is Taffy.
+                region(ui, "mapmod-editor", panels.editor.shrink(14.0), |ui| {
+                    egui::ScrollArea::vertical().id_salt("mapmod-right-scroll")
+                        .auto_shrink([false, false]).show(ui, |ui| {
+                            ui.strong("ACTIVE FILE");
+                            match self.model_placement.ent_loaded_file.as_deref() {
+                                Some(name) => { ui.label(name); }
+                                None => { ui.colored_label(theme::TEXT_DIM(), "No .ent file loaded"); }
+                            }
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                let can_save = self.model_placement.ent_loaded_file.is_some();
+                                if ui.add_enabled(can_save, egui::Button::new("SAVE"))
+                                    .on_hover_text("Write the current placements to the active .ent file")
+                                    .clicked() { file_action = Some(FileAction::Save); }
+                                if ui.button("SAVE AS...").clicked() {
+                                    self.model_placement.ent_save_as_open = !self.model_placement.ent_save_as_open;
+                                    self.model_placement.ent_save_as_overwrite_confirm = false;
+                                    if self.model_placement.ent_save_as_open {
+                                        self.model_placement.ent_save_as_name = if can_save {
+                                            suggested_copy_name(&self.model_placement.ent_filename)
+                                        } else { self.model_placement.ent_filename.clone() };
+                                    }
+                                }
+                                if ui.add_enabled(can_save, egui::Button::new("RELOAD"))
+                                    .on_hover_text("Reload the active file from disk")
+                                    .clicked() {
+                                    if self.model_placement.ent_dirty {
+                                        self.model_placement.ent_pending_selection =
+                                            self.model_placement.ent_loaded_file.clone().map(EntFileChoice::Load);
+                                    } else if let Some(name) = &self.model_placement.ent_loaded_file {
+                                        file_action = Some(FileAction::Load(name.clone()));
+                                    }
+                                }
+                            });
+                            if self.model_placement.ent_save_as_open {
+                                ui.add_space(7.0);
+                                ui.label("New file name, relative to mapmods/");
+                                if ui.add(egui::TextEdit::singleline(&mut self.model_placement.ent_save_as_name)
+                                    .desired_width(f32::INFINITY).hint_text("mp/duel3_copy.ent")).changed() {
+                                    self.model_placement.ent_save_as_overwrite_confirm = false;
+                                }
+                                if self.model_placement.ent_save_as_overwrite_confirm {
+                                    ui.colored_label(theme::WARNING(), "This file already exists. Replace it?");
+                                    ui.horizontal(|ui| {
+                                        if ui.button("OVERWRITE FILE").clicked() {
+                                            file_action = Some(FileAction::SaveAs {
+                                                filename: self.model_placement.ent_save_as_name.clone(), overwrite: true });
+                                        }
+                                        if ui.button("CANCEL").clicked() {
+                                            self.model_placement.ent_save_as_overwrite_confirm = false;
+                                        }
+                                    });
+                                } else if ui.button("CREATE / SAVE AS").clicked() {
+                                    let name = self.model_placement.ent_save_as_name.trim().to_owned();
+                                    if clean_ent_name(&name).is_ok() &&
+                                        self.game_write_path("mapmods").join(&name).exists() {
+                                        self.model_placement.ent_save_as_overwrite_confirm = true;
+                                    } else {
+                                        file_action = Some(FileAction::SaveAs { filename: name, overwrite: false });
+                                    }
+                                }
+                            }
+                            if let Some(pending) = self.model_placement.ent_pending_selection.clone() {
+                                ui.separator();
+                                if self.model_placement.ent_dirty {
+                                    ui.colored_label(theme::WARNING(), "Unsaved local edits will be discarded.");
+                                }
+                                match &pending {
+                                    EntFileChoice::Unload => {
+                                        ui.label("Unload this .ent and remove its local placements and shader remaps?");
+                                        ui.label("The file on disk and original BSP entities will remain unchanged.");
+                                    }
+                                    EntFileChoice::Load(name) => { ui.label(format!("Load {name}?")); }
+                                }
+                                ui.horizontal(|ui| {
+                                    let confirm = match &pending {
+                                        EntFileChoice::Unload if self.model_placement.ent_dirty => "DISCARD & UNLOAD",
+                                        EntFileChoice::Unload => "UNLOAD",
+                                        EntFileChoice::Load(_) if self.model_placement.ent_dirty => "DISCARD & LOAD",
+                                        EntFileChoice::Load(_) => "LOAD FILE",
+                                    };
+                                    if ui.button(confirm).clicked() {
+                                        self.model_placement.ent_pending_selection = None;
+                                        file_action = Some(match pending {
+                                            EntFileChoice::Unload => FileAction::Unload,
+                                            EntFileChoice::Load(name) => FileAction::Load(name),
+                                        });
+                                    }
+                                    if ui.button("KEEP EDITING").clicked() {
+                                        self.model_placement.ent_pending_selection = None;
+                                    }
+                                });
+                            }
+                            ui.add_space(12.0);
+                            ui.separator();
+                            ui.strong("STAGED IN THIS MAP");
+                            ui.label(format!("{} models  ·  {} brush models  ·  {} effects",
+                                self.model_placement.placed.len(),
+                                self.model_placement.bmodel_placed.len(), self.model_placement.fx_placed.len()));
+                            ui.label(format!("{} authored shader remaps", self.model_placement.authored_remaps.len()));
+                            ui.add_space(5.0);
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("EDIT PLACEMENTS").clicked() { edit = true; }
+                                if ui.button("SHADER REMAPS").clicked() { shader_editor = true; }
+                                if self.model_placement.edit_mode && ui.button("EXIT MAP EDITING").clicked() {
+                                    exit_edit = true;
+                                }
+                            });
+
+                            if let Some(selected) = self.model_placement.editor_selected {
+                                let detail = match selected {
+                                    EditSelection::Md3(i) => self.model_placement.placed.get(i)
+                                        .map(|p| (format!("MD3 #{i}: {}", p.qpath), p.origin, p.angles, Some(p.scale))),
+                                    EditSelection::Bmodel(i) => self.model_placement.bmodel_placed.get(i)
+                                        .map(|p| (format!("BMODEL #{i}: *{}", p.model), p.hit, p.angles, None)),
+                                    EditSelection::Fx(i) => self.model_placement.fx_placed.get(i)
+                                        .map(|p| (format!("FX #{i}: {}", p.effect), p.origin, p.angles, None)),
+                                };
+                                if let Some((name, mut position, mut angles, mut scale)) = detail {
+                                    ui.add_space(10.0);
+                                    ui.separator();
+                                    ui.strong(format!("SELECTED  {name}"));
+                                    let mut changed = false;
+                                    ui.horizontal(|ui| {
+                                        ui.label("Position");
+                                        for i in 0..3 {
+                                            ui.label(["X", "Y", "Z"][i]);
+                                            changed |= ui.add(egui::DragValue::new(&mut position[i]).speed(1.0)).changed();
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Rotation");
+                                        for i in 0..3 {
+                                            ui.label(["P", "Y", "R"][i]);
+                                            changed |= ui.add(egui::DragValue::new(&mut angles[i])
+                                                .speed(0.5).suffix("°")).changed();
+                                        }
+                                    });
+                                    if let Some(value) = scale.as_mut() {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Scale");
+                                            changed |= ui.add(egui::DragValue::new(value)
+                                                .speed(0.02).range(0.01..=100.0)).changed();
+                                        });
+                                    }
+                                    if changed { selected_transform = Some((selected, position, angles, scale)); }
+                                    ui.horizontal(|ui| {
+                                        if ui.button("DUPLICATE").clicked() { duplicate = true; }
+                                        if ui.button("DELETE").clicked() { delete = true; }
+                                    });
+                                }
+                            }
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new(
+                                "Only additive placements and startup shader remaps can be loaded. A file with different BSP entities is rejected without changing your work.")
+                                .small().color(theme::TEXT_DIM()));
+                        });
                 });
-                ui.checkbox(&mut self.model_placement.ent_overwrite, "Allow export to overwrite existing .ent file");
-                ui.separator();
-                ui.label("Export writes a complete OpenJK-style entity list: original BSP entities plus your placements.");
-                ui.label("Import is additive-only; original entities are preserved. Authored remaps export as trigger_always.");
-                ui.small("Edit: Ctrl+LMB on empty space opens Add (MD3 / FX / BMODEL). LMB on an object drags it; Ctrl+drag moves vertically.");
-                ui.small("MMB yaw/pitch · RMB local roll · Ctrl+Z/Y undo/redo · Ctrl+D duplicate · Backspace cancels Add · Esc opens the normal menu.");
-                ui.label("BMODEL geometry remains unscaled. Server behavior/collision depends on the host game module; imports are local previews only.");
-                if !self.model_placement.ent_status.is_empty() { ui.label(&self.model_placement.ent_status); }
+
+                region(ui, "mapmod-footer", panels.footer.shrink(9.0), |ui| {
+                    ui.label(egui::RichText::new(
+                        "SAVE writes the active file. SAVE AS creates a named variant. Selecting a radio button loads that file into the local editor.")
+                        .small().color(theme::TEXT_DIM()));
+                    if !self.model_placement.ent_status.is_empty() {
+                        let color = if self.model_placement.ent_status.contains("FAILED") {
+                            theme::DANGER()
+                        } else { theme::TEXT() };
+                        ui.colored_label(color, &self.model_placement.ent_status);
+                    } else {
+                        ui.label(egui::RichText::new(
+                            "Tip: Ctrl+LMB adds a model/effect; drag edits placements. Imports are local previews.")
+                            .small().color(theme::TEXT_DIM()));
+                    }
+                });
             });
+
         if let Some((selection, position, angles, scale)) = selected_transform {
-            use super::egui_model_placement::EditSelection;
             if position.iter().chain(&angles).all(|v| v.is_finite())
                 && scale.is_none_or(|v| v.is_finite() && (0.01..=100.0).contains(&v)) {
                 self.placement_checkpoint();
@@ -557,18 +917,27 @@ impl App {
         }
         if duplicate { self.duplicate_selected_placement(); }
         if delete { self.delete_hovered_placement(); }
+        if refresh { self.refresh_map_mod_files(); }
         if close { self.set_overlay(OverlayMode::None); }
         if exit_edit { self.exit_map_editing(); }
         if edit { self.enter_placement_edit(); }
         if shader_editor { self.open_shader_remap(None); }
-        if undo { self.undo_model_placement(); }
-        if redo { self.redo_model_placement(); }
-        if let Some(export) = action {
-            let result = if export { self.export_map_mod() } else { self.import_map_mod() };
-            self.model_placement.ent_status = match result {
-                Ok(msg) => msg,
-                Err(err) => format!(".ENT {} FAILED: {err}", if export { "EXPORT" } else { "IMPORT" }),
+        if let Some(action) = file_action {
+            let result = match action {
+                FileAction::Unload => Ok(self.unload_map_mod()),
+                FileAction::Load(filename) => self.load_map_mod_file(&filename),
+                FileAction::Save => self.save_map_mod_as(&self.model_placement.ent_filename.clone(), true),
+                FileAction::SaveAs { filename, overwrite } => self.save_map_mod_as(&filename, overwrite),
             };
+            match result {
+                Ok(message) => {
+                    self.model_placement.ent_status = message;
+                    self.model_placement.ent_save_as_open = false;
+                    self.model_placement.ent_save_as_overwrite_confirm = false;
+                    self.refresh_map_mod_files();
+                }
+                Err(error) => self.model_placement.ent_status = format!("MAP MOD FAILED: {error}"),
+            }
             self.egui_repaint_requested = true;
         }
     }
@@ -577,6 +946,51 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unloading_clears_staged_objects_and_keeps_a_fresh_save_as_name() {
+        let mut state = ModelPlacementUi::default();
+        state.map_label = "mp/duel3.bsp".into();
+        state.ent_loaded_file = Some("mp/duel3_copy.ent".into());
+        state.ent_filename = "mp/duel3_copy.ent".into();
+        state.ent_dirty = true;
+        state.ent_pending_selection = Some(EntFileChoice::Unload);
+        state.edit_mode = true;
+        state.editor_placing = true;
+        state.editor_selected = Some(crate::app::egui_model_placement::EditSelection::Md3(0));
+        state.placed.push(ModelPlacement { qpath: "models/foo.md3".into(),
+            origin: [0.0; 3], angles: [0.0; 3], scale: 1.0,
+            bounds: ([0.0; 3], [1.0; 3]) });
+        state.bmodel_placed.push(BmodelPlacement { model: 1, pivot: [0.0; 3],
+            hit: [0.0; 3], angles: [0.0; 3], bounds: ([0.0; 3], [1.0; 3]) });
+        state.fx_placed.push(FxPlacement { effect: "env/fire".into(),
+            origin: [0.0; 3], angles: [0.0; 3], delay_ms: 200 });
+        state.authored_remaps.insert("old".into(), "new".into());
+
+        let old_remaps = clear_ent_staging(&mut state);
+        assert_eq!(old_remaps.get("old").map(String::as_str), Some("new"));
+        assert!(state.ent_loaded_file.is_none());
+        assert_eq!(state.ent_filename, "mp/duel3.ent");
+        assert!(state.ent_pending_selection.is_none());
+        assert!(state.placed.is_empty() && state.bmodel_placed.is_empty() && state.fx_placed.is_empty());
+        assert!(state.authored_remaps.is_empty());
+        assert!(!state.ent_dirty && state.placed_dirty && state.bmodel_collision_dirty);
+        assert!(state.edit_mode && state.active && !state.editor_placing);
+        assert!(state.editor_selected.is_none());
+    }
+    #[test]
+    fn lists_only_valid_ent_files_recursively() {
+        let dir = std::env::temp_dir().join(format!("dinurdo-mapmods-{}-{}",
+            std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(dir.join("mp")).unwrap();
+        std::fs::write(dir.join("mp/duel3.ent"), b"{}").unwrap();
+        std::fs::write(dir.join("mp/duel3_copy.ent"), b"{}").unwrap();
+        std::fs::write(dir.join("mp/ignored.txt"), b"{}").unwrap();
+        let entries = list_ent_files(&dir).unwrap();
+        assert_eq!(entries, ["mp/duel3.ent", "mp/duel3_copy.ent"]);
+        assert_eq!(suggested_copy_name("mp/duel3.ent"), "mp/duel3_copy.ent");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn preserves_duplicate_properties_and_original_entity_order() {
         let original = vec![entity(&[("classname", "worldspawn".into()), ("music", "a".into()),

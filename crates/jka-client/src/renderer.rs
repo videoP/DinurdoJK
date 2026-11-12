@@ -937,6 +937,8 @@ struct Renderer {
     ocean_spray_pipeline: Option<wgpu::RenderPipeline>,
     /// Developer "riversource" patches: native Unreal river solver, debug view.
     live_rivers: Vec<crate::river_runtime::LiveRiver>,
+    /// Developer drains, applied to every live river and to new ones.
+    river_drains: Vec<crate::river_runtime::LocalDrain>,
     /// Presented players for river PreSim collisions (same records the
     /// ocean interaction reads), refreshed every render frame.
     river_actors: Arc<Vec<crate::ocean::interaction::ActorSample>>,
@@ -1361,6 +1363,10 @@ struct Renderer {
     /// needs the depth prepass and full post only below the surface; the plan
     /// is rebuilt when the camera crosses it.
     dof_plan_underwater: bool,
+    /// Live rivers existed when the frame plan was built. The river body
+    /// refracts a copy of the scene, so they force the compact post path
+    /// (a copyable scene target) even with post-processing and MSAA off.
+    plan_has_rivers: bool,
     motion_blur_runtime_scale: f32,
     previous_frame_time: f32,
     color_lut_preset: ColorLutPreset,

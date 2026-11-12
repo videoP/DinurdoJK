@@ -1285,8 +1285,8 @@ fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
             let (x0, y0) = (i as f32 * step, j as f32 * step);
             let (x1, y1) = (x0 + step, y0 + step);
             let p = |x: f32, y: f32| [x, y, ground(x, y)];
-            collision.push(jka_assets::bsp::river::CollisionSurface { triangle: [p(x0, y0), p(x1, y0), p(x1, y1)], solid_bottom_z: None });
-            collision.push(jka_assets::bsp::river::CollisionSurface { triangle: [p(x0, y0), p(x1, y1), p(x0, y1)], solid_bottom_z: None });
+            collision.push(jka_assets::bsp::river::CollisionSurface { triangle: [p(x0, y0), p(x1, y0), p(x1, y1)], solid_bottom_z: None, wall: false });
+            collision.push(jka_assets::bsp::river::CollisionSurface { triangle: [p(x0, y0), p(x1, y1), p(x0, y1)], solid_bottom_z: None, wall: false });
         }
     }
     let source = LocalSource {
@@ -1300,7 +1300,7 @@ fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
         mode: crate::river_runtime::SourceMode::WaterLevel,
         discharge_cfs:None,
     };
-    let spawn = |source| LiveRiver::spawn(device, queue, &collision, source, |_| None, None);
+    let spawn = |source| LiveRiver::spawn(device, queue, &collision, None, source, |_| None, None);
     assert!(spawn(LocalSource { radius: 8.0, ..source }).is_err());
     assert!(spawn(LocalSource { rate: 0.0, ..source }).is_err());
     let mut river = spawn(source).unwrap();

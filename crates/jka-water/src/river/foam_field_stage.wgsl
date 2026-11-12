@@ -63,6 +63,12 @@ fn river_foam_emit(unit:vec2<f32>)->f32 {
 @compute @workgroup_size(8,8)
 fn foam_stage(@builtin(global_invocation_id) id:vec3<u32>) {
     if any(id.xy>=textureDimensions(foam_output)) {return;}
+    river_foam_cell(id.xy);
+}
+
+// One FoamGrid cell of stage 16 (also called by jka-river's block-culled entry).
+fn river_foam_cell(cell:vec2<u32>) {
+    let id=vec3<u32>(cell,0u);
     let unit=(vec2<f32>(id.xy)+0.5)*foam.grid.yz;
     // Grid2D_Foam_Advect: UnitToWorld world position, curl noise, advection.
     let world=(foam.unit_to_world*vec4<f32>(unit,0.0,1.0)).xyz;

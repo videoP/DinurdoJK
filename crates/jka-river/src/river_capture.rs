@@ -75,6 +75,57 @@ pub fn clip_collision(
     (count >= 3).then_some((polygon, count))
 }
 
+/// A steep patch/soup face (`CollisionSurface::wall`) for the top-down
+/// capture. A vertical patch projects to a line with no area, so water would
+/// pass straight through it. Widen its XY footprint by `half_width` (map
+/// units) on every side into a rectangle at the face's highest point; with
+/// `half_width` at 0.75 cell the covered cells form an unbroken (8-connected)
+/// barrier, which the 4-neighbour solver cannot cross. A face entirely above
+/// the water level (arch, overhang) is dropped so water flows under it.
+pub fn wall_slab(t: &[[f32; 3]; 3], half_width: f32, water_level: Option<f32>) -> Option<[[f32; 3]; 4]> {
+    let bottom = t.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min);
+    let top = t.iter().map(|p| p[2]).fold(f32::NEG_INFINITY, f32::max);
+    if water_level.is_some_and(|level| bottom > level) {
+        return None;
+    }
+    let edge = |i: usize, j: usize| (t[j][0] - t[i][0]).hypot(t[j][1] - t[i][1]);
+    let (a, b) = [(0, 1), (1, 2), (2, 0)]
+        .into_iter()
+        .max_by(|&(i, j), &(k, l)| edge(i, j).total_cmp(&edge(k, l)))
+        .expect("three edges");
+    let length = edge(a, b);
+    let u = if length > 1e-4 { [(t[b][0] - t[a][0]) / length, (t[b][1] - t[a][1]) / length] } else { [1.0, 0.0] };
+    let v = [-u[1], u[0]];
+    let mut range = [[0.0f32, 0.0f32]; 2];
+    for p in t {
+        let r = [p[0] - t[a][0], p[1] - t[a][1]];
+        for (axis, d) in [u, v].into_iter().enumerate() {
+            let s = r[0] * d[0] + r[1] * d[1];
+            range[axis] = [range[axis][0].min(s), range[axis][1].max(s)];
+        }
+    }
+    let corner = |su: f32, sv: f32| [t[a][0] + u[0] * su + v[0] * sv, t[a][1] + u[1] * su + v[1] * sv, top];
+    let [lu, hu] = [range[0][0] - half_width, range[0][1] + half_width];
+    let [lv, hv] = [range[1][0] - half_width, range[1][1] + half_width];
+    Some([corner(lu, lv), corner(hu, lv), corner(hu, hv), corner(lu, hv)])
+}
+
+/// One collision surface's riverbed polygon (3 or 4 vertices, map units):
+/// a wall slab for steep mesh faces, `clip_collision` otherwise.
+pub fn bed_polygon(
+    t: &[[f32; 3]; 3],
+    solid_bottom_z: Option<f32>,
+    wall: bool,
+    water_level: Option<f32>,
+    cell_size: f32,
+) -> Option<([[f32; 3]; 4], usize)> {
+    if wall {
+        wall_slab(t, 0.75 * cell_size, water_level).map(|p| (p, 4))
+    } else {
+        clip_collision(t, solid_bottom_z, water_level)
+    }
+}
+
 pub struct BspCapture {
     positions: Vec<[f32; 3]>,
     groups: Vec<(MeshClass, Sides, Vec<u32>)>,
@@ -174,26 +225,37 @@ impl BspCapture {
         origin_map_units: [f32; 3],
         half_extent: [f32; 2],
     ) -> Result<Self, String> {
-        Self::capture_collision(triangles.iter().map(|t| (t, None)), origin_map_units, half_extent, None)
+        Self::capture_collision(triangles.iter().map(|t| (t, None, false)), origin_map_units, half_extent, None, 0.0)
     }
 
     /// Keep grounded solid obstacles that intersect the water, while dropping
-    /// overhead brushes and clipping terrain without brush thickness.
+    /// overhead brushes and clipping terrain without brush thickness. Steep
+    /// patch faces become wall slabs sized for `cell_size` (map units).
     pub fn from_collision_for_source(
         surfaces: &[jka_assets::bsp::river::CollisionSurface],
         origin_map_units: [f32; 3],
         half_extent: [f32; 2],
         water_level: f32,
+        cell_size: f32,
     ) -> Result<Self, String> {
-        if !water_level.is_finite() { return Err("invalid river capture water level".into()); }
-        Self::capture_collision(surfaces.iter().map(|s| (&s.triangle, s.solid_bottom_z)), origin_map_units, half_extent, Some(water_level))
+        if !water_level.is_finite() || !(cell_size.is_finite() && cell_size > 0.0) {
+            return Err("invalid river capture water level or cell size".into());
+        }
+        Self::capture_collision(
+            surfaces.iter().map(|s| (&s.triangle, s.solid_bottom_z, s.wall)),
+            origin_map_units,
+            half_extent,
+            Some(water_level),
+            cell_size,
+        )
     }
 
     fn capture_collision<'a>(
-        triangles: impl IntoIterator<Item = (&'a [[f32; 3]; 3], Option<f32>)>,
+        triangles: impl IntoIterator<Item = (&'a [[f32; 3]; 3], Option<f32>, bool)>,
         origin_map_units: [f32; 3],
         half_extent: [f32; 2],
         water_level: Option<f32>,
+        cell_size: f32,
     ) -> Result<Self, String> {
         if origin_map_units.iter().chain(&half_extent).any(|v| !v.is_finite())
             || half_extent.iter().any(|v| *v <= 0.0)
@@ -202,16 +264,16 @@ impl BspCapture {
         }
         let mut positions = Vec::new();
         let mut indices = Vec::new();
-        for (t, solid_bottom_z) in triangles {
+        for (t, solid_bottom_z, wall) in triangles {
+            let Some((polygon, count)) = bed_polygon(t, solid_bottom_z, wall, water_level, cell_size) else { continue; };
             let outside = (0..2).any(|a| {
-                let lo = t.iter().map(|p| p[a]).fold(f32::INFINITY, f32::min);
-                let hi = t.iter().map(|p| p[a]).fold(f32::NEG_INFINITY, f32::max);
+                let lo = polygon[..count].iter().map(|p| p[a]).fold(f32::INFINITY, f32::min);
+                let hi = polygon[..count].iter().map(|p| p[a]).fold(f32::NEG_INFINITY, f32::max);
                 hi < origin_map_units[a] - half_extent[a] || lo > origin_map_units[a] + half_extent[a]
             });
             if outside {
                 continue;
             }
-            let Some((polygon, count)) = clip_collision(t, solid_bottom_z, water_level) else { continue; };
             for k in 2..count {
                 for p in [polygon[0], polygon[k - 1], polygon[k]] {
                 let converted = std::array::from_fn::<_, 3, _>(|axis| {
@@ -232,6 +294,53 @@ impl BspCapture {
             positions,
             groups: vec![(MeshClass::Landscape, Sides::TwoSided, indices)],
         })
+    }
+
+    /// `r_riverCaptureMode 1`: the reachable bed (`river_reach::classify`)
+    /// as Landscape and the structures above it as Actors, both two-sided, so
+    /// the Actors capture records their real tops and undersides. Triangles
+    /// outside the capture rectangle are dropped.
+    pub fn from_classified(
+        landscape: &[[[f32; 3]; 3]],
+        actors: &[[[f32; 3]; 3]],
+        origin_map_units: [f32; 3],
+        half_extent: [f32; 2],
+    ) -> Result<Self, String> {
+        if origin_map_units.iter().chain(&half_extent).any(|v| !v.is_finite())
+            || half_extent.iter().any(|v| *v <= 0.0)
+        {
+            return Err("invalid river collision capture origin or extent".into());
+        }
+        let mut positions = Vec::new();
+        let mut groups = Vec::new();
+        for (class, triangles) in [(MeshClass::Landscape, landscape), (MeshClass::Actors, actors)] {
+            let mut indices = Vec::new();
+            for t in triangles {
+                let outside = (0..2).any(|a| {
+                    let lo = t.iter().map(|p| p[a]).fold(f32::INFINITY, f32::min);
+                    let hi = t.iter().map(|p| p[a]).fold(f32::NEG_INFINITY, f32::max);
+                    hi < origin_map_units[a] - half_extent[a] || lo > origin_map_units[a] + half_extent[a]
+                });
+                if outside {
+                    continue;
+                }
+                for p in t {
+                    let converted = std::array::from_fn::<_, 3, _>(|axis| {
+                        (p[axis] - origin_map_units[axis]) * CENTIMETRES_PER_MAP_UNIT
+                    });
+                    if converted.iter().any(|v| !v.is_finite()) {
+                        return Err("nonfinite river collision vertex".into());
+                    }
+                    indices.push(u32::try_from(positions.len()).map_err(|_| "too many river capture vertices")?);
+                    positions.push(converted);
+                }
+            }
+            if class == MeshClass::Landscape && indices.is_empty() {
+                return Err("no reachable river bed in the capture area (r_riverCaptureMode 1)".into());
+            }
+            groups.push((class, Sides::TwoSided, indices));
+        }
+        Ok(Self { positions, groups })
     }
 
     pub fn meshes(&self) -> Vec<Mesh<'_>> {
@@ -747,5 +856,30 @@ impl DepthCaptures {
 
     pub fn resolution(&self) -> u32 {
         self.resolution
+    }
+}
+
+#[cfg(test)]
+mod wall_slab_tests {
+    use super::*;
+
+    #[test]
+    fn vertical_patch_face_becomes_a_widened_wall_unless_overhead() {
+        // A vertical face along X: no area from above.
+        let face = [[0.0, 0.0, 0.0], [64.0, 0.0, 0.0], [64.0, 0.0, 100.0]];
+        let slab = wall_slab(&face, 12.0, Some(50.0)).expect("grounded wall is kept");
+        let xs = slab.map(|p| p[0]);
+        let ys = slab.map(|p| p[1]);
+        assert!(slab.iter().all(|p| p[2] == 100.0), "flat at the face's top");
+        assert_eq!(xs.iter().copied().fold(f32::INFINITY, f32::min), -12.0);
+        assert_eq!(xs.iter().copied().fold(f32::NEG_INFINITY, f32::max), 76.0);
+        assert_eq!(ys.iter().copied().fold(f32::INFINITY, f32::min), -12.0);
+        assert_eq!(ys.iter().copied().fold(f32::NEG_INFINITY, f32::max), 12.0);
+        // Entirely above the water: an arch the river passes under.
+        let arch = face.map(|p| [p[0], p[1], p[2] + 200.0]);
+        assert!(wall_slab(&arch, 12.0, Some(50.0)).is_none());
+        // Ground faces still take the clip path.
+        let floor = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]];
+        assert_eq!(bed_polygon(&floor, None, false, Some(50.0), 16.0).map(|(_, n)| n), Some(3));
     }
 }

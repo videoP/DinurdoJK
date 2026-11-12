@@ -2047,7 +2047,7 @@ impl RagdollWorld {
             Some(FxDraw::Quad {
                 positions, uvs: glass.spec.uvs,
                 rgba: [255, 255, 255, (alpha * 255.0) as u8],
-                shader: "gfx/misc/test_crackle".to_owned(),
+                shader: "gfx/misc/test_crackle".into(),
             })
         }).collect()
     }

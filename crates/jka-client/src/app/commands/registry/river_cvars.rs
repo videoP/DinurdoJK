@@ -1,6 +1,15 @@
 //! Authored river material controls; native defaults, generation unchanged.
 use super::cvar_prelude::*;
 app_cvars! {
+    APP_R_RIVERUNDERWATEROPTICS {
+        runtime: CvarDef::new("r_riverUnderwaterOptics", "1", "0..1",
+            "River underwater A/B: 0 original appearance, 1 shared Blue Water optics with subtle waterline tint (default). Visual only; s_underwater audio is independent.",
+            CvarType::Int {min:0,max:1}, CvarFlags::ARCHIVE, LatchScope::None,
+            |app:&App|CvarValue::Int(i32::from(app.video.river_settings.underwater_optics)),
+            |app,value|{let CvarValue::Int(v)=value else {unreachable!()};app.video.river_settings.underwater_optics=v.clamp(0,1) as u8;app.commit_river_settings();Ok(())}),
+        config: CvarBinding {load_video:Some(|s,_,v,_|{if let Ok(v)=v.parse::<u8>(){s.river_settings.underwater_optics=v.min(1);}}),
+            archive:Some((29134,|s|s.video.river_settings.underwater_optics.to_string())),..CvarBinding::NONE}, implementations: []
+    }
     APP_R_RIVERFOAMMINIMUMDEPTH {
         runtime: CvarDef::new("r_riverFoamMinimumDepth", "60", "0..200", "Minimum water-column depth for new river foam in map units. Full depth weight is reached at 3.333 times this depth; zero removes the depth gate.", CvarType::Float {min:0.0,max:200.0}, CvarFlags::ARCHIVE, LatchScope::None,
             |app:&App|CvarValue::Float(app.video.river_settings.foam_minimum_depth), |app,value|{let CvarValue::Float(v)=value else {unreachable!()};app.video.river_settings.foam_minimum_depth=v;app.commit_river_settings();Ok(())}),

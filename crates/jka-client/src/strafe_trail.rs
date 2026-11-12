@@ -789,7 +789,7 @@ fn append_formatted_time_marker(draws: &mut Vec<FxDraw>, origin: [f32; 3], camer
         } else if let Some(digit)=byte.checked_sub(b'0').filter(|d|*d<=9) {
             draws.push(FxDraw::Sprite {shader_time:0.0,origin:pos,
                 radius:PLUM_NUMBER_SIZE*0.5,rotation:0.0,rgba,
-                shader:NUMBER_SHADERS[digit as usize].to_owned(),
+                shader:NUMBER_SHADERS[digit as usize].into(),
             });
         }
     }

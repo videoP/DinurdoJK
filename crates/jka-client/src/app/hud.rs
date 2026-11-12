@@ -84,6 +84,15 @@ impl App {
         let console_line_kinds: Vec<crate::logging::ConsoleLineKind> = visible_rows.iter()
             .map(|row| self.console_line_kinds.get(row.line).copied().unwrap_or_default())
             .collect();
+        let console_translate_checked: Vec<Option<bool>> = if self.overlay == OverlayMode::Console
+            && !self.console_hl2
+        {
+            visible_rows.iter().map(|row| {
+                if row.start_col != 0 { return None; }
+                self.console_chat_ids.get(row.line).copied().flatten()
+                    .and_then(|id| self.console_chat_translate_checked(id))
+            }).collect()
+        } else { Vec::new() };
 
         // Selection coordinates remain tied to original messages so a resize
         // never changes what a drag, double-click, or Ctrl+C selects.
@@ -225,9 +234,11 @@ impl App {
             console_status: self.console_status.clone(),
             console_lines,
             console_line_kinds,
+            console_translate_checked,
             console_scroll: 0,
             console_size: self.console_size,
             console_hl2: self.console_hl2,
+            classic_console_chat_menu_open: self.classic_console_chat_menu_open(),
             console_scale: self.console_scale,
             console_selection,
             console_search_open: self.console_search_open,

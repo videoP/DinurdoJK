@@ -15,6 +15,7 @@ struct RiverFar {
     lattice: vec4<i32>, // lattice cells xy, tile table width, log2 tile size
     lod: vec4<f32>,     // LODScale (cm), LOD morphing enabled, NumQuadsLOD0, tile cells
     window: vec4<f32>,  // camera-window interior min xy, max xy (river cm); empty when min > max
+    format: vec4<u32>,  // x: pool normals packed (r_riverStorageMode 2), else vec4<f32> words; yzw unused
 }
 struct RiverFarInstance {
     translation: vec4<f32>, // Data[0]: tile centre xy, base height, unused (river cm)
@@ -26,7 +27,8 @@ struct RiverFarInstance {
 @group(1) @binding(10) var<uniform> river_far: RiverFar;
 @group(1) @binding(11) var<storage, read> far_slots: array<i32>;
 @group(1) @binding(12) var<storage, read> far_surface: array<vec4<f32>>;
-@group(1) @binding(13) var<storage, read> far_normals: array<vec4<f32>>;
+// Pool normals as words: four FP32 words per cell, or one octahedral word.
+@group(1) @binding(13) var<storage, read> far_normals: array<u32>;
 @group(1) @binding(14) var<storage, read> far_instances: array<RiverFarInstance>;
 
 // Pool index of a lattice cell, or -1 outside the lattice / not resident.
@@ -47,7 +49,9 @@ fn river_far_load(cell: vec2<i32>) -> vec4<f32> {
 fn river_far_normal_load(cell: vec2<i32>) -> vec3<f32> {
     let i = river_far_index(cell);
     if i < 0 { return vec3<f32>(0.0, 0.0, 1.0); }
-    return far_normals[u32(i)].xyz;
+    if river_far.format.x != 0u { return river_unpack_normal(far_normals[u32(i)]); }
+    let w = u32(i) * 4u;
+    return bitcast<vec3<f32>>(vec3<u32>(far_normals[w], far_normals[w + 1u], far_normals[w + 2u]));
 }
 // river_live_field on the pool: cell-centred bilinear, zero outside.
 fn river_far_field(world_xy: vec2<f32>) -> vec4<f32> {
@@ -128,7 +132,17 @@ struct RiverFarOut {
     let normal = river_far_base_normal(world_xy);
     let detail = river_wave_vertex(ocean_detail, ocean_sampler, world_xy, fluid.zw, normal, river_view.time.x, river_wpo_advection());
     let wave_height = river_advected_height(detail.a, length(fluid.zw), camera_distance, river_wave_height());
-    let world = river_grid_displacement(fluid, normal, wave_height, rest, up, river_motion(river_view.time.z), false);
+    var world = river_grid_displacement(fluid, normal, wave_height, rest, up, river_motion(river_view.time.z), false);
+    // Bed clamp, vertex half (river_surface.wgsl river_lip_lift).
+    {
+        let position = (world_xy - river_far.origin.xy) / river_far.origin.w - vec2<f32>(0.5);
+        let cell = vec2<i32>(floor(position));
+        let a = river_far_load(cell);
+        let b = river_far_load(cell + vec2<i32>(1, 0));
+        let c = river_far_load(cell + vec2<i32>(0, 1));
+        let d = river_far_load(cell + vec2<i32>(1, 1));
+        world += up * river_lip_lift(a, b, c, d, fluid.x, river_far.origin.w);
+    }
     let map = world / RIVER_CM_PER_UNIT;
     var out: RiverFarOut;
     out.clip = camera.view_proj * vec4<f32>(map.x, map.z, -map.y, 1.0);
@@ -154,8 +168,8 @@ fn river_far_pixel(world: vec3<f32>, pixel_depth: f32, foam: RiverFoam) -> River
     // Inside the simulation everywhere (the lattice border is a collider).
     let masks = river_surface_masks(fluid.y, 1.0, vec2<f32>(0.5), vec2<f32>(1.0e6), 1.0, pixel_depth, 3.0e38);
     let base = river_far_base_normal(world_xy);
-    let wpo = river_wave_fragment(ocean_detail, ocean_sampler, world_xy, fluid.zw, base, time, river_wpo_advection()).xyz;
-    let detail = river_wave_fragment(ocean_detail, ocean_sampler, world_xy, fluid.zw, base, time, river_detail_advection()).xyz;
+    let wpo = river_wave_fragment_lod(ocean_detail, ocean_sampler, world_xy, fluid.zw, base, time, river_wpo_advection(), river_view.material_lod.xy).xyz;
+    let detail = river_wave_fragment_lod(ocean_detail, ocean_sampler, world_xy, fluid.zw, base, time, river_detail_advection(), river_view.material_lod.xy).xyz;
     let graph_normal = river_surface_normal(base, wpo, detail, length(fluid.zw), river_motion(river_view.time.z), river_wave_height(),
         foam.normal, foam.total, river_foam_settings().shading.x, masks.simulation_mask);
     // The camera window draws its interior (it drops its own outermost cell).
@@ -177,7 +191,21 @@ fn river_far_pixel(world: vec3<f32>, pixel_depth: f32, foam: RiverFoam) -> River
 
 // r_showtris river bit: the water mesh tiles, coloured by LOD level (as
 // r.Water.WaterMesh.ShowLODLevels colours by GColorList index).
+// r_riverWire 0: only where fs_far draws (outside the window, wet).
 @fragment fn fs_far_wire(input: RiverFarOut) -> @location(0) vec4<f32> {
+    let fluid = river_far_field(input.world.xy);
+    let masks = river_surface_masks(fluid.y, 1.0, vec2<f32>(0.5), vec2<f32>(1.0e6), 1.0, 0.0, 3.0e38);
+    let inside = all(input.world.xy > river_far.window.xy) && all(input.world.xy < river_far.window.zw);
+    if inside || masks.material_mask < 0.3333 {
+        discard;
+    }
+    return river_far_lod_colour(input);
+}
+// r_riverWire 1: every tile, dry parts included.
+@fragment fn fs_far_wire_full(input: RiverFarOut) -> @location(0) vec4<f32> {
+    return river_far_lod_colour(input);
+}
+fn river_far_lod_colour(input: RiverFarOut) -> vec4<f32> {
     let colours = array<vec3<f32>, 8>(
         vec3<f32>(1.0, 0.2, 0.2), vec3<f32>(1.0, 0.6, 0.1), vec3<f32>(1.0, 1.0, 0.2), vec3<f32>(0.3, 1.0, 0.3),
         vec3<f32>(0.2, 0.9, 1.0), vec3<f32>(0.3, 0.4, 1.0), vec3<f32>(0.8, 0.3, 1.0), vec3<f32>(1.0, 1.0, 1.0));

@@ -197,7 +197,8 @@ impl Renderer {
             || manual_exposure
             || self.overbright_bits != 0
             || legacy2_precision_post
-            || rain_lens_copy;
+            || rain_lens_copy
+            || self.plan_has_rivers;
         let use_post = compact_post_reason || full_post_effects;
         // Gamma and color LUTs affect only the final image. Keep the fast BSP
         // shaders/frame recorder and reuse one compact post pass for both.

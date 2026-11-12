@@ -201,6 +201,8 @@ impl GameSession {
                             // validate the spectator-follow heuristic against.
                             spectating_you: false,
                             muted: false,
+                            translate_checked: None,
+                            translate_source: None,
                             crowned: false,
                             model: String::new(),
                             model_fallback: String::new(),
@@ -2544,6 +2546,8 @@ impl App {
                 let audio_eye = scene::jka_position(self.camera.position.to_array());
                 let bsp_submerged = playback.sound_presenter.as_ref().is_some_and(|s| s.underwater_enabled())
                     && playback.player_presenter.audio_listener_in_bsp_water(audio_eye);
+                let river_submerged = playback.sound_presenter.as_ref().is_some_and(|s| s.underwater_enabled())
+                    && crate::river_runtime::listener_in_river(audio_eye);
                 if let Some(sound) = &mut playback.sound_presenter {
                     let yaw = self.camera.yaw;
                     sound.frame(
@@ -2556,7 +2560,7 @@ impl App {
                         },
                         &playback.presented_entities,
                         playback.audio_followed_entity.as_ref(),
-                        bsp_submerged,
+                        bsp_submerged || river_submerged,
                     );
                     if let Some(snapshot) = playback.client_game.current_snapshot() {
                         sound.update_announcer(
