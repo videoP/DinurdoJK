@@ -592,7 +592,7 @@ impl App {
                         .message_ref(chat_id)
                         .and_then(|message| message.record_censor(&display_text));
                     self.chat_lines.push_back(ChatRecord {
-                        text: display_text,
+                        text: crate::cgame::decode_wire_cyrillic(&display_text).unwrap_or(display_text),
                         team,
                         created: now,
                         demo_elapsed_ms,

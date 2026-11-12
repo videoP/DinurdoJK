@@ -3116,8 +3116,41 @@ pub fn bytes_to_lossless_ascii(value: &[u8]) -> String {
 pub fn text_to_jka_bytes(value: &str) -> Vec<u8> {
     value
         .chars()
-        .map(|ch| u8::try_from(ch as u32).unwrap_or(b'?'))
+        .map(|ch| u8::try_from(ch as u32).unwrap_or_else(|_| cyrillic_to_windows_1251(ch).unwrap_or(b'?')))
         .collect()
+}
+
+/// Windows-1251 byte for a Cyrillic character. Russian JKA players type in
+/// this codepage, so typed Cyrillic goes on the wire as it would from theirs.
+pub fn cyrillic_to_windows_1251(ch: char) -> Option<u8> {
+    match ch {
+        '\u{410}'..='\u{44F}' => Some(0xC0 + (ch as u32 - 0x410) as u8),
+        '\u{401}' => Some(0xA8),
+        '\u{451}' => Some(0xB8),
+        '\u{404}' => Some(0xAA),
+        '\u{454}' => Some(0xBA),
+        '\u{406}' => Some(0xB2),
+        '\u{456}' => Some(0xB3),
+        '\u{407}' => Some(0xAF),
+        '\u{457}' => Some(0xBF),
+        '\u{490}' => Some(0xA5),
+        '\u{491}' => Some(0xB4),
+        _ => None,
+    }
+}
+
+/// Received text is one char per wire byte. When it is really Cyrillic
+/// (Windows-1251, or UTF-8 from a modern client) return it as Unicode so the
+/// UI fonts can draw it; anything else yields `None`.
+pub fn decode_wire_cyrillic(value: &str) -> Option<String> {
+    use jka_client_services::chat_translation::text::{decode, Codepage};
+    if value.is_ascii() || value.chars().any(|ch| ch as u32 > 0xFF) {
+        return None;
+    }
+    let decoded = decode(&text_to_jka_bytes(value), Codepage::Auto);
+    // Same char count keeps column positions (colour spans, name prefix) valid.
+    let cyrillic = decoded.chars().any(|ch| ('\u{400}'..='\u{4FF}').contains(&ch));
+    (cyrillic && decoded.chars().count() == value.chars().count()).then_some(decoded)
 }
 
 /// Unicode characters Windows produces for the old no-leading-zero ALT codes.
@@ -3146,6 +3179,11 @@ pub fn unicode_input_char_to_jka_char(ch: char) -> char {
     }
     // Leading-zero Windows ALT codes and Latin-1 paste paths can already carry
     // the desired raw 8-bit value. Preserve those when CP437 has no match.
+    // Cyrillic stays Unicode so the input line can show it; it is encoded as
+    // Windows-1251 only when sent (`text_to_jka_bytes`).
+    if cyrillic_to_windows_1251(ch).is_some() {
+        return ch;
+    }
     char::from(u8::try_from(code).unwrap_or(b'?'))
 }
 
@@ -5271,5 +5309,27 @@ mod breath_weather_port_tests {
             "wind", "constantwind ( 0 800 0 )", "gustingwind"] {
             assert!(breath_weather_command_enables_cold(command), "{command}");
         }
+    }
+}
+
+#[cfg(test)]
+mod cyrillic_text_tests {
+    use super::*;
+
+    #[test]
+    fn typed_cyrillic_survives_input_and_goes_out_as_windows_1251() {
+        let typed = unicode_input_to_jka_text("привет");
+        assert_eq!(typed, "привет");
+        assert_eq!(text_to_jka_bytes(&typed), [0xEF, 0xF0, 0xE8, 0xE2, 0xE5, 0xF2]);
+        assert_eq!(text_to_jka_bytes("Ёё"), [0xA8, 0xB8]);
+        assert_eq!(text_to_jka_bytes("你"), b"?");
+    }
+
+    #[test]
+    fn received_windows_1251_is_shown_as_cyrillic() {
+        let wire: String = text_to_jka_bytes("^7Bob^7: ^2привет").into_iter().map(char::from).collect();
+        assert_eq!(decode_wire_cyrillic(&wire).as_deref(), Some("^7Bob^7: ^2привет"));
+        assert_eq!(decode_wire_cyrillic("plain"), None);
+        assert_eq!(decode_wire_cyrillic("caf\u{e9} cr\u{e8}me"), None);
     }
 }

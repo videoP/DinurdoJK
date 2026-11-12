@@ -343,6 +343,7 @@ impl App {
         chat_id: Option<u64>,
     ) {
         let (line, skip_notify) = Self::strip_console_notify_prefix(line.into());
+        let line = crate::cgame::decode_wire_cyrillic(&line).unwrap_or(line);
         match chat_id {
             Some(id) => crate::logging::write_chat_console_line(kind, format_args!("{line}"), id),
             None => crate::logging::write_console_line(kind, format_args!("{line}")),
