@@ -3,6 +3,7 @@ use super::{
     original_sun::{self, BakedSunCalibration},
     sun_bake_cache as cache,
     sun_bake_upload::MaskUpload,
+    sun_direction_fit::{self, DirectionFit},
 };
 use crate::renderer::{
     scene, Arc, DrawBatch, GpuImage, GpuVertex, Renderer, StaticAoWorldSource, TextureData,
@@ -25,7 +26,7 @@ struct Source {
     lightmaps: Arc<Vec<TextureData>>,
     surface_ids: Vec<u32>,
     surfaces: Vec<scene::LegacyDlightSurface>,
-    sun: scene::DirectionalSun,
+    sun: Option<scene::DirectionalSun>,
     encoding: Option<scene::BakedSunEncoding>,
 }
 
@@ -52,9 +53,23 @@ impl Drop for Pending {
     }
 }
 
+struct DirectionPending {
+    rx: mpsc::Receiver<Result<DirectionFit, String>>,
+    cancelled: Arc<AtomicBool>,
+}
+impl Drop for DirectionPending {
+    fn drop(&mut self) { self.cancelled.store(true, Ordering::Relaxed); }
+}
+
 pub(in crate::renderer) struct SunBake {
     source: Option<Arc<Source>>,
     pending: Option<Pending>,
+    direction_pending: Option<DirectionPending>,
+    direction_status: crate::renderer::BakedSunDirectionStatus,
+    fitted_direction: Option<DirectionFit>,
+    using_detected: bool,
+    selected_sun: Option<scene::DirectionalSun>,
+    selected_encoding: Option<scene::BakedSunEncoding>,
     pub(in crate::renderer) ready: bool,
     pub(in crate::renderer) auto_strength: Option<f32>,
     masks: Option<Vec<Vec<u8>>>,
@@ -80,9 +95,8 @@ impl SunBake {
         surfaces: &[scene::LegacyDlightSurface],
     ) -> Self {
         let source = ao
-            .zip(sun)
             .filter(|_| lightmaps.iter().any(|image| image.rgba16f.is_none()))
-            .map(|(ao, sun)| {
+            .map(|ao| {
                 Arc::new(Source {
                     cache: ao.cache.clone(),
                     vertices: Arc::clone(&ao.vertices),
@@ -102,9 +116,20 @@ impl SunBake {
                 .map(|image| [image.width, image.height])
                 .collect()
         });
+        let supported = source.is_some();
         Self {
             source,
             pending: None,
+            direction_pending: None,
+            direction_status: if supported {
+                crate::renderer::BakedSunDirectionStatus::Idle
+            } else {
+                crate::renderer::BakedSunDirectionStatus::Unavailable
+            },
+            fitted_direction: None,
+            using_detected: false,
+            selected_sun: sun,
+            selected_encoding: encoding,
             ready: false,
             auto_strength: None,
             masks: None,
@@ -140,6 +165,11 @@ impl SunBake {
             return;
         };
         patch_mask(mask, base, rgba, image, rect);
+    }
+
+    /// The original baked direction can differ from the current/edited map sun.
+    pub(in crate::renderer) fn baked_direction(&self) -> Option<scene::DirectionalSun> {
+        self.selected_sun
     }
 
     pub(in crate::renderer) fn has_masks(&self) -> bool {
@@ -187,15 +217,15 @@ fn patch_mask(mask: &[u8], base: [u32; 2], rgba: &mut [u8], image: [u32; 2], rec
     }
 }
 
-fn fingerprint(source: &Source) -> u64 {
+fn fingerprint(source: &Source, sun: scene::DirectionalSun, encoding: Option<scene::BakedSunEncoding>) -> u64 {
     // Same deterministic FoldHasher on disk and across runs. Bump the cache
     // magic/version whenever reconstruction math changes.
     let mut hash = scene::FoldHasher::default();
-    hash.write(b"baked-sun-v5-clip-cap");
+    hash.write(b"baked-sun-v6-direction-search");
     hash.write(&source.cache.map_hash.to_le_bytes());
     hash.write(bytemuck::cast_slice(&source.vertices));
     hash.write(bytemuck::cast_slice(&source.surface_ids));
-    hash.write(format!("{:?}{:?}{:?}", source.sun, source.encoding, source.surfaces).as_bytes());
+    hash.write(format!("{:?}{:?}{:?}", sun, encoding, source.surfaces).as_bytes());
     let mut filtered = std::collections::BTreeSet::new();
     for batch in &source.batches {
         hash.write(format!("{batch:?}").as_bytes());
@@ -264,10 +294,12 @@ fn run(
     cancelled: &AtomicBool,
     device: &wgpu::Device,
     worker_override: u8,
+    sun: scene::DirectionalSun,
+    encoding: Option<scene::BakedSunEncoding>,
 ) -> Result<Completed, String> {
     lower_priority();
     let started = Instant::now();
-    let key = fingerprint(source);
+    let key = fingerprint(source, sun, encoding);
     let path = cache_path(source, key);
     let sizes: Vec<_> = source
         .lightmaps
@@ -298,12 +330,12 @@ fn run(
                 .lightmaps
                 .iter()
                 .all(|image| image.rgba16f.is_none() && image.mip_level_count == 1);
-            let mut images = if supported && source.encoding.is_some() {
+            let mut images = if supported && encoding.is_some() {
                 source.lightmaps.as_ref().clone()
             } else {
                 Vec::new()
             };
-            let projected = source.encoding.filter(|_| supported).and_then(|encoding| {
+            let projected = encoding.filter(|_| supported).and_then(|encoding| {
                 original_sun::bake_authored_sun_masks(
                     &source.vertices,
                     &source.batches,
@@ -311,7 +343,7 @@ fn run(
                     &mut images,
                     &source.surface_ids,
                     source.surfaces.len(),
-                    source.sun,
+                    sun,
                     encoding,
                     cancelled,
                 )
@@ -332,7 +364,7 @@ fn run(
                     &source.lightmaps,
                     &source.surface_ids,
                     &source.surfaces,
-                    source.sun,
+                    sun,
                     cancelled,
                 )
             });
@@ -370,7 +402,137 @@ fn run(
     })
 }
 
+fn direction_selection_status(fit: Option<DirectionFit>, using_detected: bool)
+    -> crate::renderer::BakedSunDirectionStatus
+{
+    fit.map_or(crate::renderer::BakedSunDirectionStatus::Idle, |fit| {
+        crate::renderer::BakedSunDirectionStatus::Found {
+            azimuth: fit.azimuth,
+            elevation: fit.elevation,
+            confidence: fit.confidence,
+            using_detected,
+        }
+    })
+}
+
 impl Renderer {
+    pub(in crate::renderer) fn baked_sun_direction_status(&self) -> crate::renderer::BakedSunDirectionStatus {
+        self.world.as_ref().filter(|world| !world.source_map)
+            .map_or(crate::renderer::BakedSunDirectionStatus::Unavailable,
+                |world| world.sun_bake.direction_status)
+    }
+
+    /// Explicit one-shot request. Only the worker traces candidate shadows.
+    /// The rendering thread merely installs a finished fit at a frame boundary.
+    pub(in crate::renderer) fn find_baked_sun_direction(&mut self) {
+        let Some(world) = self.world.as_mut().filter(|world| !world.source_map) else { return; };
+        let state = &mut world.sun_bake;
+        if state.direction_pending.is_some() { return; }
+        let Some(source) = state.source.clone() else {
+            state.direction_status = crate::renderer::BakedSunDirectionStatus::Unavailable;
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancelled);
+        match std::thread::Builder::new().name("jka-sun-direction-search".into()).spawn(move || {
+            lower_priority();
+            let result = sun_direction_fit::search(&source.vertices, &source.batches, &source.lightmaps, &signal);
+            let _ = tx.send(result);
+        }) {
+            Ok(_) => {
+                state.direction_pending = Some(DirectionPending { rx, cancelled });
+                state.direction_status = crate::renderer::BakedSunDirectionStatus::Searching;
+                println!("[BAKED SUN] Searching low-resolution shadow gradients for original yaw/pitch");
+            }
+            Err(error) => {
+                state.direction_status = crate::renderer::BakedSunDirectionStatus::Failed;
+                eprintln!("[BAKED SUN] Could not launch direction search: {error}");
+            }
+        }
+    }
+
+    /// Switch the *baked* sun source, never the live sky. A detected fit is
+    /// retained for the current map so both sources can be selected repeatedly
+    /// without running the expensive directional search again.
+    pub(in crate::renderer) fn select_baked_sun_direction(&mut self, detected: bool) {
+        self.select_baked_sun_direction_impl(detected, false);
+    }
+
+    fn select_baked_sun_direction_impl(&mut self, detected: bool, fit_changed: bool) {
+        let Some(world) = self.world.as_mut().filter(|world| !world.source_map) else { return; };
+        let state = &mut world.sun_bake;
+        let Some(source) = state.source.as_ref() else { return; };
+        let (sun, encoding) = if detected {
+            let Some(fit) = state.fitted_direction else { return; };
+            let color = source.sun.map_or([1.0; 3], |sun| sun.color);
+            let intensity = source.sun.map_or(350.0, |sun| sun.intensity.max(1.0));
+            (Some(scene::DirectionalSun::from_q3_angles(color, intensity, fit.azimuth, fit.elevation)),
+                Some(source.encoding.unwrap_or(scene::BakedSunEncoding {
+                    exposure: 0.0, gamma: 1.0, compensate: 1.0, brightness: 1.0,
+                    deviance: 0.0, samples: 1,
+                })))
+        } else {
+            let Some(sun) = source.sun else { return; };
+            (Some(sun), source.encoding)
+        };
+        if state.using_detected == detected && !fit_changed {
+            // The selected source is already active. If a search is still
+            // running, selecting it again only cancels that search, retaining
+            // the finished calibration and currently bound masks.
+            if state.direction_pending.take().is_some() {
+                state.direction_status = direction_selection_status(state.fitted_direction, detected);
+            }
+            return;
+        }
+        // Cancel outstanding search/reconstruction. A cancelled receiver cannot
+        // later install its old direction or mask after the user switches back.
+        state.direction_pending.take();
+        state.pending.take();
+        state.selected_sun = sun;
+        state.selected_encoding = encoding;
+        state.using_detected = detected;
+        state.direction_status = direction_selection_status(state.fitted_direction, detected);
+        state.ready = false;
+        state.auto_strength = None;
+        let had_masks = state.masks.take().is_some() | state.contour_masks.take().is_some();
+        state.active_contour = false;
+        // A previous fit may have installed its alpha mask into the original
+        // lightmaps. Restore their source alpha, preserving the current AO RGB,
+        // before preparing another fit. No per-frame GPU work is introduced.
+        if had_masks {
+            if let Some(upload) = state.upload.as_ref() {
+                let alphas: Vec<Vec<u8>> = world.lightmap_base_data.iter().map(|base| {
+                    base.rgba.chunks_exact(4).map(|pixel| pixel[3]).collect()
+                }).collect();
+                let source_images = world.baked_sun_cache.as_ref()
+                    .map_or(&world.lightmaps, |cache| &cache.original);
+                let restored = upload.apply(&self.device, &self.queue, source_images,
+                    &world.lightmap_base_data, &alphas);
+                if let Some(cache) = world.baked_sun_cache.as_mut() {
+                    cache.original = restored.clone();
+                    cache.active = false;
+                    cache.strength = None;
+                }
+                world.lightmaps = restored;
+            }
+        }
+        // Keep the warmed mask-upload pipeline for an eventual next install.
+        world.baked_sun_radiance = None;
+        world.baked_sun_encoding = None;
+        let source_name = if detected { "detected" } else { "authored map" };
+        println!("[BAKED SUN] Using {source_name} direction; refreshing sunlight calibration");
+        // The lightmap source can have changed even when the composition is
+        // active; always rebind immediately after a one-shot alpha restoration.
+        self.rebuild_frame_plan();
+        self.sync_runtime_variant_flags();
+        // update_lighting_settings and binding rebuild are performed below.
+        let mut world = self.world.take().unwrap();
+        self.rebuild_world_surface_bind_groups(&mut world);
+        self.world = Some(world);
+        self.update_lighting_settings();
+    }
+
     /// Read-only: the UI receives a notification only when this result changes.
     /// Never expose a previous map's fitted value through the saved manual cvar.
     pub(in crate::renderer) fn baked_sun_auto_status(&self) -> crate::renderer::BakedSunAutoStatus {
@@ -388,7 +550,7 @@ impl Renderer {
                 None => BakedSunAutoStatus::Unavailable,
             };
         }
-        if bake.source.is_none() && bake.pending.is_none() {
+        if bake.selected_sun.is_none() || (bake.source.is_none() && bake.pending.is_none()) {
             BakedSunAutoStatus::Unavailable
         } else {
             BakedSunAutoStatus::Calibrating
@@ -398,6 +560,37 @@ impl Renderer {
     /// One settings/ready/channel check in ordinary frames. Hashing, cache I/O,
     /// tracing and pipeline compilation stay on the background worker.
     pub(in crate::renderer) fn sync_sun_bake(&mut self) {
+        let direction_result = self.world.as_mut().and_then(|world| {
+            let state = &mut world.sun_bake;
+            let result = state.direction_pending.as_ref().and_then(|pending| match pending.rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err("direction worker disconnected".into())),
+                Err(mpsc::TryRecvError::Empty) => None,
+            });
+            if result.is_some() { state.direction_pending.take(); }
+            result
+        });
+        if let Some(result) = direction_result {
+            match result {
+                Ok(fit) => {
+                    self.world.as_mut().unwrap().sun_bake.fitted_direction = Some(fit);
+                    self.select_baked_sun_direction_impl(true, true);
+                    println!("[BAKED SUN] Matched original sun: yaw {:.2}°, pitch {:.2}°, score {:.3}, {} shadow edges. Rebuilding removal masks.",
+                        fit.azimuth, fit.elevation, fit.confidence, fit.transitions);
+                }
+                Err(error) => {
+                    if let Some(world) = self.world.as_mut() {
+                        let state = &mut world.sun_bake;
+                        state.direction_status = if state.fitted_direction.is_some() {
+                            direction_selection_status(state.fitted_direction, state.using_detected)
+                        } else {
+                            crate::renderer::BakedSunDirectionStatus::Failed
+                        };
+                    }
+                    eprintln!("[BAKED SUN] Sun-direction search rejected: {error}; original lightmaps preserved");
+                }
+            }
+        }
         let desired = self.baked_sun_removal_auto || self.baked_sun_removal_contour
             || requested(self.effective_baked_sun_removal(), self.baked_sun_debug_mode);
         let worker_override = self.bake_threads;
@@ -428,7 +621,6 @@ impl Renderer {
                     Err(error) => {
                         let state = &mut self.world.as_mut().unwrap().sun_bake;
                         state.ready = true;
-                        state.source = None;
                         eprintln!(
                             "[BAKED SUN] background preparation failed after {:.2}s; authored lighting preserved: {error}",
                             started.elapsed().as_secs_f64()
@@ -450,9 +642,11 @@ impl Renderer {
             return;
         }
         let state = &mut self.world.as_mut().unwrap().sun_bake;
-        if state.ready || state.pending.is_some() {
+        if state.ready || state.pending.is_some() || state.direction_pending.is_some() {
             return;
         }
+        let Some(sun) = state.selected_sun else { return; };
+        let encoding = state.selected_encoding;
         let Some(source) = state.source.clone() else {
             return;
         };
@@ -464,13 +658,12 @@ impl Renderer {
         match std::thread::Builder::new()
             .name("jka-baked-sun-cache".into())
             .spawn(move || {
-                let result = run(&source, &signal, &device, worker_override);
+                let result = run(&source, &signal, &device, worker_override, sun, encoding);
                 let _ = tx.send(result);
             }) {
             Ok(_) => state.pending = Some(Pending { rx, cancelled, started }),
             Err(error) => {
                 state.ready = true;
-                state.source = None;
                 eprintln!("[BAKED SUN] could not start background worker: {error}");
             }
         }
@@ -509,7 +702,7 @@ impl Renderer {
         };
         let Some(data) = result.data else {
             world.sun_bake.ready = true;
-            world.sun_bake.source = None;
+            // Keep source for the explicit search/retry button.
             self.world = Some(world);
             println!(
                 "[BAKED SUN] calibration unavailable after {:.2}s (background {:.2}s); authored lighting retained",
@@ -535,11 +728,7 @@ impl Renderer {
                 if contour { world.sun_bake.contour_masks.as_ref().unwrap() } else { &masks },
             );
             world.sun_bake.active_contour = contour;
-            world.baked_sun_encoding = world
-                .sun_bake
-                .source
-                .as_ref()
-                .and_then(|source| source.encoding);
+            world.baked_sun_encoding = world.sun_bake.selected_encoding;
             world.sun_bake.masks = Some(masks);
             world.sun_bake.upload = Some(upload);
             self.rebuild_world_surface_bind_groups(&mut world);
@@ -565,9 +754,8 @@ impl Renderer {
         }
         world.baked_sun_radiance = Some(calibration.radiance);
         world.sun_bake.ready = true;
-        // The worker's full tracing/material snapshot is no longer needed.
-        // Retain only byte masks and dimensions for later AO updates.
-        world.sun_bake.source = None;
+        // Retain the immutable source for explicit correction/retry. Vertices
+        // and lightmaps are Arc-shared; no per-frame tracing is added.
         self.world = Some(world);
         self.history_valid = false;
         self.update_lighting_settings();

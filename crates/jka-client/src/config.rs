@@ -602,7 +602,7 @@ fn config_section(name: &str) -> usize {
     let matches = |needles: &[&str]| needles.iter().any(|needle| n.contains(*needle));
     if matches(&["sensitivity", "m_yaw", "m_pitch", "mouseaccel", "m_filter", "cl_input", "cl_timerresolution", "in_mouse", "in_confinecursor"]) {
         1
-    } else if matches(&["r_mode", "r_custom", "r_window", "r_fullscreen", "r_backend", "r_swapinterval", "r_maxframelatency", "r_earlysubmit", "r_presentcopy", "r_ext_multisample", "com_maxfps", "r_hdrpaperwhite", "r_hdrpeak", "r_hdrstyle"]) {
+    } else if matches(&["r_rgb565", "r_igpumemoryab", "r_igpuab", "r_collisionworld", "r_shittertexture", "r_competitiveab", "r_legacyblendtransfer", "r_mode", "r_custom", "r_window", "r_fullscreen", "r_backend", "r_swapinterval", "r_maxframelatency", "r_earlysubmit", "r_presentcopy", "r_ext_multisample", "com_maxfps", "r_hdrpaperwhite", "r_hdrpeak", "r_hdrstyle"]) {
         2
     } else if matches(&["texture", "material", "anisotrop", "r_picmip", "r_pom", "r_parallax", "r_glass", "r_detail", "r_bump", "r_normalmap"]) {
         3
@@ -1005,6 +1005,49 @@ fn split_cfg_words(line: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shitter_ab_values_archive_independently_without_preset_selector() {
+        let path = std::env::temp_dir().join(format!(
+            "djk-shitter-ab-{}-{:?}.cfg", std::process::id(), std::thread::current().id()
+        ));
+        let mut video = VideoSettings::default();
+        video.igpu_ab = 19;
+        video.igpu_memory_ab = 1;
+        video.rgb565 = 1;
+        video.collision_world = true;
+        video.shitter_texture = true;
+        video.competitive_ab = 5;
+        video.legacy_blend_transfer = 4;
+        save_video_settings(&path, video, &crate::keybinds::Bindings::default(),
+            &ClientPresentationSettings::default(), &AudioSettings::default()).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        for (name, value) in [
+            ("r_igpuAB", "19"), ("r_igpuMemoryAB", "1"), ("r_rgb565", "1"),
+            ("r_collisionWorld", "1"), ("r_shitterTexture", "1"),
+            ("r_competitiveAB", "5"), ("r_legacyBlendTransfer", "4"),
+        ] {
+            assert!(text.contains(&format!("seta {name} \"{value}\"")), "{name}");
+        }
+        assert!(!text.contains("r_qualityPreset"));
+        let loaded = load_video_settings(&path);
+        assert_eq!(loaded.igpu_ab, 19);
+        assert_eq!(loaded.igpu_memory_ab, 1);
+        assert_eq!(loaded.rgb565, 1);
+        assert!(loaded.collision_world);
+        assert!(loaded.shitter_texture);
+        assert_eq!(loaded.competitive_ab, 5);
+        assert_eq!(loaded.legacy_blend_transfer, 4);
+        // Each value is an ordinary independent preference. No preset replay
+        // should undo a manual choice, and older configs retain safe defaults.
+        fs::write(&path, "seta r_collisionWorld \"0\"\nseta r_rgb565 \"1\"\n").unwrap();
+        let custom = load_video_settings(&path);
+        assert!(!custom.collision_world);
+        assert_eq!(custom.rgb565, 1);
+        assert_eq!(custom.igpu_ab, 0);
+        assert_eq!(custom.igpu_memory_ab, 0);
+        let _ = fs::remove_file(&path);
+    }
 
     #[test]
     fn desktop_resolution_mode_defaults_and_round_trips_without_overwriting_legacy_custom() {

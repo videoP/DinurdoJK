@@ -62,7 +62,7 @@ impl Renderer {
         let sun = if self.debug_volumes.sun_ray_authored {
             self.world
                 .as_ref()
-                .and_then(|world| world.sun)
+                .and_then(|world| world.sun_bake.baked_direction())
                 .unwrap_or_else(|| self.active_sun())
         } else {
             self.active_sun()

@@ -120,10 +120,79 @@ impl Renderer {
         });
     }
 
+    /// Material classification and photographic grade are compiled only when
+    /// mode 6 is active. Retain both PSOs across toggles and never block the
+    /// render thread; reuse the existing depth/policy attachments and post BG.
+    pub(in crate::renderer) fn ensure_nir_post_pipeline(&mut self) {
+        if self.thermal_vision != 6 { return; }
+        let output_format = self.config.format;
+        for masked in [false, true] {
+            let ready = if masked { self.nir_depth_mask_pipeline.is_some() }
+                        else { self.nir_depth_pipeline.is_some() };
+            if ready { continue; }
+            let key = PipelineJobKey::new(if masked { "nir-depth-mask" } else { "nir-depth" }, 0, 0);
+            if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+                if masked { self.nir_depth_mask_pipeline = Some(pipeline); }
+                else { self.nir_depth_pipeline = Some(pipeline); }
+                continue;
+            }
+            let device = self.device.clone();
+            let cam = self.camera_layout.clone();
+            let surf = self.surface_layout.clone();
+            let planar = self.planar_reflection_layout.clone();
+            self.pipeline_jobs.request(key, if masked { "NIR masked world prepass" } else { "NIR world prepass" }, move || {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("JKA lazy near-IR world classifier"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("../../depth_prepass.wgsl").into()),
+                });
+                let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("JKA lazy NIR world prepass layout"),
+                    bind_group_layouts: &[Some(&cam), Some(&surf), Some(&planar)],
+                    immediate_size: 0,
+                });
+                if masked {
+                    crate::renderer::create_depth_prepass_mask_pipeline_with_entry(&device, &layout, &module, "fs_nir_mask")
+                } else {
+                    crate::renderer::create_depth_prepass_pipeline_with_entry(&device, &layout, &module, "fs_nir")
+                }
+            });
+        }
+        if self.nir_post_pipeline.is_none() {
+            let key = PipelineJobKey::new("nir-post", 0, pipeline_hash(&(output_format,)));
+            if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+                self.nir_post_pipeline = Some(pipeline);
+            } else {
+                let device = self.device.clone();
+                let layout = self.post_pipeline_layout.clone();
+                let shader = self.post_shader.clone();
+                self.pipeline_jobs.request(key, "NIR photographic post", move || {
+                    super::pipelines::create_post_pipeline_with_entry(
+                        &device, &layout, &shader, output_format, None, "fs_main_nir")
+                });
+            }
+        }
+        if self.taa_enabled && self.nir_taa_pipeline.is_none() {
+            let scene_format = self.scene_format();
+            let key = PipelineJobKey::new("nir-taa", 0, pipeline_hash(&(output_format, scene_format)));
+            if let Some(pipeline) = self.pipeline_jobs.take_ready(key) {
+                self.nir_taa_pipeline = Some(pipeline);
+            } else {
+                let device = self.device.clone();
+                let layout = self.post_pipeline_layout.clone();
+                let shader = self.post_shader.clone();
+                self.pipeline_jobs.request(key, "NIR TAA-compatible post", move || {
+                    super::pipelines::create_taa_post_pipeline_with_entry(
+                        &device, &layout, &shader, output_format, scene_format, "fs_main_taa_nir")
+                });
+            }
+        }
+    }
+
     /// No thermal-specific PSO is requested or polled while r_thermalVision=0.
     /// Both pipelines are cached across toggles. RT-TAA's alternative renderer
     /// is bypassed while thermal is active so there is always a thermal output.
     pub(in crate::renderer) fn ensure_thermal_post_pipeline(&mut self) {
+        if self.thermal_vision == 6 { self.ensure_nir_post_pipeline(); return; }
         if self.thermal_vision == 0 { return; }
         let device = self.device.clone();
         let layout = self.post_pipeline_layout.clone();
@@ -400,7 +469,7 @@ impl Renderer {
             },
             exposure_controls: [self.effective_auto_exposure_strength(),
                 if self.native_display_mapping_active() { 1.0 } else { 0.0 }, f32::from(self.thermal_vision),
-                if self.thermal_vision == 0 { 0.0 } else {
+                if self.thermal_vision == 0 || self.thermal_vision == 6 { 0.0 } else {
                     let eye = crate::scene::jka_position([camera_pos_time[0], camera_pos_time[1], camera_pos_time[2]]);
                     let contents = self.world.as_ref().map_or(0, |world| {
                         world.thermal_liquids.iter().filter(|liquid| liquid.contains(eye))

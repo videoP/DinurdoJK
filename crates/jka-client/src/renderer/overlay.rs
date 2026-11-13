@@ -1033,6 +1033,15 @@ impl Renderer {
     /// required lazy PSOs are ready, draw the *whole* overlay with the normal
     /// sRGB pipeline so no mixed-space stages or pipeline validation errors occur.
     pub(in crate::renderer) fn ensure_encoded_2d_pipelines(&mut self) -> bool {
+        self.ensure_encoded_2d_pipelines_with_extra(&[])
+    }
+
+    /// Spout may show shader-backed quads that are absent from the local UI.
+    /// Prepare only the required additional blend variants, without touching
+    /// the normal native HUD path or eagerly compiling unused PSOs.
+    pub(in crate::renderer) fn ensure_encoded_2d_pipelines_with_extra(
+        &mut self, extra_batches: &[UiIconShaderBatch],
+    ) -> bool {
         let format = if self.hdr_output.is_some() {
             wgpu::TextureFormat::Rgba8Unorm
         } else {
@@ -1075,7 +1084,7 @@ impl Renderer {
             for batch in self.screen_fx_batches.iter().chain(self.enemy_icon_batches.iter()) {
                 if let Some(slot) = needed.get_mut(batch.blend as usize) { *slot = Some(batch.blend); }
             }
-            for batch in &self.ui_icon_shader_batches {
+            for batch in self.ui_icon_shader_batches.iter().chain(extra_batches) {
                 if let Some(slot) = needed.get_mut(batch.stage.blend as usize) { *slot = Some(batch.stage.blend); }
             }
             let mut all_ready = gamma.encoded_pipeline.is_some();
@@ -1117,7 +1126,7 @@ impl Renderer {
         for batch in self.screen_fx_batches.iter().chain(self.enemy_icon_batches.iter()) {
             if let Some(slot) = needed.get_mut(batch.blend as usize) { *slot = Some(batch.blend); }
         }
-        for batch in &self.ui_icon_shader_batches {
+        for batch in self.ui_icon_shader_batches.iter().chain(extra_batches) {
             if let Some(slot) = needed.get_mut(batch.stage.blend as usize) { *slot = Some(batch.stage.blend); }
         }
         let mut all_ready = self.ui_encoded_pipeline.is_some();
@@ -1647,14 +1656,52 @@ impl Renderer {
               || self.ui_state.extension_shader_flags.iter().any(|&flag| flag)
               || !self.hud_shader_sources.is_empty())
         { return; }
-        // Collect only the tagged triangles. In practice this is the small
-        // handful of scope/Force icons on screen, not the whole HUD.
-        let mut segments: Vec<(u8, u32, usize, Vec<UiVertex>)> = Vec::new();
-        for (layer, source) in [
-            (0, self.ui_dynamic_vertices.as_slice()),
-            (1, self.ui_transient_vertices.as_slice()),
-            (2, self.ui_retained_vertices.as_slice()),
-        ] {
+        let segments = Self::collect_ui_shader_segments(&[
+            self.ui_dynamic_vertices.as_slice(),
+            self.ui_transient_vertices.as_slice(),
+            self.ui_retained_vertices.as_slice(),
+        ]);
+        if segments.is_empty() { return; }
+        // Move only the scratch vectors, not the source HUD. The local and
+        // stream compositor each get their own painter-order batch offsets.
+        let mut vertices = std::mem::take(&mut self.ui_icon_shader_vertices);
+        let mut batches = std::mem::take(&mut self.ui_icon_shader_batches);
+        self.prepare_ui_icon_shader_segments(segments, None, &mut vertices, &mut batches);
+        if !vertices.is_empty() {
+            self.queue.write_buffer(&self.ui_icon_shader_buffer, 0, bytemuck::cast_slice(&vertices));
+        }
+        self.ui_icon_shader_vertices = vertices;
+        self.ui_icon_shader_batches = batches;
+    }
+
+    /// Build authored HUD stages from the *redacted stream* vertices, rather
+    /// than using the original game's shader draw offsets or unfiltered UI.
+    /// The caller owns a separate GPU vertex buffer for these stages.
+    pub(in crate::renderer) fn prepare_stream_ui_icon_shaders(
+        &mut self, snapshot: &UiSnapshot, vertices: &[UiVertex],
+    ) -> (Vec<UiVertex>, Vec<UiIconShaderBatch>) {
+        if snapshot.video.skip_ui || vertices.is_empty() ||
+            !(self.ui_icons_loaded && snapshot.icon_shader_flags.iter().any(|&flag| flag)
+              || snapshot.extension_shader_flags.iter().any(|&flag| flag)
+              || !self.hud_shader_sources.is_empty())
+        { return (Vec::new(), Vec::new()); }
+        let segments = Self::collect_ui_shader_segments(&[vertices]);
+        let mut shader_vertices = Vec::new();
+        let mut batches = Vec::new();
+        if !segments.is_empty() {
+            // Do NOT clear the local HUD uniforms here. Both streams may draw
+            // in the same frame; append stream uniforms after local offsets.
+            self.prepare_ui_icon_shader_segments(segments, Some(snapshot),
+                &mut shader_vertices, &mut batches);
+        }
+        (shader_vertices, batches)
+    }
+
+    /// Each input slice is a separate painter layer. A stream passes its
+    /// flattened filtered HUD as layer 0, so offsets refer to that buffer.
+    fn collect_ui_shader_segments(sources: &[&[UiVertex]]) -> Vec<(u8, u32, usize, Vec<UiVertex>)> {
+        let mut segments = Vec::new();
+        for (layer, source) in sources.iter().enumerate() {
             let mut i = 0;
             while i + 3 <= source.len() {
                 let mark = source[i].textured;
@@ -1664,15 +1711,22 @@ impl Renderer {
                     while i + 3 <= source.len()
                         && ui_shader_material_index(source[i].textured) == Some(index)
                     { i += 3; }
-                    segments.push((layer, start as u32, index, source[start..i].to_vec()));
+                    segments.push((layer as u8, start as u32, index, source[start..i].to_vec()));
                 } else { i += 3; }
             }
         }
-        if segments.is_empty() { return; }
-        // Native authored icons still use the existing on-demand resolver;
+        segments
+    }
+
+    fn prepare_ui_icon_shader_segments(
+        &mut self,
+        segments: Vec<(u8, u32, usize, Vec<UiVertex>)>,
+        stream_snapshot: Option<&UiSnapshot>,
+        shader_vertices: &mut Vec<UiVertex>,
+        shader_batches: &mut Vec<UiIconShaderBatch>,
+    ) {
+        // Native authored icons use the existing cached/on-demand resolver;
         // extension stages arrive pre-resolved from the HUD image worker.
-        // Reuse resolved frame textures/PSOs. The resolver is never used in
-        // the no-shader path, nor on subsequent frames for the same icon.
         let seconds = self.frame_time();
         let gamma_active = self.ui_gamma_active();
         let srgb_output = self.config.format.is_srgb();
@@ -1682,16 +1736,17 @@ impl Renderer {
                 let command_index = index - USER_SHADER_INDEX_BASE;
                 let widget_index = command_index / crate::extensions::MAX_HUD_COMMANDS;
                 let command_index = command_index % crate::extensions::MAX_HUD_COMMANDS;
-                let command = self.ui_state.extension_hud.get(widget_index)
+                let ui_state = stream_snapshot.unwrap_or(&self.ui_state);
+                let command = ui_state.extension_hud.get(widget_index)
                     .and_then(|w| w.widget.commands.get(command_index));
                 if let Some(crate::extensions::HudCommand::ShaderImage {
                     name, shader, params, ..
                 }) = command {
                     let found = self.hud_shader_sources.iter().any(|(key, _)| key == shader);
-                    let source_index = self.ui_state.extension_images.iter().position(|v| v == name);
+                    let source_index = ui_state.extension_images.iter().position(|v| v == name);
                     if found {
                         if let (Some(source_index), Some(gpu)) = (source_index, self.hud_shader_gpu.as_mut()) {
-                            let (uv0, uv1) = self.ui_state.extension_uv(source_index);
+                            let (uv0, uv1) = ui_state.extension_uv(source_index);
                             let uniform = HudShaderUniform {
                                 atlas_rect: [uv0[0], uv0[1], uv1[0]-uv0[0], uv1[1]-uv0[1]],
                                 values: *params,
@@ -1700,17 +1755,17 @@ impl Renderer {
                                     if srgb_output { 1.0 } else { 0.0 }],
                             };
                             if let Some(offset) = gpu.append(uniform) {
-                                if self.ui_icon_shader_vertices.len() + quad.len() <= 16_384 {
-                                    let start = self.ui_icon_shader_vertices.len() as u32;
-                                    self.ui_icon_shader_vertices.extend(quad.iter().map(|v| {
+                                if shader_vertices.len() + quad.len() <= 16_384 {
+                                    let start = shader_vertices.len() as u32;
+                                    shader_vertices.extend(quad.iter().map(|v| {
                                         let mut v = *v;
                                         v.textured = ui::EXT_IMAGE_TEXTURE_SOURCE;
                                         v
                                     }));
-                                    self.ui_icon_shader_batches.push(UiIconShaderBatch {
+                                    shader_batches.push(UiIconShaderBatch {
                                         layer, original_start, original_end,
                                         stage: ScreenFxBatch {
-                                            range: start..self.ui_icon_shader_vertices.len() as u32,
+                                            range: start..shader_vertices.len() as u32,
                                             blend: FxBlend::Alpha, texture_key: None,
                                         },
                                         user: Some((shader.clone(), offset)),
@@ -1727,7 +1782,7 @@ impl Renderer {
             }
             // Every shader-tagged span must be excluded from the native UI
             // pipeline even if its authored material is missing/unrenderable.
-            self.ui_icon_shader_batches.push(UiIconShaderBatch {
+            shader_batches.push(UiIconShaderBatch {
                 layer, original_start, original_end,
                 stage: ScreenFxBatch {
                     range: 0..0, blend: FxBlend::Alpha, texture_key: None,
@@ -1746,7 +1801,8 @@ impl Renderer {
                 }
                 let is_extension = index >= ui::ICON_NAMES.len();
                 let name = if is_extension {
-                    self.ui_state.extension_images.get(index - ui::ICON_NAMES.len()).cloned()
+                    stream_snapshot.unwrap_or(&self.ui_state)
+                        .extension_images.get(index - ui::ICON_NAMES.len()).cloned()
                 } else {
                     Some(ui::icon_name(index).into_owned()).filter(|name| !name.is_empty())
                 };
@@ -1776,22 +1832,23 @@ impl Renderer {
             // Temporarily move the cached stage list to avoid borrowing self
             // while lazy-created FX pipelines and texture bind groups are built.
             let Some(stages) = self.ui_icon_shader_materials.remove(&index) else { continue; };
-            let shader_start = self.ui_icon_shader_vertices.len();
+            let shader_start = shader_vertices.len();
             for stage in stages.iter().take(64) {
-                if self.ui_icon_shader_vertices.len() + quad.len() > 16_384 { break; }
+                if shader_vertices.len() + quad.len() > 16_384 { break; }
                 self.ensure_screen_fx_pipeline(stage.blend);
                 let texture_key = stage.texture_at_time(seconds)
                     .map(|texture| self.ensure_screen_fx_texture(&texture));
                 let time = jka_assets::shader::shader_time(
                     seconds, stage.shader_time_offset, stage.shader_clamp_time,
                 );
-                let start = self.ui_icon_shader_vertices.len() as u32;
+                let start = shader_vertices.len() as u32;
                 for mut v in quad.iter().copied() {
                     // The extension's atlas UVs encode clipping and mirroring.
                     // Remap them into the original image's 0..1 UV domain
                     // before applying authored tcMods and sampling stage maps.
                     if index >= ui::ICON_NAMES.len() {
-                        let (uv0, uv1) = self.ui_state.extension_uv(index - ui::ICON_NAMES.len());
+                        let (uv0, uv1) = stream_snapshot.unwrap_or(&self.ui_state)
+                            .extension_uv(index - ui::ICON_NAMES.len());
                         v.uv = [
                             (v.uv[0] - uv0[0]) / (uv1[0] - uv0[0]),
                             (v.uv[1] - uv0[1]) / (uv1[1] - uv0[1]),
@@ -1804,21 +1861,21 @@ impl Renderer {
                     let cut = stage.alpha_test;
                     v.textured = if cut >= 0.74 { 3.0 } else if cut >= 0.49 { 2.0 }
                         else if cut > 0.0 { 4.0 } else if cut < 0.0 { 5.0 } else { 1.0 };
-                    self.ui_icon_shader_vertices.push(v);
+                    shader_vertices.push(v);
                 }
-                self.ui_icon_shader_batches.push(UiIconShaderBatch {
+                shader_batches.push(UiIconShaderBatch {
                     layer,
                     original_start,
                     original_end,
                     stage: ScreenFxBatch {
-                        range: start..self.ui_icon_shader_vertices.len() as u32,
+                        range: start..shader_vertices.len() as u32,
                         blend: stage.blend,
                         texture_key,
                     },
                     user: None,
                 });
             }
-            if shader_start == self.ui_icon_shader_vertices.len() {
+            if shader_start == shader_vertices.len() {
                 rverbose!(1, "HUD shader icon {index}: no renderable stages");
             }
             self.ui_icon_shader_materials.insert(index, stages);
@@ -1830,7 +1887,7 @@ impl Renderer {
         }
         // Render with the already compiled pipeline, or display the original
         // image while a first-use shader PSO is being prepared asynchronously.
-        let names: Vec<_> = self.ui_icon_shader_batches.iter()
+        let names: Vec<_> = shader_batches.iter()
             .filter_map(|batch| batch.user.as_ref().map(|(name, _)| name.clone()))
             .collect();
         // Prepare the native and encoded attachment variants independently.
@@ -1849,12 +1906,6 @@ impl Renderer {
             if let Some(format) = encoded_format {
                 self.ensure_hud_shader_pipeline(&name, format);
             }
-        }
-        if !self.ui_icon_shader_vertices.is_empty() {
-            self.queue.write_buffer(
-                &self.ui_icon_shader_buffer, 0,
-                bytemuck::cast_slice(&self.ui_icon_shader_vertices),
-            );
         }
     }
 
@@ -3394,6 +3445,40 @@ pub(in crate::renderer) struct ScreenFxBatch {
     pub(in crate::renderer) range: std::ops::Range<u32>,
     pub(in crate::renderer) blend: FxBlend,
     pub(in crate::renderer) texture_key: Option<String>,
+}
+
+#[cfg(test)]
+mod streamed_ui_shader_span_tests {
+    use super::*;
+
+    #[test]
+    fn stream_uses_filtered_vertex_offsets_not_local_offsets() {
+        let plain = UiVertex { position: [0.0; 2], uv: [0.0; 2],
+            color: [255; 4], textured: 1.0 };
+        let authored = UiVertex { textured: ui::EXT_IMAGE_SHADER_SOURCE_BASE, ..plain };
+        // The stream may omit redacted quads preceding a shader-backed HUD
+        // image. Its offsets must refer to the newly built stream buffer.
+        let local = [vec![plain; 3], vec![authored; 6]].concat();
+        let filtered = [vec![authored; 6], vec![plain; 3]].concat();
+        let local_spans = Renderer::collect_ui_shader_segments(&[&local]);
+        let stream_spans = Renderer::collect_ui_shader_segments(&[&filtered]);
+        assert_eq!(local_spans.len(), 1);
+        assert_eq!(stream_spans.len(), 1);
+        assert_eq!((local_spans[0].0, local_spans[0].1, local_spans[0].3.len()), (0, 3, 6));
+        assert_eq!((stream_spans[0].0, stream_spans[0].1, stream_spans[0].3.len()), (0, 0, 6));
+    }
+
+    #[test]
+    fn local_shader_stages_retain_separate_painter_layers() {
+        let authored = UiVertex { position: [0.0; 2], uv: [0.0; 2],
+            color: [255; 4], textured: ui::EXT_IMAGE_SHADER_SOURCE_BASE };
+        let dynamic = vec![authored; 3];
+        let transient = vec![authored; 6];
+        let segments = Renderer::collect_ui_shader_segments(&[&dynamic, &transient]);
+        assert_eq!(segments.iter().map(|(layer, offset, _, quad)|
+            (*layer, *offset, quad.len())).collect::<Vec<_>>(),
+            vec![(0, 0, 3), (1, 0, 6)]);
+    }
 }
 
 #[cfg(test)]

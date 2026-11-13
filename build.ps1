@@ -150,6 +150,64 @@ function Format-SignedBuildBytes([long]$Bytes) {
     if ($absolute -ge 1KB) { return ('{0}{1:N1} KiB' -f $prefix, ($absolute / 1KB)) }
     return ('{0}{1} B' -f $prefix, [long]$absolute)
 }
+# rustc keys each incremental folder by crate name + a hash of the crate's
+# configuration (dependency graph, features, profile, target kind, flags).
+# Any Cargo.toml/Cargo.lock/feature edit mints a new hash; rustc only trims old
+# sessions INSIDE the current folder and never deletes a superseded folder, so
+# each change orphans a full copy (the game crate alone is 3-12 GB). After a
+# successful build, keep the two newest folders per crate (the game build plus
+# its `cargo test` configuration) and the newest set of hashed game test
+# binaries in deps; delete the rest. Skipped while another Cargo/rustc runs.
+function Remove-StaleIncrementalCache([string]$Folder) {
+    $incremental = Join-Path $Folder 'incremental'
+    if (-not [System.IO.Directory]::Exists($incremental)) { return }
+    if (Get-Process -Name cargo, rustc -ErrorAction SilentlyContinue) {
+        Write-Host '[JKA PRUNE] Skipped: another cargo/rustc process is running.' -ForegroundColor DarkYellow
+        return
+    }
+    $stale = @()
+    Get-ChildItem -LiteralPath $incremental -Directory |
+        Group-Object { $_.Name -replace '-[0-9a-z]+$', '' } |
+        ForEach-Object { $stale += @($_.Group | Sort-Object LastWriteTime -Descending | Select-Object -Skip 2) }
+    $deps = Join-Path $Folder 'deps'
+    $testFiles = @()
+    if ([System.IO.Directory]::Exists($deps)) {
+        $testGroups = @(Get-ChildItem -LiteralPath $deps -File -Filter 'DinurdoJK-*' |
+            Where-Object { $_.Name -match '^DinurdoJK-[0-9a-f]{16}\.' } |
+            Group-Object { $_.Name.Substring(0, 26) } |
+            Sort-Object { ($_.Group | Measure-Object LastWriteTime -Maximum).Maximum } -Descending)
+        $testFiles = @($testGroups | Select-Object -Skip 1 | ForEach-Object { $_.Group })
+    }
+    if ($stale.Count -eq 0 -and $testFiles.Count -eq 0) { return }
+    $volumeBefore = $null
+    try { $volumeBefore = [long]([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($Folder))).AvailableFreeSpace } catch { }
+    # Size only what is actually removed (scanned only when there is something to prune).
+    [long]$incrementalBytes = 0
+    foreach ($item in $stale) {
+        [long]$bytes = 0
+        try {
+            foreach ($file in [System.IO.Directory]::EnumerateFiles($item.FullName, '*', [System.IO.SearchOption]::AllDirectories)) {
+                try { $bytes += ([System.IO.FileInfo]::new($file)).Length } catch { }
+            }
+        } catch { }
+        try {
+            Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
+            $incrementalBytes += $bytes
+            Write-Host ("  - incremental\{0}  {1:N2} GiB" -f $item.Name, ($bytes / 1GB)) -ForegroundColor DarkGray
+        } catch { Write-Warning "Could not remove stale cache $($item.Name): $($_.Exception.Message)" }
+    }
+    [long]$testBytes = 0
+    foreach ($item in $testFiles) {
+        try { Remove-Item -LiteralPath $item.FullName -Force -ErrorAction Stop; $testBytes += $item.Length } catch { }
+    }
+    # Incremental sessions hard-link shared files, so the by-path total can exceed
+    # the space the drive actually got back; show both.
+    $freed = 'unknown'
+    if ($null -ne $volumeBefore) {
+        try { $freed = '{0:N2} GiB' -f ((([System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($Folder))).AvailableFreeSpace - $volumeBefore) / 1GB) } catch { }
+    }
+    Write-Host ("[JKA PRUNE] Deleted {0:N2} GiB: {1} incremental folder(s) {2:N2} GiB + {3} test-binary file(s) {4:N2} GiB | drive space regained: {5}" -f (($incrementalBytes + $testBytes) / 1GB), $stale.Count, ($incrementalBytes / 1GB), $testFiles.Count, ($testBytes / 1GB), $freed) -ForegroundColor Green
+}
 $profileRootBytesBefore = Get-ProfileRootFileBytes $buildDirectory
 $volumeDisk = $null
 $volumeFreeBefore = $null
@@ -241,6 +299,7 @@ $updateKeyFile = Join-Path $PSScriptRoot 'update-public-key.hex'
 if (-not $env:DINURDOJK_UPDATE_PUBLIC_KEY_HEX -and (Test-Path -LiteralPath $updateKeyFile)) {
     $env:DINURDOJK_UPDATE_PUBLIC_KEY_HEX = ([System.IO.File]::ReadAllText($updateKeyFile)).Trim()
 }
+$buildSucceeded = $false
 $cacheReport = New-CargoArtifactReport
 $cacheSnapshot = $null
 Push-Location $PSScriptRoot
@@ -317,6 +376,8 @@ try {
         }
         throw 'Build failed. Check the Rust and MSVC toolchain messages above.'
     }
+    # Pruning runs at the very end (finally block), after the exe is copied.
+    $buildSucceeded = $true
     if (-not $buildsInPlace) {
         New-Item -ItemType Directory -Force -Path $runtimeDirectory | Out-Null
         $builtExecutable = Join-Path $buildDirectory 'DinurdoJK.exe'
@@ -383,4 +444,10 @@ try {
         } catch { }
     }
     Write-Host '           Net size changes only; not SSD write bytes. -CacheAudit for full breakdown.' -ForegroundColor DarkGray
+    # Last step: the exe is already staged and usable, so the prune (and the
+    # sizing it does only when something is stale) never delays the build.
+    # Pruning must never fail a successful build.
+    if ($buildSucceeded) {
+        try { Remove-StaleIncrementalCache $buildDirectory } catch { Write-Warning "Cache prune failed: $($_.Exception.Message)" }
+    }
 }

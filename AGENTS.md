@@ -25,7 +25,12 @@
 - Check available disk space before substantial compilation. Inspect existing cache configurations and running Cargo processes before assuming a fresh build is necessary. If expected headroom is insufficient, stop compilation and explain the space requirement instead of repeatedly filling the drive.
 - Batch source changes before building. Reuse an already-built test executable when its sources are unchanged. Do not run successive build/check/test/Clippy variants for routine verification when the existing build and focused tests suffice.
 - Rebuild again only for a material source change, a failure, or an unresolved validation concern. Keep final verification to the necessary game build and focused test run using the existing configuration.
-- Never automatically delete caches to make room. Identify specific obsolete folders and their sizes, then obtain the user's explicit cleanup instruction; preserve runnable outputs and current caches.
+- The user only ever runs `build.ps1 -Fast` and `-Faster`. Every other Cargo configuration in `target/fast` comes from agents, and each one mints a new incremental hash folder (`target/fast/incremental/<crate>-<hash>`, 3-12 GB for the game crate) that rustc never deletes. The hash covers the dependency graph, features, profile, target kind (bin, test, check), and `-C metadata`-relevant flags. So:
+  - Build and test only the game package (`-p DinurdoJK`) with the default features. Do not use `--workspace`, `--all-targets`, `--all-features`, `--no-default-features`, or extra `--features` for routine work: they change feature unification and re-hash shared dependencies such as wgpu.
+  - Do not run `cargo check` or `cargo clippy` in place of a build. Each is a separate configuration with its own cache. Run Clippy only when the task asks for it.
+  - Do not add, remove, or toggle Cargo features, `[profile.*]` settings, or dependency versions casually. Each change re-hashes the game crate and everything that depends on the changed crate. Batch such edits, and mention them in the report.
+- `build.ps1` prunes superseded caches after every successful build (user-approved 2026-11-13). It keeps the two newest incremental folders per crate (game build plus its test configuration) and the newest hashed `deps/DinurdoJK-<hash>.*` test binaries. Do not disable or bypass this. If direct Cargo runs left orphans, the next `build.ps1` run removes them.
+- Outside that automatic prune, never delete caches to make room. Identify specific obsolete folders and their sizes, then get the user's explicit cleanup instruction. Preserve runnable outputs and current caches.
 
 ## Rust ownership and architecture
 

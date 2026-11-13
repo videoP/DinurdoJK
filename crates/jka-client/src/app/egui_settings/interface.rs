@@ -1,20 +1,25 @@
 //! Interface.
+use crate::app::egui_menu::{selected_setup_section, SetupSection, SETUP_TAB_INTERFACE};
 use crate::app::egui_settings::{
     draw_crosshair_glyph, percent, segmented_row, theme, ui_catalog, App, OverlayMode,
 };
 
 impl App {
     pub(in crate::app) fn egui_interface_page(&mut self, ui: &mut egui::Ui) {
-        theme::page_title(
-            ui,
-            "INTERFACE / HUD",
-            "Choose one style per movement component. Position and scale enabled components with HUD Edit.",
-        );
+        let section = selected_setup_section(ui.ctx(), SETUP_TAB_INTERFACE);
+        let (title, description) = match section {
+            Some(SetupSection::InterfaceHud) => ("INTERFACE / HUD & APPEARANCE", "HUD styling, layout, crosshair and targeting."),
+            Some(SetupSection::InterfaceMovement) => ("INTERFACE / MOVEMENT HUD", "Strafehelper, movement readouts and jump metrics. Move enabled components with HUD Edit."),
+            Some(SetupSection::InterfaceOverlays) => ("INTERFACE / SCOREBOARD & OVERLAYS", "Scoreboard and kill feed presentation."),
+            _ => ("INTERFACE / CHAT & CONSOLE", "Chat display, translation, filtering and console behavior."),
+        };
+        theme::page_title(ui, title, description);
 
         egui::ScrollArea::vertical()
-            .id_salt("jka_interface_settings")
+            .id_salt(("jka_interface_settings", section))
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                if section == Some(SetupSection::InterfaceHud) {
                 theme::section(ui, "PALETTE", "Colours of the menus and the in-game scoreboard, kill feed, chat and console. Applies immediately.");
                 theme::row(ui, "Colour palette", "ui_palette. Classic is the original blue slate; Celadon is warm stone with green and rose.", theme::Reset::None, |ui| {
                     let active = crate::palette::active();
@@ -67,12 +72,17 @@ impl App {
                     },
                 );
 
-                self.egui_killfeed_settings(ui);
-                self.egui_scoreboard_settings(ui);
-                self.egui_chat_settings(ui);
-                self.egui_chat_translation_settings(ui);
-                self.egui_chat_filter_settings(ui);
-
+                }
+                if section == Some(SetupSection::InterfaceOverlays) {
+                    self.egui_killfeed_settings(ui);
+                    self.egui_scoreboard_settings(ui);
+                }
+                if section == Some(SetupSection::InterfaceChat) {
+                    self.egui_chat_settings(ui);
+                    self.egui_chat_translation_settings(ui);
+                    self.egui_chat_filter_settings(ui);
+                }
+                if section == Some(SetupSection::InterfaceMovement) {
                 theme::section(
                     ui,
                     "MOVEMENT COMPONENTS",
@@ -234,6 +244,8 @@ impl App {
 
                 ui.collapsing("Readout formatting & network graph", |ui| self.egui_japro_hud_settings(ui));
 
+                }
+                if section == Some(SetupSection::InterfaceHud) {
                 theme::section(
                     ui,
                     "CROSSHAIR",
@@ -243,7 +255,7 @@ impl App {
                 if self.strafe_helper.flags & crate::ui::SHELPER_CROSSHAIR != 0 {
                     theme::banner(
                         ui,
-                        "cg_strafeHelper bit 16384 is set: jaPRO's line crosshair replaces these settings.",
+                        "cg_strafeHelper bit 16384: jaPRO draws a fixed center-screen line instead of the ordinary dynamic crosshair.",
                         theme::WARNING(),
                     );
                 }
@@ -414,6 +426,8 @@ impl App {
                     },
                 );
 
+                }
+                if section == Some(SetupSection::InterfaceChat) {
                 theme::section(ui, "CHAT", "The say / say_team input line.");
                 theme::row(
                     ui,
@@ -497,6 +511,7 @@ impl App {
                         }
                     },
                 );
+                }
             });
     }
 }

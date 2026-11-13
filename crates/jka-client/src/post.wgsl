@@ -3261,6 +3261,14 @@ fn fs_main_thermal(input: VertexOut) -> @location(0) vec4<f32> {
     return vec4<f32>(select(color, color * 2.0, settings.snow_haze.w > 0.5), 1.0);
 }
 
+// Real infrared photography detects *reflected* near-IR illumination, not
+// emitted thermal radiation. This is a fast, material-aware approximation:
+// one scene sample plus one policy/depth load, with no extra post passes.
+@fragment
+fn fs_main_nir(input: VertexOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(nir_photo_color(input.uv), 1.0);
+}
+
 // Specialized A/B path for frames where rain is the only spatial post effect.
 // It deliberately preserves rain's depth haze/froxel composite, final puddle film,
 // wet-weather grade and compact display grading while avoiding unrelated post work.
@@ -3442,6 +3450,18 @@ fn fs_main_taa_thermal(input: VertexOut) -> TaaFragmentOut {
     return out;
 }
 
+// NIR has no moving heat field. Just like the separate LWIR TAA entry,
+// preserve current scene history for an instant return to normal vision.
+@fragment
+fn fs_main_taa_nir(input: VertexOut) -> TaaFragmentOut {
+    var current = textureLoad(scene_texture, taa_pixel_from_uv(input.uv, textureDimensions(scene_texture)), 0).rgb;
+    if (settings.taa_params.x > 0.5) { current = taa_tonemap(current); }
+    var out: TaaFragmentOut;
+    out.display = vec4<f32>(nir_photo_color(input.uv), 1.0);
+    out.history = vec4<f32>(current, 1.0);
+    return out;
+}
+
 // Drawn during the world scene render pass, after depth-writing models and
 // before the transparent BSP queue/ocean and foreground model FX. Never read
 // the scene color target: fixed-function blending multiplies opaque RGB by
@@ -3466,6 +3486,55 @@ fn fs_cloud_shadow_opaque(input: VertexOut) -> @location(0) vec4<f32> {
     return vec4<f32>(vec3<f32>(factor), 1.0);
 }
 
+
+// PHOTOGRAPHIC_NEAR_IR_LIBRARY
+// Reflected near-infrared approximation (Heron material-aware NIR approach;
+// not copied code). No thermal physics: bright skin/foliage, dark sky/water,
+// original scene illumination/shadow detail and monochrome photographic tone.
+// The world prepass writes estimated NIR reflectance to policy.b only in mode 6;
+// entity policy.b still identifies props (.81) versus warm bodies (.83+).
+fn nir_photo_color(uv: vec2<f32>) -> vec3<f32> {
+    let dims = vec2<i32>(textureDimensions(linear_depth_texture));
+    let pixel = clamp(vec2<i32>(uv * vec2<f32>(dims)), vec2<i32>(0), dims - vec2<i32>(1));
+    let depth = textureLoad(linear_depth_texture, pixel, 0).x;
+    let rgb = max(scene(uv), vec3<f32>(0.0));
+    let visible = luminance(rgb);
+    var reflected = 0.0;
+    if (!valid_depth(depth)) {
+        // Clear NIR skies are nearly black (little backscatter). Preserve
+        // very bright solar discs and flashes rather than painting them black.
+        reflected = 0.018 + 0.12 * smoothstep(0.4, 1.3, visible)
+            + 0.85 * smoothstep(1.4, 5.0, visible);
+    } else {
+        let policy = textureLoad(reflection_policy_texture, pixel, 0);
+        var reflectance = clamp(policy.b, 0.02, 0.80);
+        // Model policy B is deliberately outside the world reflectance range.
+        if (policy.r < 0.5 && policy.b > 0.822) {
+            // Existing Ghoul2 chest/head proximity is *anatomical* here, not
+            // its thermal heat value: bright living skin/body and dark eyes,
+            // while keeping visible high-frequency detail in the final grade.
+            let anatomy = clamp((policy.b - 0.83) / 0.17, 0.0, 1.0);
+            reflectance = 0.64 + 0.19 * anatomy;
+        } else if (policy.r < 0.5 && policy.b > 0.804) {
+            reflectance = 0.40; // MD3 props / weapons, no invented skin
+        }
+        // Scene luminance supplies received lighting and baked/dynamic
+        // shadows. Material reflectance is a separate input; we do NOT just
+        // desaturate RGB or use thermal heat. Preserve some texture contrast.
+        let irradiance = clamp(sqrt(visible * 1.55), 0.08, 1.38);
+        let photographic_detail = clamp(visible / (visible + 0.55), 0.0, 1.0);
+        reflected = reflectance * irradiance * (0.82 + 0.30 * photographic_detail);
+    }
+    // Monochrome negative with compressed highlights and strong black point.
+    // One rational film shoulder; no per-pixel convolution or temporal noise.
+    let exposure = max(reflected * 1.28 - 0.026, 0.0);
+    let film = clamp(exposure * (1.0 + exposure * 0.42)
+        / (exposure * (1.0 + exposure * 0.42) + 0.27), 0.0, 1.0);
+    let gamma = max(settings.color.x, 0.05);
+    let linear = pow(vec3<f32>(film), vec3<f32>(1.0 / gamma));
+    // Match the thermal display path's optional overbright (8-bit/HDR).
+    return select(linear, linear * 2.0, settings.snow_haze.w > 0.5);
+}
 
 // THERMAL_VISION_LIBRARY
 // Stylised long-wave IR view (r_thermalVision). Heat is a smooth scalar built

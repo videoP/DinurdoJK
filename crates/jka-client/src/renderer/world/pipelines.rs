@@ -2108,6 +2108,16 @@ pub(in crate::renderer) fn create_depth_prepass_pipeline(
     shader: &wgpu::ShaderModule,
     thermal: bool,
 ) -> wgpu::RenderPipeline {
+    create_depth_prepass_pipeline_with_entry(device, layout, shader,
+        if thermal { "fs_thermal" } else { "fs_main" })
+}
+
+pub(in crate::renderer) fn create_depth_prepass_pipeline_with_entry(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    fragment_entry: &str,
+) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA AO depth prepass pipeline"),
         layout: Some(layout),
@@ -2136,7 +2146,7 @@ pub(in crate::renderer) fn create_depth_prepass_pipeline(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(if thermal { "fs_thermal" } else { "fs_main" }),
+            entry_point: Some(fragment_entry),
             compilation_options: Default::default(),
             targets: &[
                 Some(wgpu::ColorTargetState {
@@ -2270,6 +2280,16 @@ pub(in crate::renderer) fn create_depth_prepass_mask_pipeline(
     shader: &wgpu::ShaderModule,
     thermal: bool,
 ) -> wgpu::RenderPipeline {
+    create_depth_prepass_mask_pipeline_with_entry(device, layout, shader,
+        if thermal { "fs_thermal_mask" } else { "fs_mask" })
+}
+
+pub(in crate::renderer) fn create_depth_prepass_mask_pipeline_with_entry(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    fragment_entry: &str,
+) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA alpha-tested depth prepass pipeline"),
         layout: Some(layout),
@@ -2298,7 +2318,7 @@ pub(in crate::renderer) fn create_depth_prepass_mask_pipeline(
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(if thermal { "fs_thermal_mask" } else { "fs_mask" }),
+            entry_point: Some(fragment_entry),
             compilation_options: Default::default(),
             targets: &[
                 Some(wgpu::ColorTargetState {

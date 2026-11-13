@@ -246,27 +246,43 @@ pub fn build_crosshair_vertices(
     // TaystJK CG_DrawCrosshair: no ordinary crosshair over zoomMode 1 or 2,
     // except cg_crossHairScope 1. This shared entry point covers both the
     // cached screen-centred and the late-latched dynamic-crosshair paths.
-    if ui.zoom_scope.is_some() && ui.crosshair.scope_mode != 1 {
+    if ui.studio_hud_virtual_layout && ui.crosshair.style == 0 { return; }
+    let helper_line = ui.strafe_helper.flags & SHELPER_CROSSHAIR != 0;
+    // TaystJK DF_DrawStrafeHUD owns the line crosshair, separately from
+    // CG_DrawCrosshair: it is fixed at 320,240, including in dynamic mode.
+    // Draw it only in the stable HUD batch, never the projected render tail.
+    if helper_line && screen_position.is_some() { return; }
+    if !helper_line && ui.zoom_scope.is_some() && ui.crosshair.scope_mode != 1 {
         return;
     }
-    if ui.studio_hud_virtual_layout && ui.crosshair.style == 0 { return; }
-    let mut crosshair = ui.crosshair;
-    if ui.strafe_helper.flags & SHELPER_CROSSHAIR != 0 {
-        crosshair.style = CROSSHAIR_STYLE_LINE;
-        crosshair.image = 0;
-    }
     let start=out.len();
-    build_crosshair_impl(
-        out,
-        crosshair,
-        ui.crosshair_target.color,
-        screen_position,
-        ui.strafe_helper.line_width,
-        w,
-        h,
-        Some(&ui.icon_atlas_uvs),
-        Some(&ui.icon_shader_flags),
-    );
+    if helper_line {
+        let color = ui.crosshair_target.color.map_or_else(|| {
+            let [r, g, b, a] = ui.crosshair.color;
+            if r == 0 && g == 0 && b == 0 { [1.0, 1.0, 1.0, 1.0] }
+            else { [f32::from(r)/255.0, f32::from(g)/255.0,
+                    f32::from(b)/255.0, f32::from(a)/255.0] }
+        }, |[r, g, b]| [r, g, b, 1.0]);
+        let unit = super::layout::hud_art_scale(w, h);
+        rect(out,
+            w as f32 * 0.5 - ui.strafe_helper.line_width.clamp(0.25, 5.0) * unit * 0.5,
+            h as f32 * 0.5 - 5.0 * unit,
+            ui.strafe_helper.line_width.clamp(0.25, 5.0) * unit,
+            10.0 * unit,
+            color, w, h);
+    } else {
+        build_crosshair_impl(
+            out,
+            ui.crosshair,
+            ui.crosshair_target.color,
+            screen_position,
+            ui.strafe_helper.line_width,
+            w,
+            h,
+            Some(&ui.icon_atlas_uvs),
+            Some(&ui.icon_shader_flags),
+        );
+    }
     // The Studio reuses its otherwise-unused CrosshairName layout slot to
     // position the *actual* crosshair. This transform only runs in Studio:
     // cg_hudCrosshairName and normal gameplay remain unchanged.

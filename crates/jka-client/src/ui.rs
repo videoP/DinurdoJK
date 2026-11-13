@@ -1276,7 +1276,7 @@ pub const SHELPER_A: u32 = 1 << 8;
 pub const SHELPER_D: u32 = 1 << 9;
 pub const SHELPER_REAR: u32 = 1 << 10;
 pub const SHELPER_CENTER: u32 = 1 << 11;
-/// jaPRO's line crosshair: replaces the normal crosshair with a short vertical line.
+/// jaPRO's own static, screen-centered 10-unit line crosshair (replaces normal crosshair).
 pub const SHELPER_CROSSHAIR: u32 = 1 << 14;
 pub const SHELPER_S: u32 = 1 << 15;
 pub const SHELPER_SA: u32 = 1 << 16;

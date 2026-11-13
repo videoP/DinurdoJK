@@ -66,6 +66,26 @@ impl PlayerViewPolicyState {
     }
 }
 
+/// TaystJK cg_view.c: the legacy helper style bits bypass camera and
+/// target damping, but SHELPER_CROSSHAIR (bit 14) alone does not. Only apply
+/// this to the presentation copy; saved/user-editable damping stays intact.
+pub fn third_person_strafehelper_damping(
+    mut settings: ThirdPersonSettings,
+    flags: u32,
+) -> ThirdPersonSettings {
+    const TAYSTJK_DAMP_BYPASS: u32 = (1 << 0) | (1 << 1) | (1 << 2)
+        | (1 << 3) | (1 << 13); // Original, Updated, CGAZ, WSW, Weze
+    if flags & TAYSTJK_DAMP_BYPASS != 0 {
+        settings.target_damp = 1.0;
+        // TaystJK only enters the style override if cameraDamp != 0;
+        // preserve that special zero branch exactly.
+        if settings.camera_damp != 0.0 {
+            settings.camera_damp = 1.0;
+        }
+    }
+    settings
+}
+
 fn bg_in_grapple_move(anim: i32) -> bool {
     matches!(
         AnimationSet::name(anim),
@@ -295,5 +315,37 @@ mod tests {
         state.pm_type = PM_INTERMISSION;
         state.weapon = 3;
         assert!(!rendering_third_person(settings, false, state));
+    }
+}
+
+#[cfg(test)]
+mod strafehelper_damping_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_strafehelper_styles_bypass_damping_only_in_effective_view() {
+        let settings = ThirdPersonSettings {
+            camera_damp: 0.3, target_damp: 0.5, ..ThirdPersonSettings::default()
+        };
+        for flag in [1 << 0, 1 << 1, 1 << 2, 1 << 3, 1 << 13] {
+            let out = third_person_strafehelper_damping(settings, flag);
+            assert_eq!(out.camera_damp, 1.0);
+            assert_eq!(out.target_damp, 1.0);
+        }
+        for flag in [0, 1 << 14, 1 << 21, 1 << 22, 1 << 23, 1 << 30] {
+            assert_eq!(third_person_strafehelper_damping(settings, flag), settings);
+        }
+        assert_eq!(settings.camera_damp, 0.3);
+        assert_eq!(settings.target_damp, 0.5);
+    }
+
+    #[test]
+    fn camera_damp_zero_retains_taystjk_special_case() {
+        let settings = ThirdPersonSettings {
+            camera_damp: 0.0, target_damp: 0.4, ..ThirdPersonSettings::default()
+        };
+        let out = third_person_strafehelper_damping(settings, 1);
+        assert_eq!(out.camera_damp, 0.0);
+        assert_eq!(out.target_damp, 1.0);
     }
 }

@@ -41,10 +41,16 @@ const MAX_MUSIC_BYTES: usize = 64 * 1024 * 1024;
 const MUSIC_FADE_SECONDS: f32 = 1.5;
 const MAX_DECODED_SAMPLES: usize = 8 * 1024 * 1024;
 const MAX_CACHE_SAMPLES: usize = 32 * 1024 * 1024;
-// OpenJK's software mixer has 32 simultaneously paintable channels. Keeping the
-// same ceiling prevents a burst of demo events from stacking 100+ full-scale
-// float sources in Rodio before the CGame channel semantics are complete.
-const MAX_VOICES: usize = 32;
+// One-shot channel pool: snd_local.h MAX_CHANNELS. JK2MV has 96 since its
+// initial import; TaystJK raised OpenJK's 32 to 96 (e7467a834, default
+// s_UseOpenAL 0 software path). With 32, a busy fight kicked unrelated sounds
+// three times sooner than either reference client.
+const MAX_VOICES: usize = 96;
+// The native EAL scene ABI holds eal_native::MAX_SOURCES (96) sources. Keep the
+// split it had before the one-shot pool grew: one-shots may hold this many
+// wet sends; the remainder belongs to per-emitter loops. Extra one-shots still
+// play dry, exactly as with EAL disabled.
+const EAL_ONESHOT_SOURCES: usize = 32;
 // OpenJK respatializes once per client frame and paints the next mix-ahead
 // chunk at the new left/right volume. With s_separation below 1.0 a nearby
 // entity or a turning third-person camera moves gains by large steps each
@@ -55,8 +61,8 @@ const GAIN_GLIDE_SECONDS: f32 = 0.010;
 // OpenJK cuts stomped/stolen channels mid-waveform. A 4 ms fade is inaudible
 // as a semantic change but removes the step discontinuity of a hard stop.
 const STOP_FADE_SECONDS: f32 = 0.004;
-// S_AddLoopSounds merges every loop of one sfx into a single channel. Vanilla
-// takes those channels from the same 32-channel pool as one-shots; merged loops
+// S_AddLoopSounds merges every loop of one sfx into a single channel. OpenJK
+// and TaystJK take those channels from the one-shot pool; merged loops
 // get their own ceiling here so a hum never steals an event sound mid-play.
 const MAX_LOOP_VOICES: usize = 32;
 const CHAN_AUTO: i32 = 0;
@@ -1540,6 +1546,13 @@ pub struct AudioInfo {
     pub sample_format: String,
     pub buffer_size: String,
     pub active_voices: usize,
+    /// One-shot pool size (snd_local.h MAX_CHANNELS).
+    pub max_voices: usize,
+    /// Explicit same-entity/channel replacements, per the legacy mixer.
+    pub channel_replacements: u64,
+    /// New one-shots that displaced an old one because the voice pool was full.
+    pub capacity_kicks: u64,
+    pub last_capacity_kick: Option<String>,
     /// Merged loop channels (one per distinct looping sfx this frame).
     pub active_loops: usize,
     /// `S_AddLoopingSound` calls this frame, before per-sfx merging.
@@ -1645,6 +1658,9 @@ impl Source for MasterTap {
 pub struct AudioBackend {
     variometer: Option<variometer::Variometer>,
     voices: Vec<Voice>,
+    channel_replacements: u64,
+    capacity_kicks: u64,
+    last_capacity_kick: Option<String>,
     loops: Vec<LoopRequest>,
     loop_voices: HashMap<String, LoopVoice>,
     // OpenJK paints loops at `s_paintedtime % length`: every loop of one sfx
@@ -1763,6 +1779,9 @@ impl AudioBackend {
         Ok(Self {
             variometer: None,
             voices: Vec::new(),
+            channel_replacements: 0,
+            capacity_kicks: 0,
+            last_capacity_kick: None,
             loops: Vec::new(),
             loop_voices: HashMap::new(),
             loop_epoch: Instant::now(),
@@ -1828,6 +1847,9 @@ impl AudioBackend {
         Self {
             variometer: None,
             voices: Vec::new(),
+            channel_replacements: 0,
+            capacity_kicks: 0,
+            last_capacity_kick: None,
             loops: Vec::new(),
             loop_voices: HashMap::new(),
             loop_epoch: Instant::now(),
@@ -1922,6 +1944,10 @@ impl AudioBackend {
             sample_format: self.output_sample_format.clone(),
             buffer_size: self.output_buffer_size.clone(),
             active_voices: self.voices.len(),
+            max_voices: MAX_VOICES,
+            channel_replacements: self.channel_replacements,
+            capacity_kicks: self.capacity_kicks,
+            last_capacity_kick: self.last_capacity_kick.clone(),
             active_loops: self.loop_voices.len(),
             loop_requests: self.loops.len(),
             overload_samples: self.overload_samples.load(Ordering::Relaxed),
@@ -2235,10 +2261,16 @@ impl AudioBackend {
         }
     }
 
+    /// One-shot voices currently holding a native EAL source.
+    fn eal_oneshot_budget_left(&self) -> bool {
+        self.voices.iter().filter(|voice| voice.wet_player.is_some()).count() < EAL_ONESHOT_SOURCES
+    }
+
     fn reconnect_eal_sends(&mut self) {
         for i in 0..self.voices.len() {
             let voice = &self.voices[i];
             if voice.wet_player.is_some() || !matches!(voice.request.origin, SoundOrigin::Entity(_) | SoundOrigin::Fixed(_)) { continue; }
+            if !self.eal_oneshot_budget_left() { break; }
             let send = self.eal_send(&voice.request.qpath, Arc::clone(&voice.sound), Arc::clone(&voice.gains), voice.loop_start.is_some(), voice.loop_start.unwrap_or(0), None);
             if let Some(send) = &send { send.set_speed(self.rate.max(0.0)); }
             self.voices[i].wet_player = send;
@@ -2565,7 +2597,7 @@ impl AudioBackend {
             p.is_finite().then(|| (v.qpath.clone(),p.max(0.0) as usize))
         }).collect();
         let split = self.eal_map.is_some() && self.eal_bus.is_some();
-        let native_limit = crate::eal_native::MAX_SOURCES - MAX_VOICES;
+        let native_limit = crate::eal_native::MAX_SOURCES - EAL_ONESHOT_SOURCES;
         if split {
             let distance = |r:&LoopRequest| match r.origin {
                 SoundOrigin::Local => 0.0,
@@ -2699,32 +2731,31 @@ impl AudioBackend {
     }
     fn play_with_loop(&mut self, mut request: SoundRequest, sound: Arc<RegisteredSound>, volume: f32, loop_start: Option<usize>) {
         self.reap_finished_voices();
-        // JK2MV: only CHAN_AUTO is exempt from same-channel replacement.
-        // Keep JKA's existing CHAN_LESS_ATTEN behavior unchanged.
+        // JK2MV's default software path replaces only the same channel.
+        // TaystJK additionally merges the three voice variants and exempts
+        // CHAN_LESS_ATTEN from replacement; preserve that JKA distinction.
         if request.channel != CHAN_AUTO && (self.jk2_mode || request.channel != 10) {
-            let (stomped, kept): (Vec<_>, Vec<_>) =
-                std::mem::take(&mut self.voices).into_iter().partition(|voice| {
-                    voice.request.entity == request.entity
-                        && channels_stomp_mode(voice.request.channel, request.channel, self.jk2_mode)
-                });
-            self.voices = kept;
-            for voice in stomped { self.retire(voice.player, voice.wet_player, &voice.gains); }
+            // The common case replaces one voice. Remove it in place instead
+            // of allocating two vectors and rebuilding the whole pool.
+            while let Some(index) = self.voices.iter().position(|voice| {
+                voice.request.entity == request.entity
+                    && channels_stomp_mode(voice.request.channel, request.channel, self.jk2_mode)
+            }) {
+                let voice = self.voices.remove(index);
+                self.channel_replacements += 1;
+                self.retire(voice.player, voice.wet_player, &voice.gains);
+            }
         }
         if self.voices.len() >= MAX_VOICES {
-            // Match the software mixer's S_PickChannel preference as far as the
-            // currently implemented one-shot channels allow: a remote sound
-            // should kick the oldest remote sound before it kicks one belonging
-            // to the listener. (Tracked/looping channels will add the other
-            // OpenJK protection rule when that presenter lands.)
-            let victim = if request.entity != self.listener.entity {
-                self.voices
-                    .iter()
-                    .position(|voice| voice.request.entity != self.listener.entity)
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+            // JK2MV/TaystJK software S_PickChannel: the oldest channel dies,
+            // except that a non-listener sound skips the listener's own
+            // channels. The reference never drops the incoming sound: if no
+            // eligible channel exists it still kicks a slot. Loops have their
+            // own pool here, matching TaystJK's `ch->loopSound` skip.
+            let victim = pick_capacity_victim(&self.voices, &request, self.listener.entity);
             let voice = self.voices.remove(victim);
+            self.capacity_kicks += 1;
+            self.last_capacity_kick = Some(format!("{} replaced {}", request.qpath, voice.request.qpath));
             self.retire(voice.player, voice.wet_player, &voice.gains);
         }
         if let SoundOrigin::Entity(ref mut origin) = request.origin {
@@ -2766,7 +2797,10 @@ impl AudioBackend {
         // only its final routing bypasses the underwater gameplay bus.
         let is_dry_voice = matches!(request.channel, 8 | 11 | 14);
         let voice_mixer = if is_dry_voice { &self.music_mixer } else { &self.mixer };
-        let wet_player = if !is_dry_voice && matches!(request.origin, SoundOrigin::Entity(_) | SoundOrigin::Fixed(_)) {
+        let wet_player = if !is_dry_voice
+            && matches!(request.origin, SoundOrigin::Entity(_) | SoundOrigin::Fixed(_))
+            && self.eal_oneshot_budget_left()
+        {
             self.eal_send(&request.qpath, Arc::clone(&sound), Arc::clone(&gains), loop_start.is_some(), loop_start.unwrap_or(0), Some(0))
         } else { None };
         if let Some(send) = &wet_player { send.set_speed(self.rate.max(0.0)); }
@@ -2836,6 +2870,9 @@ impl AudioBackend {
     pub fn clear(&mut self) {
         if let Some(tone) = self.variometer.take() { tone.stop(); }
         for voice in std::mem::take(&mut self.voices) { self.retire(voice.player, voice.wet_player, &voice.gains); }
+        self.channel_replacements = 0;
+        self.capacity_kicks = 0;
+        self.last_capacity_kick = None;
         for (_, voice) in std::mem::take(&mut self.loop_voices) { self.retire(voice.player, voice.wet_player, &voice.gains); }
         self.loops.clear();
         self.origins.clear();
@@ -2854,6 +2891,29 @@ impl AudioBackend {
 impl Drop for AudioBackend { fn drop(&mut self) { self.clear(); } }
 
 fn is_voice_channel(channel: i32) -> bool { matches!(channel, 3 | 4 | 12) }
+
+/// `ch->entnum == listener_number` in S_PickChannel. The references start
+/// S_StartLocalSound (announcer, UI, local chat) on listener_number; this
+/// client routes those as SoundOrigin::Local on entity 1023 or the viewed
+/// client, so Local output counts as the listener's too.
+fn is_listener_sound(request: &SoundRequest, listener_entity: u16) -> bool {
+    request.entity == listener_entity || matches!(request.origin, SoundOrigin::Local)
+}
+
+/// JK2MV/TaystJK software S_PickChannel victim on a full pool. Voices are
+/// only appended and removals keep order, so Vec order is `startSample`
+/// order and index 0 is the oldest. A listener sound kicks the oldest of all
+/// (the protection only filters non-listener requests); anything else kicks
+/// the oldest non-listener voice, else falls back to a slot like the
+/// reference's `firstToDie = &s_channels[0]` (here: the oldest).
+fn pick_capacity_victim(voices: &[Voice], incoming: &SoundRequest, listener_entity: u16) -> usize {
+    if is_listener_sound(incoming, listener_entity) {
+        return 0;
+    }
+    voices.iter()
+        .position(|voice| !is_listener_sound(&voice.request, listener_entity))
+        .unwrap_or(0)
+}
 
 /// OpenJK S_CheckChannelStomp: the three voice channels mutually replace one
 /// another for the same entity, while all other non-auto channels only replace
@@ -3437,6 +3497,131 @@ mod tests {
         backend.frame(backend.listener, [(2, [0.0, 100.0, 0.0])].into_iter());
         assert_eq!(backend.voices.last().unwrap().gains.get(), [1.0, 0.0]);
         assert_eq!(backend.info().largest_gain_step, 1.0);
+    }
+
+    #[test]
+    fn full_listener_pool_still_accepts_remote_sound_like_reference() {
+        let (mut backend, _output) = AudioBackend::offline();
+        let sound = Arc::new(RegisteredSound {
+            samples: vec![0.05; 48_000].into(), sample_rate: rodio::nz!(48_000),
+        });
+        // Every voice is the listener's: the oldest is a SoundOrigin::Local
+        // notification on the 1023 sentinel, the rest are on listener.entity.
+        for i in 0..MAX_VOICES {
+            let mut local = request(0);
+            local.entity = if i == 0 { 1023 } else { backend.listener.entity };
+            local.origin = if i == 0 { SoundOrigin::Local } else { SoundOrigin::Entity([0.0; 3]) };
+            local.qpath = format!("local-{i}.wav");
+            backend.play(local, Arc::clone(&sound));
+        }
+        assert_eq!(backend.voices.len(), MAX_VOICES);
+        let mut remote = request(0);
+        remote.qpath = "saberhitwall.wav".into();
+        backend.play(remote, Arc::clone(&sound));
+        // S_PickChannel never refuses a sound; with no eligible channel it
+        // kicks firstToDie's initial slot (the oldest voice here).
+        assert_eq!(backend.voices.len(), MAX_VOICES);
+        assert_eq!(backend.info().capacity_kicks, 1);
+        assert!(!backend.voices.iter().any(|voice| voice.request.qpath == "local-0.wav"));
+        assert!(backend.voices.iter().any(|voice| voice.request.qpath == "saberhitwall.wav"));
+    }
+
+    #[test]
+    fn full_pool_listener_sound_kicks_oldest_of_any_owner() {
+        let (mut backend, _output) = AudioBackend::offline();
+        let sound = Arc::new(RegisteredSound {
+            samples: vec![0.05; 48_000].into(), sample_rate: rodio::nz!(48_000),
+        });
+        for i in 0..MAX_VOICES {
+            let mut voice = request(0);
+            // Oldest is the listener's own; the protection only filters
+            // requests that do not belong to the listener.
+            voice.entity = if i == 0 { backend.listener.entity } else { (i + 1) as u16 };
+            voice.qpath = format!("voice-{i}.wav");
+            backend.play(voice, Arc::clone(&sound));
+        }
+        let mut announcer = request(0);
+        announcer.entity = 1023;
+        announcer.origin = SoundOrigin::Local;
+        announcer.qpath = "announcer.wav".into();
+        backend.play(announcer, Arc::clone(&sound));
+        assert!(!backend.voices.iter().any(|voice| voice.request.qpath == "voice-0.wav"));
+        assert!(backend.voices.iter().any(|voice| voice.request.qpath == "voice-1.wav"));
+        assert!(backend.voices.iter().any(|voice| voice.request.qpath == "announcer.wav"));
+    }
+
+    #[test]
+    fn full_voice_pool_kicks_oldest_remote_before_any_local_voice() {
+        let (mut backend, _output) = AudioBackend::offline();
+        let sound = Arc::new(RegisteredSound {
+            samples: vec![0.05; 48_000].into(), sample_rate: rodio::nz!(48_000),
+        });
+        let mut local = request(0);
+        local.entity = 1023;
+        local.origin = SoundOrigin::Local;
+        local.qpath = "ui-notification.wav".into();
+        backend.play(local, Arc::clone(&sound));
+        for i in 0..MAX_VOICES - 1 {
+            let mut remote = request(0);
+            remote.entity = (i + 1) as u16;
+            remote.qpath = format!("remote-{i}.wav");
+            backend.play(remote, Arc::clone(&sound));
+        }
+        let mut incoming = request(0);
+        incoming.entity = 600;
+        incoming.qpath = "saberhitwall.wav".into();
+        backend.play(incoming, Arc::clone(&sound));
+        assert!(backend.voices.iter().any(|voice| voice.request.qpath == "ui-notification.wav"));
+        assert!(!backend.voices.iter().any(|voice| voice.request.qpath == "remote-0.wav"));
+        assert!(backend.voices.iter().any(|voice| voice.request.qpath == "saberhitwall.wav"));
+        assert_eq!(backend.info().capacity_kicks, 1);
+        assert_eq!(backend.info().last_capacity_kick.as_deref(), Some("saberhitwall.wav replaced remote-0.wav"));
+        backend.clear();
+        assert_eq!(backend.info().capacity_kicks, 0);
+        assert_eq!(backend.info().last_capacity_kick, None);
+    }
+
+    #[test]
+    fn saber_wall_hits_share_one_weapon_channel() {
+        // S_StartSound(endpos, -1, CHAN_WEAPON) from every player's blade:
+        // each wall hit stomps the previous one instead of stacking.
+        let (mut backend, _output) = AudioBackend::offline();
+        let sound = Arc::new(RegisteredSound {
+            samples: vec![0.05; 48_000].into(), sample_rate: rodio::nz!(48_000),
+        });
+        for jk2 in [true, false] {
+            backend.set_jk2_mode(jk2);
+            backend.clear();
+            for i in 0..10 {
+                let hit = SoundRequest {
+                    qpath: format!("sound/weapons/saber/saberhitwall{}.wav", i % 3 + 1),
+                    entity: 1023,
+                    channel: 2,
+                    origin: SoundOrigin::Fixed([i as f32 * 16.0, 0.0, 0.0]),
+                };
+                backend.play(hit, Arc::clone(&sound));
+            }
+            assert_eq!(backend.voices.len(), 1, "jk2={jk2}");
+            assert_eq!(backend.info().channel_replacements, 9, "jk2={jk2}");
+        }
+    }
+
+    #[test]
+    fn channel_replacement_and_chan_auto_overlap_remain_legacy_compatible() {
+        let (mut backend, _output) = AudioBackend::offline();
+        let sound = Arc::new(RegisteredSound {
+            samples: vec![0.05; 48_000].into(), sample_rate: rodio::nz!(48_000),
+        });
+        backend.set_jk2_mode(true);
+        backend.play(request(2), Arc::clone(&sound));
+        backend.play(request(2), Arc::clone(&sound));
+        assert_eq!(backend.voices.len(), 1);
+        assert_eq!(backend.info().channel_replacements, 1);
+        backend.play(request(0), Arc::clone(&sound));
+        backend.play(request(0), Arc::clone(&sound));
+        assert_eq!(backend.voices.len(), 3);
+        assert_eq!(backend.info().channel_replacements, 1);
+        assert_eq!(backend.info().capacity_kicks, 0);
     }
 
     #[test]

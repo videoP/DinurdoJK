@@ -1,73 +1,53 @@
 name: DinurdoJK Linux (Build and Signed Release)
-
-# One Linux compilation per run. Every run uploads a build artifact; following
-# successful Windows publication it also packages/signs and attaches Linux
-# assets to that same release. No Windows/macOS job depends on Linux success.
+# Build immediately on push, without deployment approval. Signing occurs only
+# after successful Windows publication and after downloading this exact build.
 on:
+  push:
+    branches: [main]
+  workflow_dispatch:
   workflow_run:
     workflows: ["DinurdoJK Signed Windows Release (DLAA)"]
     types: [completed]
     branches: [main]
-  workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
-  linux-release:
+  linux-build:
     if: >-
       github.repository == 'videoP/DinurdoJK' &&
-      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
-      (github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == 'videoP/DinurdoJK' &&
-      github.event.workflow_run.head_branch == 'main'))
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     permissions:
-      contents: write
-    environment: release-signing
+      contents: read
     env:
-      GH_TOKEN: ${{ github.token }}
       DINURDOJK_UPDATE_PUBLIC_KEY_HEX: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
       DINURDOJK_NWH_SOURCE_B64: ${{ secrets.DINURDOJK_NWH_SOURCE_B64 }}
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
       AUDIONIMBUS_AUTO_INSTALL_PROGRESS: '0'
       RUSTFLAGS: '-C link-arg=-Wl,-rpath,$ORIGIN/DinurdoJK/dependencies'
-
     steps:
-      - name: Checkout exact Windows release commit
+      - name: Checkout exact pushed commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
-
-      - name: Set up Python for signing tooling
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Find version-matched published Windows release
-        id: release
+      - name: Stamp version and require build inputs
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/stamp_ci_version.py
-          tag="$(python3 scripts/make_signed_linux_release.py --print-tag)"
-          commit="$(git rev-parse HEAD)"
-          if ! target="$(gh release view "$tag" --json targetCommitish -q .targetCommitish 2>/dev/null)"; then
-            echo "::notice::No Windows release matching $tag; Linux publication skipped."
-            echo 'matching=false' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [[ "$target" != "$commit" ]]; then
-            echo "::notice::Windows release $tag points to $target, not $commit; Linux publication skipped."
-            echo 'matching=false' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo 'matching=true' >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
+          [[ "${DINURDOJK_UPDATE_PUBLIC_KEY_HEX:-}" =~ ^[0-9a-fA-F]{64}$ ]] || {
+            echo '::error::Set repository variable DINURDOJK_UPDATE_PUBLIC_KEY_HEX (public Ed25519 key)'; exit 1;
+          }
+          test -n "${DINURDOJK_NWH_SOURCE_B64:-}" || {
+            echo '::error::Set repository secret DINURDOJK_NWH_SOURCE_B64 for unapproved builds'; exit 1;
+          }
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -129,18 +109,7 @@ jobs:
           tar -C dist/compile -czf dist/DinurdoJK-linux-x86_64.tar.gz DinurdoJK
           sha256sum dist/DinurdoJK-linux-x86_64.tar.gz
 
-      - name: Upload Linux build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: DinurdoJK-linux-x86_64-${{ github.run_id }}
-          path: |
-            dist/DinurdoJK-linux-x86_64.tar.gz
-            dist/linux-compile-dependencies.txt
-          if-no-files-found: error
-          retention-days: 14
-
       - name: Locate bundled Steam Audio and verify Linux runtime
-        if: steps.release.outputs.matching == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -165,6 +134,112 @@ jobs:
             exit 1
           fi
           echo "PHONON_PATH=$phonon" >> "$GITHUB_ENV"
+
+      - name: Stage unsigned CI artifact including Linux native dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/ci-linux-upload
+          cp dist/DinurdoJK-linux-x86_64.tar.gz dist/ci-linux-upload/
+          cp dist/linux-compile-dependencies.txt dist/ci-linux-upload/
+          cp dist/linux-check/DinurdoJK/dependencies/libphonon.so dist/ci-linux-upload/
+          cp dist/linux-dependencies.txt dist/ci-linux-upload/
+
+      - name: Upload Linux build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DinurdoJK-linux-x86_64-${{ github.run_id }}
+          path: dist/ci-linux-upload/
+          if-no-files-found: error
+          retention-days: 14
+
+  linux-publish:
+    if: >-
+      github.repository == 'videoP/DinurdoJK' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == 'videoP/DinurdoJK' &&
+      github.event.workflow_run.head_branch == 'main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: write
+      actions: read
+    environment: release-signing
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DINURDOJK_UPDATE_PUBLIC_KEY_HEX: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
+    steps:
+      - name: Checkout exact Windows release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Find version-matched published Windows release
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/stamp_ci_version.py
+          tag="$(python3 scripts/make_signed_linux_release.py --print-tag)"
+          commit="$(git rev-parse HEAD)"
+          if ! target="$(gh release view "$tag" --json targetCommitish -q .targetCommitish 2>/dev/null)"; then
+            echo "::notice::No Windows release matching $tag; Linux publication skipped."
+            echo 'matching=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$target" != "$commit" ]]; then
+            echo "::notice::Windows release $tag points to $target, not $commit; Linux publication skipped."
+            echo 'matching=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'matching=true' >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for corresponding Linux build artifact
+        if: steps.release.outputs.matching == 'true'
+        id: build_artifact
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          python3 scripts/wait_for_ci_artifact.py \
+            --workflow linux.yml --sha "$RELEASE_SHA" \
+            --artifact-prefix 'DinurdoJK-linux-x86_64-' \
+            --timeout-seconds 10800
+
+      - name: Download and verify Linux CI artifact
+        if: steps.release.outputs.matching == 'true'
+        shell: bash
+        env:
+          RUN_ID: ${{ steps.build_artifact.outputs.run_id }}
+          ARTIFACT_NAME: ${{ steps.build_artifact.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/linux-build" target/release dist/linux-check/DinurdoJK/dependencies
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$ARTIFACT_NAME" --dir "$RUNNER_TEMP/linux-build"
+          tar -xzf "$RUNNER_TEMP/linux-build/DinurdoJK-linux-x86_64.tar.gz" -C target/release
+          cp "$RUNNER_TEMP/linux-build/libphonon.so" dist/linux-check/DinurdoJK/dependencies/libphonon.so
+          cp target/release/DinurdoJK dist/linux-check/DinurdoJK/DinurdoJK
+          chmod 755 target/release/DinurdoJK
+          chmod 755 dist/linux-check/DinurdoJK/DinurdoJK
+          test -x target/release/DinurdoJK
+          readelf -h target/release/DinurdoJK | grep -q 'Class:.*ELF64'
+          readelf -h target/release/DinurdoJK | grep -q 'Machine:.*Advanced Micro Devices X86-64'
+          readelf -d target/release/DinurdoJK | grep -Fq '$ORIGIN/DinurdoJK/dependencies'
+          readelf -h dist/linux-check/DinurdoJK/dependencies/libphonon.so | grep -q 'Class:.*ELF64'
+          readelf -h dist/linux-check/DinurdoJK/dependencies/libphonon.so | grep -q 'Machine:.*Advanced Micro Devices X86-64'
+          ldd dist/linux-check/DinurdoJK/DinurdoJK | tee dist/linux-dependencies.txt
+          if grep -q 'not found' dist/linux-dependencies.txt; then
+            echo 'Missing dynamic dependency in standalone Linux package' >&2
+            exit 1
+          fi
+          echo "PHONON_PATH=$RUNNER_TEMP/linux-build/libphonon.so" >> "$GITHUB_ENV"
 
       - name: Download Windows release's shared assets
         if: steps.release.outputs.matching == 'true'

@@ -1120,7 +1120,6 @@ struct SaberContactHistory {
     last_contact_normal: [f32; 3],
     last_time: i32,
     next_fx_sample_time: f64,
-    last_sound_time: i32,
     last_spark_time: i32,
 }
 
@@ -1133,7 +1132,6 @@ impl Default for SaberContactHistory {
             last_contact_normal: [0.0, 1.0, 0.0],
             last_time: i32::MIN / 2,
             next_fx_sample_time: f64::NEG_INFINITY,
-            last_sound_time: i32::MIN / 2,
             last_spark_time: i32::MIN / 2,
         }
     }
@@ -1399,13 +1397,37 @@ pub struct SaberClashFlare {
     pub color: [f32; 4],
 }
 
-/// MVSDK cg_players.c uses trace.endpos, entity -1, CHAN_WEAPON.
-/// Authored .efx sounds retain the unchanged CHAN_AUTO route.
+/// Owner of the 100 ms wall-scrape sound cooldown.
+/// MVSDK cg_players.c keeps it on the player (`cent->saberHitWallSoundDebounceTime`),
+/// so in JK2 mode every contact probe of one player shares it. TaystJK/OpenJK
+/// keep it per blade (`client->saber[s].blade[b].hitWallDebounceTime`).
+fn saber_wall_sound_debounce_key(key: SaberTrailKey, jk2: bool) -> SaberTrailKey {
+    if jk2 {
+        SaberTrailKey { entity_num: key.entity_num, saber_num: 0, blade_num: 0 }
+    } else {
+        key
+    }
+}
+
+/// `cg.time - debounce >= 100`; a rewound clock stays quiet until it catches up.
+fn saber_wall_sound_due(last_by_key: &mut HashMap<SaberTrailKey, i32>, key: SaberTrailKey, time: i32) -> bool {
+    if last_by_key.get(&key).is_some_and(|&last| {
+        time < last || time.saturating_sub(last) < 100
+    }) {
+        return false;
+    }
+    last_by_key.insert(key, time);
+    true
+}
+
+/// MVSDK and TaystJK cg_players.c both use
+/// `S_StartSound(trace.endpos, -1, CHAN_WEAPON, saberhitwall%i)`. The shared
+/// non-entity CHAN_WEAPON makes every wall hit stomp the previous one in the
+/// software mixer, so only one plays at a time; CHAN_AUTO would stack copies.
+/// 1023 (ENTITYNUM_NONE) stands in for -1; EV_SABER_CLASHFLARE uses the same pair.
 fn saber_wall_contact_sound(origin: [f32; 3], variant: i32) -> FxSound {
     let mut sound = FxSound::auto(origin, format!("sound/weapons/saber/saberhitwall{variant}.wav"));
-    if jka_assets::pk3::active_jk2().is_some() {
-        sound.channel = 2; // CHAN_WEAPON; -1 is ENTITYNUM_NONE.
-    }
+    sound.channel = 2; // CHAN_WEAPON
     sound
 }
 
@@ -1509,6 +1531,8 @@ pub struct WeaponFx {
     /// collision-plane mark, which is what source-.map previews use.
     mark_surfaces: Option<std::sync::Arc<jka_assets::bsp::MarkSurfaces>>,
     saber_contact_history: HashMap<SaberTrailKey, SaberContactHistory>,
+    /// Wall-hit sound cooldowns: per player in JK2 (MVSDK), per blade in JKA.
+    saber_wall_sound_debounce: HashMap<SaberTrailKey, i32>,
     saber_wall_marks: Vec<SaberWallMark>,
     /// Footprints (`_PlayerFootStep`'s CG_ImpactMark) and how they are styled.
     foot_marks: Vec<FootMark>,
@@ -1620,6 +1644,7 @@ impl WeaponFx {
             saber_marks: SaberMarkMode::Legacy,
             collision_world: None,
             saber_contact_history: HashMap::new(),
+            saber_wall_sound_debounce: HashMap::new(),
             saber_wall_marks: Vec::new(),
             foot_marks: Vec::new(),
             efx_world_marks: Vec::new(),
@@ -1693,6 +1718,7 @@ impl WeaponFx {
         if self.saber_marks != mode {
             self.saber_marks = mode;
             self.saber_contact_history.clear();
+            self.saber_wall_sound_debounce.clear();
             if !matches!(mode, SaberMarkMode::Legacy) {
                 self.saber_wall_marks.clear();
             }
@@ -1708,6 +1734,7 @@ impl WeaponFx {
         let _ = self.worker_tx.send(FxWorkerCommand::SetCollision(world.clone()));
         self.collision_world = world;
         self.saber_contact_history.clear();
+        self.saber_wall_sound_debounce.clear();
         self.saber_wall_marks.clear();
         self.melt.clear();
     }
@@ -1819,6 +1846,7 @@ impl WeaponFx {
             self.tripmine_fx.clear();
             self.force_fx_cadence.clear();
             self.saber_contact_history.clear();
+            self.saber_wall_sound_debounce.clear();
         }
     }
 
@@ -1849,6 +1877,7 @@ impl WeaponFx {
             // Do not connect a newly fixed-rate stroke to history accumulated
             // under presentation-frame cadence (or vice versa).
             self.saber_contact_history.clear();
+            self.saber_wall_sound_debounce.clear();
         }
     }
 
@@ -1894,6 +1923,7 @@ impl WeaponFx {
         self.saber_trail_segments.clear();
         self.saber_clash_flare = None;
         self.saber_contact_history.clear();
+        self.saber_wall_sound_debounce.clear();
         self.saber_wall_marks.clear();
         self.melt.clear();
         self.time = time;
@@ -1946,6 +1976,7 @@ impl WeaponFx {
             self.saber_trail_segments.clear();
             self.saber_clash_flare = None;
             self.saber_contact_history.clear();
+            self.saber_wall_sound_debounce.clear();
             self.saber_wall_marks.clear();
             self.efx_world_marks.clear();
             self.melt.clear();
@@ -3107,6 +3138,18 @@ impl WeaponFx {
         self.melt.end_stroke(melt_stroke_id(key));
     }
 
+    /// Sound timing is independent of the render/EFX sampling cadence; the
+    /// cooldown owner follows the active game's cgame (see the key helper).
+    fn play_saber_wall_contact_if_due(&mut self, key: SaberTrailKey, origin: [f32; 3]) {
+        let jk2 = jka_assets::pk3::active_jk2().is_some();
+        let debounce_key = saber_wall_sound_debounce_key(key, jk2);
+        if !saber_wall_sound_due(&mut self.saber_wall_sound_debounce, debounce_key, self.time) {
+            return;
+        }
+        let variant = self.runner_rng.irand(1, 3);
+        self.immediate_sounds.push(saber_wall_contact_sound(origin, variant));
+    }
+
     fn saber_world_contact(
         &mut self,
         key: SaberTrailKey,
@@ -3226,12 +3269,8 @@ impl WeaponFx {
 
                 // Audio is not an EFX density artifact. Keep OpenJK's 100 ms
                 // wall-hit debounce independent of the visual sampling rate.
-                if can_mark && previous.have_old_pos
-                    && self.time.saturating_sub(previous.last_sound_time) >= 100
-                {
-                    let variant = self.runner_rng.irand(1, 3);
-                    self.immediate_sounds.push(saber_wall_contact_sound(hit.end, variant));
-                    next.last_sound_time = self.time;
+                if can_mark && previous.have_old_pos {
+                    self.play_saber_wall_contact_if_due(key, hit.end);
                 }
             }
             next.last_contact_pos = hit.end;
@@ -3262,13 +3301,8 @@ impl WeaponFx {
                     if length3(sub3(hit.end, previous.old_pos)) > 1.0e-4 {
                         self.push_legacy_saber_wall_mark(previous.old_pos, hit.end, hit_normal);
                     }
-                    // OpenJK uses blade.hitWallDebounceTime and allows another
-                    // wall-hit sound every 100 ms while continuous contact lasts.
-                    if self.time.saturating_sub(previous.last_sound_time) >= 100 {
-                        let variant = self.runner_rng.irand(1, 3);
-                        self.immediate_sounds.push(saber_wall_contact_sound(hit.end, variant));
-                        next.last_sound_time = self.time;
-                    }
+                    // Per player in JK2 (MVSDK), per blade in JKA (TaystJK).
+                    self.play_saber_wall_contact_if_due(key, hit.end);
                 }
             }
             SaberMarkMode::Enhanced => {
@@ -3291,10 +3325,8 @@ impl WeaponFx {
                         self.collision_world.as_mut(),
                         wall_color,
                     );
-                    if previous.have_old_pos && self.time.saturating_sub(previous.last_sound_time) >= 100 {
-                        let variant = self.runner_rng.irand(1, 3);
-                        self.immediate_sounds.push(saber_wall_contact_sound(hit.end, variant));
-                        next.last_sound_time = self.time;
+                    if previous.have_old_pos {
+                        self.play_saber_wall_contact_if_due(key, hit.end);
                     }
                     let flicker = 0.94 + (self.time as f32 * 0.029).sin() * 0.06;
                     let heat01 = (heat / 1.25).clamp(0.0, 1.0);
@@ -5199,6 +5231,40 @@ pub(crate) fn angles_to_axis(angles: [f32; 3]) -> [[f32; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saber_wall_sound_cooldown_owner_follows_game() {
+        let blade = |entity_num, saber_num, blade_num| SaberTrailKey { entity_num, saber_num, blade_num };
+        let (a, b, other) = (blade(7, 0, 0), blade(7, 0, 1), blade(8, 0, 0));
+        // JK2 (MVSDK cent->saberHitWallSoundDebounceTime): one per player.
+        let mut last = HashMap::new();
+        let jk2 = |key| saber_wall_sound_debounce_key(key, true);
+        assert!(saber_wall_sound_due(&mut last, jk2(a), 1_000));
+        assert!(!saber_wall_sound_due(&mut last, jk2(b), 1_000));
+        assert!(!saber_wall_sound_due(&mut last, jk2(a), 1_099));
+        assert!(saber_wall_sound_due(&mut last, jk2(other), 1_099));
+        assert!(saber_wall_sound_due(&mut last, jk2(b), 1_100));
+        assert!(!saber_wall_sound_due(&mut last, jk2(a), 1_100));
+        // A rewound clock stays quiet until reset (begin_frame/reset_for_seek).
+        assert!(!saber_wall_sound_due(&mut last, jk2(a), 900));
+        last.clear();
+        assert!(saber_wall_sound_due(&mut last, jk2(a), 900));
+        // JKA (TaystJK blade[b].hitWallDebounceTime): one per blade.
+        let mut last = HashMap::new();
+        let jka = |key| saber_wall_sound_debounce_key(key, false);
+        assert!(saber_wall_sound_due(&mut last, jka(a), 1_000));
+        assert!(saber_wall_sound_due(&mut last, jka(b), 1_000));
+        assert!(!saber_wall_sound_due(&mut last, jka(a), 1_099));
+        assert!(saber_wall_sound_due(&mut last, jka(a), 1_100));
+    }
+
+    #[test]
+    fn saber_wall_sound_uses_shared_non_entity_weapon_channel() {
+        // Both MVSDK and TaystJK: S_StartSound(endpos, -1, CHAN_WEAPON, ...).
+        let sound = saber_wall_contact_sound([1.0, 2.0, 3.0], 2);
+        assert_eq!((sound.entity, sound.channel), (1023, 2));
+        assert_eq!(sound.qpath, "sound/weapons/saber/saberhitwall2.wav");
+    }
 
     #[test]
     fn taystjk_charge_states_shaders_and_camera_shake() {

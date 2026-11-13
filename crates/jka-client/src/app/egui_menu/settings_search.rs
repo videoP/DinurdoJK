@@ -6,6 +6,7 @@ use super::*;
 struct SearchItem {
     tab: usize,
     section: Option<VideoSection>,
+    subsection: Option<SetupSection>,
     label: &'static str,
     hint: &'static str,
     alias: &'static str,
@@ -45,6 +46,8 @@ fn category(item: SearchItem) -> &'static str {
             VideoSection::Glass => "Glass",
             VideoSection::Optimizations => "Optimizations",
         }
+    } else if let Some(section) = item.subsection {
+        section.label()
     } else {
         match item.tab {
             SETUP_TAB_GAME => "Game",
@@ -65,6 +68,14 @@ fn category(item: SearchItem) -> &'static str {
 fn path(item: SearchItem) -> String {
     if item.tab == SETUP_TAB_VIDEO {
         format!("VIDEO  /  {}", category(item))
+    } else if item.subsection.is_some() {
+        let tab = match item.tab {
+            SETUP_TAB_GAME => "GAME",
+            SETUP_TAB_AUDIO => "AUDIO",
+            SETUP_TAB_INTERFACE => "INTERFACE",
+            _ => "SETUP",
+        };
+        format!("{}  /  {}", tab, category(item))
     } else {
         category(item).to_ascii_uppercase()
     }
@@ -174,6 +185,7 @@ impl App {
         if let Some(item) = chosen {
             self.setup_selected = item.tab;
             if let Some(section) = item.section { self.video_section = section; }
+            if let Some(section) = item.subsection { select_setup_section(ui.ctx(), section); }
             clear_query(ui.ctx());
             theme::jump_to_setting(ui.ctx(), item.label);
             self.egui_repaint_requested = true;
@@ -191,6 +203,18 @@ mod tests {
         assert!(items.len() > 100, "index should cover the actual Settings pages");
         assert!(items.iter().any(|item| item.label == "Anti-aliasing"));
         assert!(items.iter().any(|item| item.label == "Player movement rate"));
+        assert!(items.iter().any(|item| item.label == "Dynamic crosshair"
+            && item.subsection == Some(SetupSection::InterfaceHud)));
+        assert!(items.iter().any(|item| item.label == "HL2-style console"
+            && item.subsection == Some(SetupSection::InterfaceChat)));
+        assert!(items.iter().any(|item| item.label == "Effects / game"
+            && item.subsection == Some(SetupSection::AudioGeneral)));
+        assert!(items.iter().any(|item| item.label == "EAL map audio"
+            && item.subsection == Some(SetupSection::AudioPositional)));
+        assert!(items.iter().any(|item| item.label == "Steam binaural HRTF"
+            && item.subsection == Some(SetupSection::AudioPositional)));
+        assert!(items.iter().any(|item| item.label == "Simulate projectiles"
+            && item.subsection == Some(SetupSection::GameGameplay)));
         assert!(items.iter().any(|item| {
             item.alias == "r_fragmentShaderMode" && score(*item, &["r_fragmentshadermode".to_owned()], "r_fragmentshadermode").is_some()
         }));

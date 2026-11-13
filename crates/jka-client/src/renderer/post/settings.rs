@@ -7,7 +7,7 @@ use crate::renderer::{
 impl Renderer {
     pub(in crate::renderer) fn set_post_effects(&mut self, effects: PostEffects) {
         let old_scene_format = self.scene_format();
-        self.thermal_vision = effects.thermal_vision.min(5);
+        self.thermal_vision = effects.thermal_vision.min(6);
         let old_auto_exposure_effective = self.effective_auto_exposure_strength() > 0.0;
         let old_bloom_pyramid = self.glow_mode.enabled() || self.halation_enabled;
         let old_authored_glow = self.glow_mode.authored();
@@ -86,14 +86,17 @@ impl Renderer {
         if let Some(output) = self.hdr_output.as_mut() {
             output.write_settings(&self.queue, effects.hdr_paper_white, effects.hdr_peak, self.tone_mapping_strength);
         }
-        self.auto_exposure_strength = effects.auto_exposure.clamp(0.0, 1.0);
+        self.auto_exposure_strength = if self.thermal_vision == 6 { 0.0 } else { effects.auto_exposure.clamp(0.0, 1.0) };
         self.auto_exposure_enabled = self.auto_exposure_strength > 0.0;
-        // Thermal reads authored `glow` stages as heat sources (post.wgsl
-        // thermal_glow_heat), so it needs the authored-only glow pyramid
-        // whatever the visible Dynamic Glow setting is.
-        self.glow_mode = if self.thermal_vision != 0 { crate::renderer::GlowMode::JkaAuthored } else { effects.glow };
-        self.halation_enabled = effects.halation;
-        self.ssao_enabled = effects.ssao;
+        // None of the visible-space bloom, SSAO or SSR composites are used by
+        // photographic NIR. Avoid their offscreen passes without changing the
+        // user's saved video settings (reapplied on the next effects update).
+        let photographic_ir = self.thermal_vision == 6;
+        self.glow_mode = if (1..=5).contains(&self.thermal_vision) {
+            crate::renderer::GlowMode::JkaAuthored
+        } else if photographic_ir { crate::renderer::GlowMode::Off } else { effects.glow };
+        self.halation_enabled = effects.halation && !photographic_ir;
+        self.ssao_enabled = effects.ssao && !photographic_ir;
         self.ssao_resolution = effects.ssao_resolution.min(1);
         self.static_bsp_ao_enabled = effects.static_bsp_ao;
         self.static_bsp_ao_lightmap = true;
@@ -128,11 +131,11 @@ impl Renderer {
         self.taa_enabled = desired_taa;
         self.rt_taa_mode = effects.rt_taa.min(2);
         self.smaa_enabled = desired_smaa;
-        self.fxaa_enabled = desired_fxaa;
+        self.fxaa_enabled = desired_fxaa && !photographic_ir;
         if self.smaa_enabled {
             self.ensure_smaa_target();
         }
-        self.contact_shadows_enabled = effects.contact_shadows;
+        self.contact_shadows_enabled = effects.contact_shadows && !photographic_ir;
         self.weather.fog.mode = effects.fog_mode;
         self.weather.fog.strength = effects.fog_strength.clamp(0.0, ui::MAX_FOG_STRENGTH);
         let previous_sun = (self.sun_override, self.sun_yaw, self.sun_pitch,
@@ -344,8 +347,8 @@ impl Renderer {
         self.sync_self_legacy_fog();
         self.reflection_quality = effects.reflection_quality;
         self.reflection_debug_enabled = effects.reflection_debug;
-        self.ssr_enabled = self.reflection_quality.ssr_enabled();
-        self.planar_reflection_mode = if self.reflection_quality == ReflectionQuality::Off {
+        self.ssr_enabled = self.reflection_quality.ssr_enabled() && !photographic_ir;
+        self.planar_reflection_mode = if photographic_ir || self.reflection_quality == ReflectionQuality::Off {
             PlanarReflectionMode::Off
         } else if self.reflection_quality.promotes_environment_planars() {
             PlanarReflectionMode::Environment
@@ -355,9 +358,9 @@ impl Renderer {
         self.chromatic_aberration_strength = effects.chromatic_aberration.max(0.0);
         self.vignette_enabled = effects.vignette;
         self.film_grain_strength = effects.film_grain_strength.clamp(0.0, 1.0);
-        self.motion_blur_strength = effects.motion_blur_strength.clamp(0.0, 1.0);
+        self.motion_blur_strength = if photographic_ir { 0.0 } else { effects.motion_blur_strength.clamp(0.0, 1.0) };
         self.dof_mode = effects.dof_mode;
-        self.depth_of_field_strength = if effects.dof_mode == ui::DofMode::Off {
+        self.depth_of_field_strength = if photographic_ir || effects.dof_mode == ui::DofMode::Off {
             0.0
         } else {
             effects.depth_of_field_strength.clamp(0.0, 1.0)

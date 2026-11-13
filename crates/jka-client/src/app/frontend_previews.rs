@@ -1712,10 +1712,11 @@ impl App {
             mode == JoinMode::Player && policy.health > 0 && policy.vehicle_num == 0;
 
         if render_third_person {
+            let third_person = self.third_person_for_strafehelper();
             if let Some(world) = self.map_collision.as_mut() {
                 let view = offset_third_person_view(
                     world,
-                    self.third_person,
+                    third_person,
                     &mut self.third_person_camera,
                     ThirdPersonViewInput {
                         origin: presentation_origin,

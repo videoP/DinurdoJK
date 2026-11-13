@@ -1,30 +1,24 @@
 name: DinurdoJK macOS (Build and Signed Release)
-
-# One native build per architecture, also retained as a downloadable Actions
-# artifact. After successful Windows publication, optionally sign/notarize and
-# attach each architecture to the same GitHub Release. A manual run can compile
-# without publishing (when no matching Windows release exists).
-# The Windows workflow name is unchanged; it owns the shared release/manifest.
+# Builds start on push; only publication waits for the Windows release.
+# Signed deployment secrets never enter the unapproved build jobs.
 on:
+  push:
+    branches: [main]
+  workflow_dispatch:
   workflow_run:
     workflows: ["DinurdoJK Signed Windows Release (DLAA)"]
     types: [completed]
     branches: [main]
-  workflow_dispatch:
-
 permissions:
   contents: read
-
 jobs:
-  macos-release:
+  macos-build:
     if: >-
       github.repository == 'videoP/DinurdoJK' &&
-      ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
-      (github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.head_repository.full_name == 'videoP/DinurdoJK' &&
-      github.event.workflow_run.head_branch == 'main'))
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
     permissions:
-      contents: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -37,51 +31,33 @@ jobs:
             arch: x86_64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
-    environment: release-signing
     env:
-      GH_TOKEN: ${{ github.token }}
+      # These must be REPOSITORY-level values; the build uses no protected environment.
       DINURDOJK_UPDATE_PUBLIC_KEY_HEX: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
       DINURDOJK_NWH_SOURCE_B64: ${{ secrets.DINURDOJK_NWH_SOURCE_B64 }}
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
       AUDIONIMBUS_AUTO_INSTALL_PROGRESS: '0'
-
     steps:
-      - name: Checkout Windows release's exact commit
+      - name: Checkout exact pushed commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Confirm matching published Windows release
-        id: release
+      - name: Stamp version and require build inputs
         shell: bash
         run: |
           set -euo pipefail
           python3 scripts/stamp_ci_version.py
-          tag="$(python3 scripts/make_signed_release.py --print-tag)"
-          expected_sha="$(git rev-parse HEAD)"
-          # The Windows workflow also succeeds on same-version pushes when it
-          # intentionally skips publication. That is not a macOS release error.
-          if ! release_sha="$(gh release view "$tag" --json targetCommitish -q .targetCommitish 2>/dev/null)"; then
-            echo "::notice::No published Windows release for $tag; skipping macOS publication."
-            echo 'matching=false' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [[ "$release_sha" != "$expected_sha" ]]; then
-            echo "::notice::Windows release $tag belongs to $release_sha, not $expected_sha; skipping Mac publication."
-            echo 'matching=false' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo 'matching=true' >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-
-
+          [[ "${DINURDOJK_UPDATE_PUBLIC_KEY_HEX:-}" =~ ^[0-9a-fA-F]{64}$ ]] || {
+            echo '::error::Set repository variable DINURDOJK_UPDATE_PUBLIC_KEY_HEX (public Ed25519 key)'; exit 1;
+          }
+          test -n "${DINURDOJK_NWH_SOURCE_B64:-}" || {
+            echo '::error::Set repository secret DINURDOJK_NWH_SOURCE_B64 for unapproved builds'; exit 1;
+          }
       - name: Install native Rust and tools
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -135,15 +111,82 @@ jobs:
           tar -C dist/compile -czf "dist/DinurdoJK-macos-${{ matrix.arch }}.tar.gz" DinurdoJK
           shasum -a 256 "dist/DinurdoJK-macos-${{ matrix.arch }}.tar.gz"
 
+      - name: Stage deterministic macOS CI artifact layout
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/ci-macos-upload
+          cp "dist/DinurdoJK-macos-${{ matrix.arch }}.tar.gz" dist/ci-macos-upload/
+          cp "macos-${{ matrix.arch }}-dependencies.txt" dist/ci-macos-upload/
+
       - name: Upload macOS build artifact (even without signing)
         uses: actions/upload-artifact@v4
         with:
           name: DinurdoJK-macos-${{ matrix.arch }}-unsigned-${{ github.run_id }}
-          path: |
-            dist/DinurdoJK-macos-${{ matrix.arch }}.tar.gz
-            macos-${{ matrix.arch }}-dependencies.txt
+          path: dist/ci-macos-upload/
           if-no-files-found: error
           retention-days: 14
+
+
+  macos-publish:
+    if: >-
+      github.repository == 'videoP/DinurdoJK' &&
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == 'videoP/DinurdoJK' &&
+      github.event.workflow_run.head_branch == 'main'
+    permissions:
+      contents: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            rust_target: aarch64-apple-darwin
+            arch: arm64
+          - runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    environment: release-signing
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DINURDOJK_UPDATE_PUBLIC_KEY_HEX: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
+    steps:
+      - name: Checkout Windows release's exact commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Confirm matching published Windows release
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/stamp_ci_version.py
+          tag="$(python3 scripts/make_signed_release.py --print-tag)"
+          expected_sha="$(git rev-parse HEAD)"
+          # The Windows workflow also succeeds on same-version pushes when it
+          # intentionally skips publication. That is not a macOS release error.
+          if ! release_sha="$(gh release view "$tag" --json targetCommitish -q .targetCommitish 2>/dev/null)"; then
+            echo "::notice::No published Windows release for $tag; skipping macOS publication."
+            echo 'matching=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$release_sha" != "$expected_sha" ]]; then
+            echo "::notice::Windows release $tag belongs to $release_sha, not $expected_sha; skipping Mac publication."
+            echo 'matching=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'matching=true' >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
 
       - name: Check optional Apple Developer signing configuration
         if: steps.release.outputs.matching == 'true'
@@ -167,6 +210,45 @@ jobs:
             echo 'ready=false' >> "$GITHUB_OUTPUT"
             echo '::warning::Mac binary built; signing/notarization not configured, so no GitHub release assets will be published.'
           fi
+
+      - name: Wait for corresponding macOS build artifact
+        if: steps.release.outputs.matching == 'true' && steps.signing.outputs.ready == 'true'
+        id: build_artifact
+        shell: bash
+        env:
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          python3 scripts/wait_for_ci_artifact.py \
+            --workflow macos.yml --sha "$RELEASE_SHA" \
+            --artifact-prefix 'DinurdoJK-macos-${{ matrix.arch }}-unsigned-' \
+            --timeout-seconds 10800
+
+      - name: Download and verify native compiled macOS artifact
+        if: steps.release.outputs.matching == 'true' && steps.signing.outputs.ready == 'true'
+        shell: bash
+        env:
+          RUN_ID: ${{ steps.build_artifact.outputs.run_id }}
+          ARTIFACT_NAME: ${{ steps.build_artifact.outputs.artifact_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/mac-build" target/release
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "$ARTIFACT_NAME" --dir "$RUNNER_TEMP/mac-build"
+          tar -xzf "$RUNNER_TEMP/mac-build/DinurdoJK-macos-${{ matrix.arch }}.tar.gz" -C target/release
+          test -s target/release/DinurdoJK
+          chmod 755 target/release/DinurdoJK
+          lipo -archs target/release/DinurdoJK | tr ' ' '\n' | grep -Fx '${{ matrix.arch }}'
+
+      - name: Download Windows release shared asset for signed macOS manifest
+        if: steps.release.outputs.matching == 'true' && steps.signing.outputs.ready == 'true'
+        shell: bash
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/windows-asset"
+          gh release download "$TAG" --pattern 'dinurdo-assets.pk4' --dir "$RUNNER_TEMP/windows-asset"
+          test -s "$RUNNER_TEMP/windows-asset/dinurdo-assets.pk4"
 
       - name: Sign, notarize, and publish standalone macOS release
         if: steps.release.outputs.matching == 'true' && steps.signing.outputs.ready == 'true'
@@ -208,16 +290,11 @@ jobs:
           mkdir -p dist/macos-${ARCH}
           python3 scripts/make_signed_macos_release.py \
             --binary target/release/DinurdoJK \
-            --assets assets/dinurdo-assets.pk4 \
+            --assets "$RUNNER_TEMP/windows-asset/dinurdo-assets.pk4" \
             --out "dist/macos-${ARCH}" --tag "$TAG" --arch "$ARCH"
           archive="dist/macos-${ARCH}/DinurdoJK-${TAG}-macos-${ARCH}-standalone.zip"
           xcrun notarytool submit "$archive" --apple-id "$APPLE_NOTARY_ID" \
             --password "$APPLE_NOTARY_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
-          # The Windows publisher owns dinurdo-assets.pk4: verify the exact
-          # release asset before referencing it in our Mac signature.
-          mkdir -p "$RUNNER_TEMP/windows-asset"
-          gh release download "$TAG" --pattern 'dinurdo-assets.pk4' --dir "$RUNNER_TEMP/windows-asset"
-          cmp "$RUNNER_TEMP/windows-asset/dinurdo-assets.pk4" assets/dinurdo-assets.pk4
           gh release upload "$TAG" \
             "$archive" \
             "dist/macos-${ARCH}/DinurdoJK-macos-${ARCH}" \

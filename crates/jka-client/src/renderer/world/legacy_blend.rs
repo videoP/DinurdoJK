@@ -11,6 +11,12 @@ pub(in crate::renderer) fn additive_pipeline(key: PipelineKey) -> bool {
     ) && key.class == crate::renderer::DrawClass::Transparent
 }
 
+/// Color attachment format of an encoded world pass: the UNORM alias of an
+/// sRGB scene, otherwise the float encoded-blend target.
+pub(in crate::renderer) fn encoded_format(scene: wgpu::TextureFormat) -> wgpu::TextureFormat {
+    if scene.is_srgb() { scene.remove_srgb_suffix() } else { wgpu::TextureFormat::Rgba16Float }
+}
+
 pub(in crate::renderer) fn pipelines(
     device: &wgpu::Device,
     layout: &wgpu::PipelineLayout,
@@ -20,11 +26,7 @@ pub(in crate::renderer) fn pipelines(
     keys: impl Iterator<Item = PipelineKey>,
     variant: crate::renderer::WorldShaderVariantKey,
 ) -> BTreeMap<PipelineKey, wgpu::RenderPipeline> {
-    let encoded_format = if format.is_srgb() {
-        format.remove_srgb_suffix()
-    } else {
-        wgpu::TextureFormat::Rgba16Float
-    };
+    let encoded_format = encoded_format(format);
     let keys = keys.collect::<std::collections::BTreeSet<_>>();
     if !keys.iter().any(|key| additive_pipeline(*key)) {
         return BTreeMap::new();
@@ -67,8 +69,7 @@ pub(in crate::renderer) fn fog_pipelines(
     if !variant.legacy_fog || !keys.iter().any(|key| additive_pipeline(*key)) {
         return BTreeMap::new();
     }
-    let encoded_format = if format.is_srgb() { format.remove_srgb_suffix() }
-        else { wgpu::TextureFormat::Rgba16Float };
+    let encoded_format = encoded_format(format);
     let mut compiled = BTreeMap::new();
     keys.into_iter().filter(|key| key.class != crate::renderer::DrawClass::Sky)
         .flat_map(|key| [false, true].map(move |depth| (key, depth)))

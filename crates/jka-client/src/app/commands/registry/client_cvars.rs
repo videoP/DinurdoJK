@@ -1774,10 +1774,16 @@ app_cvars! {
                     value: &str,
                 ) -> Result<(), String> {
                     {
-                        self.third_person.camera_damp = value
+                        let damp = value
                             .trim()
                             .parse::<f32>()
                             .map_err(|_| format!("{name}: expected a number"))?;
+                        if self.third_person.camera_damp != damp {
+                            self.third_person.camera_damp = damp;
+                            // TaystJK cg_xcvar.h: CG_ClearThirdPersonDamp on edit.
+                            // Reinitialize from the next collision-tested ideal view.
+                            self.third_person_camera.reset();
+                        }
                         self.mark_config_dirty();
                     }
                     Ok(())
@@ -2052,10 +2058,15 @@ app_cvars! {
                     value: &str,
                 ) -> Result<(), String> {
                     {
-                        self.third_person.target_damp = value
+                        let damp = value
                             .trim()
                             .parse::<f32>()
                             .map_err(|_| format!("{name}: expected a number"))?;
+                        if self.third_person.target_damp != damp {
+                            self.third_person.target_damp = damp;
+                            // Match TaystJK's CG_ClearThirdPersonDamp callback.
+                            self.third_person_camera.reset();
+                        }
                         self.mark_config_dirty();
                     }
                     Ok(())

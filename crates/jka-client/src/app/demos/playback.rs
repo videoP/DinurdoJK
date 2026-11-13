@@ -13,6 +13,37 @@ use crate::app::{
     REWARD_ICON_SIZE, REWARD_TIME_MS,
 };
 
+use crate::camera::{ThirdPersonCameraState, ThirdPersonSettings, ThirdPersonViewOutput};
+use jka_movement::{TraceQuery, TraceResult, TraceWorld};
+
+// A missing BSP is not an implicit camera collision. Keep worldless movement
+// prediction disabled, but still run the ordinary OpenJK third-person camera
+// with unobstructed presentation-only traces.
+struct WorldlessCameraTrace;
+
+impl TraceWorld for WorldlessCameraTrace {
+    fn trace(&mut self, query: TraceQuery) -> TraceResult {
+        TraceResult::clear(query.end)
+    }
+
+    fn point_contents(&mut self, _point: [f32; 3], _pass_entity: i32) -> i32 {
+        0
+    }
+}
+
+#[inline]
+fn offset_third_person_view_optional_world<W: TraceWorld>(
+    world: Option<&mut W>,
+    settings: ThirdPersonSettings,
+    state: &mut ThirdPersonCameraState,
+    input: ThirdPersonViewInput,
+) -> ThirdPersonViewOutput {
+    match world {
+        Some(world) => offset_third_person_view(world, settings, state, input),
+        None => offset_third_person_view(&mut WorldlessCameraTrace, settings, state, input),
+    }
+}
+
 impl GameSession {
     pub(in crate::app) fn set_playback_rate(
         &mut self,
@@ -517,6 +548,14 @@ impl GameSession {
 }
 
 impl App {
+    /// Effective third-person damping for this presentation frame, without
+    /// changing the user's archived camera/target damping cvars.
+    pub(in crate::app) fn third_person_for_strafehelper(&self) -> crate::camera::ThirdPersonSettings {
+        crate::cgame::view::third_person_strafehelper_damping(
+            self.third_person, self.strafe_helper.flags,
+        )
+    }
+
     pub(in crate::app) fn play_selected_demo(&mut self) {
         self.play_selected_demo_from(None);
     }
@@ -1001,7 +1040,7 @@ impl App {
                 && super::super::wallrun_camera::is_wall_running(sample.policy.legs_anim))
             && self.subframe_input_view_rotation().is_some();
         if render_third_person {
-            let mut third_person = self.third_person;
+            let mut third_person = self.third_person_for_strafehelper();
             let mut camera_angles = sample.view_angles;
             if let Some(mode) = spectator_mode {
                 third_person.enabled = true;
@@ -1071,45 +1110,43 @@ impl App {
                     }
                 }
             }
-            if let Some(world) = self.map_collision.as_mut() {
-                let view = offset_third_person_view(
-                    world,
-                    third_person,
-                    &mut self.third_person_camera,
-                    ThirdPersonViewInput {
-                        // TaystJK CG_OffsetThirdPersonView freezes the target
-                        // focus at gCGFallVector when the player starts falling.
-                        // The post-view override below then aims at the moving
-                        // player and places the eye at that same frozen origin.
-                        origin: self.falling_death.map_or(sample.native_origin, |fall| fall.anchor),
-                        view_angles: camera_angles,
-                        velocity: sample.velocity,
-                        view_height: sample.view_height,
-                        // Orbit is spectator-owned. Do not let OpenJK's dead-camera
-                        // yaw override replace the local orbit yaw when the followed
-                        // player is dead (or a reconstructed demo POV reports 0 HP).
-                        health: if spectator_mode == Some(SpectatorCameraMode::Orbit) {
-                            sample.policy.health.max(1)
-                        } else {
-                            sample.policy.health
-                        },
-                        dead_yaw: sample.dead_yaw,
-                        client_num: sample.client_num,
-                        time: sample.presentation_time_ms,
-                        teleported: sample.teleported,
+            let view = offset_third_person_view_optional_world(
+                self.map_collision.as_mut(),
+                third_person,
+                &mut self.third_person_camera,
+                ThirdPersonViewInput {
+                    // TaystJK CG_OffsetThirdPersonView freezes the target
+                    // focus at gCGFallVector when the player starts falling.
+                    // The post-view override below then aims at the moving
+                    // player and places the eye at that same frozen origin.
+                    origin: self.falling_death.map_or(sample.native_origin, |fall| fall.anchor),
+                    view_angles: camera_angles,
+                    velocity: sample.velocity,
+                    view_height: sample.view_height,
+                    // Orbit is spectator-owned. Do not let OpenJK's dead-camera
+                    // yaw override replace the local orbit yaw when the followed
+                    // player is dead (or a reconstructed demo POV reports 0 HP).
+                    health: if spectator_mode == Some(SpectatorCameraMode::Orbit) {
+                        sample.policy.health.max(1)
+                    } else {
+                        sample.policy.health
                     },
-                );
-                self.camera.position = glam::Vec3::from_array(scene::render_position(view.origin));
-                self.camera.yaw = view.angles[1].to_radians();
-                self.camera.pitch = -view.angles[0].to_radians();
-                if latch_input_available {
-                    if let Some(latch) = view.late_latch {
-                        self.render_view_latch = ViewLatchMode::ThirdPerson(latch);
-                    }
+                    dead_yaw: sample.dead_yaw,
+                    client_num: sample.client_num,
+                    time: sample.presentation_time_ms,
+                    teleported: sample.teleported,
+                },
+            );
+            self.camera.position = glam::Vec3::from_array(scene::render_position(view.origin));
+            self.camera.yaw = view.angles[1].to_radians();
+            self.camera.pitch = -view.angles[0].to_radians();
+            if latch_input_available {
+                if let Some(latch) = view.late_latch {
+                    self.render_view_latch = ViewLatchMode::ThirdPerson(latch);
                 }
-                self.apply_falling_death_camera(&sample);
-                return;
             }
+            self.apply_falling_death_camera(&sample);
+            return;
         }
         self.camera.position = glam::Vec3::from_array(sample.eye_position);
         self.camera.yaw = sample.view_angles[1].to_radians();
@@ -1150,7 +1187,7 @@ impl App {
             self.camera.yaw = fake.view_angles[1].to_radians();
             self.camera.pitch = -fake.view_angles[0].to_radians();
         } else {
-            let mut third_person = self.third_person;
+            let mut third_person = self.third_person_for_strafehelper();
             third_person.enabled = true;
             let mut camera_angles = fake.view_angles;
             match self.spectator_camera.mode {
@@ -1171,41 +1208,35 @@ impl App {
             if self.live_buttons.contains("+zoom") {
                 third_person.range = self.japro_zoom_third_person_range(third_person.range);
             }
-            if let Some(world) = self.map_collision.as_mut() {
-                let view = offset_third_person_view(
-                    world,
-                    third_person,
-                    &mut self.third_person_camera,
-                    ThirdPersonViewInput {
-                        origin: fake.native_origin,
-                        view_angles: camera_angles,
-                        velocity: fake.velocity,
-                        // Remote EntityState has no viewheight/dead_yaw.
-                        // 26 is JKA's standing viewheight and matches the
-                        // first-person approximation used by demo_fake_view.
-                        view_height: 26,
-                        // Same rule for reconstructed remote demo POVs: Orbit
-                        // owns yaw even if remote health is unavailable/zero.
-                        health: if self.spectator_camera.mode == SpectatorCameraMode::Orbit {
-                            fake.health.max(1)
-                        } else {
-                            fake.health
-                        },
-                        dead_yaw: fake.view_angles[1],
-                        client_num: fake.client_num,
-                        time: sample.presentation_time_ms,
-                        teleported: false,
+            let view = offset_third_person_view_optional_world(
+                self.map_collision.as_mut(),
+                third_person,
+                &mut self.third_person_camera,
+                ThirdPersonViewInput {
+                    origin: fake.native_origin,
+                    view_angles: camera_angles,
+                    velocity: fake.velocity,
+                    // Remote EntityState has no viewheight/dead_yaw.
+                    // 26 is JKA's standing viewheight and matches the
+                    // first-person approximation used by demo_fake_view.
+                    view_height: 26,
+                    // Same rule for reconstructed remote demo POVs: Orbit
+                    // owns yaw even if remote health is unavailable/zero.
+                    health: if self.spectator_camera.mode == SpectatorCameraMode::Orbit {
+                        fake.health.max(1)
+                    } else {
+                        fake.health
                     },
-                );
-                self.camera.position =
-                    glam::Vec3::from_array(scene::render_position(view.origin));
-                self.camera.yaw = view.angles[1].to_radians();
-                self.camera.pitch = -view.angles[0].to_radians();
-            } else {
-                self.camera.position = glam::Vec3::from_array(fake.eye_position);
-                self.camera.yaw = fake.view_angles[1].to_radians();
-                self.camera.pitch = -fake.view_angles[0].to_radians();
-            }
+                    dead_yaw: fake.view_angles[1],
+                    client_num: fake.client_num,
+                    time: sample.presentation_time_ms,
+                    teleported: false,
+                },
+            );
+            self.camera.position =
+                glam::Vec3::from_array(scene::render_position(view.origin));
+            self.camera.yaw = view.angles[1].to_radians();
+            self.camera.pitch = -view.angles[0].to_radians();
         }
     }
 
@@ -2590,5 +2621,62 @@ impl App {
             self.publish_transient_ui();
         }
         Ok(advance)
+    }
+}
+
+#[cfg(test)]
+mod worldless_camera_tests {
+    use super::*;
+
+    fn input() -> ThirdPersonViewInput {
+        ThirdPersonViewInput {
+            origin: [12.0, 4.0, 30.0],
+            view_angles: [0.0, 0.0, 0.0],
+            velocity: [0.0; 3],
+            view_height: 26,
+            health: 100,
+            dead_yaw: 0.0,
+            client_num: 0,
+            time: 1000.0,
+            teleported: false,
+        }
+    }
+
+    #[test]
+    fn missing_bsp_keeps_third_person_camera_behind_player() {
+        let mut state = ThirdPersonCameraState::default();
+        let settings = ThirdPersonSettings::default();
+        let view = offset_third_person_view_optional_world::<WorldlessCameraTrace>(
+            None, settings, &mut state, input(),
+        );
+        assert!((view.origin[0] - (12.0 - settings.range)).abs() < 0.001);
+        assert!((view.origin[1] - 4.0).abs() < 0.001);
+        assert!((view.origin[2] - (30.0 + 26.0 + settings.vert_offset)).abs() < 0.001);
+    }
+
+    struct ClippedCameraWorld {
+        traces: usize,
+    }
+
+    impl TraceWorld for ClippedCameraWorld {
+        fn trace(&mut self, query: TraceQuery) -> TraceResult {
+            self.traces += 1;
+            TraceResult { fraction: 0.0, end: query.start, ..TraceResult::clear(query.end) }
+        }
+
+        fn point_contents(&mut self, _point: [f32; 3], _pass_entity: i32) -> i32 {
+            0
+        }
+    }
+
+    #[test]
+    fn loaded_bsp_still_uses_camera_collision_traces() {
+        let mut world = ClippedCameraWorld { traces: 0 };
+        let mut state = ThirdPersonCameraState::default();
+        let view = offset_third_person_view_optional_world(
+            Some(&mut world), ThirdPersonSettings::default(), &mut state, input(),
+        );
+        assert_eq!(world.traces, 2);
+        assert_eq!(view.origin, [12.0, 4.0, 56.0]);
     }
 }

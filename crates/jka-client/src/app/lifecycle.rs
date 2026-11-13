@@ -694,6 +694,10 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 self.publish_ui();
             }
+            UserEvent::BakedSunDirectionStatus(status) => {
+                self.baked_sun_direction_status = status;
+                self.publish_ui();
+            }
             UserEvent::BakedSunAutoStatus(status) => {
                 self.baked_sun_auto_status = status;
                 self.publish_ui();

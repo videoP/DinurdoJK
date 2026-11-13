@@ -5,6 +5,11 @@
 //! a freshly redacted native 2D snapshot onto its own target. DX12 exposes that
 //! private target to Spout2 through DX12/D3D11On12 or Vulkan/D3D11 KMT.
 //! Neither transport reads pixels through system memory.
+//!
+//! Only frames due for OBS (`capture_due`, at most `STREAM_FPS`) do any of
+//! this. Ordinarily the copy is encoded inside the main frame and the stream's
+//! command buffers ride its submission; `submit_scene` is the deferred form
+//! for layouts whose scene finishes after the main submit.
 use crate::renderer::{
     ui, Renderer, UiVertex, UI_BUFFER_BYTES, UI_DYNAMIC_BUFFER_BYTES, UI_TRANSIENT_BUFFER_BYTES,
 };
@@ -19,6 +24,7 @@ use std::time::{Duration, Instant};
 
 const STREAM_FPS: u32 = 60;
 const STREAM_NAME: &str = "DinurdoJK Stream";
+const STREAM_SHADER_MAX_VERTICES: u64 = 16_384;
 
 struct FrameResources {
     width: u32,
@@ -29,6 +35,7 @@ struct FrameResources {
     view: wgpu::TextureView,
     encoded_view: wgpu::TextureView,
     ui_buffer: wgpu::Buffer,
+    shader_buffer: wgpu::Buffer,
 }
 
 #[cfg(all(test, windows))]
@@ -229,6 +236,12 @@ impl StreamOutput {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::VERTEX,
             mapped_at_creation: false,
         });
+        let shader_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("JKA streamer authored HUD stages"),
+            size: STREAM_SHADER_MAX_VERTICES * std::mem::size_of::<UiVertex>() as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
         self.resources = Some(FrameResources {
             width,
             height,
@@ -238,29 +251,84 @@ impl StreamOutput {
             view,
             encoded_view,
             ui_buffer,
+            shader_buffer,
         });
     }
 
-    /// Called after the scene+post submit and BEFORE egui/native local overlay.
-    /// Source is the SDR backbuffer or early-present target, not a second world pass.
+    /// Per-frame gate, evaluated before the frame layout is chosen. Only a
+    /// frame that will publish to OBS (at most `STREAM_FPS` per second) may
+    /// change the layout; every other frame renders exactly as streaming off.
+    pub(in crate::renderer) fn capture_due(&mut self, now: Instant) -> bool {
+        if !self.settings.enabled || self.warned_unsupported {
+            return false;
+        }
+        if self.last_frame.is_some_and(|t| {
+            now.duration_since(t) < Duration::from_secs_f64(1.0 / f64::from(STREAM_FPS))
+        }) {
+            return false;
+        }
+        // An existing sender must accept a frame now, else this OBS frame is
+        // dropped instead of paid for. `prepare` creates a missing sender.
+        #[cfg(windows)]
+        {
+            if self.dx12_sender.as_ref().is_some_and(|sender| !sender.ready()) {
+                return false;
+            }
+            if let Some(sender) = self.vulkan_sender.as_mut() {
+                if let Err(error) = sender.poll_ready() {
+                    self.pause_unsupported(&error);
+                    return false;
+                }
+                if sender.free_slot().is_none() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Deferred capture, for layouts whose scene is only final after the main
+    /// submit (SMAA, CRT, menu backdrop). Called BEFORE egui/native local
+    /// overlay. Source is the SDR backbuffer or early-present target.
     pub(in crate::renderer) fn submit_scene(
         &mut self,
         renderer: &mut Renderer,
         source: &wgpu::Texture,
+        now: Instant,
     ) {
-        if !self.settings.enabled || self.warned_unsupported {
+        let Some(mut capture) = self.prepare(renderer, source, now) else {
             return;
+        };
+        let mut encoder = renderer
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("JKA streamer deferred scene copy"),
+            });
+        capture.encode_scene_copy(&mut encoder);
+        renderer.queue.submit(
+            std::iter::once(encoder.finish()).chain(capture.take_command_buffers()),
+        );
+        self.finish(&renderer.queue, capture);
+    }
+
+    /// Record everything for one OBS frame except the scene copy: the
+    /// privacy-filtered HUD over the stream target and the native transport.
+    /// The caller encodes `StreamCapture::encode_scene_copy` where the scene
+    /// is final and no local UI has been drawn, submits the capture's command
+    /// buffers right after that encoder, then calls `finish`.
+    pub(in crate::renderer) fn prepare(
+        &mut self,
+        renderer: &mut Renderer,
+        source: &wgpu::Texture,
+        now: Instant,
+    ) -> Option<StreamCapture> {
+        if !self.settings.enabled || self.warned_unsupported {
+            return None;
         }
         let backend = renderer.device.adapter_info().backend;
         if !matches!(backend, wgpu::Backend::Dx12 | wgpu::Backend::Vulkan) {
             self.pause_unsupported("GPU-native Spout2 requires DX12 or Vulkan on Windows");
-            return;
-        }
-        let now = Instant::now();
-        if self.last_frame.is_some_and(|t| {
-            now.duration_since(t) < Duration::from_secs_f64(1.0 / f64::from(STREAM_FPS))
-        }) {
-            return;
+            return None;
         }
         let format = source.format();
         let view_format = renderer.config.format;
@@ -279,21 +347,19 @@ impl StreamOutput {
                 source.format(),
                 source.usage()
             ));
-            return;
+            return None;
         }
         let width = renderer.config.width;
         let height = renderer.config.height;
         if width == 0 || height == 0 || source.width() != width || source.height() != height {
             self.pause_unsupported("scene size differs from stream output size");
-            return;
+            return None;
         }
         self.ensure_resources(&renderer.device, width, height, format, view_format);
         #[cfg(windows)]
         if backend == wgpu::Backend::Dx12 && self.dx12_sender.is_none() {
             let result = {
-                let Some(resources) = &self.resources else {
-                    return;
-                };
+                let resources = self.resources.as_ref()?;
                 dx12_spout::Dx12Sender::new(&renderer.device, &resources.color, format, STREAM_NAME)
             };
             match result {
@@ -306,7 +372,7 @@ impl StreamOutput {
                 }
                 Err(error) => {
                     self.pause_unsupported(&error);
-                    return;
+                    return None;
                 }
             }
         }
@@ -317,7 +383,7 @@ impl StreamOutput {
                 .as_ref()
                 .is_some_and(dx12_spout::Dx12Sender::ready)
         {
-            return; // no blocking wait for a reusable DX12 command allocator
+            return None; // no blocking wait for a reusable DX12 command allocator
         }
         #[cfg(windows)]
         let vulkan_slot = if backend == wgpu::Backend::Vulkan {
@@ -338,32 +404,21 @@ impl StreamOutput {
                     }
                     Err(error) => {
                         self.pause_unsupported(&error);
-                        return;
+                        return None;
                     }
                 }
             }
-            let sender = self.vulkan_sender.as_mut().unwrap();
-            if let Err(error) = sender.poll_ready() {
-                self.pause_unsupported(&error);
-                return;
-            }
-            let Some(slot) = sender.free_slot() else {
-                return;
-            };
-            Some(slot)
+            // `capture_due` already polled this frame; a new sender is empty.
+            Some(self.vulkan_sender.as_ref()?.free_slot()?)
         } else {
             None
         };
         #[cfg(not(windows))]
         {
             self.pause_unsupported("Spout2 GPU transport is Windows only");
-            return;
+            return None;
         }
-        let encoded = renderer.hdr_output.is_none() && renderer.config.format.is_srgb()
-            && renderer.ensure_encoded_2d_pipelines();
-        let Some(resources) = &self.resources else {
-            return;
-        };
+        let resources = self.resources.as_ref()?;
 
         let mut snapshot = renderer.ui_state.clone();
         crate::streamer::strip_local_only(&mut snapshot);
@@ -404,27 +459,31 @@ impl StreamOutput {
         if vertices.len() > max {
             vertices.truncate(max - max % 3);
         }
+        // Authored HUD shader quads are deliberately absent from the normal UI
+        // atlas. Resolve the *filtered* stream's shader spans independently;
+        // never copy unfiltered local shader batches or their vertex offsets.
+        let (shader_vertices, shader_batches) =
+            renderer.prepare_stream_ui_icon_shaders(&snapshot, &vertices);
         if !vertices.is_empty() {
-            renderer
-                .queue
-                .write_buffer(&resources.ui_buffer, 0, bytemuck::cast_slice(&vertices));
+            renderer.queue.write_buffer(
+                &resources.ui_buffer, 0, bytemuck::cast_slice(&vertices));
         }
+        if !shader_vertices.is_empty() {
+            renderer.queue.write_buffer(
+                &resources.shader_buffer, 0, bytemuck::cast_slice(&shader_vertices));
+        }
+        // The stream can have a different set of authored stages than the
+        // local HUD. Include its blends in lazy encoded-pipeline readiness.
+        let encoded = renderer.hdr_output.is_none() && renderer.config.format.is_srgb()
+            && renderer.ensure_encoded_2d_pipelines_with_extra(&shader_batches);
+        // Recorded now, submitted after the encoder holding the scene copy:
+        // queue order, not recording order, sequences the two.
         let mut encoder = renderer
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("JKA streamer GPU copy+masked UI"),
+                label: Some("JKA streamer filtered 2D + transport state"),
             });
-        let extent = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-        encoder.copy_texture_to_texture(
-            source.as_image_copy(),
-            resources.color.as_image_copy(),
-            extent,
-        );
-        if !vertices.is_empty() || renderer.screen_fx_vertex_count != 0 || renderer.enemy_icon_vertex_count != 0 {
+        if!vertices.is_empty() || renderer.screen_fx_vertex_count != 0 || renderer.enemy_icon_vertex_count != 0 {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JKA streamer filtered 2D only"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -477,14 +536,30 @@ impl StreamOutput {
                 } else {
                     ui_gamma.map_or(&renderer.ui_pipeline, |gamma| &gamma.pipeline)
                 };
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, if encoded { &renderer.ui_encoded_bind_group }
-                    else { &renderer.ui_bind_group }, &[]);
-                if let Some(group) = encoded_gamma_group.or_else(|| ui_gamma.map(|gamma| &gamma.group)) {
+                let ui_group = if encoded { &renderer.ui_encoded_bind_group }
+                    else { &renderer.ui_bind_group };
+                let gamma_group = encoded_gamma_group.or_else(|| ui_gamma.map(|gamma| &gamma.group));
+                if let Some(group) = gamma_group {
                     pass.set_bind_group(1, group, &[]);
                 }
-                pass.set_vertex_buffer(0, resources.ui_buffer.slice(..));
-                pass.draw(0..vertices.len() as u32, 0..1);
+                // All filtered UI was flattened into layer 0; the other
+                // layers are empty. The shared draw routine preserves shader
+                // stage/painter order and still uses its fast path otherwise.
+                Renderer::draw_ui_batches_shadered(
+                    &mut pass, pipeline, ui_group, gamma_group,
+                    &resources.ui_buffer, vertices.len() as u32,
+                    &resources.ui_buffer, 0,
+                    &resources.ui_buffer, 0,
+                    &resources.shader_buffer, &shader_batches,
+                    screen_fx_pipelines, &renderer.screen_fx_textures,
+                    &renderer.screen_fx_white_bind_group, encoded,
+                    if encoded {
+                        renderer.ui_encoded_format.expect("ready streamer encoded UI pipeline")
+                    } else {
+                        renderer.config.format
+                    },
+                    renderer.hud_shader_gpu.as_ref(),
+                );
             }
         }
         // Vulkan copies the finished composition into its external-memory
@@ -514,7 +589,7 @@ impl StreamOutput {
                 slot,
             ) {
                 self.pause_unsupported(&error);
-                return;
+                return None;
             }
             transport_encoder = Some(native);
         }
@@ -528,25 +603,65 @@ impl StreamOutput {
                 }),
             );
         }
-        renderer.queue.submit(
-            std::iter::once(encoder.finish())
-                .chain(transport_encoder.map(wgpu::CommandEncoder::finish)),
-        );
+        let mut command_buffers = Vec::with_capacity(2);
+        command_buffers.push(encoder.finish());
+        command_buffers.extend(transport_encoder.map(wgpu::CommandEncoder::finish));
+        Some(StreamCapture {
+            source: source.clone(),
+            color: resources.color.clone(),
+            command_buffers,
+            #[cfg(windows)]
+            vulkan_slot,
+            started: now,
+        })
+    }
+
+    /// Publish after the queue submission that carried `capture`'s buffers.
+    /// Dropping an unsubmitted capture instead is safe: no slot was claimed.
+    pub(in crate::renderer) fn finish(&mut self, queue: &wgpu::Queue, capture: StreamCapture) {
         #[cfg(windows)]
-        if let Some(slot) = vulkan_slot {
-            self.vulkan_sender
-                .as_mut()
-                .unwrap()
-                .queued(&renderer.queue, slot);
-            self.last_frame = Some(now);
+        if let Some(slot) = capture.vulkan_slot {
+            if let Some(sender) = self.vulkan_sender.as_mut() {
+                sender.queued(queue, slot);
+                self.last_frame = Some(capture.started);
+            }
         }
+        #[cfg(not(windows))]
+        let _ = queue;
         #[cfg(windows)]
         if let Some(sender) = self.dx12_sender.as_mut() {
             match sender.publish() {
-                Ok(true) => self.last_frame = Some(now),
+                Ok(true) => self.last_frame = Some(capture.started),
                 Ok(false) => {} // send frame dropped; keep game responsive
                 Err(error) => self.pause_unsupported(&error),
             }
         }
+    }
+}
+
+/// One OBS frame. Only the scene copy has to sit between post and the local
+/// HUD; the filtered HUD and native transport are separate command buffers
+/// that must follow the copy's encoder in the same (or a later) submission.
+pub(in crate::renderer) struct StreamCapture {
+    source: wgpu::Texture,
+    color: wgpu::Texture,
+    command_buffers: Vec<wgpu::CommandBuffer>,
+    #[cfg(windows)]
+    vulkan_slot: Option<usize>,
+    started: Instant,
+}
+
+impl StreamCapture {
+    /// Encode where the scene is final and no local UI/console/egui is drawn.
+    pub(in crate::renderer) fn encode_scene_copy(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.copy_texture_to_texture(
+            self.source.as_image_copy(),
+            self.color.as_image_copy(),
+            self.color.size(),
+        );
+    }
+
+    pub(in crate::renderer) fn take_command_buffers(&mut self) -> Vec<wgpu::CommandBuffer> {
+        std::mem::take(&mut self.command_buffers)
     }
 }

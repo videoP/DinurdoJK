@@ -621,7 +621,11 @@ impl Renderer {
         // advertise the UNORM view needed by encoded world blending. Render
         // into our regular scene target and resolve through the existing post
         // path instead of creating an invalid alias of the SMAA texture.
-        let legacy_world_possible = (!self.scene_format().is_srgb()
+        // Shitter/no-world paths skip every authored world batch (see the
+        // batch loop's `continue`), so encoded world blending never runs and
+        // must not force an offscreen scene + gamma copy (e.g. RGB565 swapchain).
+        let legacy_world_possible = !collision_world_only && !competitive_no_world
+            && (!self.scene_format().is_srgb()
             || !self.surface_unorm_alias_supported || self.smaa_enabled) && self.world.as_ref().is_some_and(|world|
             !world.pipeline_variants[&world.active_pipeline_variant].encoded_world_pipelines.is_empty());
         // A WGPU swapchain is not necessarily a texture-binding resource.
@@ -1669,14 +1673,26 @@ impl Renderer {
                 && self.hdr_output.is_none()
                 && self.crt_scope == ui::CrtScope::Off
         });
+        // Spout: only a frame due for OBS (<= STREAM_FPS) may differ from the
+        // streaming-off layout. Inline capture encodes the scene copy in the
+        // main encoder before the local HUD and rides the main submission.
+        // Deferred capture is kept for layouts whose scene is only final after
+        // the main submit (SMAA, CRT, menu backdrop) and for the HDR/Studio
+        // pause paths; those frames draw the local HUD late, as before.
+        let stream_now = Instant::now();
+        let stream_due = self.stream_output.capture_due(stream_now);
+        let stream_inline = stream_due && self.hdr_output.is_none() && !self.smaa_enabled
+            && !crt_active && !menu_backdrop_active
+            && self.studio_world_viewport.is_none() && self.studio_export_size.is_none();
+        let stream_deferred = stream_due && !stream_inline;
         let early_submit = studio_composite.is_none() && self.early_submit_frame(menu_backdrop_active);
         info.early_submit = early_submit;
         // r_presentCopy: acquire as usual, render offscreen, copy at the end of
         // the main encoder (see present_copy_frame).
-        // Streaming defers local HUD drawing until after the scene copy. The
-        // present-copy path copies earlier, so use acquire-first while streaming.
+        // Deferred streaming draws the local HUD after the scene copy. The
+        // present-copy path copies earlier, so it uses acquire-first then.
         let present_copy = studio_composite.is_none() && !early_submit
-            && !self.stream_output.enabled() && self.present_copy_frame(menu_backdrop_active);
+            && !stream_deferred && self.present_copy_frame(menu_backdrop_active);
         info.present_copy = present_copy;
         let (frame, surface_view) = if studio_composite.is_some() {
             let frame = self.acquire_render_frame(&mut info)?;
@@ -2508,7 +2524,9 @@ impl Renderer {
             if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
             pass.set_pipeline(if lean_rain_depth {
                 &self.rain_depth_prepass_pipeline
-            } else if self.thermal_vision != 0 && self.thermal_depth_pipeline.is_some() {
+            } else if self.thermal_vision == 6 && self.nir_depth_pipeline.is_some() {
+                self.nir_depth_pipeline.as_ref().unwrap()
+            } else if (1..=5).contains(&self.thermal_vision) && self.thermal_depth_pipeline.is_some() {
                 self.thermal_depth_pipeline.as_ref().unwrap()
             } else {
                 &self.depth_prepass_pipeline
@@ -2555,7 +2573,7 @@ impl Renderer {
                     // visible-color stage is transparent. Give that surface a
                     // depth/heat receiver only in the active thermal prepass;
                     // normal transparency and all other depth users are unchanged.
-                    let thermal_lava_sheet = self.thermal_vision != 0
+                    let thermal_lava_sheet = (1..=5).contains(&self.thermal_vision)
                         && self.thermal_depth_pipeline.is_some()
                         && batch.source.thermal_lava
                         && batch.source.pipeline.class == DrawClass::Transparent;
@@ -2575,7 +2593,9 @@ impl Renderer {
                                 if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                                 pass.set_pipeline(if lean_rain_depth {
                                     &self.rain_depth_prepass_pipeline
-                                } else if self.thermal_vision != 0 && self.thermal_depth_pipeline.is_some() {
+                                } else if self.thermal_vision == 6 && self.nir_depth_pipeline.is_some() {
+                                    self.nir_depth_pipeline.as_ref().unwrap()
+                                } else if (1..=5).contains(&self.thermal_vision) && self.thermal_depth_pipeline.is_some() {
                                     self.thermal_depth_pipeline.as_ref().unwrap()
                                 } else {
                                     &self.depth_prepass_pipeline
@@ -2595,7 +2615,9 @@ impl Renderer {
                                 if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                                 pass.set_pipeline(if lean_rain_depth {
                                     &self.rain_depth_prepass_mask_pipeline
-                                } else if self.thermal_vision != 0 && self.thermal_depth_mask_pipeline.is_some() {
+                                } else if self.thermal_vision == 6 && self.nir_depth_mask_pipeline.is_some() {
+                                    self.nir_depth_mask_pipeline.as_ref().unwrap()
+                                } else if (1..=5).contains(&self.thermal_vision) && self.thermal_depth_mask_pipeline.is_some() {
                                     self.thermal_depth_mask_pipeline.as_ref().unwrap()
                                 } else {
                                     &self.depth_prepass_mask_pipeline
@@ -3549,6 +3571,22 @@ impl Renderer {
                 } else { 0.0 },
             ))
         } else { None };
+        // Inline Spout: record the filtered stream HUD + transport now, while
+        // `&mut self` is still available (the SMAA borrow below forbids it).
+        // Only the scene copy is encoded later, before the local HUD.
+        let mut stream_capture = if stream_inline {
+            let source = if early_submit || present_copy {
+                self.early_present_target.as_ref().map(|target| target.texture.clone())
+            } else {
+                frame.as_ref().map(|frame| frame.texture.clone())
+            };
+            source.and_then(|source| {
+                let mut stream = std::mem::take(&mut self.stream_output);
+                let capture = stream.prepare(self, &source, stream_now);
+                self.stream_output = stream;
+                capture
+            })
+        } else { None };
         let mut smaa_frame = if self.smaa_enabled {
             self.smaa_target
                 .as_mut()
@@ -3579,6 +3617,16 @@ impl Renderer {
         } else {
             final_output
         };
+        // Same source the world_encoding! encode receives; a mismatch there
+        // falls back to a fresh bind group, so this can never bind stale data.
+        if let Some(blend) = self.world_encoded_blend.as_mut() {
+            let encode_source = if self.msaa_samples > 1 {
+                self.targets.msaa_view.as_ref()
+            } else {
+                Some(scene_output)
+            };
+            blend.prepare_world_sources(&self.device, encode_source);
+        }
 
         let mut compact_group_drawn = std::mem::take(&mut self.compact_group_scratch);
         let mut face_plane_cull_scratch = std::mem::take(&mut self.face_plane_cull_scratch);
@@ -4255,7 +4303,6 @@ impl Renderer {
                 ..Default::default()
             });
             let encoded_color_view = (encoded_world && flare_scene_format.is_srgb()).then(|| encoded_alias(color_view));
-            let encoded_resolve_view = if encoded_world && flare_scene_format.is_srgb() { resolve_target.map(encoded_alias) } else { None };
             let mut encoded_world_active = false;
             info.perf_world_skip_clear = skip_world_color_clear(
                 self.color_clear_mode, self.fast_sky, sky_portal_drawn, world.sky_covers_background,
@@ -4383,12 +4430,13 @@ impl Renderer {
                         if let Some(blend) = &self.world_encoded_blend {
                             if requested { blend.encode_world(&self.device, &mut encoder,
                                 if self.msaa_samples > 1 { color_view } else { scene_output }, &self.targets.depth_view); }
-                            else { blend.decode_world(&self.device, &mut encoder, color_view, resolve_target); }
+                            else { blend.decode_world(&self.device, &mut encoder, color_view); }
                         }
                         pass = crate::renderer::world::legacy_blend::resume(
                             &mut encoder,
                             if requested { encoded_color_view.as_ref().unwrap_or_else(|| self.world_encoded_blend.as_ref().unwrap().color_view()) } else { color_view },
-                            if requested { if let Some(blend) = &self.world_encoded_blend { blend.resolve_view() } else { encoded_resolve_view.as_ref() } } else { resolve_target },
+                            // Encoded passes never resolve: the normal pass that always follows does.
+                            if requested { None } else { resolve_target },
                             &self.targets.depth_view, world, &self.camera_bind_group,
                             if enhanced_world_shader { &world.lighting_bind_group } else { &world.lighting_bind_group_lean },
                             world_shadow_receiver_bind_group, &self.planar_reflection.bind_group,
@@ -6510,11 +6558,21 @@ impl Renderer {
                 // Unlike grouping by shader, the bundle cannot reorder alpha
                 // blending or depth-equal siblings. Legacy fog replay is left on
                 // the original direct path until it can be included in the key.
-                let cache_deferred = !encoded_world && !glass_capture_needed && !self.gpu_driven_enabled
+                // Encoded (display-space) blending is cached too when the whole
+                // stream shares one encoding, so one pass switch precedes replay;
+                // a mixed stream keeps the direct path's per-batch switches.
+                let deferred_encoded = |position: usize| {
+                    let batch = &active.batches[active.indices[position]];
+                    encoded_world && !batch.source.glass_primary
+                        && active_pipeline_variant.encoded_world_pipelines.contains_key(&batch.source.pipeline)
+                };
+                let cache_encoded = deferred_transparent.first().is_some_and(|&position| deferred_encoded(position));
+                let cache_deferred = !glass_capture_needed && !self.gpu_driven_enabled
                     && !render_ocean
                     && optical_volumes.is_none()
                     && self.planar_reflection_debug_mode == PlanarReflectionDebugMode::Off
                     && deferred_transparent.len() >= 48
+                    && deferred_transparent.iter().all(|&position| deferred_encoded(position) == cache_encoded)
                     && !deferred_transparent.iter().any(|&position| {
                         let batch = &active.batches[active.indices[position]];
                         batch.source.legacy_fog_pass && self.weather.fog.legacy_uses_separate_pass(
@@ -6532,6 +6590,9 @@ impl Renderer {
                     for &active_pos in &deferred_transparent {
                         let batch = &active.batches[active.indices[active_pos]];
                         let (binding, pipeline) = active_pipeline_variant.base_pipeline(batch);
+                        let pipeline = if cache_encoded {
+                            &active_pipeline_variant.encoded_world_pipelines[&batch.source.pipeline]
+                        } else { pipeline };
                         bundle_cache.scratch.push(DeferredCommand {
                             pipeline: pipeline.clone(),
                             binding,
@@ -6557,7 +6618,9 @@ impl Renderer {
                         vertices: world.vertex_buffer.clone(),
                         dlight_ids: world.legacy_dlight_surface_id_buffer.clone(),
                         indices: world.index_buffer.clone(),
-                        color_format: flare_scene_format,
+                        color_format: if cache_encoded {
+                            crate::renderer::world::legacy_blend::encoded_format(flare_scene_format)
+                        } else { flare_scene_format },
                         sample_count: self.msaa_samples,
                     };
                     let result = bundle_cache.update(&self.device, resources);
@@ -6566,6 +6629,7 @@ impl Renderer {
                         info.perf_deferred_bundle_build = u32::from(result.built);
                     }
                     if let Some(bundle) = bundle_cache.bundle() {
+                        world_encoding!(cache_encoded);
                         pass.execute_bundles(std::iter::once(bundle));
                         for (kind, binds) in result.program_binds.into_iter().enumerate() {
                             info.world_shader_programs.binds[kind] = info.world_shader_programs.binds[kind].saturating_add(binds);
@@ -7503,7 +7567,7 @@ impl Renderer {
                     for &batch_index in active.indices {
                         let batch = &active.batches[batch_index];
                         if (batch.source.force_sight_only && !force_sight_on || hidden_bsp_model_surface(self.draw_bsp_model_surfaces, batch, &world.material_debug))
-                            || !(batch.source.authored_glow || (self.thermal_vision != 0 && batch.source.thermal_source_stage))
+                            || !(batch.source.authored_glow || ((1..=5).contains(&self.thermal_vision) && batch.source.thermal_source_stage))
                             || (self.fast_sky != 0 && batch.source.pipeline.class == DrawClass::Sky)
                             || batch.is_inline_entity
                             || !batch_area_visible(batch, effective_area_mask)
@@ -7572,7 +7636,7 @@ impl Renderer {
                         .copied()
                         .filter(|&index| {
                             let source = &active.batches[index].source;
-                            source.authored_glow || (self.thermal_vision != 0 && source.thermal_source_stage)
+                            source.authored_glow || ((1..=5).contains(&self.thermal_vision) && source.thermal_source_stage)
                         })
                         .collect::<Vec<_>>();
                     if !glow_inline_visible.is_empty() {
@@ -7917,7 +7981,7 @@ impl Renderer {
                 self.world.as_ref().and_then(|world| world.visibility.as_ref()),
                 self.pvs_mode != PvsMode::Off,
                 self.weather.fog.legacy_drawfog_value(),
-                if self.thermal_vision != 0 {
+                if (1..=5).contains(&self.thermal_vision) {
                     self.targets.authored_glow.as_ref().map(|glow| {
                         (glow.msaa_view.as_ref().unwrap_or(&glow.view),
                          glow.msaa_view.as_ref().map(|_| &glow.view))
@@ -8381,7 +8445,8 @@ impl Renderer {
             let regional = rt_taa_active.then_some(self.rt_taa_resources.as_ref()).flatten()
                 .filter(|r| r.input.is_some() && r.pipeline.is_some());
             let temporal_pipeline = if self.taa_enabled {
-                if self.thermal_vision != 0 { self.thermal_taa_pipeline.as_ref().or(self.taa_post_pipeline.as_ref()) }
+                if self.thermal_vision == 6 { self.nir_taa_pipeline.as_ref().or(self.taa_post_pipeline.as_ref()) }
+                else if self.thermal_vision != 0 { self.thermal_taa_pipeline.as_ref().or(self.taa_post_pipeline.as_ref()) }
                 else { self.taa_post_pipeline.as_ref() }
             }
                 else { regional.and_then(|r| r.pipeline.as_ref()) };
@@ -8457,7 +8522,13 @@ impl Renderer {
                     multiview_mask: None,
                 });
                 tile_cost::scissor(&mut pass, self.targets._scene_texture.width(), self.targets._scene_texture.height());
-                if self.thermal_vision != 0 && self.thermal_post_pipeline.is_some() {
+                if self.thermal_vision == 6 && self.nir_post_pipeline.is_some() {
+                    pass.set_pipeline(self.nir_post_pipeline.as_ref().unwrap());
+                    pass.set_bind_group(0,
+                        &self.post_bind_groups[self.history_read_index]
+                            [self.ssao_history_read_index][self.ssr_history_read_index]
+                            [self.cloud_history_read_index], &[]);
+                } else if (1..=5).contains(&self.thermal_vision) && self.thermal_post_pipeline.is_some() {
                     pass.set_pipeline(self.thermal_post_pipeline.as_ref().unwrap());
                     pass.set_bind_group(0,
                         &self.post_bind_groups[self.history_read_index]
@@ -8629,6 +8700,11 @@ impl Renderer {
             render_height,
             self.msaa_samples,
         );
+        // Inline Spout capture point: the scene is final and no local HUD,
+        // console or egui has been drawn into it yet.
+        if let Some(capture) = stream_capture.as_ref() {
+            capture.encode_scene_copy(&mut encoder);
+        }
 
         // Decide whether the native JKA overlay belongs before or after CRT.
         // Scene keeps it crisp. Scene + HUD always sends it through CRT.
@@ -8645,7 +8721,7 @@ impl Renderer {
         let competitive_hide_hud = (self.competitive_ab == 4 || self.competitive_ab == 9 || self.competitive_ab == 14
             || competitive_mask & probe::HUD != 0)
             && !self.egui_active && self.ui_state.mode != ui::OverlayMode::Console;
-        let native_ui_in_main = !competitive_hide_hud && !self.stream_output.enabled()
+        let native_ui_in_main = !competitive_hide_hud && !stream_deferred
             && !self.smaa_enabled
             && !menu_backdrop_active
             && !scene_snapshot_requested
@@ -8806,7 +8882,7 @@ impl Renderer {
         // SMAA and the menu backdrop both submit work after this encoder, so
         // those paths intentionally do a tiny late copy submit instead.
         if self.hdr_output.is_none() && !self.smaa_enabled && !menu_backdrop_active && !self.egui_active && !crt_active
-            && !scene_snapshot_requested && !self.stream_output.enabled()
+            && !scene_snapshot_requested && !stream_deferred
         {
             if let Some(readback) = screenshot_readback.as_mut() {
                 let staging_buffer = &self
@@ -8895,7 +8971,12 @@ impl Renderer {
         let frame_submission = self.queue.submit(prefix_command_buffer.into_iter()
             .chain(dlss_command_buffers.into_iter().flatten())
             .chain(super::finish::ordered_buffers(None, command_buffer, profiler_readback_copy))
+            // Inline stream HUD/transport after the buffer holding its copy.
+            .chain(stream_capture.as_mut().map(|capture| capture.take_command_buffers()).unwrap_or_default())
             .chain(stats_readback_copy));
+        if let Some(capture) = stream_capture.take() {
+            self.stream_output.finish(&self.queue, capture);
+        }
         if let Some(started) = perf_submit_api_started {
             info.perf_primary_submit_api_ms = started.elapsed().as_secs_f64() * 1000.0;
         }
@@ -8925,7 +9006,7 @@ impl Renderer {
             // its original material blend space AFTER SMAA and BEFORE CRT.
             // This replaces the native HUD's main-encoder draw, not duplicates it.
             if self.crt_scope == ui::CrtScope::SceneHud && !competitive_hide_hud
-                && !self.stream_output.enabled() && !menu_backdrop_active
+                && !stream_deferred && !menu_backdrop_active
                 && !scene_snapshot_requested
             {
                 if let Some(crt_view) = crt_view.as_ref() {
@@ -8959,7 +9040,7 @@ impl Renderer {
         }
         // Capture only the scene, BEFORE unfiltered local native UI or egui.
         // The stream draws its own privacy-filtered HUD over this shared scene.
-        if self.stream_output.enabled() {
+        if stream_deferred {
             if self.hdr_output.is_some() {
                 self.stream_output.pause_unsupported("HDR output has no isolated SDR stream resolve");
             } else if studio_composite.is_some() || self.studio_world_viewport.is_some() || self.studio_export_size.is_some() {
@@ -8978,10 +9059,10 @@ impl Renderer {
                         // Cloning the handle releases the field borrow before
                         // stream submission prepares lazy encoded pipelines.
                         let source = target.texture.clone();
-                        stream.submit_scene(self, &source);
+                        stream.submit_scene(self, &source, stream_now);
                     }
                 } else if let Some(frame) = frame.as_ref() {
-                    stream.submit_scene(self, &frame.texture);
+                    stream.submit_scene(self, &frame.texture, stream_now);
                 }
                 self.stream_output = stream;
             }
@@ -9032,7 +9113,7 @@ impl Renderer {
         }
         // Streaming kept this HUD out of the first CRT resolve so the stream
         // could copy a clean scene. Restore local Scene+HUD layering before egui.
-        let stream_scene_hud_crt = !competitive_hide_hud && self.stream_output.enabled()
+        let stream_scene_hud_crt = !competitive_hide_hud && stream_deferred
             && self.crt_scope == ui::CrtScope::SceneHud && !menu_backdrop_active
             && (self.studio_world_viewport.is_none() || self.ui_state.mode == ui::OverlayMode::Console);
         if stream_scene_hud_crt {
@@ -9076,7 +9157,7 @@ impl Renderer {
                 || self.egui_active
                 || self.smaa_enabled && self.crt_scope != ui::CrtScope::SceneHud
                 || scene_snapshot_requested
-                || self.stream_output.enabled()
+                || stream_deferred
                 || self.crt_scope == ui::CrtScope::Scene);
         let native_ui_late_drawn = late_native_ui && (self.studio_world_viewport.is_none()
             || self.ui_state.mode == ui::OverlayMode::Console) && has_native_2d_batches;

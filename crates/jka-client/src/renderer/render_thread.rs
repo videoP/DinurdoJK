@@ -157,6 +157,8 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::RunAcquireProbe(..) => "RunAcquireProbe",
         RenderCommand::StartShitterSweep { .. } => "StartShitterSweep",
         RenderCommand::ProbeSharedPresent => "ProbeSharedPresent",
+        RenderCommand::FindBakedSunDirection => "FindBakedSunDirection",
+        RenderCommand::SelectBakedSunDirection { .. } => "SelectBakedSunDirection",
         RenderCommand::SetInputLateLatch(..) => "SetInputLateLatch",
         RenderCommand::SetMsaa(..) => "SetMsaa",
         RenderCommand::SetTextureFilter(..) => "SetTextureFilter",
@@ -997,6 +999,7 @@ pub(in crate::renderer) fn render_thread_main(
     let mut last_sun_bake_status: Option<(u32, crate::renderer::SunBakeStage)> = None;
     // This is a one-event-per-change status channel, not per-frame telemetry.
     let mut last_baked_sun_auto_status: Option<crate::renderer::BakedSunAutoStatus> = None;
+    let mut last_baked_sun_direction_status: Option<crate::renderer::BakedSunDirectionStatus> = None;
 
     let mut stats_started = Instant::now();
     // Start of the current cap interval. Pacing from a fixed cadence rather than
@@ -1503,6 +1506,8 @@ pub(in crate::renderer) fn render_thread_main(
                             frame_pace_anchor = Instant::now();
                         }
                     }
+                    Ok(RenderCommand::FindBakedSunDirection) => renderer.find_baked_sun_direction(),
+                    Ok(RenderCommand::SelectBakedSunDirection { detected }) => renderer.select_baked_sun_direction(detected),
                     Ok(RenderCommand::ProbeSharedPresent) => {
                         // On-demand read-only native query. No swapchain recreation,
                         // frame synchronization, or change to the presentation path.
@@ -2576,6 +2581,11 @@ pub(in crate::renderer) fn render_thread_main(
         if last_baked_sun_auto_status != Some(auto_status) {
             last_baked_sun_auto_status = Some(auto_status);
             let _ = proxy.send_event(UserEvent::BakedSunAutoStatus(auto_status));
+        }
+        let direction_status = renderer.baked_sun_direction_status();
+        if last_baked_sun_direction_status != Some(direction_status) {
+            last_baked_sun_direction_status = Some(direction_status);
+            let _ = proxy.send_event(UserEvent::BakedSunDirectionStatus(direction_status));
         }
         if gamma_preparation.is_some() && render_result.is_ok() && !renderer.baked_brightness.busy {
             let generation = gamma_preparation.take().unwrap();

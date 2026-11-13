@@ -614,7 +614,7 @@ impl Renderer {
             // Select the variant when Relighting is enabled, not every sunset.
             || (self.sky_backend == 1 && self.sun_override)
             || ((self.baked_sun_removal > 0.0 || self.baked_sun_removal_auto || self.baked_sun_removal_contour)
-                && self.world.as_ref().is_some_and(|world| !world.source_map && world.sun.is_some()))
+                && self.world.as_ref().is_some_and(|world| !world.source_map && world.sun_bake.baked_direction().is_some()))
     }
 
     /// Snow shell, Snowflow and footprint shading only ever touch authored snow

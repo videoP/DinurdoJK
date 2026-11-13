@@ -251,7 +251,7 @@ pub use api::{
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, EguiRenderData, ModelGeometrySource,
     FxGpuSpriteInstance, FxGpuSprites, FxGpuResidentSprites, FxGpuResidentFrame, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
     InlineModelInstance, InspectorEntityHint, PostEffects, RayTracedRigidInstance, RenderCommand, SunBakeStage,
-    BakedSunAutoStatus,
+    BakedSunAutoStatus, BakedSunDirectionStatus,
     RenderSnapshot, TileCostCommand, ScreenshotFormat, SourceMaterialParams, SpectatorHighlight,
     StudioSourceFrame, StudioSceneFrame, StudioSceneLighting,
     SpectatorHighlightTeam, TransientLight, PBR_PROFILE_COMPANION_COMPRESSION,
@@ -469,6 +469,7 @@ use world::inline_models::{
 };
 use world::pipelines::{
     create_depth_prepass_mask_pipeline, create_depth_prepass_pipeline,
+    create_depth_prepass_mask_pipeline_with_entry, create_depth_prepass_pipeline_with_entry,
     create_entity_prepass_pipeline, create_entity_rain_prepass_pipeline,
     create_entity_shadow_pipeline, create_hiz_prepass_pipeline,
     create_rain_depth_prepass_pipeline,
@@ -1578,6 +1579,11 @@ struct Renderer {
     thermal_post_pipeline: Option<wgpu::RenderPipeline>,
     thermal_depth_pipeline: Option<wgpu::RenderPipeline>,
     thermal_depth_mask_pipeline: Option<wgpu::RenderPipeline>,
+    // Lazily compiled only for photographic near-IR (r_thermalVision 6).
+    nir_depth_pipeline: Option<wgpu::RenderPipeline>,
+    nir_depth_mask_pipeline: Option<wgpu::RenderPipeline>,
+    nir_post_pipeline: Option<wgpu::RenderPipeline>,
+    nir_taa_pipeline: Option<wgpu::RenderPipeline>,
     thermal_taa_pipeline: Option<wgpu::RenderPipeline>,
     /// r_postSpecialize: full-post pipelines keyed by `POST_FEATURES` mask,
     /// compiled on the pipeline workers the first time a mask is used.

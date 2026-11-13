@@ -68,13 +68,13 @@ const TOP_CONTROLS: usize = 3;
 pub(super) const TOP_SETUP: usize = 4;
 const TOP_VOTE: usize = 5;
 
-const SETUP_TAB_GAME: usize = 0;
+pub(in crate::app) const SETUP_TAB_GAME: usize = 0;
 const SETUP_TAB_MOVEMENT: usize = 1;
 pub(super) const SETUP_TAB_CAMERA: usize = 2;
 const SETUP_TAB_VIDEO: usize = 3;
-const SETUP_TAB_AUDIO: usize = 4;
+pub(in crate::app) const SETUP_TAB_AUDIO: usize = 4;
 const SETUP_TAB_NETWORK: usize = 5;
-const SETUP_TAB_INTERFACE: usize = 6;
+pub(in crate::app) const SETUP_TAB_INTERFACE: usize = 6;
 const SETUP_TAB_EXTENSIONS: usize = 7;
 const SETUP_TAB_STREAMER: usize = 8;
 const SETUP_TAB_PK3: usize = 9;
@@ -378,6 +378,83 @@ impl VideoSection {
     ];
     const OPTIMIZATIONS: [(Self, &'static str); 1] = [(Self::Optimizations, "Optimizations")];
     const DEBUG: [(Self, &'static str); 1] = [(Self::DebugTools, "Debug & tools")];
+}
+
+// Navigation destinations for the grouped non-Video Setup pages. The selection
+// lives in the egui context, independently per top-level tab; no gameplay or
+// serialized config state is involved. Keep these groups coarse: never a rail
+// destination for a single control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(in crate::app) enum SetupSection {
+    GameSystem,
+    GameGameplay,
+    GamePresentation,
+    AudioGeneral,
+    AudioPositional,
+    InterfaceHud,
+    InterfaceMovement,
+    InterfaceOverlays,
+    InterfaceChat,
+}
+
+impl SetupSection {
+    pub(in crate::app) fn label(self) -> &'static str {
+        match self {
+            Self::GameSystem => "Launch & updates",
+            Self::GameGameplay => "Gameplay & animations",
+            Self::GamePresentation => "Spectating & effects",
+            Self::AudioGeneral => "General Audio",
+            Self::AudioPositional => "Positional Audio",
+            Self::InterfaceHud => "HUD & appearance",
+            Self::InterfaceMovement => "Movement HUD",
+            Self::InterfaceOverlays => "Scoreboard & overlays",
+            Self::InterfaceChat => "Chat & console",
+        }
+    }
+
+    fn tab(self) -> usize {
+        match self {
+            Self::GameSystem | Self::GameGameplay | Self::GamePresentation => SETUP_TAB_GAME,
+            Self::AudioGeneral | Self::AudioPositional => SETUP_TAB_AUDIO,
+            Self::InterfaceHud | Self::InterfaceMovement | Self::InterfaceOverlays | Self::InterfaceChat => SETUP_TAB_INTERFACE,
+        }
+    }
+}
+
+const GAME_SECTIONS: &[(SetupSection, &str)] = &[
+    (SetupSection::GameSystem, "Launch & updates"),
+    (SetupSection::GameGameplay, "Gameplay & animations"),
+    (SetupSection::GamePresentation, "Spectating & effects"),
+];
+const AUDIO_SECTIONS: &[(SetupSection, &str)] = &[
+    (SetupSection::AudioGeneral, "General Audio"),
+    (SetupSection::AudioPositional, "Positional Audio"),
+];
+const INTERFACE_SECTIONS: &[(SetupSection, &str)] = &[
+    (SetupSection::InterfaceHud, "HUD & appearance"),
+    (SetupSection::InterfaceMovement, "Movement HUD"),
+    (SetupSection::InterfaceOverlays, "Scoreboard & overlays"),
+    (SetupSection::InterfaceChat, "Chat & console"),
+];
+
+fn setup_sections(tab: usize) -> &'static [(SetupSection, &'static str)] {
+    match tab {
+        SETUP_TAB_GAME => GAME_SECTIONS,
+        SETUP_TAB_AUDIO => AUDIO_SECTIONS,
+        SETUP_TAB_INTERFACE => INTERFACE_SECTIONS,
+        _ => &[],
+    }
+}
+
+pub(in crate::app) fn selected_setup_section(ctx: &egui::Context, tab: usize) -> Option<SetupSection> {
+    let sections = setup_sections(tab);
+    let &(fallback, _) = sections.first()?;
+    let stored = ctx.data(|data| data.get_temp::<SetupSection>(egui::Id::new(("setup_section", tab))));
+    Some(stored.filter(|section| section.tab() == tab).unwrap_or(fallback))
+}
+
+pub(in crate::app) fn select_setup_section(ctx: &egui::Context, section: SetupSection) {
+    ctx.data_mut(|data| data.insert_temp(egui::Id::new(("setup_section", section.tab())), section));
 }
 
 // ------------------------------------------------------------- free widgets --

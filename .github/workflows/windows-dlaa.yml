@@ -1,28 +1,27 @@
 name: DinurdoJK Signed Windows Release (DLAA)
-
+# Compilation runs immediately on push. Only the publication job uses
+# release-signing and the protected Ed25519 private key.
 on:
   push:
     branches: [main]
   workflow_dispatch:
-
-# A new Cargo version publishes once; subsequent same-version pushes are skipped.
 concurrency:
   group: dinurdojk-signed-windows-release
   cancel-in-progress: true
-
 permissions:
   contents: read
-
 jobs:
-  signed-release:
+  windows-build:
     if: github.repository == 'videoP/DinurdoJK' && github.ref == 'refs/heads/main'
     runs-on: windows-2022
     timeout-minutes: 180
-    environment: release-signing
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      publish: ${{ steps.version.outputs.publish }}
+      tag: ${{ steps.version.outputs.tag }}
     env:
-      # The public key must be present at RUST COMPILATION time.
+      # Repository public variable and private NWH build secret (NOT the updater signer).
       DINURDOJK_UPDATE_PUBLIC_KEY_HEX: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -51,7 +50,7 @@ jobs:
         shell: pwsh
         run: |
           if ($env:DINURDOJK_UPDATE_PUBLIC_KEY_HEX -notmatch '^[0-9a-fA-F]{64}$') {
-            throw 'Missing release-signing Environment variable DINURDOJK_UPDATE_PUBLIC_KEY_HEX.'
+            throw 'Set REPOSITORY variable DINURDOJK_UPDATE_PUBLIC_KEY_HEX (public signing key).'
           }
           $tag = (& python scripts/make_signed_release.py --print-tag).Trim()
           if ($LASTEXITCODE -ne 0 -or $tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
@@ -80,8 +79,18 @@ jobs:
           'publish=true' >> $env:GITHUB_OUTPUT
           Write-Host "Building $tag from $env:GITHUB_SHA."
 
-      # The full NWH module is deliberately absent from Git. Restore it only
-      # for an approved release, before Cargo runs build.rs / rustc.
+      # The full NWH module is deliberately absent from Git. Restore it
+      # from the repository build secret before Cargo runs build.rs / rustc.
+      - name: Require non-deployment NWH source for parallel compilation
+        if: steps.version.outputs.publish == 'true'
+        shell: pwsh
+        env:
+          DINURDOJK_NWH_SOURCE_B64: ${{ secrets.DINURDOJK_NWH_SOURCE_B64 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:DINURDOJK_NWH_SOURCE_B64)) {
+            throw 'Set REPOSITORY Actions secret DINURDOJK_NWH_SOURCE_B64 for automatic builds.'
+          }
+
       - name: Restore local-only NWH source
         if: steps.version.outputs.publish == 'true'
         shell: pwsh
@@ -89,7 +98,7 @@ jobs:
           DINURDOJK_NWH_SOURCE_B64: ${{ secrets.DINURDOJK_NWH_SOURCE_B64 }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:DINURDOJK_NWH_SOURCE_B64)) {
-            throw 'Missing release-signing Environment secret DINURDOJK_NWH_SOURCE_B64.'
+            throw 'Missing repository Actions secret DINURDOJK_NWH_SOURCE_B64.'
           }
           $relativePath = 'crates/jka-client/src/net/nwh_private.rs'
           if (Test-Path -LiteralPath $relativePath) {
@@ -376,15 +385,6 @@ jobs:
 
       # Fail fast on signer dependencies before the expensive compilation.
       # The PRIVATE signing key is supplied only to the later signing step.
-      - name: Install Ed25519 signer
-        if: steps.version.outputs.publish == 'true'
-        shell: pwsh
-        run: |
-          python -m pip install --disable-pip-version-check 'cryptography>=43,<48'
-          if ($LASTEXITCODE -ne 0) { throw 'Ed25519 cryptography installation failed.' }
-          python -c 'from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; print("Ed25519 signer ready")'
-          if ($LASTEXITCODE -ne 0) { throw 'Ed25519 signer import failed.' }
-
       - name: Build optimized Release with DLAA
         if: steps.version.outputs.publish == 'true'
         shell: pwsh
@@ -403,8 +403,91 @@ jobs:
             }
           }
 
-      - name: Package and sign updater release
+      - name: Preserve NVIDIA SDK license in Windows compilation payload
         if: steps.version.outputs.publish == 'true'
+        shell: pwsh
+        run: |
+          $license = 'target/release/licenses/NVIDIA-DLSS-SDK-LICENSE.txt'
+          New-Item -ItemType Directory -Force (Split-Path $license -Parent) | Out-Null
+          Copy-Item (Join-Path $env:DLSS_SDK 'LICENSE.txt') $license -ErrorAction Stop
+          if ((Get-Item $license).Length -eq 0) { throw 'Missing NVIDIA DLSS license.' }
+
+      - name: Upload unsigned Windows runtime for protected release job
+        if: steps.version.outputs.publish == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: DinurdoJK-windows-runtime-${{ github.run_id }}
+          path: |
+            target/release/DinurdoJK.exe
+            target/release/DinurdoJK/dependencies/*
+            target/release/licenses/NVIDIA-DLSS-SDK-LICENSE.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  windows-publish:
+    needs: windows-build
+    if: >-
+      github.repository == 'videoP/DinurdoJK' &&
+      github.ref == 'refs/heads/main' &&
+      needs.windows-build.outputs.publish == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 180
+    environment: release-signing
+    permissions:
+      contents: write
+    env:
+      DINURDOJK_UPDATE_PUBLIC_KEY_HEX: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout exact commit for packaging
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Stamp and verify publication tag
+        shell: pwsh
+        run: |
+          python scripts/stamp_ci_version.py
+          if ($LASTEXITCODE -ne 0) { throw 'Could not stamp build version.' }
+          $tag = (& python scripts/make_signed_release.py --print-tag).Trim()
+          if ($LASTEXITCODE -ne 0 -or $tag -cne '${{ needs.windows-build.outputs.tag }}') {
+            throw 'Windows build tag disagrees with publishing tag.'
+          }
+          if ($env:DINURDOJK_UPDATE_PUBLIC_KEY_HEX -notmatch '^[0-9a-fA-F]{64}$') {
+            throw 'Missing release signing environment public key.'
+          }
+      - name: Download immutable Windows compiled runtime
+        uses: actions/download-artifact@v4
+        with:
+          name: DinurdoJK-windows-runtime-${{ github.run_id }}
+          path: target/release
+      - name: Verify Windows compiled runtime payload
+        shell: pwsh
+        run: |
+          foreach ($name in @('DinurdoJK.exe', 'DinurdoJK/dependencies/nvngx_dlss.dll',
+                               'DinurdoJK/dependencies/OpenALSoft.x86_64.dll',
+                               'DinurdoJK/dependencies/dxcompiler.dll',
+                               'DinurdoJK/dependencies/dxil.dll',
+                               'DinurdoJK/dependencies/ffmpeg.exe',
+                               'licenses/NVIDIA-DLSS-SDK-LICENSE.txt')) {
+            $path = Join-Path 'target/release' $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+                (Get-Item -LiteralPath $path).Length -le 0) {
+              throw "Windows CI artifact missing $path"
+            }
+          }
+      - name: Install Ed25519 signer
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check 'cryptography>=43,<48'
+          if ($LASTEXITCODE -ne 0) { throw 'Ed25519 cryptography installation failed.' }
+          python -c 'from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; print("Ed25519 signer ready")'
+          if ($LASTEXITCODE -ne 0) { throw 'Ed25519 signer import failed.' }
+
+      - name: Package and sign updater release
         shell: pwsh
         env:
           # Private key is exposed to this one signing step, NEVER to the build.
@@ -417,7 +500,9 @@ jobs:
                               'FFmpeg-SOURCE-NOTICE.txt')) {
             Copy-Item -LiteralPath (Join-Path 'release-licenses' $name) -Destination (Join-Path $licenseDir $name) -ErrorAction Stop
           }
-          Copy-Item (Join-Path $env:DLSS_SDK 'LICENSE.txt') (Join-Path $licenseDir 'NVIDIA-DLSS-SDK-LICENSE.txt') -ErrorAction Stop
+          if (-not (Test-Path -LiteralPath (Join-Path $licenseDir 'NVIDIA-DLSS-SDK-LICENSE.txt') -PathType Leaf)) {
+            throw 'NVIDIA SDK license was not preserved in Windows CI build artifact.'
+          }
           foreach ($name in @('dxcompiler.dll', 'dxil.dll')) {
             if (-not (Test-Path -LiteralPath (Join-Path 'target/release/DinurdoJK/dependencies' $name) -PathType Leaf)) {
               throw "Missing Microsoft DXC runtime before signing: $name"
@@ -426,31 +511,29 @@ jobs:
           if (-not (Test-Path -LiteralPath 'target/release/DinurdoJK/dependencies/ffmpeg.exe' -PathType Leaf)) {
             throw 'Missing pinned FFmpeg runtime before signing: DinurdoJK/dependencies/ffmpeg.exe'
           }
-          python scripts/make_signed_release.py --runtime target/release --out dist/release --tag '${{ steps.version.outputs.tag }}'
+          python scripts/make_signed_release.py --runtime target/release --out dist/release --tag '${{ needs.windows-build.outputs.tag }}'
           if ($LASTEXITCODE -ne 0) { throw 'Release signing failed.' }
           if ((Get-Item 'dist/release/release-manifest.sig').Length -ne 64) {
             throw 'Signature must be 64 raw Ed25519 bytes.'
           }
           # The full ZIP is for new/manual installations. Individual assets
           # are for the updater; the signed manifest binds their exact hashes.
-          $archive = "dist/release/DinurdoJK-${{ steps.version.outputs.tag }}-full.zip"
+          $archive = "dist/release/DinurdoJK-${{ needs.windows-build.outputs.tag }}-full.zip"
           python -c 'import sys, json, zipfile, pathlib, hashlib; p=pathlib.Path(sys.argv[1]); d=p.parent; z=zipfile.ZipFile(p); m=json.loads((d/"release-manifest.json").read_bytes()); files=set(m["files"]); names=set(z.namelist()); notices={n for n in names if n.startswith("licenses/")}; required={"licenses/FFmpeg-GPL-3.0.txt","licenses/FFmpeg-SOURCE-NOTICE.txt","licenses/OpenAL-Soft-LGPL-2.0.txt","licenses/DXC-LICENSE.txt","licenses/DXC-ThirdPartyNotices.txt","licenses/NVIDIA-DLSS-SDK-LICENSE.txt"}; assert m["format"]==2; assert names==files|notices; assert required<=notices; assert all(not n.lower().endswith(".txt") for n in files); assert {"DinurdoJK.exe","DinurdoJK/shared/dinurdo-assets.pk4","DinurdoJK/dependencies/dxcompiler.dll","DinurdoJK/dependencies/dxil.dll","DinurdoJK/dependencies/ffmpeg.exe"}<=files; assert all(hashlib.sha256(z.read(n)).hexdigest()==f["sha256"] for n,f in m["files"].items()); print("Verified runtime-only signed manifest and full ZIP license notices")' $archive
           if ($LASTEXITCODE -ne 0) { throw 'Release layout, notices or hashes failed verification.' }
 
       - name: Upload signed updater artifact
-        if: steps.version.outputs.publish == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: DinurdoJK-${{ steps.version.outputs.tag }}-signed-update
+          name: DinurdoJK-${{ needs.windows-build.outputs.tag }}-signed-update
           path: dist/release/*
           if-no-files-found: error
           retention-days: 14
 
       - name: Create official GitHub Release
-        if: steps.version.outputs.publish == 'true'
         shell: pwsh
         run: |
-          $tag = '${{ steps.version.outputs.tag }}'
+          $tag = '${{ needs.windows-build.outputs.tag }}'
           $assets = @(Get-ChildItem 'dist/release' -File | Sort-Object Name | ForEach-Object { $_.FullName })
           $manifest = Get-Content 'dist/release/release-manifest.json' -Raw | ConvertFrom-Json
           $expectedCount = @($manifest.files.PSObject.Properties).Count + 3

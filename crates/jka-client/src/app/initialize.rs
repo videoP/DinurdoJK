@@ -59,6 +59,16 @@ impl App {
             }
         }
         let mut video = config::load_video_settings(&config_path);
+        // These cvars keep real, independently archived values. Restore the
+        // global renderer switches (especially RGB565/D16) before the first
+        // renderer/swapchain is constructed, not through a preset replay.
+        crate::renderer::set_rgb565_requested(video.rgb565);
+        crate::renderer::set_igpu_depth_requested(video.igpu_memory_ab);
+        crate::renderer::set_igpu_ab_mode(video.igpu_ab);
+        crate::renderer::set_collision_world_only(video.collision_world);
+        crate::renderer::set_shitter_texture_enabled(video.shitter_texture);
+        crate::renderer::set_competitive_ab_mode(video.competitive_ab);
+        crate::renderer::set_legacy_blend_mode(video.legacy_blend_transfer);
         crate::logging::set_developer_level(video.developer_level);
         crate::logging::set_renderer_verbose_level(video.renderer_verbose);
         let audio = config::load_audio_settings(&config_path);
@@ -859,6 +869,7 @@ impl App {
             static_ao_progress: None,
             sun_bake_progress: None,
             baked_sun_auto_status: crate::renderer::BakedSunAutoStatus::Calibrating,
+            baked_sun_direction_status: crate::renderer::BakedSunDirectionStatus::Idle,
             preserve_game_state_on_next_map_upload: false,
             renderer_restart_started: None,
             renderer_restart_suspended: false,

@@ -43,6 +43,7 @@ const MAX_PROP_INDEX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROP_INDEX_ENTRIES: usize = 1024;
 const EF_NODRAW: i32 = 1 << 8;
 const EF_DEAD: i32 = 1 << 1;
+const EF2_SHIP_DEATH: i32 = 1 << 7;
 /// bg_public.h: authoritative spawn protection flag consumed by CG_Player.
 const EF_INVULNERABLE: i32 = 1 << 27;
 const EF2_HYPERSPACE: i32 = 1 << 5;
@@ -71,6 +72,29 @@ const PW_YSALAMIRI: i32 = 15;
 const SHIELD_HIT_SHADER: &str = "halfShieldShell";
 /// cg_players.c MAX_SHIELD_TIME / MIN_SHIELD_TIME.
 const SHIELD_MAX_TIME_MS: i32 = 2000;
+
+/// `CG_Player` gates its child refEntities (hit shields, seeker drones and
+/// powerup spheres) on the same visibility early returns as the player body.
+/// These MD3s live in EntityPresenter, so apply that decision before drawing.
+/// This is presentation only: never remove players from snapshot/trace data.
+fn auxiliary_player_visible(
+    entity: &PresentedEntity,
+    viewer: &crate::japro_cg::StyleViewer,
+) -> bool {
+    if entity.entity_type != super::ET_PLAYER {
+        return true;
+    }
+    let flags = entity.state.field_i32("eFlags").unwrap_or(0);
+    if flags & EF_NODRAW != 0 || entity.state.field_i32("eFlags2").unwrap_or(0) & EF2_SHIP_DEATH != 0 {
+        return false;
+    }
+    crate::japro_cg::classify(
+        viewer,
+        i32::from(entity.number),
+        entity.state.field_i32("bolt1").unwrap_or(0),
+        flags & EF_DEAD != 0,
+    ).visible
+}
 
 #[derive(Clone)]
 struct Md3SurfaceAsset {
@@ -670,6 +694,8 @@ impl EntityPresenter {
         followed: Option<&PresentedEntity>,
         time: i32,
         hide_entity: Option<u16>,
+        intermission: bool,
+        viewer_style: &crate::japro_cg::StyleViewer,
     ) -> Vec<DynamicModelSurface> {
         self.shield_hits
             .retain(|_, hit| hit.until > time && hit.until - time <= SHIELD_MAX_TIME_MS + 500);
@@ -681,7 +707,9 @@ impl EntityPresenter {
         for entity in followed.into_iter().chain(entities.iter()) {
             if entity.entity_type != super::ET_PLAYER
                 || Some(entity.number) == hide_entity
+                || suppressed_during_intermission(intermission, entity)
                 || !seen.insert(entity.number)
+                || !auxiliary_player_visible(entity, viewer_style)
             {
                 continue;
             }
@@ -1345,15 +1373,20 @@ impl EntityPresenter {
         predicted_player: Option<&PresentedEntity>,
         current_time: i32,
         intermission: bool,
+        viewer_style: &crate::japro_cg::StyleViewer,
     ) -> Vec<DynamicModelSurface> {
         let mut draws = Vec::new();
         if intermission { return draws; }
         for entity in entities.iter().filter(|e| e.entity_type == super::ET_PLAYER) {
             let source = predicted_player.filter(|p| p.number == entity.number).unwrap_or(entity);
-            self.present_seeker_drone(source, entities, predicted_player, current_time, &mut draws);
+            if auxiliary_player_visible(source, viewer_style) {
+                self.present_seeker_drone(source, entities, predicted_player, current_time, &mut draws);
+            }
         }
         if let Some(predicted) = predicted_player {
-            if !entities.iter().any(|e| e.number == predicted.number) {
+            if !entities.iter().any(|e| e.number == predicted.number)
+                && auxiliary_player_visible(predicted, viewer_style)
+            {
                 self.present_seeker_drone(predicted, entities, predicted_player, current_time, &mut draws);
             }
         }
@@ -1412,6 +1445,7 @@ impl EntityPresenter {
         followed: Option<&PresentedEntity>,
         game: &ClientGameState,
         view_origin: [f32; 3],
+        viewer_style: &crate::japro_cg::StyleViewer,
     ) -> Vec<DynamicModelSurface> {
         let intermission = game.rendering_intermission();
         let mut seen = HashSet::new();
@@ -1420,6 +1454,7 @@ impl EntityPresenter {
             if !matches!(entity.entity_type, super::ET_PLAYER | super::ET_NPC)
                 || suppressed_during_intermission(intermission, entity)
                 || !seen.insert(entity.number)
+                || !auxiliary_player_visible(entity, viewer_style)
             {
                 continue;
             }
@@ -3944,6 +3979,47 @@ fn facing_axis(axis: [[f32; 3]; 3], origin: [f32; 3], eye: [f32; 3], locked: boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auxiliary_shield_sphere_and_seeker_visibility_tracks_cg_player() {
+        use jka_protocol::gamestate::{EntityState, ENTITY_FIELDS};
+        let mut player = PresentedEntity {
+            number: 8, entity_type: super::super::ET_PLAYER,
+            origin: [0.0; 3], angles: [0.0; 3],
+            state: EntityState { number: 8, fields: [0; ENTITY_FIELDS.len()] },
+        };
+        let viewer = crate::japro_cg::StyleViewer {
+            japlus: true, japlus_duel_alpha: 0, client_num: 2,
+            dueling: true, duel_index: 7,
+            ..Default::default()
+        };
+        // JA+ duelalpha hides the bystander; the target opponent remains.
+        assert!(!auxiliary_player_visible(&player, &viewer));
+        player.number = 7;
+        assert!(auxiliary_player_visible(&player, &viewer));
+        player.number = 2;
+        assert!(auxiliary_player_visible(&player, &viewer));
+        player.number = 8;
+        assert!(auxiliary_player_visible(&player, &crate::japro_cg::StyleViewer {
+            japlus_duel_alpha: -1, ..viewer
+        }));
+        assert!(auxiliary_player_visible(&player, &crate::japro_cg::StyleViewer {
+            plugin_disable: crate::japro_cg::plugin_disable::DUEL_SEE_OTHERS, ..viewer
+        }));
+        assert!(auxiliary_player_visible(&player, &crate::japro_cg::StyleViewer {
+            free_spectator: true, ..viewer
+        }));
+        let flags = ENTITY_FIELDS.iter().position(|(name, _)| *name == "eFlags").unwrap();
+        player.state.fields[flags] = EF_NODRAW as u32;
+        assert!(!auxiliary_player_visible(&player, &crate::japro_cg::StyleViewer {
+            japlus_duel_alpha: -1, ..viewer
+        }));
+        player.state.fields[flags] = 0;
+        // ET_NPC remains outside the ET_PLAYER-only JA+ cull, matching
+        // this client's existing CG_Player classifier behavior.
+        player.entity_type = super::super::ET_NPC;
+        assert!(auxiliary_player_visible(&player, &viewer));
+    }
 
     #[test]
     fn force_shockwave_proxy_faces_camera_and_retains_real_hand_depth() {

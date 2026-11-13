@@ -1174,7 +1174,7 @@ app_cvars! {
     }
 
     APP_R_RGB565 {
-        runtime: CvarDef::new("r_rgb565", "", "0..1", "Native Vulkan packed RGB565 color A/B: 0 original 32bpp swapchain; 1 request real 16bpp R5G6B5 swapchain with fixed-function blending. Unsupported drivers fall back visibly; no offscreen conversion. Session-only; latched until Apply Video Settings or vid_restart.", CvarType::String, CvarFlags::NONE, LatchScope::VidRestart,
+        runtime: CvarDef::new("r_rgb565", "", "0..1", "Native Vulkan packed RGB565 color A/B: 0 original 32bpp swapchain; 1 request real 16bpp R5G6B5 swapchain with fixed-function blending. Unsupported drivers fall back visibly; no offscreen conversion. Archived; latched until Apply Video Settings or vid_restart.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::VidRestart,
             |_app: &App| CvarValue::String(crate::renderer::rgb565_requested().to_string()),
             |app, value| App::cvar_set_rgb565(app, APP_R_RGB565.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_rgb565, Some(|name, value| {
@@ -1182,7 +1182,16 @@ app_cvars! {
                 .map(|v| v.to_string())
                 .ok_or_else(|| format!("{name}: expected 0 or 1"))
         })),
-        config: CvarBinding::NONE,
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.rgb565 = value.trim().parse::<u8>().ok().filter(|v| *v <= 1).unwrap_or(settings.rgb565);
+            }),
+            apply_latched: Some(|settings, value| {
+                settings.rgb565 = value.trim().parse::<u8>().ok().filter(|v| *v <= 1).unwrap_or(settings.rgb565);
+            }),
+            archive: Some((37120, |state| state.video.rgb565.to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: [impl App {
             fn cvar_set_rgb565(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let mode: u8 = value.trim().parse().map_err(|_| format!("{name}: expected 0 or 1"))?;
@@ -1192,6 +1201,8 @@ app_cvars! {
                 // Do not independently restart; other format latches must be
                 // committed together before renderer initialization.
                 crate::renderer::set_rgb565_requested(mode);
+                self.video.rgb565 = mode;
+                self.mark_config_dirty();
                 self.push_console_line(format!("[RGB565] requested={mode}; renderer format chosen during video apply"));
                 Ok(())
             }
@@ -1199,7 +1210,7 @@ app_cvars! {
     }
 
     APP_R_COLLISION_WORLD {
-        runtime: CvarDef::new("r_collisionWorld", "", "0..1", "Live competitive-world A/B: 0 authored world/materials, 1 native BSP geometry with original PVS/area/frustum culling and one indexed multidraw. Uses flat shading by default; r_shitterTexture enables one shared factory/base image. No collision/acoustic mesh, lightmaps, or duplicate world buffers. Flat player team colors and gunmetal weapons/hilts retained. Legacy cvar name for live A/B. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_collisionWorld", "", "0..1", "Live competitive-world A/B: 0 authored world/materials, 1 native BSP geometry with original PVS/area/frustum culling and one indexed multidraw. Uses flat shading by default; r_shitterTexture enables one shared factory/base image. No collision/acoustic mesh, lightmaps, or duplicate world buffers. Flat player team colors and gunmetal weapons/hilts retained. Legacy cvar name for live A/B. Archived.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |_app: &App| CvarValue::String(u8::from(crate::renderer::collision_world_only()).to_string()),
             |app, value| App::cvar_set_collision_world(app, APP_R_COLLISION_WORLD.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_collision_world, Some(|name, value| {
@@ -1207,7 +1218,13 @@ app_cvars! {
                 .map(|v| v.to_string())
                 .ok_or_else(|| format!("{name}: expected 0 or 1"))
         })),
-        config: CvarBinding::NONE,
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.collision_world = parse_bool(value).unwrap_or(settings.collision_world);
+            }),
+            archive: Some((37121, |state| u8::from(state.video.collision_world).to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: [impl App {
             fn cvar_set_collision_world(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let enabled = match value.trim() {
@@ -1215,6 +1232,10 @@ app_cvars! {
                     _ => return Err(format!("{name}: expected 0 or 1")),
                 };
                 crate::renderer::set_collision_world_only(enabled);
+                if self.video.collision_world != enabled {
+                    self.video.collision_world = enabled;
+                    self.mark_config_dirty();
+                }
                 self.console_status = format!("NATIVE BSP WORLD: {}", if enabled { "ON" } else { "OFF" });
                 self.push_console_line(format!("[NATIVE BSP WORLD] {} (original BSP geometry/PVS/multidraw, optional raw image via r_shitterTexture)", if enabled { "ON" } else { "OFF" }));
                 Ok(())
@@ -1223,7 +1244,7 @@ app_cvars! {
     }
 
     APP_R_SHITTER_TEXTURE {
-        runtime: CvarDef::new("r_shitterTexture", "", "0..1", "Shitter native BSP world only: 0 original flat shader (zero texture samples), 1 one repeating raw textures/factory/base image with directional lighting. Ignores the authored JKA material stages; lazily loads the image and builds a separate pipeline. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_shitterTexture", "", "0..1", "Shitter native BSP world only: 0 original flat shader (zero texture samples), 1 one repeating raw textures/factory/base image with directional lighting. Ignores the authored JKA material stages; lazily loads the image and builds a separate pipeline. Archived.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |_app: &App| CvarValue::String(u8::from(crate::renderer::shitter_texture_enabled()).to_string()),
             |app, value| App::cvar_set_shitter_texture(app, APP_R_SHITTER_TEXTURE.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_shitter_texture, Some(|name, value| {
@@ -1231,7 +1252,13 @@ app_cvars! {
                 .map(|v| v.to_string())
                 .ok_or_else(|| format!("{name}: expected 0 or 1"))
         })),
-        config: CvarBinding::NONE,
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.shitter_texture = parse_bool(value).unwrap_or(settings.shitter_texture);
+            }),
+            archive: Some((37122, |state| u8::from(state.video.shitter_texture).to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: [impl App {
             fn cvar_set_shitter_texture(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let enabled = match value.trim() {
@@ -1239,6 +1266,10 @@ app_cvars! {
                     _ => return Err(format!("{name}: expected 0 or 1")),
                 };
                 crate::renderer::set_shitter_texture_enabled(enabled);
+                if self.video.shitter_texture != enabled {
+                    self.video.shitter_texture = enabled;
+                    self.mark_config_dirty();
+                }
                 self.console_status = format!("SHITTER WORLD TEXTURE: {}", if enabled { "ON" } else { "OFF" });
                 self.push_console_line(format!("[SHITTER WORLD TEXTURE] {}: {}", if enabled { "ON" } else { "OFF" }, if enabled { "textures/factory/base, single sampled stage" } else { "original sample-free flat shader" }));
                 Ok(())
@@ -1247,16 +1278,25 @@ app_cvars! {
     }
 
     APP_R_COMPETITIVE_AB {
-        runtime: CvarDef::new("r_competitiveAB", "", "0..2147483663", "Experimental stripped competitive renderer: 0 original; 1 no main BSP world; 2 no dynamic models; 3 no client FX; 4 hide native HUD (console retained); 5 one stage + cheap baked lightmaps + fast sky; 6 additionally omit BSP model-path props; 7 additionally stop client FX; 8 additionally omit non-water transparent world surfaces; 9 omit HUD; 10 no world preparation/drawing; 11 one-texture world (no lightmaps or fused stages); 12 flat-color world; 13 flat world without extra transparent BSP; 14 flat world without models/FX/HUD; 15 acquire/submit-only render ceiling (normal client continues). 16+ = independent skip-bitmask: mask=value-16, bits documented in competitive_ab_probes.md; e.g. 17 PVS, 24 patch LOD, 4112 no world draw, 8208 no world prep and draw. Session only; 0 and 16 are baselines.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_competitiveAB", "", "0..2147483663", "Experimental stripped competitive renderer: 0 original; 1 no main BSP world; 2 no dynamic models; 3 no client FX; 4 hide native HUD (console retained); 5 one stage + cheap baked lightmaps + fast sky; 6 additionally omit BSP model-path props; 7 additionally stop client FX; 8 additionally omit non-water transparent world surfaces; 9 omit HUD; 10 no world preparation/drawing; 11 one-texture world (no lightmaps or fused stages); 12 flat-color world; 13 flat world without extra transparent BSP; 14 flat world without models/FX/HUD; 15 acquire/submit-only render ceiling (normal client continues). 16+ = independent skip-bitmask: mask=value-16, bits documented in competitive_ab_probes.md; e.g. 17 PVS, 24 patch LOD, 4112 no world draw, 8208 no world prep and draw. Archived; 0 and 16 are baselines.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.competitive_ab.to_string()),
             |app, value| App::cvar_set_competitive_ab(app, APP_R_COMPETITIVE_AB.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_competitive_ab, None),
-        config: CvarBinding::NONE,
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.competitive_ab = value.trim().parse::<u32>().ok().filter(|v| *v <= crate::renderer::competitive_probe::MAX_MODE).unwrap_or(settings.competitive_ab);
+            }),
+            archive: Some((37123, |state| state.video.competitive_ab.to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: [impl App {
             fn cvar_set_competitive_ab(&mut self, _name: &str, value: &str) -> Result<(), String> {
                 let mode: u32 = value.trim().parse().map_err(|_| "r_competitiveAB expects a decimal mode/bitmask (see competitive_ab_probes.md)".to_owned())?;
                 if mode > crate::renderer::competitive_probe::MAX_MODE { return Err("r_competitiveAB mode out of range".to_owned()); }
-                self.video.competitive_ab = mode;
+                if self.video.competitive_ab != mode {
+                    self.video.competitive_ab = mode;
+                    self.mark_config_dirty();
+                }
                 crate::renderer::set_competitive_ab_mode(mode);
                 self.render_command(RenderCommand::SetCompetitiveAb(mode));
                 self.console_status = format!("COMPETITIVE A/B: mode={mode} mask=0x{:06x} (0/16 = original; see competitive_ab_probes.md)", crate::renderer::competitive_probe_mask(mode));
@@ -3460,7 +3500,7 @@ app_cvars! {
     }
 
     APP_R_IGPU_MEMORY_AB {
-        runtime: CvarDef::new("r_igpuMemoryAB", "", "0..1", "Real GPU depth buffer A/B: 0 original Depth32Float (32 bits/pixel), 1 Depth16Unorm (16 bits/pixel). Recreates renderer and pipelines on Apply Video Settings or vid_restart; no resolution changes or color conversion. Session only.", CvarType::String, CvarFlags::NONE, LatchScope::VidRestart,
+        runtime: CvarDef::new("r_igpuMemoryAB", "", "0..1", "Real GPU depth buffer A/B: 0 original Depth32Float (32 bits/pixel), 1 Depth16Unorm (16 bits/pixel). Recreates renderer and pipelines on Apply Video Settings or vid_restart; no resolution changes or color conversion. Archived.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::VidRestart,
             |app| CvarValue::String(crate::renderer::igpu_depth_requested().to_string()),
             |app, value| App::cvar_set_igpu_memory_ab(app, APP_R_IGPU_MEMORY_AB.entry.name, &value.to_string())
         ).with_text_setter(App::cvar_set_igpu_memory_ab, Some(|name, value| {
@@ -3468,7 +3508,16 @@ app_cvars! {
                 .map(|v| v.to_string())
                 .ok_or_else(|| format!("{name}: expected 0 (D32) or 1 (D16)"))
         })),
-        config: CvarBinding::NONE,
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.igpu_memory_ab = value.trim().parse::<u8>().ok().filter(|v| *v <= 1).unwrap_or(settings.igpu_memory_ab);
+            }),
+            apply_latched: Some(|settings, value| {
+                settings.igpu_memory_ab = value.trim().parse::<u8>().ok().filter(|v| *v <= 1).unwrap_or(settings.igpu_memory_ab);
+            }),
+            archive: Some((37124, |state| state.video.igpu_memory_ab.to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: [impl App {
             fn cvar_set_igpu_memory_ab(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let mode = value.trim().parse::<u8>().ok().filter(|mode| *mode <= 1)
@@ -3477,6 +3526,8 @@ app_cvars! {
                 // Executed by the shared video-apply latch drain. The video
                 // state machine owns the single renderer restart.
                 crate::renderer::set_igpu_depth_requested(mode);
+                self.video.igpu_memory_ab = mode;
+                self.mark_config_dirty();
                 self.push_console_line(format!(
                     "[IGPU DEPTH A/B] requested={} ({}); depth format chosen during video apply",
                     mode,
@@ -3488,11 +3539,17 @@ app_cvars! {
     }
 
     APP_R_IGPUAB {
-        runtime: CvarDef::new("r_igpuAB", "", "0..31", "CPU-throughput A/B bitmask (session-only, 0=unchanged): +1 single encoder (disable optional world split); +2 cache repeated model bind groups; +4 eligible opaque/alpha-test model render bundles; +8 alternate Ghoul2 bone/draw staging write_buffer_with; +16 cached main-view clip planes (8-corner AABB cull replacement). Combine by addition; compare 3 vs 19. Does not change shader/visual quality, renderer preset, post, or legacy blending.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("r_igpuAB", "", "0..31", "CPU-throughput A/B bitmask (archived, 0=unchanged): +1 single encoder (disable optional world split); +2 cache repeated model bind groups; +4 eligible opaque/alpha-test model render bundles; +8 alternate Ghoul2 bone/draw staging write_buffer_with; +16 cached main-view clip planes (8-corner AABB cull replacement). Combine by addition; compare 3 vs 19. Does not change shader/visual quality, renderer preset, post, or legacy blending.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(App::cvar_get_r_igpuab(app)),
             |app, value| App::cvar_set_r_igpuab(app, APP_R_IGPUAB.entry.name, &value.to_string())
         ).with_text_setter(App::cvar_set_r_igpuab, None),
-        config: CvarBinding::NONE,
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.igpu_ab = value.trim().parse::<u8>().ok().filter(|v| *v <= 31).unwrap_or(settings.igpu_ab);
+            }),
+            archive: Some((37125, |state| state.video.igpu_ab.to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: [impl App {
             fn cvar_get_r_igpuab(&self) -> String {
                 crate::renderer::igpu_ab_mode().to_string()
@@ -3501,6 +3558,10 @@ app_cvars! {
                 let mode = value.trim().parse::<u8>().ok().filter(|mode| *mode <= 31)
                     .ok_or_else(|| format!("{name}: expected 0..31 (bitmask +1 encoder, +2 state, +4 bundles, +8 staging, +16 clip planes)"))?;
                 crate::renderer::set_igpu_ab_mode(mode);
+                if self.video.igpu_ab != mode {
+                    self.video.igpu_ab = mode;
+                    self.mark_config_dirty();
+                }
                 self.render_command(RenderCommand::SetIgpuAbMode(mode));
                 self.console_status = format!(
                     "iGPU CPU A/B {mode}: encoder={} bind-cache={} model-bundles={} Ghoul2-staging={} cached-frustum={} (0=original)",
@@ -4911,18 +4972,28 @@ app_cvars! {
     APP_R_LEGACYBLENDTRANSFER {
         runtime: CvarDef::new(
             "r_legacyBlendTransfer", "4", "0..4",
-            "Model-blend mode (default 4, session-only): 0 exact 16-bit encoded intermediate+resolve (reference); 1 8-bit encoded intermediate; 2 native blend+resolve; 3 native blend without forced resolve; 4 direct encoded-space blend into the SDR swapchain UNORM alias (no transfers; automatically falls back to mode 0 for HDR/MSAA/offscreen/post).",
-            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            "Model-blend mode (default 4, archived): 0 exact 16-bit encoded intermediate+resolve (reference); 1 8-bit encoded intermediate; 2 native blend+resolve; 3 native blend without forced resolve; 4 direct encoded-space blend into the SDR swapchain UNORM alias (no transfers; automatically falls back to mode 0 for HDR/MSAA/offscreen/post).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |_app| CvarValue::String(crate::renderer::legacy_blend_mode().to_string()),
             |app, value| App::cvar_set_r_legacyblendtransfer(app, APP_R_LEGACYBLENDTRANSFER.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_r_legacyblendtransfer, None),
-        config: CvarBinding::NONE,
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.legacy_blend_transfer = value.trim().parse::<u8>().ok().filter(|v| *v <= 4).unwrap_or(settings.legacy_blend_transfer);
+            }),
+            archive: Some((37126, |state| state.video.legacy_blend_transfer.to_string())),
+            ..CvarBinding::NONE
+        },
         implementations: [impl App {
             fn cvar_set_r_legacyblendtransfer(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let mode = value.trim().parse::<u8>()
                     .map_err(|_| format!("{name} expects 0, 1, 2, 3 or 4"))?;
                 if mode > 4 { return Err(format!("{name} expects 0, 1, 2, 3 or 4")); }
                 crate::renderer::set_legacy_blend_mode(mode);
+                if self.video.legacy_blend_transfer != mode {
+                    self.video.legacy_blend_transfer = mode;
+                    self.mark_config_dirty();
+                }
                 self.console_status = format!("LEGACY MODEL TRANSFERS: {}", match mode {
                     0 => "16-bit encoded reference",
                     1 => "8-bit encoded A/B",

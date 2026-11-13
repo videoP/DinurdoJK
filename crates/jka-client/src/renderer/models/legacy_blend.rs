@@ -96,6 +96,7 @@ fn padded_transfer_rect(
 
 pub(in crate::renderer) struct LegacyModelBlend {
     size: (u32, u32, u32, wgpu::TextureFormat, wgpu::TextureFormat),
+    /// Single-sample, except per-sample mode where it is the MSAA target.
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     msaa_texture: Option<wgpu::Texture>,
@@ -105,6 +106,10 @@ pub(in crate::renderer) struct LegacyModelBlend {
     encode: wgpu::RenderPipeline,
     decode: wgpu::RenderPipeline,
     per_sample: bool,
+    /// Cached world transfer sources: encode keyed by its scene view, decode
+    /// always this object's own target. Rebuilt when the scene view changes.
+    world_encode_source: Option<(wgpu::TextureView, wgpu::BindGroup)>,
+    world_decode_source: Option<wgpu::BindGroup>,
 }
 
 impl LegacyModelBlend {
@@ -123,19 +128,22 @@ impl LegacyModelBlend {
         self.msaa_view.as_ref().unwrap_or(&self.view)
     }
 
-    pub(in crate::renderer) fn resolve_view(&self) -> Option<&wgpu::TextureView> {
-        self.msaa_view.as_ref().map(|_| &self.view)
-    }
-
     pub(in crate::renderer) fn encode_world(
         &self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
         scene: &wgpu::TextureView, depth: &wgpu::TextureView,
     ) {
-        let source = self.bind(device, scene);
+        let fresh;
+        let source = match &self.world_encode_source {
+            Some((view, group)) if view == scene => group,
+            _ => { fresh = self.bind(device, scene); &fresh }
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("JKA world encode destination"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: self.color_view(), depth_slice: None, resolve_target: self.resolve_view(),
+                view: self.color_view(), depth_slice: None,
+                // Never resolved: with MSAA, decode reads the multisampled
+                // target and the following normal world pass resolves.
+                resolve_target: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -146,25 +154,34 @@ impl LegacyModelBlend {
             ..Default::default()
         });
         pass.set_pipeline(&self.encode);
-        pass.set_bind_group(0, &source, &[]);
+        pass.set_bind_group(0, source, &[]);
         pass.draw(0..3, 0..1);
     }
 
     pub(in crate::renderer) fn decode_world(
         &self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder,
-        color: &wgpu::TextureView, resolve: Option<&wgpu::TextureView>,
+        color: &wgpu::TextureView,
     ) {
-        let source = self.bind(device, if self.per_sample { self.color_view() } else { &self.view });
+        let fresh;
+        let source = match &self.world_decode_source {
+            Some(group) => group,
+            None => {
+                fresh = self.bind(device, if self.per_sample { self.color_view() } else { &self.view });
+                &fresh
+            }
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("JKA world return to linear"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: color, depth_slice: None, resolve_target: resolve,
+                view: color, depth_slice: None,
+                // The normal world pass resumed right after decode resolves.
+                resolve_target: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
             })],
             ..Default::default()
         });
         pass.set_pipeline(&self.decode);
-        pass.set_bind_group(0, &source, &[]);
+        pass.set_bind_group(0, source, &[]);
         pass.draw(0..3, 0..1);
     }
 
@@ -263,9 +280,12 @@ impl LegacyModelBlend {
                 view_formats: &[],
             })
         };
-        let texture = make_texture(1);
+        // Per-sample (MSAA world blending) reads the multisampled target
+        // directly and never resolves, so it is the only texture. Otherwise an
+        // MSAA attachment resolves into the single-sample `texture`.
+        let texture = make_texture(if per_sample { size.2 } else { 1 });
         let view = texture.create_view(&Default::default());
-        let msaa_texture = (size.2 > 1).then(|| make_texture(size.2));
+        let msaa_texture = (!per_sample && size.2 > 1).then(|| make_texture(size.2));
         let msaa_view = msaa_texture
             .as_ref()
             .map(|t| t.create_view(&Default::default()));
@@ -280,6 +300,26 @@ impl LegacyModelBlend {
             encode,
             decode,
             per_sample,
+            world_encode_source: None,
+            world_decode_source: None,
+        }
+    }
+
+    /// Outside any render pass: (re)build the cached world transfer bind
+    /// groups. `scene` is the view `encode_world` will receive.
+    pub(in crate::renderer) fn prepare_world_sources(
+        &mut self, device: &wgpu::Device, scene: Option<&wgpu::TextureView>,
+    ) {
+        match scene {
+            Some(scene) if self.world_encode_source.as_ref().is_none_or(|(view, _)| view != scene) => {
+                self.world_encode_source = Some((scene.clone(), self.bind(device, scene)));
+            }
+            None => self.world_encode_source = None,
+            _ => {}
+        }
+        if self.world_decode_source.is_none() {
+            let source = if self.per_sample { self.color_view() } else { &self.view };
+            self.world_decode_source = Some(self.bind(device, source));
         }
     }
 

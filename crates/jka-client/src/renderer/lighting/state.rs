@@ -407,7 +407,7 @@ impl Renderer {
         // this path only subtracts its estimated direct contribution.
         let authored_sun = self.world.as_ref()
             .filter(|world| !world.source_map)
-            .and_then(|world| world.sun);
+            .and_then(|world| world.sun_bake.baked_direction());
         let has_authored_sun = authored_sun.is_some();
         let old = authored_sun.unwrap_or_else(|| self.active_sun());
         // Pending/unsupported reconstruction must preserve the authored image.
@@ -427,7 +427,7 @@ impl Renderer {
         let old_map = self.shadow_resources.original_sun_cache.filter(|cache| {
             self.baked_sun_shadow_map && self.world.as_ref().is_some_and(|world| {
                 !world.source_map && world.remap_asset_hash == cache.map_identity
-                    && world.sun.is_some_and(|sun| sun.direction == cache.direction)
+                    && world.sun_bake.baked_direction().is_some_and(|sun| sun.direction == cache.direction)
             })
         });
         let (baked_shadow_ids,all_local_baked)=self.baked_local_shader_inputs();

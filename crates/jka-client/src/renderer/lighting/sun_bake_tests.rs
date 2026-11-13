@@ -78,11 +78,11 @@ fn source() -> Source {
         lightmaps: Arc::new(vec![image]),
         surface_ids: vec![0, 1],
         surfaces: vec![scene::LegacyDlightSurface::default(); 2],
-        sun: scene::DirectionalSun {
+        sun: Some(scene::DirectionalSun {
             direction: [0., -1., 0.],
             color: [1.; 3],
             intensity: 340.,
-        },
+        }),
         encoding: Some(scene::BakedSunEncoding {
             exposure: 0.,
             gamma: 1.,
@@ -115,22 +115,22 @@ fn zero_settings_do_not_request_sunlight_work() {
 #[test]
 fn sunlight_cache_fingerprint_tracks_geometry_sun_lightmaps_and_alpha_casters() {
     let mut source = source();
-    let key = fingerprint(&source);
-    source.sun.intensity += 1.;
-    assert_ne!(key, fingerprint(&source));
-    source.sun.intensity -= 1.;
-    assert_eq!(key, fingerprint(&source));
+    let key = fingerprint(&source, source.sun.unwrap(), source.encoding);
+    let mut changed_sun = source.sun.unwrap();
+    changed_sun.intensity += 1.;
+    assert_ne!(key, fingerprint(&source, changed_sun, source.encoding));
+    assert_eq!(key, fingerprint(&source, source.sun.unwrap(), source.encoding));
     Arc::make_mut(&mut source.vertices)[0].position[0] += 1.;
-    assert_ne!(key, fingerprint(&source));
+    assert_ne!(key, fingerprint(&source, source.sun.unwrap(), source.encoding));
     Arc::make_mut(&mut source.vertices)[0].position[0] -= 1.;
     Arc::make_mut(&mut source.lightmaps)[0].rgba[0] ^= 1;
-    assert_ne!(key, fingerprint(&source));
+    assert_ne!(key, fingerprint(&source, source.sun.unwrap(), source.encoding));
     Arc::make_mut(&mut source.lightmaps)[0].rgba[0] ^= 1;
     source.batches[0].alpha_shadow = true;
     source.batches[0].baked_shadow_texture = Some(0);
-    let caster_key = fingerprint(&source);
+    let caster_key = fingerprint(&source, source.sun.unwrap(), source.encoding);
     Arc::make_mut(&mut source.textures)[0].rgba[3] ^= 255;
-    assert_ne!(caster_key, fingerprint(&source));
+    assert_ne!(caster_key, fingerprint(&source, source.sun.unwrap(), source.encoding));
 }
 
 #[test]
@@ -181,7 +181,7 @@ fn one_atlas_sunlight_is_bit_identical_with_one_or_four_workers() {
                     &mut images,
                     &source.surface_ids,
                     source.surfaces.len(),
-                    source.sun,
+                    source.sun.unwrap(),
                     source.encoding.unwrap(),
                     &AtomicBool::new(false),
                 )
@@ -205,7 +205,7 @@ fn one_atlas_sunlight_is_bit_identical_with_one_or_four_workers() {
         &mut cancelled_images,
         &source.surface_ids,
         2,
-        source.sun,
+        source.sun.unwrap(),
         source.encoding.unwrap(),
         &AtomicBool::new(true)
     )
@@ -301,4 +301,30 @@ fn completed_sun_mask_preserves_ao_rgb_on_gpu_in_linear_and_srgb() {
         }
         assert!(scope.pop().await.is_none());
     });
+}
+
+#[test]
+fn directional_fit_status_preserves_candidate_when_using_authored_sun() {
+    let fit = DirectionFit {
+        azimuth: 137.25,
+        elevation: 32.5,
+        confidence: 0.82,
+        transitions: 123,
+    };
+    assert_eq!(direction_selection_status(None, false),
+        crate::renderer::BakedSunDirectionStatus::Idle);
+    assert_eq!(direction_selection_status(Some(fit), false),
+        crate::renderer::BakedSunDirectionStatus::Found {
+            azimuth: fit.azimuth,
+            elevation: fit.elevation,
+            confidence: fit.confidence,
+            using_detected: false,
+        });
+    assert_eq!(direction_selection_status(Some(fit), true),
+        crate::renderer::BakedSunDirectionStatus::Found {
+            azimuth: fit.azimuth,
+            elevation: fit.elevation,
+            confidence: fit.confidence,
+            using_detected: true,
+        });
 }

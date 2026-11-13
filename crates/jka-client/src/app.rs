@@ -1210,6 +1210,7 @@ pub struct App {
     sun_bake_progress: Option<(u32, crate::renderer::SunBakeStage)>,
     /// Live calibrated coefficient from render thread; never stored in r_bakedSunRemoval.
     baked_sun_auto_status: crate::renderer::BakedSunAutoStatus,
+    baked_sun_direction_status: crate::renderer::BakedSunDirectionStatus,
     preserve_game_state_on_next_map_upload: bool,
     renderer_restart_started: Option<Instant>,
     /// The renderer restart spans several event-loop turns. Unlike TaystJK's

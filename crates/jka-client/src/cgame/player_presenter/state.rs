@@ -608,6 +608,13 @@ impl PlayerPresenter {
         self.japro = options;
     }
 
+    /// The `CG_Player` visibility decision actually used for this frame's
+    /// player bodies. Auxiliary MD3 effects must reuse it instead of inventing
+    /// a separate JA+/jaPRO duel-isolation rule.
+    pub fn style_viewer(&self) -> crate::japro_cg::StyleViewer {
+        self.viewer_style
+    }
+
     pub fn begin_perf_frame(&mut self) {
         self.perf = Ghoul2PerfStats::default();
     }

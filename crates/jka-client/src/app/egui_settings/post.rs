@@ -6,14 +6,15 @@ use crate::app::egui_settings::{
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_post_processing(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "THERMAL VISION", "Experimental scene heat estimation with separate thermal palettes. Off has no thermal passes or shader variant. World shader material types are classified; dynamic models use a warm-biased fallback.");
-        const THERMAL_PALETTES: [(u8, &str); 6] = [
+        theme::section(ui, "INFRARED VISION", "Thermal modes estimate emitted heat. Photographic IR instead approximates reflected near-infrared from scene lighting and surface materials (the Dune: Part Two look). Each active mode uses its own lazy shaders; Off has no vision-specific work.");
+        const THERMAL_PALETTES: [(u8, &str); 7] = [
             (0, "Off"), (1, "Predator"), (2, "White hot"),
             (3, "Black hot"), (4, "Ironbow"), (5, "Heat debug"),
+            (6, "Photo IR"),
         ];
         if let Some(mode) = segmented_row(
-            ui, "Heat vision",
-            "Predator uses the Geeks3D blue-yellow-red palette. White hot, black hot and ironbow share the same scalar heat estimate; heat debug shows it as grayscale.",
+            ui, "Vision mode",
+            "Modes 1-5 show estimated heat. Photo IR is a reflected-light, monochrome near-IR approximation: vegetation/skin lighten, water/sky darken, and existing scene shadows remain. RGB textures cannot provide measured IR reflectance.",
             theme::Reset::None,
             self.video.thermal_vision,
             &THERMAL_PALETTES,

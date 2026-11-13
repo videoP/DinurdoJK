@@ -1,5 +1,6 @@
 //! Game.
 use crate::app::egui_settings::{segmented_row, theme, App};
+use crate::app::egui_menu::{selected_setup_section, SetupSection, SETUP_TAB_GAME};
 
 #[cfg(windows)]
 #[derive(Clone)]
@@ -88,16 +89,19 @@ fn jka_link_settings(ui: &mut egui::Ui) {
 
 impl App {
     pub(in crate::app) fn egui_game_settings(&mut self, ui: &mut egui::Ui) {
-        theme::page_title(
-            ui,
-            "GAME / VIEW",
-            "Launch, weapon and view-effect options. Camera controls live on the Camera tab.",
-        );
+        let section = selected_setup_section(ui.ctx(), SETUP_TAB_GAME);
+        let (title, description) = match section {
+            Some(SetupSection::GameSystem) => ("GAME / LAUNCH & UPDATES", "Launch behavior, updates and server links."),
+            Some(SetupSection::GameGameplay) => ("GAME / GAMEPLAY & ANIMATIONS", "Weapon preferences and client-side player presentation."),
+            _ => ("GAME / SPECTATING & EFFECTS", "Spectator presentation and gameplay view effects."),
+        };
+        theme::page_title(ui, title, description);
 
         egui::ScrollArea::vertical()
-            .id_salt("jka_game_view_settings")
+            .id_salt(("jka_game_view_settings", section))
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                if section == Some(SetupSection::GameSystem) {
                 theme::section(ui, "STARTUP", "Choose where the game opens on your next launch.");
                 theme::row(
                     ui,
@@ -153,6 +157,8 @@ impl App {
                     }
                 }
 
+                }
+                if section == Some(SetupSection::GameGameplay) {
                 theme::section(ui, "WEAPONS", "Weapon selection and projectile presentation.");
                 theme::row(
                     ui,
@@ -245,6 +251,8 @@ impl App {
                     },
                 );
 
+                }
+                if section == Some(SetupSection::GamePresentation) {
                 theme::section(
                     ui,
                     "SPECTATING & DEMOS",
@@ -322,6 +330,7 @@ impl App {
                     &[(0, "Off"), (1, "Effects"), (2, "Effects + weapons")],
                 ) {
                     let _ = self.set_console_cvar("cg_screenShake", &value.to_string());
+                }
                 }
             });
     }

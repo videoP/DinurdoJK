@@ -3,6 +3,7 @@ use crate::app::egui_menu::{
     confirmation_dialog, rail_group, rail_item, theme, App, ApplyVideoPath, Duration,
     EguiRenderData, ElementState, FrontendPage, Instant, KeyCode, KeyEvent, MapEditor, MouseButton,
     OverlayMode, PhysicalKey, RenderCommand, VideoSection, Window, WindowEvent, CONTENT_MAX_W,
+    selected_setup_section, select_setup_section, setup_sections,
     GUTTER, SETUP_TABS, SETUP_TAB_AUDIO, SETUP_TAB_CAMERA, SETUP_TAB_GAME, SETUP_TAB_INTERFACE,
     SETUP_TAB_MOD, SETUP_TAB_PK3, SETUP_TAB_EXTENSIONS, SETUP_TAB_STREAMER, SETUP_TAB_MOVEMENT, SETUP_TAB_NETWORK, SETUP_TAB_VIDEO, TOP_CONTROLS,
     TOP_ITEMS, TOP_PROFILE, TOP_RESUME, TOP_SETUP, TOP_VOTE,
@@ -1051,9 +1052,14 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_body(&mut self, root: &mut egui::Ui) {
-        let on_video = self.egui_display_overlay() == OverlayMode::Video && self.setup_selected == SETUP_TAB_VIDEO;
-        if on_video {
-            self.egui_video_rail(root);
+        let in_setup = self.egui_display_overlay() == OverlayMode::Video;
+        let on_video = in_setup && self.setup_selected == SETUP_TAB_VIDEO;
+        if in_setup {
+            if on_video {
+                self.egui_video_rail(root);
+            } else if !setup_sections(self.setup_selected).is_empty() {
+                self.egui_setup_section_rail(root);
+            }
         }
         let body = self.menu_shell(root.ctx()).body;
         super::shell_layout::region(root, "jka_menu_body_region", body, |ui| {
@@ -1167,39 +1173,93 @@ impl App {
         }
     }
 
-    // ---------------------------------------------------------- video rail --
+    // ---------------------------------------------------------- setup rail --
+
+    /// Both the Video rail and the grouped Setup rails use the same clipped
+    /// scroll area. The wheel only scrolls the rail when the pointer is over it.
+    fn egui_setup_rail_contents(
+        root: &mut egui::Ui,
+        region_id: &'static str,
+        scroll_id: &'static str,
+        rail: egui::Rect,
+        content: impl FnOnce(&mut egui::Ui),
+    ) {
+        super::shell_layout::region(root, region_id, rail, |ui| {
+            let rect = ui.max_rect();
+            ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, theme::RAIL_FILL());
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(rect.right() - 1.0, rect.top()),
+                    egui::vec2(1.0, rect.height()),
+                ),
+                egui::CornerRadius::ZERO,
+                theme::LINE(),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt(scroll_id)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.set_width((rect.width() - 1.0).max(1.0));
+                    ui.add_space(12.0);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    content(ui);
+                });
+        });
+    }
+
+    pub(in crate::app::egui_menu) fn egui_setup_section_rail(&mut self, root: &mut egui::Ui) {
+        let tab = self.setup_selected;
+        let Some(rail) = self.menu_shell(root.ctx()).rail else { return };
+        let selected = selected_setup_section(root.ctx(), tab);
+        let mut target = None;
+        let scroll_id = match tab {
+            SETUP_TAB_GAME => "jka_game_rail_scroll",
+            SETUP_TAB_AUDIO => "jka_audio_rail_scroll",
+            SETUP_TAB_INTERFACE => "jka_interface_rail_scroll",
+            _ => "jka_setup_rail_scroll",
+        };
+        Self::egui_setup_rail_contents(root, "jka_setup_rail", scroll_id, rail, |ui| {
+            rail_group(ui, match tab {
+                SETUP_TAB_GAME => "GAME",
+                SETUP_TAB_AUDIO => "AUDIO",
+                SETUP_TAB_INTERFACE => "INTERFACE",
+                _ => "SETUP",
+            });
+            for &(section, label) in setup_sections(tab) {
+                if rail_item(ui, label, selected == Some(section)).clicked() {
+                    target = Some(section);
+                }
+            }
+        });
+        if let Some(section) = target {
+            if selected != Some(section) {
+                select_setup_section(root.ctx(), section);
+                super::settings_search::clear_query(root.ctx());
+                self.egui_repaint_requested = true;
+                self.publish_ui();
+            }
+        }
+    }
 
     pub(in crate::app::egui_menu) fn egui_video_rail(&mut self, root: &mut egui::Ui) {
         let mut target = None;
         let Some(rail) = self.menu_shell(root.ctx()).rail else { return };
-        super::shell_layout::region(root, "jka_video_rail", rail, |ui| {
-                let rect = ui.max_rect();
-                ui.painter().rect_filled(rect, egui::CornerRadius::ZERO, theme::RAIL_FILL());
-                ui.add_space(12.0);
-                ui.painter().rect_filled(
-                    egui::Rect::from_min_size(
-                        egui::pos2(rect.right() - 1.0, rect.top()),
-                        egui::vec2(1.0, rect.height()),
-                    ),
-                    egui::CornerRadius::ZERO,
-                    theme::LINE(),
-                );
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for (title, entries) in [
-                    ("RENDERING", &VideoSection::RENDERING[..]),
-                    ("ENVIRONMENT", &VideoSection::ENVIRONMENT[..]),
-                    ("OPTIMIZATIONS", &VideoSection::OPTIMIZATIONS[..]),
-                    ("DEBUG", &VideoSection::DEBUG[..]),
-                ] {
-                    rail_group(ui, title);
-                    for (section, label) in entries.iter().copied() {
-                        if rail_item(ui, label, section == self.video_section).clicked() {
-                            target = Some(section);
-                        }
+        Self::egui_setup_rail_contents(root, "jka_video_rail", "jka_video_rail_scroll", rail, |ui| {
+            for (title, entries) in [
+                ("RENDERING", &VideoSection::RENDERING[..]),
+                ("ENVIRONMENT", &VideoSection::ENVIRONMENT[..]),
+                ("OPTIMIZATIONS", &VideoSection::OPTIMIZATIONS[..]),
+                ("DEBUG", &VideoSection::DEBUG[..]),
+            ] {
+                rail_group(ui, title);
+                for (section, label) in entries.iter().copied() {
+                    if rail_item(ui, label, section == self.video_section).clicked() {
+                        target = Some(section);
                     }
-                    ui.add_space(10.0);
                 }
-            });
+                ui.add_space(10.0);
+            }
+        });
         if let Some(section) = target {
             if self.video_section != section {
                 self.video_section = section;

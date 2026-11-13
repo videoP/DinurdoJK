@@ -1,5 +1,5 @@
 //! Taffy layout of the menu chrome shared by every egui page: header, the
-//! Setup tab strip, the Video rail, the page body and the footer strip. The
+//! Setup tab strip, the Setup section rail, the page body and the footer strip. The
 //! regions are computed once per frame here and handed to the painters in
 //! `shell.rs` / `frontend_pages.rs`, which used to stack egui Panels.
 use crate::ui::flex::{Container, Flex};
@@ -107,7 +107,8 @@ impl crate::app::App {
         };
         compute(ctx.content_rect(), ShellSpec {
             tabs: video,
-            rail: video && self.setup_selected == super::SETUP_TAB_VIDEO,
+            rail: video && (self.setup_selected == super::SETUP_TAB_VIDEO
+                || !super::setup_sections(self.setup_selected).is_empty()),
             footer_h,
         })
     }

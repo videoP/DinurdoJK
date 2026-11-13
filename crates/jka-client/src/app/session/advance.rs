@@ -888,11 +888,14 @@ impl GameSession {
                 self.forced_player_models.as_ref(),
             ),
         );
+        // Share CG_Player's actual snapshot-view visibility with every MD3
+        // owned by that player; these used to bypass JA+ duelalpha culling.
+        let viewer_style = self.player_presenter.style_viewer();
         // TaystJK CG_Player: seeker drones are independent orbiting MD3s;
         // playerState can synthesize a local owner absent from the snapshot.
         dynamic_models.extend(self.entity_presenter.present_seeker_drones(
             &self.presented_entities, followed_entity.as_ref(), target_server_time,
-            self.client_game.rendering_intermission(),
+            self.client_game.rendering_intermission(), &viewer_style,
         ));
         // TaystJK CG_Player: boon/enlightenment/ysalamiri and spawn
         // protection are separate MD3 refEntities, not Ghoul2 body tints.
@@ -906,6 +909,7 @@ impl GameSession {
             followed_entity.as_ref(),
             &self.client_game,
             sphere_view_origin,
+            &viewer_style,
         ));
         // CG_PlayerHitFX: armor-absorbed hits flash a half-shield on the victim
         // (never on your own first-person body).
@@ -918,6 +922,8 @@ impl GameSession {
             } else {
                 None
             },
+            self.client_game.rendering_intermission(),
+            &viewer_style,
         ));
         self.client_perf.player_present_ms =
             player_present_started.elapsed().as_secs_f64() * 1000.0;

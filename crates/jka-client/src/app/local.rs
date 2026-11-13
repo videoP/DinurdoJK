@@ -19,14 +19,13 @@ impl App {
 
         match result {
             Ok(true) => {
-                self.console_status =
-                    "NOCLIP ON  |  MOUSE1/MOUSE2 = 10X SPEED EACH  |  BOTH = 100X".into();
-                self.push_console_line(format!("^2{}", self.console_status));
+                self.console_status = "noclip ON".into();
+                self.push_console_line(self.console_status.clone());
                 self.push_local_snapshot(true);
             }
             Ok(false) => {
-                self.console_status = "NOCLIP OFF".into();
-                self.push_console_line(format!("^3{}", self.console_status));
+                self.console_status = "noclip OFF".into();
+                self.push_console_line(self.console_status.clone());
                 self.push_local_snapshot(true);
             }
             Err(error) => {

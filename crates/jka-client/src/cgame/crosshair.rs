@@ -34,6 +34,9 @@ pub struct CrosshairViewer {
     pub duel_in_progress: bool,
     pub duel_index: i32,
     pub weapon: i32,
+    /// Local `cg_stylePlayer` cvar; TaystJK uses these *name-specific* bits,
+    /// not `jp_duelalpha`, when deciding whether to identify hidden players.
+    pub style_player: u32,
 }
 
 impl CrosshairViewer {
@@ -245,6 +248,20 @@ pub fn crosshair_name(
     if !(0..MAX_CLIENTS as i32).contains(&target) || target_state.is_some_and(cloaked) {
         return None;
     }
+    // TaystJK CG_DrawCrosshairNames: hiding duel participants with
+    // cg_stylePlayer suppresses their names as well. JA+ jp_duelalpha does
+    // not enter this check upstream, so preserve that distinction.
+    if viewer.duel_in_progress {
+        if target != viewer.duel_index
+            && viewer.style_player & crate::japro_cg::style::HIDE_NONDUELERS != 0
+        {
+            return None;
+        }
+    } else if target_state.is_some_and(|state| field_i32(state, "bolt1") != 0)
+        && viewer.style_player & crate::japro_cg::style::HIDE_DUELERS != 0
+    {
+        return None;
+    }
     let index = CS_PLAYERS.checked_add(u16::try_from(target).ok()?)?;
     let name = game.configstring(index).and_then(|info| info_value(info, b"n")).map(super::bytes_to_lossless_ascii)?;
 
@@ -386,6 +403,30 @@ mod tests {
         assert_eq!(crosshair_name(&team, &duel_view, 3, false, None, 1.0, false, 1.0).unwrap().color, BLACK);
         assert!(crosshair_name(&team, &me, 40, false, None, 1.0, true, 1.0).is_none());
         assert_eq!(sanitize_name("^1Red^7 ^xName"), "Red xName");
+    }
+
+    #[test]
+    fn taystjk_styleplayer_hides_crosshair_names_but_not_duelalpha_alone() {
+        let game = game(0, &[(0, 0), (3, 0), (7, 0)]);
+        let dueler = state(&[("bolt1", 1)]);
+        let racer = state(&[("bolt1", 2)]);
+        let normal = state(&[("bolt1", 0)]);
+        let mut viewer = viewer(0, 0);
+        viewer.duel_in_progress = true;
+        viewer.duel_index = 7;
+        // Just as in TaystJK, JA+ jp_duelalpha without the style bit
+        // does NOT automatically suppress crosshair names.
+        assert!(crosshair_name(&game, &viewer, 3, false, Some(&normal), 1.0, true, 1.0).is_some());
+        viewer.style_player = crate::japro_cg::style::HIDE_NONDUELERS;
+        assert!(crosshair_name(&game, &viewer, 3, false, Some(&normal), 1.0, true, 1.0).is_none());
+        assert!(crosshair_name(&game, &viewer, 7, false, Some(&dueler), 1.0, true, 1.0).is_some());
+
+        viewer.duel_in_progress = false;
+        viewer.style_player = crate::japro_cg::style::HIDE_DUELERS;
+        assert!(crosshair_name(&game, &viewer, 3, false, Some(&dueler), 1.0, false, 1.0).is_none());
+        // Upstream tests nonzero bolt1, not only its duel (1) value.
+        assert!(crosshair_name(&game, &viewer, 3, false, Some(&racer), 1.0, true, 1.0).is_none());
+        assert!(crosshair_name(&game, &viewer, 3, false, Some(&normal), 1.0, true, 1.0).is_some());
     }
 
     #[test]

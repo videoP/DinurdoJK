@@ -384,6 +384,7 @@ impl App {
         self.static_ao_progress = None;
         self.sun_bake_progress = None;
         self.baked_sun_auto_status = crate::renderer::BakedSunAutoStatus::Calibrating;
+        self.baked_sun_direction_status = crate::renderer::BakedSunDirectionStatus::Idle;
         self.reset_asset_catalogs_for_game_change();
         self.map_collision = None;
         self.map_mark_surfaces = None;

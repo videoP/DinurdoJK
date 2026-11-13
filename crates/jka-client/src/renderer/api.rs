@@ -31,6 +31,16 @@ pub enum BakedSunAutoStatus {
     ContourGuided,
 }
 
+/// Status of the explicit, CPU-only reverse shadow search (not AUTO strength).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BakedSunDirectionStatus {
+    Idle,
+    Searching,
+    Found { azimuth: f32, elevation: f32, confidence: f32, using_detected: bool },
+    Failed,
+    Unavailable,
+}
+
 impl SunBakeStage {
     pub fn label(self) -> &'static str {
         match self {
@@ -1185,6 +1195,10 @@ pub enum RenderCommand {
     StartShitterSweep { path: PathBuf },
     /// One-shot read-only Vulkan shared-present capability query on the current window.
     ProbeSharedPresent,
+    /// Search original BSP shadow gradients for an absent/stale baked sun.
+    FindBakedSunDirection,
+    /// Reuse the authored sun or the most recent detected direction for removal.
+    SelectBakedSunDirection { detected: bool },
     SetInputLateLatch(bool),
     SetMsaa(u32),
     SetTextureFilter(TextureFilter),

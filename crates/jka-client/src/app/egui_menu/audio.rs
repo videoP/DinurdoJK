@@ -1,5 +1,5 @@
 //! Audio.
-use crate::app::egui_menu::{theme, App};
+use crate::app::egui_menu::{theme, App, selected_setup_section, SetupSection, SETUP_TAB_AUDIO};
 
 impl App {
     pub(in crate::app::egui_menu) fn audio_choice_row(
@@ -26,19 +26,22 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn egui_audio_page(&mut self, ui: &mut egui::Ui) {
-        theme::page_title(
-            ui,
-            "AUDIO",
-            "Game audio levels, EAL/OpenAL map acoustics, Steam Audio and output diagnostics.",
-        );
+        let section = selected_setup_section(ui.ctx(), SETUP_TAB_AUDIO);
+        let (title, description) = match section {
+            Some(SetupSection::AudioGeneral) => ("AUDIO / GENERAL AUDIO", "Sound levels and gameplay audio feedback."),
+            _ => ("AUDIO / POSITIONAL AUDIO", "Map acoustics, spatial audio and subsystem diagnostics."),
+        };
+        theme::page_title(ui, title, description);
 
         egui::ScrollArea::vertical()
-            .id_salt("jka_audio_settings")
+            .id_salt(("jka_audio_settings", section))
             .auto_shrink([false, false])
             .show(ui, |ui| self.egui_audio_page_contents(ui));
     }
 
     pub(in crate::app::egui_menu) fn egui_audio_page_contents(&mut self, ui: &mut egui::Ui) {
+        let section = selected_setup_section(ui.ctx(), SETUP_TAB_AUDIO);
+        if section == Some(SetupSection::AudioGeneral) {
         theme::section(ui, "MIX", "Changes are live and archived to DinurdoJK.cfg.");
         macro_rules! audio_slider {
             ($label:literal, $tip:literal, $field:ident, $cvar:literal) => {
@@ -283,6 +286,8 @@ impl App {
             &[(0, "Off"), (1, "Set 1"), (2, "Set 2"), (3, "Set 3"), (4, "Set 4"), (5, "Saber plain"), (6, "Saber any")],
         );
 
+        }
+        if section == Some(SetupSection::AudioPositional) {
         theme::section(ui, "MAP ACOUSTICS · EAL / OPENAL SOFT", "Map-authored .eal environmental effects. Independent of Steam Audio; changes are saved.");
         theme::row(
             ui,
@@ -424,6 +429,11 @@ impl App {
             );
         });
 
+        let info = self
+            .game_session
+            .as_ref()
+            .and_then(|playback| playback.sound_presenter.as_ref())
+            .and_then(|sound| sound.info());
         theme::section(
             ui,
             "OUTPUT & DIAGNOSTICS",
@@ -467,6 +477,20 @@ impl App {
                             info.active_voices
                         ),
                         if overload { theme::WARNING() } else { theme::TEXT_DIM() },
+                    );
+                },
+            );
+            theme::row(
+                ui,
+                "Voice allocation",
+                "Legacy same-channel replacement is expected. Full-pool kicks mean every one-shot channel was busy and a new sound cut off the oldest one (other players' sounds first). Counters reset on level/seek.",
+                theme::Reset::None,
+                |ui| {
+                    theme::hint(
+                        ui,
+                        &format!("{} channel replacements · {} full-pool kicks",
+                            info.channel_replacements, info.capacity_kicks),
+                        if info.capacity_kicks > 0 { theme::WARNING() } else { theme::TEXT_DIM() },
                     );
                 },
             );
@@ -589,6 +613,7 @@ impl App {
                 theme::Reset::None,
                 |ui| theme::hint(ui, "Not active", theme::TEXT_FAINT()),
             );
+        }
         }
     }
 }

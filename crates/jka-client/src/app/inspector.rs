@@ -6,6 +6,55 @@ use crate::app::{
     SurfaceInspectorSection,
 };
 
+/// TaystJK `staticCrosshairOverride`, with native JK2 versus JKA weapon ids.
+/// Keep DinurdoJK's newer 2D helper modes as static Smart overrides as before.
+fn smart_crosshair_static_override(is_jk2: bool, weapon: i32, japro_racemode: bool, flags: u32) -> bool {
+    let non_ranged = if is_jk2 {
+        // MVSDK bg_public.h: WP_NONE=0, WP_STUN_BATON=1, WP_SABER=2,
+        // WP_BRYAR_PISTOL=3 (a ranged weapon).
+        matches!(weapon, 0 | 1 | 2)
+    } else {
+        // OpenJK bg_public.h: WP_NONE=0, WP_STUN_BATON=1,
+        // WP_MELEE=2, WP_SABER=3.
+        matches!(weapon, 0 | 1 | 2 | 3)
+    };
+    non_ranged
+        || japro_racemode
+        || flags & (ui::SHELPER_UPDATED | ui::SHELPER_CGAZ
+            | ui::SHELPER_XONOTIC | ui::SHELPER_Q3DF | ui::SHELPER_WARSOW_HUD) != 0
+}
+
+/// `WP_MuzzlePoint` from the bundled OpenJK and MVSDK bg_weapons.c files.
+/// Weapon numbering differs between JK2 and JKA: never index one game's
+/// table with the other's weapon id.
+fn crosshair_muzzle_offset(is_jk2: bool, weapon: i32) -> [f32; 3] {
+    const JKA: [[f32; 3]; 17] = [
+        [0.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 8.0, 0.0],
+        [8.0, 16.0, 0.0], [12.0, 6.0, -6.0], [12.0, 6.0, -6.0],
+        [12.0, 6.0, -6.0], [12.0, 2.0, -6.0], [12.0, 4.5, -6.0],
+        [12.0, 6.0, -6.0], [12.0, 6.0, -6.0], [12.0, 8.0, -4.0],
+        [12.0, 0.0, -4.0], [12.0, 0.0, -10.0], [12.0, 0.0, -4.0],
+        [12.0, 6.0, -6.0], [12.0, 6.0, -6.0],
+    ];
+    const JK2: [[f32; 3]; 14] = [
+        [0.0, 0.0, 0.0], [0.0, 8.0, 0.0], [8.0, 16.0, 0.0],
+        [12.0, 6.0, -6.0], [12.0, 6.0, -6.0], [12.0, 6.0, -6.0],
+        [12.0, 2.0, -6.0], [12.0, 4.5, -6.0], [12.0, 6.0, -6.0],
+        [12.0, 6.0, -6.0], [12.0, 8.0, 0.0], [12.0, 0.0, -4.0],
+        [12.0, 0.0, -10.0], [12.0, 0.0, -4.0],
+    ];
+    let Ok(index) = usize::try_from(weapon) else { return [0.0; 3]; };
+    if is_jk2 {
+        // MVSDK CG_CalcMuzzlePoint suppresses melee-weapon offsets.
+        if matches!(weapon, 1 | 2) { return [0.0; 3]; }
+        JK2.get(index).copied().unwrap_or([0.0; 3])
+    } else {
+        // OpenJK/TaystJK CG_CalcMuzzlePoint suppresses these classes.
+        if matches!(weapon, 1 | 2 | 3 | 6 | 17 | 18) { return [0.0; 3]; }
+        JKA.get(index).copied().unwrap_or([0.0; 3])
+    }
+}
+
 /// Half-extent of the box drawn for a point entity (no brush model) by
 /// `r_drawEntities` — shared by the mesh builder and the trace hit test so
 /// what you can click always matches what you see.
@@ -394,26 +443,6 @@ impl App {
         const MAX_CLIENTS: i32 = 32;
         const TEAM_SPECTATOR: i32 = 3;
         const STAT_HEALTH: usize = 0;
-        // WP_MuzzlePoint from the vendored jaPRO/OpenJK bg_weapons.c.
-        const MUZZLE: [[f32; 3]; 17] = [
-            [0.0, 0.0, 0.0],
-            [0.0, 8.0, 0.0],
-            [0.0, 8.0, 0.0],
-            [8.0, 16.0, 0.0],
-            [12.0, 6.0, -6.0],
-            [12.0, 6.0, -6.0],
-            [12.0, 6.0, -6.0],
-            [12.0, 2.0, -6.0],
-            [12.0, 4.5, -6.0],
-            [12.0, 6.0, -6.0],
-            [12.0, 6.0, -6.0],
-            [12.0, 8.0, -4.0],
-            [12.0, 0.0, -4.0],
-            [12.0, 0.0, -10.0],
-            [12.0, 0.0, -4.0],
-            [12.0, 6.0, -6.0],
-            [12.0, 6.0, -6.0],
-        ];
 
         let settings = self.crosshair;
         let session_supports_crosshair = self.game_session.as_ref().is_some_and(|session| {
@@ -476,7 +505,7 @@ impl App {
         // a static centre-ray scan from the camera, never a playerState muzzle.
         let free_view = self.spectator_broadcast.free_active()
             || (!session.live && self.demo_view_mode == DemoViewMode::Free);
-        let (viewer, alive) = if free_view {
+        let (mut viewer, alive) = if free_view {
             (
                 CrosshairViewer {
                     client: -1,
@@ -494,6 +523,7 @@ impl App {
                     duel_in_progress: ps.field_i32("duelInProgress").unwrap_or(0) != 0,
                     duel_index: ps.field_i32("duelIndex").unwrap_or(0),
                     weapon: ps.field_i32("weapon").unwrap_or(0),
+                    style_player: self.japro_cg.style_player,
                 },
                 ps.stats[STAT_HEALTH] > 0,
             )
@@ -518,6 +548,7 @@ impl App {
                             weapon: state
                                 .and_then(|state| state.field_i32("weapon"))
                                 .unwrap_or(0),
+                            style_player: self.japro_cg.style_player,
                         },
                         state
                             .and_then(|state| state.field_i32("health"))
@@ -537,18 +568,21 @@ impl App {
             }
         };
 
-        // TaystJK staticCrosshairOverride(): mode 1 is unconditionally dynamic;
-        // mode 2 goes static for the authored weapon/racemode/strafehelper cases.
-        // WSW/Weze strafehelper add-ons are intentionally absent from this client,
-        // so there are no corresponding flags to test here.
-        let static_override = if settings.dynamic == 2 {
-            matches!(viewer.weapon, 0 | 1 | 2 | 3)
-                || ps.stats[crate::japro_cg::STAT_RACEMODE] != 0
-                || self.strafe_helper.flags & (ui::SHELPER_UPDATED | ui::SHELPER_CGAZ | ui::SHELPER_XONOTIC | ui::SHELPER_Q3DF | ui::SHELPER_WARSOW_HUD) != 0
-        } else {
-            false
-        };
-        let dynamic = settings.dynamic != 0 && !static_override && viewer.client >= 0;
+        viewer.style_player = session.japro_cg.style_player;
+
+        // TaystJK staticCrosshairOverride: Smart-only restrictions. JK2 uses
+        // different weapon ids; the race stat is meaningful only on jaPRO.
+        let is_jk2 = self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2();
+        let static_override = settings.dynamic == 2 && smart_crosshair_static_override(
+            is_jk2,
+            viewer.weapon,
+            session.client_game.is_japro() && ps.stats[crate::japro_cg::STAT_RACEMODE] != 0,
+            self.strafe_helper.flags,
+        );
+        // If BSP collision is unavailable, the world-space endpoint cannot be
+        // produced; keep a visible static crosshair rather than silently losing it.
+        let dynamic = settings.dynamic != 0 && !static_override
+            && viewer.client >= 0 && self.map_collision.is_some();
 
         // CG_CrosshairTrace. TaystJK deliberately uses two different angle sources in
         // third person: predictedPlayerState.viewangles for the trace direction, but
@@ -615,7 +649,7 @@ impl App {
                 // player's lerpAngles for the third-person weapon-offset basis.
                 let mut direction_angles = trace_angles;
                 let emplaced_index = ps.field_i32("emplacedIndex").unwrap_or(0);
-                let emplaced = viewer.weapon == 17 && emplaced_index != 0;
+                let emplaced = !is_jk2 && viewer.weapon == 17 && emplaced_index != 0;
                 if emplaced && direction_angles[0] > 40.0 {
                     direction_angles[0] = 40.0;
                 }
@@ -654,15 +688,7 @@ impl App {
                     }
                 }
 
-                let weapon = usize::try_from(viewer.weapon)
-                    .ok()
-                    .filter(|&weapon| weapon < MUZZLE.len())
-                    .unwrap_or(0);
-                let offset = if matches!(viewer.weapon, 1 | 2 | 3 | 6 | 17 | 18) {
-                    [0.0; 3]
-                } else {
-                    MUZZLE[weapon]
-                };
+                let offset = crosshair_muzzle_offset(is_jk2, viewer.weapon);
                 muzzle[0] += offset_forward[0] * offset[0] + offset_right[0] * offset[1];
                 muzzle[1] += offset_forward[1] * offset[0] + offset_right[1] * offset[1];
                 muzzle[2] += offset_forward[2] * offset[0] + offset_right[2] * offset[1];
@@ -1453,5 +1479,41 @@ mod trace_fx_tests {
         for value in ["fire/smoke", "effects/fire/smoke", "effects/fire/smoke.efx", "EFFECTS\\FIRE\\SMOKE.EFX"] {
             assert_eq!(trace_effect_resource_key(value), "effects/fire/smoke.efx");
         }
+    }
+}
+
+#[cfg(test)]
+mod crosshair_parity_tests {
+    use super::*;
+
+    #[test]
+    fn smart_distinguishes_jk2_bryar_from_jka_saber() {
+        for weapon in [0, 1, 2] {
+            assert!(smart_crosshair_static_override(true, weapon, false, 0));
+        }
+        assert!(!smart_crosshair_static_override(true, 3, false, 0)); // JK2 Bryar
+        assert!(smart_crosshair_static_override(false, 3, false, 0)); // JKA Saber
+        assert!(!smart_crosshair_static_override(false, 4, false, 0)); // JKA Bryar
+    }
+
+    #[test]
+    fn smart_requires_actual_japro_racemode_or_static_style() {
+        assert!(!smart_crosshair_static_override(false, 4, false, ui::SHELPER_ORIGINAL));
+        assert!(smart_crosshair_static_override(false, 4, true, 0));
+        for flags in [ui::SHELPER_UPDATED, ui::SHELPER_CGAZ, ui::SHELPER_XONOTIC,
+                      ui::SHELPER_Q3DF, ui::SHELPER_WARSOW_HUD] {
+            assert!(smart_crosshair_static_override(false, 4, false, flags));
+        }
+        assert!(!smart_crosshair_static_override(false, 4, false, ui::SHELPER_CROSSHAIR));
+    }
+
+    #[test]
+    fn native_muzzle_tables_do_not_shift_jk2_weapon_ids() {
+        assert_eq!(crosshair_muzzle_offset(true, 3), [12.0, 6.0, -6.0]); // JK2 Bryar
+        assert_eq!(crosshair_muzzle_offset(false, 4), [12.0, 6.0, -6.0]); // JKA Bryar
+        assert_eq!(crosshair_muzzle_offset(true, 10), [12.0, 8.0, 0.0]); // JK2 Rocket
+        assert_eq!(crosshair_muzzle_offset(false, 11), [12.0, 8.0, -4.0]); // JKA Rocket
+        assert_eq!(crosshair_muzzle_offset(true, 2), [0.0; 3]); // JK2 Saber
+        assert_eq!(crosshair_muzzle_offset(false, 3), [0.0; 3]); // JKA Saber
     }
 }

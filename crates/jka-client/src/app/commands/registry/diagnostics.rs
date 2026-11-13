@@ -1006,9 +1006,16 @@ commands! {
                         info.channels, info.sample_rate, info.sample_format, info.buffer_size
                     ));
                     self.push_console_line(format!(
-                        "^3AUDIO MIX:^7 voices {} / 32 | loops {} ({} requests) | pre-limit peak {:.3} | overload samples {}",
-                        info.active_voices, info.active_loops, info.loop_requests, info.peak_before_limiter, info.overload_samples
+                        "^3AUDIO MIX:^7 voices {} / {} | loops {} ({} requests) | pre-limit peak {:.3} | overload samples {}",
+                        info.active_voices, info.max_voices, info.active_loops, info.loop_requests, info.peak_before_limiter, info.overload_samples
                     ));
+                    self.push_console_line(format!(
+                        "^3AUDIO ALLOCATOR:^7 channel replacements {} | full-pool kicks {} (since level/seek reset)",
+                        info.channel_replacements, info.capacity_kicks
+                    ));
+                    if let Some(last) = &info.last_capacity_kick {
+                        self.push_console_line(format!("^3AUDIO LAST KICK:^7 {last}"));
+                    }
                     self.push_console_line(format!(
                         "^3AUDIO SOURCES:^7 {} (each retains its decoded rate; mixer converts to {} Hz output)",
                         source_rates, info.sample_rate

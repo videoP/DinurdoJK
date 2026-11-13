@@ -1063,7 +1063,7 @@ impl Renderer {
         let Some(world) = self.world.as_ref().filter(|world| !world.source_map) else {
             return;
         };
-        let Some(sun) = world.sun else { return; };
+        let Some(sun) = world.sun_bake.baked_direction() else { return; };
         let cache_valid = self.shadow_resources.original_sun_cache.is_some_and(|cache| {
             cache.map_identity == world.remap_asset_hash && cache.direction == sun.direction
         });

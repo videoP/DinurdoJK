@@ -129,19 +129,21 @@ impl App {
             // ------------------------------------------- baked lighting --
             // This is a subtraction from authored baked light and is independent
             // of the edited runtime sun direction and intensity.
-            let baked_sun_ready = authored.is_some();
+            let detected = self.baked_sun_direction_status;
+            let baked_sun_ready = authored.is_some()
+                || matches!(detected, crate::renderer::BakedSunDirectionStatus::Found { .. });
             theme::section(
                 ui,
                 "BAKED LIGHTING",
                 "Approximate removal of the map's baked direct sun. This control never adds a replacement light.",
             );
-            if authored.is_none() {
+            if authored.is_none() && !baked_sun_ready {
                 theme::banner(
                     ui,
-                    "Inactive: this map has no authored sun to remove from its baked lighting.",
+                    "No q3map_sun in the current shaders. Detect the original baked sun from lightmap shadow edges below.",
                     theme::WARNING(),
                 );
-            } else {
+            } else if authored.is_some() {
                 theme::banner(
                     ui,
                     "When compiler settings are available, removal projects the authored sun into the lightmap and subtracts before exposure and filtering. Other maps use an estimated fallback.",
@@ -158,7 +160,57 @@ impl App {
                     );
                 }
             }
-            if authored.is_some() && !self.video.baked_sun_shadow_map {
+            theme::row(ui, "Find baked sun direction",
+                "One-time low-resolution CPU search of BSP shadow edges across azimuth/elevation, followed by coarse-to-fine refinement. Does not change the current sky sun. Reconstructs removal masks in the background; preserves the original map if the result is uncertain.",
+                theme::Reset::None, |ui| {
+                    ui.add_enabled_ui(!matches!(detected,
+                        crate::renderer::BakedSunDirectionStatus::Searching |
+                        crate::renderer::BakedSunDirectionStatus::Unavailable), |ui| {
+                        if theme::ghost_button(ui, "FIND ORIGINAL SUN").clicked() {
+                            self.render_command(crate::renderer::RenderCommand::FindBakedSunDirection);
+                            self.video.baked_sun_removal_auto = true;
+                            self.video.baked_sun_removal_contour = false;
+                            self.sync_post_effects();
+                            self.mark_config_dirty();
+                        }
+                    });
+                });
+            // The two sources are independent of the live sun/sky settings.
+            // Keep both choices visible after detection so an expensive search
+            // need not be repeated just to A/B against the authored direction.
+            let found = matches!(detected, crate::renderer::BakedSunDirectionStatus::Found { .. });
+            let using_detected = matches!(detected,
+                crate::renderer::BakedSunDirectionStatus::Found { using_detected: true, .. });
+            if authored.is_some() && (found || matches!(detected, crate::renderer::BakedSunDirectionStatus::Searching)) {
+                theme::row(ui, "Baked sun source",
+                    "Select the direction used to remove original baked sunlight. MAP SUN restores the actual shader-authored direction and recalibrates; DETECTED reuses the last matching result. Neither changes the live sky sun.",
+                    theme::Reset::None, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(!using_detected && !matches!(detected, crate::renderer::BakedSunDirectionStatus::Searching), "Map sun (authored)").clicked()
+                                && (using_detected || matches!(detected, crate::renderer::BakedSunDirectionStatus::Searching)) {
+                                self.render_command(crate::renderer::RenderCommand::SelectBakedSunDirection { detected: false });
+                            }
+                            ui.add_enabled_ui(found, |ui| {
+                                if ui.selectable_label(using_detected, "Detected").clicked() && !using_detected {
+                                    self.render_command(crate::renderer::RenderCommand::SelectBakedSunDirection { detected: true });
+                                }
+                            });
+                        });
+                    });
+            }
+            match detected {
+                crate::renderer::BakedSunDirectionStatus::Searching => {
+                    theme::hint(ui, "Comparing low-resolution sun shadow candidates (background CPU)...", theme::TEXT_DIM());
+                }
+                crate::renderer::BakedSunDirectionStatus::Found { azimuth, elevation, confidence, using_detected } => {
+                    theme::banner(ui, &format!("BAKED SUN FOUND  azimuth {azimuth:.1}°  elevation {elevation:.1}°  edge fit {confidence:.2}  | using {} direction for removal", if using_detected { "detected" } else { "authored map" }), theme::TEXT_DIM());
+                }
+                crate::renderer::BakedSunDirectionStatus::Failed => {
+                    theme::banner(ui, "Unable to distinguish a reliable original sun; see console for evidence. Original lightmap preserved. You can retry.", theme::WARNING());
+                }
+                _ => {}
+            }
+            if baked_sun_ready && !self.video.baked_sun_shadow_map {
                 theme::banner(
                     ui,
                     "Legacy fallback ignores occlusion and can subtract inside baked shadows on uncalibrated surfaces. Choose Shadow map for occlusion in the fallback.",

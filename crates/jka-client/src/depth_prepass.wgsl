@@ -308,6 +308,33 @@ fn thermal_world_material() -> f32 {
     return heat;
 }
 
+// Photographic NIR (700-1000 nm) reflectance estimates. This is *not*
+// temperature: q3map surface types predict the Wood effect, dark water/glass
+// and varying fabric response. Real spectral reflectance requires measured
+// material data; RGB alone cannot recover it. The NIR-only prepass writes B
+// into the existing policy attachment, so no extra full-screen target exists.
+fn nir_world_reflectance() -> f32 {
+    let kind = (material.header.w >> 8u) & 31u;
+    var reflectance = 0.47;  // unknown masonry/concrete
+    switch (kind) {
+        case 1u, 2u: { reflectance = 0.52; }  // wood
+        case 3u, 4u: { reflectance = 0.36; }  // metal
+        case 5u, 6u: { reflectance = 0.79; }  // vegetation: Wood effect
+        case 7u, 9u, 17u: { reflectance = 0.48; } // soil / gravel / mud
+        case 8u: { reflectance = 0.68; }  // sand
+        case 10u: { reflectance = 0.12; } // glass
+        case 14u: { reflectance = 0.76; } // snow
+        case 21u, 22u: { reflectance = 0.27; } // cloth: dark dyed fabric preset
+        case 24u, 25u: { reflectance = 0.38; } // rubber/plastic
+        case 27u: { reflectance = 0.24; } // carpet
+        default: {}
+    }
+    if ((material.header.w & (1u << 17u)) != 0u) { reflectance = 0.10; }
+    if ((material.header.z & 65536u) != 0u) { reflectance = 0.055; } // water
+    // Unlike LWIR, emissive/glow/lava *do not* imply strong reflected NIR.
+    return reflectance;
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> FragmentOut {
     var out: FragmentOut;
@@ -379,6 +406,38 @@ fn fs_thermal_mask(input: MaskVertexOut) -> FragmentOut {
     }
     out.reflection_policy = reflection_policy(input.world_position);
     out.reflection_policy.b = thermal_world_material();
+    return out;
+}
+
+// NIR uses the normal prepass geometry / alpha coverage and a separate
+// lazy pipeline. Dynamic-model B remains 0.81 (prop) or 0.83+ (body).
+@fragment
+fn fs_nir(input: VertexOut) -> FragmentOut {
+    var out: FragmentOut;
+    out.linear_depth = radial_depth(input.world_position);
+    out.motion_vector = vec2<f32>(0.0);
+    if ((camera.render_flags.y & 4u) != 0u) {
+        out.motion_vector = bevy_motion_vector(input.world_position);
+    }
+    out.reflection_policy = reflection_policy(input.world_position);
+    out.reflection_policy.b = nir_world_reflectance();
+    return out;
+}
+
+@fragment
+fn fs_nir_mask(input: MaskVertexOut) -> FragmentOut {
+    let alpha = textureSample(base_texture, base_sampler, input.uv).a * input.alpha_multiplier;
+    if (material.params.x > 0.0 && alpha < material.params.x || material.params.x < 0.0 && alpha >= -material.params.x) {
+        discard;
+    }
+    var out: FragmentOut;
+    out.linear_depth = radial_depth(input.world_position);
+    out.motion_vector = vec2<f32>(0.0);
+    if ((camera.render_flags.y & 4u) != 0u) {
+        out.motion_vector = bevy_motion_vector(input.world_position);
+    }
+    out.reflection_policy = reflection_policy(input.world_position);
+    out.reflection_policy.b = nir_world_reflectance();
     return out;
 }
 

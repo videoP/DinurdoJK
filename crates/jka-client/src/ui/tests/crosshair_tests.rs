@@ -202,3 +202,38 @@ fn line_crosshair_is_a_short_vertical_line() {
     let [min_x, _, max_x, _] = pixel_bounds(&thick, width, height);
     assert!((max_x - min_x - 10.0).abs() < 0.01);
 }
+
+#[test]
+fn helper_line_is_fixed_and_not_part_of_projected_dynamic_crosshair() {
+    let (width, height) = (1280_u32, 960_u32);
+    let mut ui = UiSnapshot::default();
+    ui.mode = OverlayMode::None;
+    ui.video.draw_2d = true;
+    ui.video.skip_ui = false;
+    ui.crosshair.style = 1;
+    ui.crosshair.dynamic = 2;
+    ui.crosshair_target.dynamic = true;
+    ui.strafe_helper.flags = SHELPER_CROSSHAIR;
+    ui.strafe_helper.line_width = 2.0;
+    let mut fixed = Vec::new();
+    build_crosshair_vertices(&mut fixed, &ui, None, width, height);
+    assert_eq!(fixed.len(), 6);
+    let [left, top, right, bottom] = pixel_bounds(&fixed, width, height);
+    assert!((right-left-4.0).abs() < 0.01);
+    assert!((bottom-top-20.0).abs() < 0.01);
+    assert!(((left+right)*0.5-width as f32*0.5).abs() < 0.01);
+    assert!(((top+bottom)*0.5-height as f32*0.5).abs() < 0.01);
+    let mut projected = Vec::new();
+    build_crosshair_vertices(&mut projected, &ui, Some([120.0, 100.0]), width, height);
+    assert!(projected.is_empty(), "helper line must never follow dynamic projection");
+    ui.crosshair.style = 0;
+    fixed.clear();
+    build_crosshair_vertices(&mut fixed, &ui, None, width, height);
+    assert_eq!(fixed.len(), 6, "separate helper line works with cg_drawCrosshair 0");
+    ui.zoom_scope = Some(UiZoomScope {mode: 1, fov: 30.0, time: 1000,
+        yaw_deg: 0.0, ammo: 150, double_ammo: false, charge_started: None,
+        binocular_art_hidden: false});
+    fixed.clear();
+    build_crosshair_vertices(&mut fixed, &ui, None, width, height);
+    assert_eq!(fixed.len(), 6, "TaystJK draws helper line independently of scope");
+}

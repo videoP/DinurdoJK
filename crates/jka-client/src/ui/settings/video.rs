@@ -125,8 +125,15 @@ pub struct VideoSettings {
     pub draw_bsp_model_surfaces: bool,
     /// Session diagnostic. 0 full, 1 opaque+masked only, 2 transparent only (no opaque depth).
     pub world_stage_probe: u8,
-    /// Session-only aggressive competitive renderer experiment (0 = stock).
+    /// Experimental competitive renderer, archived like other quality cvars.
     pub competitive_ab: u32,
+    /// Shitter/throughput A/B values; persisted individually, never as a preset ID.
+    pub igpu_ab: u8,
+    pub igpu_memory_ab: u8,
+    pub rgb565: u8,
+    pub collision_world: bool,
+    pub shitter_texture: bool,
+    pub legacy_blend_transfer: u8,
     /// `r_fastsky`: 0 normal textured sky, 1 pale sky blue, 2..9 TaystJK palette, 10 red.
     pub fast_sky: u8,
     /// Debug overlays for trigger volumes and clip/collision-only brushes.
@@ -795,6 +802,12 @@ impl Default for VideoSettings {
             draw_bsp_model_surfaces: true,
             world_stage_probe: 0,
             competitive_ab: 0,
+            igpu_ab: 0,
+            igpu_memory_ab: 0,
+            rgb565: 0,
+            collision_world: false,
+            shitter_texture: false,
+            legacy_blend_transfer: 4,
             fast_sky: 0,
             draw_triggers: false,
             draw_clip_brushes: false,

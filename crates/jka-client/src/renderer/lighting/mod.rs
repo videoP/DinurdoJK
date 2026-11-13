@@ -7,6 +7,7 @@ pub(in crate::renderer) mod legacy_dlights;
 pub(in crate::renderer) mod local_shadows;
 pub(in crate::renderer) mod original_sun;
 pub(in crate::renderer) mod sun_bake;
+mod sun_direction_fit;
 mod sun_bake_cache;
 mod sun_bake_upload;
 pub(in crate::renderer) mod baked_sun_cache;

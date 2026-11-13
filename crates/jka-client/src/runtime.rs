@@ -277,6 +277,7 @@ pub enum UserEvent {
     },
     /// Original authored-sun removal calibration result (not static-sun relighting progress).
     BakedSunAutoStatus(crate::renderer::BakedSunAutoStatus),
+    BakedSunDirectionStatus(crate::renderer::BakedSunDirectionStatus),
     /// Targeted current-BSP acoustic preparation requested by `snd_restart`.
     /// This does not rebuild or upload the rendered world.
     SteamAudioScenePrepared {

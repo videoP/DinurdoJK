@@ -58,6 +58,43 @@ const FUNCTIONS: &[&str] = &[
     "sky_slider", "locked_slider", "slider", "slider_with", "choice",
 ];
 
+/// Assign a search result to the subsection that actually renders the
+/// control. Match ranges in the source rather than maintaining a second
+/// table of individual cvars and labels. The markers are existing sections
+/// and function names: they fail visibly if a page is reorganized.
+fn subsection_for(path: &str, source: &str, pos: usize) -> &'static str {
+    let between = |start: &str, end: &str| -> bool {
+        let a = source.find(start).expect("missing search subsection start marker");
+        let b = source.find(end).expect("missing search subsection end marker");
+        pos >= a && pos < b
+    };
+    if path.ends_with("egui_settings/game.rs") {
+        if pos < source.find("\"WEAPONS\"").unwrap() { "Some(SetupSection::GameSystem)" }
+        else if pos < source.find("\"SPECTATING & DEMOS\"").unwrap() { "Some(SetupSection::GameGameplay)" }
+        else { "Some(SetupSection::GamePresentation)" }
+    } else if path.ends_with("egui_menu/audio.rs") {
+        if pos < source.find("\"MAP ACOUSTICS · EAL / OPENAL SOFT\"").unwrap() { "Some(SetupSection::AudioGeneral)" }
+        else { "Some(SetupSection::AudioPositional)" }
+    } else if path.ends_with("egui_settings/interface.rs") {
+        let helpers = source.find("fn egui_killfeed_settings(").unwrap();
+        if pos >= helpers {
+            if between("fn egui_killfeed_settings(", "fn egui_chat_settings(") {
+                "Some(SetupSection::InterfaceOverlays)"
+            } else {
+                "Some(SetupSection::InterfaceChat)"
+            }
+        } else if pos < source.find("\"MOVEMENT COMPONENTS\"").unwrap() {
+            "Some(SetupSection::InterfaceHud)"
+        } else if pos < source.find("\"CROSSHAIR\"").unwrap() {
+            "Some(SetupSection::InterfaceMovement)"
+        } else if pos < source.find("\"CHAT\", \"The say / say_team").unwrap() {
+            "Some(SetupSection::InterfaceHud)"
+        } else {
+            "Some(SetupSection::InterfaceChat)"
+        }
+    } else { "None" }
+}
+
 fn literal(s: &str) -> Option<&str> {
     let trimmed = s.trim();
     if !trimmed.starts_with('"') { return None; }
@@ -172,7 +209,8 @@ pub fn generate(manifest: &Path, out: &Path) -> std::io::Result<()> {
                 if seen.insert((tab, section, label.to_owned())) {
                     let section = if section == "None" { "None".to_owned() }
                                   else { format!("Some(VideoSection::{section})") };
-                    rows.push(format!("    SearchItem {{ tab: {tab}, section: {section}, label: {label}, hint: {hint}, alias: {alias} }},\n"));
+                    let subsection = subsection_for(path, text, start);
+                    rows.push(format!("    SearchItem {{ tab: {tab}, section: {section}, subsection: {subsection}, label: {label}, hint: {hint}, alias: {alias} }},\n"));
                 }
             }
         }
@@ -192,7 +230,8 @@ pub fn generate(manifest: &Path, out: &Path) -> std::io::Result<()> {
                 if seen.insert((tab, section, label.to_owned())) {
                     let section = if section == "None" { "None".to_owned() }
                                   else { format!("Some(VideoSection::{section})") };
-                    rows.push(format!("    SearchItem {{ tab: {tab}, section: {section}, label: {label}, hint: {hint}, alias: \"\" }},\n"));
+                    let subsection = subsection_for(path, text, pos + table_start + " in [".len() + start);
+                    rows.push(format!("    SearchItem {{ tab: {tab}, section: {section}, subsection: {subsection}, label: {label}, hint: {hint}, alias: \"\" }},\n"));
                 }
             }
         }

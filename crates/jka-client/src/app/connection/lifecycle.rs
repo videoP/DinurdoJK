@@ -58,6 +58,7 @@ impl App {
         self.static_ao_progress = None;
         self.sun_bake_progress = None;
         self.baked_sun_auto_status = crate::renderer::BakedSunAutoStatus::Calibrating;
+        self.baked_sun_direction_status = crate::renderer::BakedSunDirectionStatus::Idle;
         self.prepared_map_cache = None;
         self.cross_game_map_seed = None;
         self.spectator_broadcast = Default::default();
@@ -165,6 +166,7 @@ impl App {
         self.static_ao_progress = None;
         self.sun_bake_progress = None;
         self.baked_sun_auto_status = crate::renderer::BakedSunAutoStatus::Calibrating;
+        self.baked_sun_direction_status = crate::renderer::BakedSunDirectionStatus::Idle;
         self.prepared_map_cache = None;
         self.spectator_broadcast = Default::default();
         self.game_session = None;

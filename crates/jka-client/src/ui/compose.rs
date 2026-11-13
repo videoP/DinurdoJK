@@ -220,7 +220,7 @@ pub fn build_transient_vertices(
         // Dynamic crosshair placement depends on the render thread's final
         // late-latched camera, so its geometry is appended in the view-dependent
         // UI tail. Static/smart-overridden crosshairs stay in this stable batch.
-        if !ui.crosshair_target.dynamic {
+        if !ui.crosshair_target.dynamic || ui.strafe_helper.flags & super::SHELPER_CROSSHAIR != 0 {
             build_crosshair_vertices(out, ui, None, width, height);
         }
         draw_placed(out, ui, HudElementId::CrosshairName, width, height, |out| {
