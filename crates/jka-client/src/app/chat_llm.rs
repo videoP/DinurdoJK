@@ -1,5 +1,5 @@
 //! Local-model chat features in the app: the chat filter (`cg_chatCensor`),
-//! `quickRundown`, and the model housekeeping shared with local translation.
+//! `chatQRD`, and the model housekeeping shared with local translation.
 //!
 //! The filter sees every received chat line after it has an id (see
 //! `chat_translation`). With `cg_chatCensorHold` the line's text stays off
@@ -75,7 +75,19 @@ struct SummaryRun {
     filter_was_on: bool,
 }
 
-/// Text fields of the settings page; `None` shows the saved value.
+#[derive(Clone, Copy)]
+pub(in crate::app) enum ChatModelUse {
+    Filter,
+    Translation(Mode),
+    Summary { minutes: Option<f32>, pass: SummaryPass },
+}
+
+pub(in crate::app) struct ChatModelDownload {
+    pub(in crate::app) url: String,
+    pub(in crate::app) usage: ChatModelUse,
+}
+
+/// Text fields and pending confirmations for the settings page.
 #[derive(Default)]
 pub(in crate::app) struct Edits {
     pub(in crate::app) translate_url: Option<String>,
@@ -84,6 +96,8 @@ pub(in crate::app) struct Edits {
     pub(in crate::app) censor_prompt: Option<String>,
     pub(in crate::app) summary_prompt: Option<String>,
     pub(in crate::app) note: Option<String>,
+    pub(in crate::app) download: Option<ChatModelDownload>,
+    pub(in crate::app) delete_model: Option<String>,
 }
 
 #[derive(Default)]
@@ -110,6 +124,8 @@ pub(in crate::app) struct ChatLlm {
     summary: Option<SummaryRun>,
     /// A summary ran this session: keep its model loaded.
     summary_used: bool,
+    /// Downloads explicitly confirmed this run, limited to selected model URLs.
+    approved_downloads: Vec<String>,
     /// The saved settings have been applied to the model host.
     booted: bool,
     /// Model states last reported in the console.
@@ -136,6 +152,7 @@ impl ChatLlm {
             verdict_tick: 0,
             summary: None,
             summary_used: false,
+            approved_downloads: Vec::new(),
             booted: false,
             watched: Vec::new(),
             last_watch: now,
@@ -258,6 +275,7 @@ impl App {
         let assist = settings.censor || self.chat_llm.summary_used;
         let translate_url = settings.translate_model().to_owned();
         let assist_url = settings.assist_model().to_owned();
+        self.chat_llm.approved_downloads.retain(|url| url == &translate_url || url == &assist_url);
         let local_model = (translate_url.clone(), cl::unescape_prompt(&settings.translate_prompt));
         if self.chat_translation.local_model != local_model {
             self.chat_translation.local_model = local_model;
@@ -277,9 +295,86 @@ impl App {
         }
         host.retain(&needed);
         for url in &needed {
-            host.ensure(url);
+            if self.chat_llm.approved_downloads.iter().any(|approved| approved == url) {
+                host.ensure(url);
+            } else {
+                host.ensure_cached(url);
+            }
         }
         self.chat_llm.watched = needed.iter().map(|url| ((*url).to_owned(), host.state(url))).collect();
+    }
+
+    pub(in crate::app) fn chat_model_can_start(&self, url: &str) -> bool {
+        engine().cached(url) || self.chat_llm.approved_downloads.iter().any(|approved| approved == url)
+    }
+
+    pub(in crate::app) fn request_chat_model_download(&mut self, usage: ChatModelUse) {
+        let url = match usage {
+            ChatModelUse::Translation(_) => self.chat_llm.settings.translate_model(),
+            _ => self.chat_llm.settings.assist_model(),
+        }.to_owned();
+        self.unload_chat_model(Some(&url));
+        self.chat_llm.edits.download = Some(ChatModelDownload { url, usage });
+        self.push_console_line("^5CHAT MODEL:^7 download needs confirmation in Setup > Interface, or /chatLlmDownload confirm. /chatLlmDownload cancel dismisses it.");
+    }
+
+    pub(in crate::app) fn confirm_chat_model_download(&mut self) {
+        let Some(download) = self.chat_llm.edits.download.take() else { return };
+        let selected = match download.usage {
+            ChatModelUse::Translation(_) => self.chat_llm.settings.translate_model(),
+            _ => self.chat_llm.settings.assist_model(),
+        };
+        if download.url != selected {
+            return;
+        }
+        if !self.chat_llm.approved_downloads.contains(&download.url) {
+            self.chat_llm.approved_downloads.push(download.url);
+        }
+        match download.usage {
+            ChatModelUse::Filter => {
+                self.chat_llm.edits.note = self.set_console_cvar("cg_chatCensor", "1").err();
+            }
+            ChatModelUse::Translation(mode) => {
+                self.chat_llm.edits.note = self.set_console_cvar("cg_chatTranslate", &mode.index().to_string()).err();
+            }
+            ChatModelUse::Summary { minutes, pass } => self.start_quick_rundown(minutes, pass),
+        }
+        self.egui_repaint_requested = true;
+    }
+
+    pub(in crate::app) fn chat_model_in_use(&self, url: &str) -> bool {
+        (url == self.chat_llm.settings.assist_model() && (self.chat_llm.settings.censor || self.chat_llm.summary_used))
+            || (url == self.chat_llm.settings.translate_model()
+                && self.chat_translation.settings.provider == ProviderKind::Local
+                && self.chat_translation.settings.mode != Mode::Off)
+    }
+
+    /// Stop the selected model's consumers before releasing it. Shared model
+    /// URLs must stop both consumers or configuration would load it again.
+    pub(in crate::app) fn unload_chat_model(&mut self, url: Option<&str>) {
+        let translate = url.is_none_or(|url| url == self.chat_llm.settings.translate_model());
+        let assist = url.is_none_or(|url| url == self.chat_llm.settings.assist_model());
+        self.chat_llm.approved_downloads.retain(|approved| url.is_some_and(|url| approved != url));
+        if self.chat_llm.edits.download.as_ref().is_some_and(|pending| url.is_none_or(|url| pending.url == url)) {
+            self.chat_llm.edits.download = None;
+        }
+        self.chat_llm.edits.delete_model = None;
+        if translate && self.chat_translation.settings.provider == ProviderKind::Local {
+            self.chat_translation.settings.mode = Mode::Off;
+            self.chat_translation.drop_config();
+            self.cancel_chat_translations();
+        }
+        if assist {
+            self.chat_llm.settings.censor = false;
+            self.cancel_chat_filter();
+            self.cancel_quick_rundown();
+            self.chat_llm.summary_used = false;
+        }
+        self.chat_llm_configure();
+        self.mark_config_dirty();
+        self.publish_ui();
+        self.publish_transient_ui();
+        self.egui_repaint_requested = true;
     }
 
     pub(in crate::app) fn chat_llm_settings_changed(&mut self) {
@@ -354,7 +449,6 @@ impl App {
             if engine().state(&url) != ModelState::Ready {
                 // Still downloading or loading: chat is shown unfiltered
                 // until the model is there (the console says so once).
-                engine().ensure(&url);
                 return None;
             }
             let held = self.chat_llm.settings.censor_hold;
@@ -613,7 +707,7 @@ impl App {
         announced
     }
 
-    /// `quickRundown [minutes] [truth|cleanse]`.
+    /// `chatQRD [minutes] [truth|cleanse]`.
     pub(in crate::app) fn start_quick_rundown(&mut self, minutes: Option<f32>, pass: SummaryPass) {
         if self.chat_llm.summary.is_some() {
             self.push_console_line("^5QUICK RUNDOWN:^7 one is already being written");
@@ -643,6 +737,11 @@ impl App {
         let transcript = self.chat_llm.history.transcript(since, pass, history::TRANSCRIPT_CHARS);
         if transcript.messages == 0 {
             self.push_console_line(format!("^5QUICK RUNDOWN:^7 nobody wrote anything in {span}"));
+            return;
+        }
+        let url = self.chat_llm.settings.assist_model();
+        if !self.chat_model_can_start(url) {
+            self.request_chat_model_download(ChatModelUse::Summary { minutes, pass });
             return;
         }
         let disclaimers = if pass == SummaryPass::Cleanse { self.chat_llm.history.disclaimers(since) } else { Vec::new() };
@@ -675,7 +774,7 @@ impl App {
                 match engine().state(&url) {
                     ModelState::Ready => break engine().generate(request),
                     ModelState::Failed(error) => break Err(error),
-                    ModelState::Idle => engine().ensure(&url),
+                    ModelState::Idle => break Err("model was unloaded".to_owned()),
                     ModelState::Downloading { .. } | ModelState::Loading => {}
                 }
                 if Instant::now() >= deadline {
@@ -733,11 +832,11 @@ impl App {
                             "The chat filter was off, so hostile periods are only as the model reported them."
                         };
                         self.push_console_line(format!(
-                            "^3DISCLAIMER:^7 cleansed summary. Wording was softened and hostile content is described, not quoted. {basis} quickRundown truth gives the unfiltered account."
+                            "^3DISCLAIMER:^7 cleansed summary. Wording was softened and hostile content is described, not quoted. {basis} chatQRD truth gives the unfiltered account."
                         ));
                     }
                     SummaryPass::Truth => self.push_console_line(
-                        "^3NOTE:^7 truth pass: written from the chat as it was sent, and may repeat offensive language. quickRundown cleanse gives a clean version.",
+                        "^3NOTE:^7 truth pass: written from the chat as it was sent, and may repeat offensive language. chatQRD cleanse gives a clean version.",
                     ),
                 }
             }
@@ -772,7 +871,7 @@ impl App {
             if settings.censor_action == CensorAction::Hide { "hides messages" } else { "masks words" },
             self.chat_llm.status_line(),
         ));
-        lines.push(format!("^3QUICK RUNDOWN:^7 {} message(s) kept for quickRundown", self.chat_llm.history.len()));
+        lines.push(format!("^3QUICK RUNDOWN:^7 {} message(s) kept for chatQRD", self.chat_llm.history.len()));
         lines
     }
 
@@ -786,5 +885,81 @@ impl App {
         }
         self.chat_llm.pointer = wanted;
         self.publish_transient_ui();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use winit::platform::windows::EventLoopBuilderExtWindows;
+
+    #[test]
+    fn chat_model_download_consent_and_visible_stop_control() {
+        let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
+            .with_any_thread(true).build().unwrap();
+        let fixture = crate::cvar_compatibility::Fixture::new();
+        std::fs::write(fixture.0.join("DinurdoJK.cfg"), "").unwrap();
+        let mut app = App::new(fixture.0.clone(), None,
+            crate::scene::MapSource::Bsp("mp/ffa3".into()), false, event_loop.create_proxy()).unwrap();
+        engine().set_cache_dir(fixture.0.join("models"));
+        let first = "https://example.invalid/first.gguf";
+        let selected = "https://example.invalid/selected.gguf";
+        app.set_console_cvar("cg_chatLlmModel", first).unwrap();
+        app.set_console_cvar("cg_chatCensor", "1").unwrap();
+        assert!(!app.chat_llm.settings.censor);
+        assert_eq!(app.chat_llm.edits.download.as_ref().unwrap().url, first);
+        assert_eq!(engine().state(first), ModelState::Idle);
+
+        // Switching selections cancels the pending request without downloading.
+        app.set_console_cvar("cg_chatLlmModel", selected).unwrap();
+        assert!(app.chat_llm.edits.download.is_none());
+        assert_eq!(engine().state(selected), ModelState::Idle);
+        assert!(!app.chat_llm.settings.censor);
+        app.set_console_cvar("cg_chatTranslateModel", selected).unwrap();
+        app.set_console_cvar("cg_chatTranslateProvider", "local").unwrap();
+        app.set_console_cvar("cg_chatTranslate", "2").unwrap();
+        assert_eq!(app.chat_translation.settings.mode, Mode::Off);
+        assert!(matches!(app.chat_llm.edits.download.as_ref().unwrap().usage, ChatModelUse::Translation(Mode::Auto)));
+        assert_eq!(engine().state(selected), ModelState::Idle);
+
+        // Simulate shared consumers and an in-flight summary without starting
+        // inference or downloading a model. Click the real settings stop button.
+        app.chat_llm.edits.download = None;
+        app.chat_llm.approved_downloads.push(selected.to_owned());
+        app.chat_llm.settings.censor = true;
+        app.chat_llm.summary_used = true;
+        app.chat_translation.settings.mode = Mode::Auto;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_reply, answer) = mpsc::channel();
+        app.chat_llm.summary = Some(SummaryRun {
+            answer, cancel: Arc::clone(&cancel), pass: SummaryPass::Truth,
+            disclaimers: Vec::new(), filter_was_on: true,
+        });
+        let context = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 1600.0));
+        let output = context.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+            app.egui_chat_filter_settings(ui);
+        });
+        let stop = output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::epaint::Shape::Text(text) if text.galley.job.text == "STOP & UNLOAD" => {
+                Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+            }
+            _ => None,
+        }).expect("stop button must remain visible beside model status");
+        assert!(screen.contains_rect(stop));
+        let position = stop.center();
+        let events = vec![egui::Event::PointerMoved(position),
+            egui::Event::PointerButton { pos: position, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+            egui::Event::PointerButton { pos: position, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }];
+        let _ = context.run_ui(egui::RawInput { screen_rect: Some(screen), events, ..Default::default() }, |ui| {
+            app.egui_chat_filter_settings(ui);
+        });
+        assert!(!app.chat_llm.settings.censor);
+        assert_eq!(app.chat_translation.settings.mode, Mode::Off);
+        assert!(!app.chat_llm.summary_used);
+        assert!(app.chat_llm.summary.is_none());
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.chat_llm.approved_downloads.is_empty());
+        assert_eq!(engine().state(selected), ModelState::Idle);
     }
 }

@@ -10,6 +10,7 @@
 //! values are drawn as unknown and old samples are dimmed.
 use super::broadcast_map::{self, RadarBlip, RadarView};
 use super::glyphs::AVATAR_SOURCE;
+use super::{flag_carrier_icon, flag_status_icon, EXT_IMAGE_SHADER_SOURCE_BASE, EXT_IMAGE_TEXTURE_SOURCE};
 use crate::cgame::{TEAM_BLUE, TEAM_RED};
 use crate::ui::flex::{Bounds, Container, Flex};
 use glam::{Vec2, Vec3};
@@ -53,6 +54,19 @@ const SIDES: [Side; 2] = [
     Side { team: TEAM_RED, color: RED, label: "RED", mirrored: false },
     Side { team: TEAM_BLUE, color: BLUE, label: "BLUE", mirrored: true },
 ];
+
+/// Use the *same* shaders as JK2's flag-status HUD and the JKA Siege
+/// scoreboard, including the red/blue textures (not colored vector flags).
+pub(crate) fn append_broadcast_flag_images(images: &mut Vec<String>) {
+    // JKA only needs the plain scoreboard flags; JK2 already registers the
+    // *_x taken versions through append_jk2_ctf_images.
+    for team in [TEAM_RED, TEAM_BLUE] {
+        let Some(name) = flag_carrier_icon(team) else { continue };
+        if !images.iter().any(|present| present == name) {
+            images.push(name.to_owned());
+        }
+    }
+}
 
 fn fade(color: [f32; 4], alpha: f32) -> [f32; 4] {
     [color[0], color[1], color[2], color[3] * alpha]
@@ -144,6 +158,22 @@ impl Paint<'_> {
         String::new()
     }
 
+    fn flag_icon(&self, out: &mut Vec<UiVertex>, flag_team: i32, b: Bounds) {
+        if let Some(name) = flag_carrier_icon(flag_team) {
+            self.hud_image(out, name, b);
+        }
+    }
+
+    fn hud_image(&self, out: &mut Vec<UiVertex>, name: &str, b: Bounds) {
+        let Some(index) = self.ui.extension_images.iter().position(|image| image == name) else { return };
+        let shader = self.ui.extension_shader_flags.get(index).copied().unwrap_or(false);
+        let (uv0, uv1) = self.ui.extension_uv(index);
+        if !shader && uv0 == uv1 { return; } // Asset not yet loaded.
+        textured_rect_with_source(out, b[0], b[1], b[2], b[3], uv0, uv1, INK,
+            if shader { EXT_IMAGE_SHADER_SOURCE_BASE + index as f32 }
+            else { EXT_IMAGE_TEXTURE_SOURCE }, self.w, self.h);
+    }
+
     fn weapon_icon(&self, out: &mut Vec<UiVertex>, weapon: usize, b: Bounds, tint: [f32; 4]) {
         let index = ICON_WEAPON_BASE + weapon;
         let (uv0, uv1) = self.ui.icon_uv(index);
@@ -171,16 +201,9 @@ pub(super) fn draw(
     let s = (h as f32 / 1080.0).min(w as f32 / 1920.0).clamp(0.5, 2.5);
     let p = Paint { txt: UiText::new(ui, small_font, w, h), ui, w, h, s };
     let bar_bottom = top_bar(out, &p, broadcast);
-    // The observed player's values live on its (outlined) card. When the
-    // native corner meters are still shown, the stacks rise clear of them.
-    // A free spectator has no status HUD at all (CG_Draw2D).
-    let native_meters_hidden = broadcast.replaces_native_vitals()
-        || ui.hud.is_none_or(|hud| hud.spectating);
-    let stack_bottom = if native_meters_hidden {
-        h as f32 - 18.0 * s
-    } else {
-        h as f32 - 128.0 * s
-    };
+    // Broadcast owns the status HUD in modes 2-4, including probe frames.
+    // Keep a single bottom anchor; telemetry may change but layout never does.
+    let stack_bottom = h as f32 - 18.0 * s;
     let stack_top = bar_bottom + 24.0 * s;
     // The radar holds the top-left corner; RED's stack starts below it.
     let red_top = radar(out, &p, broadcast).map_or(stack_top, |bottom| stack_top.max(bottom + 16.0 * s));
@@ -362,6 +385,37 @@ fn top_bar(out: &mut Vec<UiVertex>, p: &Paint, b: &SpectatorBroadcastUi) -> f32 
     bar_b[1] + bar_b[3]
 }
 
+/// For JK2, authoritative CS_FLAGSTATUS decides whether a carried flag
+/// actually belongs on a player's card. Never trust stale interpolated entity
+/// powerups when the server says that flag was dropped. JKA uses its normal
+/// observed flag powerups (there is no JK2 enhanced-status overlay).
+fn card_flag(player: &BroadcastPlayerUi, ui: &UiSnapshot) -> Option<(i32, Option<u32>)> {
+    if ui.jk2_mode {
+        // Prefer CS_FLAGSTATUS when available; only a flag whose status has
+        // not been received at all may fall back to live entity powerups.
+        let confirmed = ui.jk2_flags.iter()
+            .find(|flag| flag.status == 1 && flag.carrier_client == Some(player.client))
+            .map(|flag| (flag.team, (flag.held_ms > 0).then_some(flag.held_ms)));
+        confirmed.or_else(|| player.carrying_flag
+            .filter(|team| !ui.jk2_flags.iter().any(|flag| flag.team == *team))
+            .map(|team| (team, None)))
+    } else {
+        player.carrying_flag.map(|team| (team, None))
+    }
+}
+
+fn missing_carrier_flags<'a>(
+    ui: &'a UiSnapshot, team: i32, players: &[&BroadcastPlayerUi],
+) -> Vec<&'a super::Jk2FlagUi> {
+    ui.jk2_flags.iter().filter(|flag| {
+        // Bucky MVSDK can have an opt-in neutral/yellow third flag, which
+        // has no dedicated spectator team stack. Attach it to RED's header.
+        (flag.team == team || (team == TEAM_RED && flag.team == 0))
+            && (flag.status == 4 || (flag.status == 1
+                && !players.iter().any(|p| Some(p.client) == flag.carrier_client)))
+    }).collect()
+}
+
 /// Player cards: RED bottom-left, BLUE bottom-right (mirrored). `tops` is
 /// the highest card edge per side, in `SIDES` order.
 fn player_stacks(out: &mut Vec<UiVertex>, p: &Paint, b: &SpectatorBroadcastUi, tops: [f32; 2], bottom: f32) {
@@ -384,7 +438,11 @@ fn player_stacks(out: &mut Vec<UiVertex>, p: &Paint, b: &SpectatorBroadcastUi, t
     let observed = b.observed.as_ref().map(|observed| observed.client);
 
     for (side, top) in SIDES.into_iter().zip(tops) {
-        let fit_rows = (((bottom - top) + gap) / (card_h + gap)).floor().max(0.0) as usize;
+        // Reserve a fixed flag-status header in JK2 CTF/CTY. That way a
+        // pickup/drop changes only the icon/label, never the number or
+        // placement of player cards (including during telemetry probes).
+        let status_h = if p.ui.jk2_mode && matches!(b.game_type, 8 | 9) { 27.0 * s } else { 0.0 };
+        let fit_rows = (((bottom - top - status_h) + gap) / (card_h + gap)).floor().max(0.0) as usize;
         let players: Vec<&BroadcastPlayerUi> = b.players.iter()
             .filter(|pl| pl.team == side.team)
             .take(fit_rows)
@@ -403,6 +461,8 @@ fn player_stacks(out: &mut Vec<UiVertex>, p: &Paint, b: &SpectatorBroadcastUi, t
             ammo: NodeId,
             ammo_text: String,
             force: NodeId,
+            speed: NodeId,
+            speed_text: String,
             kd: NodeId,
             kd_text: String,
         }
@@ -431,15 +491,20 @@ fn player_stacks(out: &mut Vec<UiVertex>, p: &Paint, b: &SpectatorBroadcastUi, t
                 _ => "--".to_owned(),
             };
             let ammo = p.text_leaf(&mut flex, &ammo_text, small_px);
-            let force = flex.leaf(64.0 * s, 4.0 * s);
+            let force = flex.leaf(52.0 * s, 4.0 * s);
+            let speed_text = if alive {
+                player.speed.map_or_else(|| "--".to_owned(), |speed| format!("{speed} ups"))
+            } else { "--".to_owned() };
+            // Fixed width prevents speed changes from moving neighbouring stats.
+            let speed = flex.leaf(65.0 * s, low_h);
             let low_spring = flex.spring();
             let kd = p.text_leaf(&mut flex, &kd_text, small_px);
-            let mut low: Vec<NodeId> = vec![ammo, force, low_spring, kd];
+            let mut low: Vec<NodeId> = vec![ammo, force, speed, low_spring, kd];
             if side.mirrored {
                 low.reverse();
             }
             let low_row = flex.node(
-                Container::row().height(low_h).pad(10.0 * s, 0.0).gap(10.0 * s),
+                Container::row().height(low_h).pad(10.0 * s, 0.0).gap(7.0 * s),
                 &low,
             );
             let body = flex.node(Container::column().width(body_w).height(card_h), &[top_row, low_row]);
@@ -449,7 +514,7 @@ fn player_stacks(out: &mut Vec<UiVertex>, p: &Paint, b: &SpectatorBroadcastUi, t
             cards.push(Card {
                 card, avatar, top_row, hp, name, name_text,
                 icon: weapon.map(|weapon| (icon, weapon)),
-                ammo, ammo_text, force, kd, kd_text,
+                ammo, ammo_text, force, speed, speed_text, kd, kd_text,
             });
         }
         let stack_h = cards.len() as f32 * card_h + cards.len().saturating_sub(1) as f32 * gap;
@@ -458,6 +523,30 @@ fn player_stacks(out: &mut Vec<UiVertex>, p: &Paint, b: &SpectatorBroadcastUi, t
         let stack = flex.absolute(Container::column().width(card_w).gap(gap), x, bottom - stack_h, &nodes);
         let screen = flex.node(Container::column().width(w).height(h), &[stack]);
         flex.compute(screen, w, h);
+
+        // This strip is attached directly to the corresponding player stack,
+        // not a second cg_enhancedFlagStatus overlay in the screen corner.
+        // A dropped flag (or unknown carrier) has no player card to decorate.
+        let missing = missing_carrier_flags(p.ui, side.team, &players);
+        if !missing.is_empty() {
+            let y = bottom - stack_h - status_h + 2.0 * s;
+            let tile_w = card_w / missing.len() as f32;
+            p.fill(out, [x, y, card_w, status_h - 4.0 * s], PLATE_DEEP);
+            for (i, flag) in missing.iter().enumerate() {
+                let tile_x = x + i as f32 * tile_w;
+                let size = 22.0 * s;
+                let icon_x = if side.mirrored { tile_x + tile_w - size - 5.0 * s }
+                    else { tile_x + 5.0 * s };
+                if let Some(image) = flag_status_icon(flag.team, flag.status) {
+                    p.hud_image(out, image, [icon_x, y, size, size]);
+                }
+                let label = if flag.status == 4 { "DROPPED" } else { "CARRIER UNKNOWN" };
+                let text_w = p.txt.width(label, small_px);
+                let tx = if side.mirrored { icon_x - text_w - 6.0 * s }
+                    else { icon_x + size + 6.0 * s };
+                p.txt.draw(out, label, tx, y + 16.0 * s, small_px, MUTED);
+            }
+        }
 
         for (player, card) in players.iter().zip(&cards) {
             let alive = player.alive != Some(false);
@@ -544,6 +633,8 @@ fn player_stacks(out: &mut Vec<UiVertex>, p: &Paint, b: &SpectatorBroadcastUi, t
                 }
                 p.fill(out, [fx, force_b[1], fill_w, force_b[3]], fade(FORCE, if stale { 0.5 } else { 0.95 }));
             }
+            p.text_centered(out, &card.speed_text, flex.bounds(card.speed), small_px,
+                if !alive { FAINT } else if player.speed_stale { fade(MUTED, 0.65) } else { INK });
             p.text(out, &card.kd_text, flex.bounds(card.kd), small_px, if alive { INK } else { FAINT });
         }
     }
@@ -567,6 +658,20 @@ fn avatar(out: &mut Vec<UiVertex>, p: &Paint, player: &BroadcastPlayerUi, b: Bou
         let wash = b[3] * 0.38;
         rect_gradient(out, b[0], b[1] + b[3] - wash, b[2], wash,
             fade(team, 0.0), fade(team, 0.0), fade(team, 0.42), fade(team, 0.42), p.w, p.h);
+        if let Some((flag_team, held_ms)) = card_flag(player, p.ui) {
+            // The scoreboard/MVSDK image is the actual flag being carried,
+            // not a new glyph or the color of the carrier's own team.
+            let size = 23.0 * p.s;
+            p.flag_icon(out, flag_team, [b[0] + b[2] - size - 2.0 * p.s,
+                b[1] + 2.0 * p.s, size, size]);
+            if let Some(ms) = held_ms {
+                let secs = ms / 1000;
+                let time = format!("{}:{:02}", secs / 60, secs % 60);
+                let strip = [b[0], b[1] + b[3] - 15.0 * p.s, b[2], 15.0 * p.s];
+                p.fill(out, strip, PLATE_DEEP);
+                p.text_centered(out, &time, strip, 11.0 * p.s, INK);
+            }
+        }
     }
 }
 
@@ -578,6 +683,60 @@ mod tests {
     fn strip_colors_keeps_plain_carets() {
         assert_eq!(strip_colors("^1Bro^7die"), "Brodie");
         assert_eq!(strip_colors("a^ b"), "a^ b");
+    }
+
+    #[test]
+    fn broadcast_uses_the_stock_ctf_scoreboard_flag_art() {
+        let mut images = vec!["gfx/hud/mpi_rflag".to_owned()];
+        append_broadcast_flag_images(&mut images);
+        append_broadcast_flag_images(&mut images);
+        assert_eq!(images, vec!["gfx/hud/mpi_rflag", "gfx/hud/mpi_bflag"]);
+        assert_eq!(flag_carrier_icon(TEAM_RED), Some("gfx/hud/mpi_rflag"));
+        assert_eq!(flag_carrier_icon(TEAM_BLUE), Some("gfx/hud/mpi_bflag"));
+        assert_eq!(flag_status_icon(TEAM_RED, 1), Some("gfx/hud/mpi_rflag_x"));
+        assert_eq!(flag_status_icon(TEAM_RED, 4), Some("gfx/hud/mpi_rflag"));
+    }
+
+    #[test]
+    fn flag_status_lives_in_cards_and_discarded_powerups_cannot_override_drops() {
+        let player = BroadcastPlayerUi {
+            client: 7, team: TEAM_BLUE, name: "Runner".into(),
+            score: None, deaths: None, weapon: None, ammo: None,
+            speed: None, speed_stale: false, alive: Some(true), vitals: None,
+            model: String::new(), model_fallback: String::new(),
+            position: None, yaw: 0, position_stale: false,
+            carrying_flag: Some(TEAM_RED), health_bar: None, force_bar: None,
+        };
+        let mut ui = UiSnapshot { jk2_mode: true, ..Default::default() };
+        ui.jk2_flags.push(super::super::Jk2FlagUi {
+            team: TEAM_RED, status: 4, carrier_client: None, carrier: None,
+            carrier_team: None, health_armor: None, held_ms: 0,
+        });
+        // The entity's old flag powerup cannot light a card after a drop.
+        assert_eq!(card_flag(&player, &ui), None);
+        assert_eq!(missing_carrier_flags(&ui, TEAM_RED, &[&player]).len(), 1);
+
+        // Confirmed pickup attaches both image and time to the correct card.
+        ui.jk2_flags[0].status = 1;
+        ui.jk2_flags[0].carrier_client = Some(7);
+        ui.jk2_flags[0].held_ms = 91_000;
+        assert_eq!(card_flag(&player, &ui), Some((TEAM_RED, Some(91_000))));
+        assert!(missing_carrier_flags(&ui, TEAM_RED, &[&player]).is_empty());
+
+        // If the carrier is unknown, never label a guessed player.
+        ui.jk2_flags[0].carrier_client = None;
+        assert_eq!(card_flag(&player, &ui), None);
+        assert_eq!(missing_carrier_flags(&ui, TEAM_RED, &[&player]).len(), 1);
+
+        // The optional third-team flag has no card stack of its own.
+        ui.jk2_flags[0].team = 0;
+        ui.jk2_flags[0].status = 4;
+        assert_eq!(missing_carrier_flags(&ui, TEAM_RED, &[&player]).len(), 1);
+        assert!(missing_carrier_flags(&ui, TEAM_BLUE, &[&player]).is_empty());
+
+        // JKA still uses the native observed flag powerups and the same art.
+        ui.jk2_mode = false;
+        assert_eq!(card_flag(&player, &ui), Some((TEAM_RED, None)));
     }
 
     #[test]

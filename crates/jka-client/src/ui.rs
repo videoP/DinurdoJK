@@ -47,6 +47,14 @@ pub(crate) fn native_hud_icon_index(category: &str, id: i64) -> Option<usize> {
 pub(crate) fn append_jk2_ctf_images(images: &mut Vec<String>) {
     hud::jk2_retail::append_jk2_ctf_images(images);
 }
+pub(crate) fn append_flag_status_images(images: &mut Vec<String>) {
+    hud::jk2_retail::append_flag_status_images(images);
+}
+
+/// Shared Raven flag media, used by the native JK2 HUD, Siege scoreboard and
+/// broadcast spectator player cards. These are real game shaders, not drawn art.
+pub(crate) use hud::jk2_retail::{flag_carrier_icon, flag_status_icon};
+pub(crate) use broadcast::append_broadcast_flag_images;
 
 pub(crate) fn append_native_hud_images(images: &mut Vec<String>, style: u8, jk2_mode: bool) {
     if jk2_mode {
@@ -218,7 +226,7 @@ pub use text::{
     UiVertex,
 };
 use text::{
-    color_code, console_text, fixed_charset_text, proportional_centerprint_text, proportional_text, proportional_text_uniform, proportional_text_width, text,
+    color_code, color_escape, console_text, fixed_charset_text, proportional_centerprint_text, proportional_text, proportional_text_uniform, proportional_text_width, text,
     truncate_jka_text, wrap_proportional_text,
 };
 
@@ -429,6 +437,10 @@ pub struct BroadcastPlayerUi {
     pub weapon: Option<i32>,
     /// Ammo of `weapon`, from an observed playerState of that same weapon.
     pub ammo: Option<i32>,
+    /// Horizontal movement speed in game units/second. None while unobserved.
+    pub speed: Option<i32>,
+    /// A sampled speed retained after the player left our view.
+    pub speed_stale: bool,
     pub alive: Option<bool>,
     pub vitals: Option<BroadcastVitals>,
     /// `model/skin` and its missing-model stand-in, for the card avatar
@@ -456,8 +468,6 @@ pub struct BroadcastObservedUi {
     pub ammo: Option<i32>,
     /// `fd.saberDrawAnimLevel` while the saber is out.
     pub saber_style: Option<i32>,
-    /// True when the observed card replaces the native health/shield/ammo/Force.
-    pub replaces_native: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,10 +490,11 @@ pub struct SpectatorBroadcastUi {
 }
 
 impl SpectatorBroadcastUi {
-    /// The native health/shield/ammo/Force meters step aside: the observed
-    /// player's values are on its card.
+    /// Broadcast mode owns the status area for its entire lifetime, even
+    /// during a follow-cycle probe, a free camera, or missing playerState.
+    /// Telemetry availability must never make the stock meters flash back.
     pub fn replaces_native_vitals(&self) -> bool {
-        self.observed.as_ref().is_some_and(|observed| observed.replaces_native)
+        true
     }
 }
 
@@ -1005,6 +1016,7 @@ pub struct Jk2FlagUi {
     pub team: i32,
     pub status: i32,
     /// Only available if the carrier can be resolved from an observed powerup.
+    pub carrier_client: Option<i32>,
     pub carrier: Option<String>,
     pub carrier_team: Option<i32>,
     /// Only use team info for friendly carriers; never invent enemy vitals.
@@ -1719,6 +1731,8 @@ pub struct UiSiegeHud {
 pub struct UiSnapshot {
     /// Active multiplayer protocol controls which game the Native HUD recreates.
     pub jk2_mode: bool,
+    /// True only for a live JK2 1.02 server that sent NWH's verification challenge.
+    pub nwh_hex_colors: bool,
     /// TaystJK CG_Draw2D fallingToDeath black fade (transient, 0..1).
     pub falling_death_fade: f32,
     pub falling_death_active: bool,
@@ -1735,6 +1749,8 @@ pub struct UiSnapshot {
     pub console_status: String,
     pub console_lines: Vec<String>,
     pub console_line_kinds: Vec<crate::logging::ConsoleLineKind>,
+    /// True for indexed demo transcript rows (reversible on seek).
+    pub console_demo_rows: Vec<bool>,
     /// Inline translation checkboxes aligned with the visible wrapped rows.
     pub console_translate_checked: Vec<Option<bool>>,
     pub console_scroll: usize,
@@ -1884,6 +1900,7 @@ impl Default for UiSnapshot {
     fn default() -> Self {
         Self {
             jk2_mode: false,
+            nwh_hex_colors: false,
             falling_death_fade: 0.0,
             falling_death_active: false,
             frontend_main_scene: false,
@@ -1895,6 +1912,7 @@ impl Default for UiSnapshot {
             console_status: String::new(),
             console_lines: Vec::new(),
             console_line_kinds: Vec::new(),
+            console_demo_rows: Vec::new(),
             console_translate_checked: Vec::new(),
             console_scroll: 0,
             console_size: ConsoleSize::Normal,

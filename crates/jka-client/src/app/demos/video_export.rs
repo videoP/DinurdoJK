@@ -1,4 +1,4 @@
-//! Deterministic demo -> editor/video export using DinurdoJK/dependencies/ffmpeg.exe.
+//! Deterministic demo -> editor/video export using native FFmpeg.
 use crate::app::{App, DemoAdvance, Duration, GameSession, Instant, RenderCommand, SessionPhase};
 use std::{
     fs::File,
@@ -137,8 +137,17 @@ pub(in crate::app) fn dependency_ffmpeg_path() -> Option<PathBuf> {
         return path.is_file().then_some(path);
     }
     let exe = std::env::current_exe().ok()?;
-    let path = exe.parent()?.join("DinurdoJK").join("dependencies").join("ffmpeg.exe");
-    path.is_file().then_some(path)
+    let name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    let path = exe.parent()?.join("DinurdoJK").join("dependencies").join(name);
+    if path.is_file() { return Some(path); }
+    // Unix builds may use their system FFmpeg installation. Bundled FFmpeg
+    // remains preferred when present; Windows behavior is unchanged.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    for directory in std::env::split_paths(&std::env::var_os("PATH")?) {
+        let candidate = directory.join(name);
+        if candidate.is_file() { return Some(candidate); }
+    }
+    None
 }
 
 fn safe_stem(source: &str) -> String {
@@ -216,7 +225,11 @@ impl App {
             return;
         }
         let Some(ffmpeg) = dependency_ffmpeg_path() else {
-            self.console_status = "DEMO EXPORT DISABLED: ffmpeg.exe must be in DinurdoJK/dependencies/".into();
+            self.console_status = if cfg!(unix) {
+                "DEMO EXPORT DISABLED: install ffmpeg or place it in DinurdoJK/dependencies/"
+            } else {
+                "DEMO EXPORT DISABLED: ffmpeg.exe must be in DinurdoJK/dependencies/"
+            }.into();
             self.push_console_line(format!("^3{}", self.console_status));
             return;
         };

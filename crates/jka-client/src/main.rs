@@ -72,6 +72,7 @@ mod materials;
 mod media_mp4;
 mod model_frame_log;
 mod net;
+mod nwh_colors;
 mod palette;
 mod emote_net;
 mod emote_net_codec;

@@ -1,6 +1,7 @@
 //! Demo recording.
 use crate::app::{demo, App, File, PathBuf};
 use std::io::Write;
+use std::path::Path;
 
 #[cfg(windows)]
 pub(in crate::app) fn demo_recording_timestamp() -> String {
@@ -42,6 +43,19 @@ pub(in crate::app) struct DemoRecording {
     pub(in crate::app) file: File,
     pub(in crate::app) path: PathBuf,
     pub(in crate::app) waiting_for_full_snapshot: bool,
+    // All map segments belong to the path selected by the original /record.
+    base_path: PathBuf,
+    next_part: u32,
+    // The next DemoMessage contains the new map's real wire gamestate.
+    rollover_pending: bool,
+}
+
+/// Each gamestate is a self-contained demo. Do not put successive maps into
+/// the same stream: their serverTime and baselines are independent.
+fn demo_segment_path(base: &Path, part: u32) -> PathBuf {
+    let stem = base.file_stem().expect("recording path has a stem").to_string_lossy();
+    let extension = base.extension().expect("recording path has a protocol extension").to_string_lossy();
+    base.with_file_name(format!("{stem}_part{part:03}.{extension}"))
 }
 
 impl App {
@@ -110,47 +124,73 @@ impl App {
 
         let qpath = PathBuf::from("demos").join(format!("{stem}.{extension}"));
         let destination = self.game_write_path(&qpath);
+        self.begin_demo_recording(destination.clone(), destination, 2, false, None);
+    }
+
+    /// A manual /record synthesizes its initial gamestate; a map rollover
+    /// starts with the server's actual gamestate message. The latter avoids
+    /// stale decoder state and packet sequence reordering if the network pump
+    /// has already parsed further packets before delivering their events.
+    fn begin_demo_recording(
+        &mut self,
+        destination: PathBuf,
+        base_path: PathBuf,
+        next_part: u32,
+        new_segment: bool,
+        incoming_gamestate: Option<(i32, Vec<u8>)>,
+    ) -> bool {
         if let Some(parent) = destination.parent() {
             if let Err(error) = std::fs::create_dir_all(parent) {
                 self.push_console_path_line(
                     format!("^1Couldn't create {}: {error}", parent.display()),
                     parent.to_path_buf(),
                 );
-                return;
+                return false;
             }
         }
 
-        let initial = self.net.as_ref().map(|net| {
-            let session = net.session();
-            // JK2MV CL_Record_f writes the native JK2 wire gamestate, not
-            // the presentation decoder's translated JKA configstrings.
-            let payload = if let Some(wire) = session.jk2_decoder() {
-                jka_protocol::jk2::demo::synthesize_gamestate_payload(wire, session.reliable_sequence())
-            } else {
-                demo::synthesize_gamestate_payload(session.decoder(), session.reliable_sequence())
-            };
-            payload.map(|payload| (session.server_message_sequence().wrapping_sub(1), payload))
-        });
-        let (sequence, payload) = match initial {
-            Some(Ok(initial)) => initial,
-            Some(Err(error)) => {
-                self.push_console_line(format!("^1Could not build demo gamestate: {error}"));
-                return;
-            }
-            None => {
-                self.push_console_line("^3You must be in a level to record.".to_owned());
-                return;
+        let (sequence, payload) = if let Some(gamestate) = incoming_gamestate {
+            gamestate
+        } else {
+            let initial = self.net.as_ref().map(|net| {
+                let session = net.session();
+                // JK2MV CL_Record_f writes the native JK2 wire gamestate, not
+                // the presentation decoder's translated JKA configstrings.
+                let payload = if let Some(wire) = session.jk2_decoder() {
+                    jka_protocol::jk2::demo::synthesize_gamestate_payload(wire, session.reliable_sequence())
+                } else {
+                    demo::synthesize_gamestate_payload(session.decoder(), session.reliable_sequence())
+                };
+                payload.map(|payload| (session.server_message_sequence().wrapping_sub(1), payload))
+            });
+            match initial {
+                Some(Ok(initial)) => initial,
+                Some(Err(error)) => {
+                    self.push_console_line(format!("^1Could not build demo gamestate: {error}"));
+                    return false;
+                }
+                None => {
+                    self.push_console_line("^3You must be in a level to record.".to_owned());
+                    return false;
+                }
             }
         };
 
-        let mut file = match File::create(&destination) {
+        let file_result = if new_segment {
+            // A map change must never overwrite an older segment, even if a
+            // same-named recording was made earlier or another process races us.
+            std::fs::OpenOptions::new().write(true).create_new(true).open(&destination)
+        } else {
+            File::create(&destination)
+        };
+        let mut file = match file_result {
             Ok(file) => file,
             Err(error) => {
                 self.push_console_path_line(
                     format!("^1ERROR: couldn't open {}: {error}", destination.display()),
                     destination.clone(),
                 );
-                return;
+                return false;
             }
         };
         if let Err(error) = demo::write_record(&mut file, sequence, &payload) {
@@ -158,13 +198,18 @@ impl App {
                 format!("^1ERROR: couldn't write {}: {error}", destination.display()),
                 destination.clone(),
             );
-            return;
+            return false;
         }
 
         self.demo_recording = Some(DemoRecording {
             file,
             path: destination.clone(),
-            waiting_for_full_snapshot: true,
+            // A raw map gamestate needs no synthetic prelude or snapshot
+            // gating: all following messages belong to this new map.
+            waiting_for_full_snapshot: !new_segment,
+            base_path,
+            next_part,
+            rollover_pending: false,
         });
         if let Some(net) = self.net.as_mut() {
             net.session_mut().set_demo_capture(true);
@@ -173,6 +218,44 @@ impl App {
             format!("^2recording to {}.", destination.display()),
             destination.clone(),
         );
+        true
+    }
+
+    /// The decoder reports Gamestate before DemoMessage, but the latter owns
+    /// the original packet bytes and sequence. Defer the split until then.
+    pub(in crate::app) fn mark_demo_recording_map_change(&mut self) {
+        if let Some(recording) = self.demo_recording.as_mut() {
+            recording.rollover_pending = true;
+        }
+    }
+
+    fn rollover_demo_recording(&mut self, sequence: i32, payload: Vec<u8>) {
+        let Some(recording) = self.demo_recording.as_ref() else { return };
+        let base_path = recording.base_path.clone();
+        let mut part = recording.next_part;
+        if !self.finish_demo_recording() {
+            return;
+        }
+        loop {
+            let destination = demo_segment_path(&base_path, part);
+            if !destination.exists() {
+                // The gamestate packet itself is the first record of this
+                // segment. Never prepend a synthetic gamestate from a decoder
+                // that may already have consumed newer network packets.
+                if self.begin_demo_recording(
+                    destination, base_path, part.saturating_add(1), true,
+                    Some((sequence, payload)),
+                ) {
+                    self.push_console_line("^3Map changed; recording continues in the new file.");
+                }
+                return;
+            }
+            let Some(next) = part.checked_add(1) else {
+                self.push_console_line("^1No free demo segment number; recording stopped.");
+                return;
+            };
+            part = next;
+        }
     }
 
     pub(in crate::app) fn record_demo_message(
@@ -181,6 +264,10 @@ impl App {
         payload: Vec<u8>,
         full_snapshot: bool,
     ) {
+        if self.demo_recording.as_ref().is_some_and(|recording| recording.rollover_pending) {
+            self.rollover_demo_recording(sequence, payload);
+            return;
+        }
         let Some(recording) = self.demo_recording.as_mut() else {
             return;
         };
@@ -204,9 +291,15 @@ impl App {
     }
 
     pub(in crate::app) fn stop_demo_recording(&mut self) {
+        self.finish_demo_recording();
+    }
+
+    /// Returns false if the previous segment could not be finalized; do not
+    /// silently continue a broken capture into another file.
+    fn finish_demo_recording(&mut self) -> bool {
         let Some(mut recording) = self.demo_recording.take() else {
             self.push_console_line("^3Not recording a demo.".to_owned());
-            return;
+            return false;
         };
         if let Some(net) = self.net.as_mut() {
             net.session_mut().set_demo_capture(false);
@@ -222,14 +315,30 @@ impl App {
                     format!("^2Stopped demo: {}", recording.path.display()),
                     recording.path.clone(),
                 );
+                true
             }
-            Err(error) => self.push_console_path_line(
-                format!(
-                    "^1Error finishing demo {}: {error}",
-                    recording.path.display()
-                ),
-                recording.path.clone(),
-            ),
+            Err(error) => {
+                self.push_console_path_line(
+                    format!("^1Error finishing demo {}: {error}", recording.path.display()),
+                    recording.path.clone(),
+                );
+                false
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::demo_segment_path;
+    use std::path::Path;
+
+    #[test]
+    fn rollover_preserves_folder_and_protocol_extension() {
+        let source = Path::new("demos/custom/session.dm_26");
+        assert_eq!(demo_segment_path(source, 2), Path::new("demos/custom/session_part002.dm_26"));
+        assert_eq!(demo_segment_path(source, 12), Path::new("demos/custom/session_part012.dm_26"));
+        let jk2 = Path::new("demos/demo0000.dm_16");
+        assert_eq!(demo_segment_path(jk2, 2), Path::new("demos/demo0000_part002.dm_16"));
     }
 }

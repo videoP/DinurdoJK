@@ -88,8 +88,8 @@ pub(in crate::ui) fn visible_text_len(value: &str) -> usize {
     let mut index = 0usize;
     let mut count = 0usize;
     while index < bytes.len() {
-        if bytes[index] == b'^' && index + 1 < bytes.len() && bytes[index + 1].is_ascii_digit() {
-            index += 2;
+        if let Some((skip, _)) = crate::ui::color_escape(&bytes, index, 1.0) {
+            index += skip;
         } else {
             count += 1;
             index += 1;
@@ -640,7 +640,12 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
             .get(absolute_line)
             .copied()
             .unwrap_or_default();
-        if let Some(tone) = console_line_tone(kind) {
+        if ui.console_demo_rows.get(absolute_line).copied().unwrap_or(false) {
+            rect(out, 0.0, line_y - 2.0, wf, line_step,
+                [0.47, 0.10, 0.14, 0.13], w, h);
+            rect(out, 10.0, line_y - 2.0, 2.0, line_step,
+                [0.80, 0.24, 0.31, 0.83], w, h);
+        } else if let Some(tone) = console_line_tone(kind) {
             rect(
                 out,
                 0.0,

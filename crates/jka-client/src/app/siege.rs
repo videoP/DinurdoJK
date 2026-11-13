@@ -24,11 +24,11 @@ pub(in crate::app) fn siege_scoreboard_icons(
     for entry in entries {
         entry.siege_icon = None;
         let flag = if entry.powerups & (1 << PW_NEUTRALFLAG) != 0 {
-            Some("icons/iconf_neutral1")
+            crate::ui::flag_carrier_icon(0)
         } else if entry.powerups & (1 << PW_REDFLAG) != 0 {
-            Some("gfx/hud/mpi_rflag")
+            crate::ui::flag_carrier_icon(1)
         } else if entry.powerups & (1 << PW_BLUEFLAG) != 0 {
-            Some("gfx/hud/mpi_bflag")
+            crate::ui::flag_carrier_icon(2)
         } else {
             None
         };

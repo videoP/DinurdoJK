@@ -935,7 +935,7 @@ struct Renderer {
     )>,
     /// Shared by every ocean; lazy, see ensure_lazy_scene_pipelines.
     ocean_spray_pipeline: Option<wgpu::RenderPipeline>,
-    /// Developer "riversource" patches: native Unreal river solver, debug view.
+    /// Developer "spawnriver" patches: native Unreal river solver, debug view.
     live_rivers: Vec<crate::river_runtime::LiveRiver>,
     /// Developer drains, applied to every live river and to new ones.
     river_drains: Vec<crate::river_runtime::LocalDrain>,

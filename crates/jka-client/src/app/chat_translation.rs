@@ -756,6 +756,13 @@ impl App {
 
     /// Disconnect, demo seek or a settings change: drop waiting requests.
     /// Their messages can be translated again from the console.
+    pub(in crate::app) fn clear_player_translation_rules(&mut self) {
+        // Client slots (and their names) are scoped to the current connection.
+        // Keep global provider/display settings and older console messages.
+        self.chat_translation.rules.clear();
+        self.chat_translation.console_menu = None;
+    }
+
     pub(in crate::app) fn cancel_chat_translations(&mut self) {
         for id in self.chat_translation.translator.cancel_all() {
             if let Some(message) = self.chat_translation.message_mut(id) {

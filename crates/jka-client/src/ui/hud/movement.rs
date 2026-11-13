@@ -1,7 +1,7 @@
 //! Hud movement.
 use crate::extensions::NativeHud;
 use crate::ui::{
-    color_code, draw_placed, fixed_charset_text, hud_line, proportional_text_uniform,
+    draw_placed, fixed_charset_text, hud_line, proportional_text_uniform,
     proportional_text_width, rect, rect_outline, text, textured_rect_with_source, HudElementId,
     MovementKeysSettings, ProportionalFont, UiSnapshot, UiVertex, CROSSHAIR_IMAGE_COUNT,
     CROSSHAIR_IMAGE_NAMES, KEY_ART_SIZE, KEY_ATLAS_COLUMNS, KEY_ATLAS_ROWS, KEY_TEXTURE_SOURCE,
@@ -633,16 +633,14 @@ pub(in crate::ui) fn build_race_timer(
 }
 
 pub(crate) fn visible_jka_chars(value: &str) -> usize {
-    let mut chars = value.chars().peekable();
+    let mut chars = value.char_indices().peekable();
     let mut visible = 0usize;
-    while let Some(ch) = chars.next() {
-        if ch == '^' {
-            if let Some(&code) = chars.peek() {
-                if color_code(code, 1.0).is_some() {
-                    let _ = chars.next();
-                    continue;
-                }
+    while let Some((index, _)) = chars.next() {
+        if let Some((skip, _)) = crate::ui::color_escape(value.as_bytes(), index, 1.0) {
+            while chars.peek().is_some_and(|(at, _)| *at < index + skip) {
+                chars.next();
             }
+            continue;
         }
         visible += 1;
     }
@@ -666,11 +664,8 @@ pub(in crate::ui) fn center_print_lines(value: &str) -> Vec<String> {
             let mut visible = 0usize;
             let mut last_space = None;
             while index < chars.len() && visible < 50 {
-                if chars[index] == '^'
-                    && index + 1 < chars.len()
-                    && color_code(chars[index + 1], 1.0).is_some()
-                {
-                    index += 2;
+                if let Some((skip, _)) = crate::ui::text::color_escape_chars(&chars, index, 1.0) {
+                    index += skip;
                     continue;
                 }
                 if chars[index].is_whitespace() {

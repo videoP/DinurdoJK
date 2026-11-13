@@ -126,6 +126,9 @@ impl App {
             self.draw_scores,
         );
         rect_ctx.jk2_mode = self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2();
+        rect_ctx.flag_status_rows = if rect_ctx.jk2_mode
+            && self.game_session.as_ref().is_some_and(|session| session.client_game.jk2_ctf3_active())
+        { 3 } else { 2 };
         let neighbors: Vec<_> = HudElementId::ALL.into_iter()
             .filter(|id| self.hud_edit_element_enabled(*id)
                 && !ui::hud_element_replaced(self.extensions.native_hidden, self.video.draw_hud, *id))
@@ -1175,6 +1178,11 @@ impl App {
                     self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2());
                 if self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2() {
                     ui::append_jk2_ctf_images(&mut images);
+                } else if self.video.jk2_enhanced_flag_status != 0 {
+                    ui::append_flag_status_images(&mut images);
+                }
+                if self.japro_cg.spec_hud >= 2 {
+                    ui::append_broadcast_flag_images(&mut images);
                 }
                 ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
                 images

@@ -173,7 +173,7 @@ use crate::{
         presented_openjk_player,
         ragdoll::{PhysicsMapMesh, RagdollConfig},
         snapshot_discontinuity,
-        view::{local_player_alpha, rendering_third_person, PlayerViewPolicyState},
+        view::{local_player_alpha, rendering_spectator_third_person, rendering_third_person, PlayerViewPolicyState},
         ClientGameState, ClientInfo, EntityPresentationKind, EventCheckDisposition,
         ForcedPlayerModels, PresentationViewer, PresentedEntity, ET_PLAYER,
     },
@@ -873,6 +873,14 @@ pub struct App {
     console_path_links: VecDeque<Vec<ConsolePathLink>>,
     /// Received chat message per console row, parallel to `console_lines`.
     console_chat_ids: VecDeque<Option<u64>>,
+    /// `Some(index)` tags a line originating from the active demo's indexed
+    /// transcript. Kept parallel to the ordinary scrollback; reversible on seek.
+    console_demo_source: VecDeque<Option<console_state::DemoConsoleSource>>,
+    /// Exclusive cursor into DemoIndex::console; never replay old entries.
+    demo_console_cursor: usize,
+    /// Demo chat metadata received during ordinary playback, awaiting its
+    /// corresponding indexed console entry (never replayed across a seek).
+    demo_console_pending_chats: VecDeque<(String, String, u64, crate::logging::ConsoleLineKind)>,
     console_timestamps: bool,
     /// TaystJK `con_notifytime`: seconds a recent console row remains over gameplay.
     /// Session-only, matching upstream's non-archive cvar flag.

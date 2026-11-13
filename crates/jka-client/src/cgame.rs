@@ -812,6 +812,14 @@ pub enum CgameNotice {
         team_scores: [i32; 2],
         entries: Vec<ScoreEntry>,
     },
+    /// CS_PLAYERS changed after an earlier `scores` response. TaystJK draws
+    /// each score row using current `cgs.clientinfo`, not the team captured
+    /// when the score packet arrived. None indicates a disconnected slot.
+    ScoreClientChanged {
+        client: i32,
+        name: Option<String>,
+        team: Option<i32>,
+    },
     /// `map_restart`.
     MapRestart,
     /// A client-generated StringEd message (`CG_GetStringEdString`), e.g. the
@@ -1267,6 +1275,16 @@ impl ClientGameState {
     /// client, so model/sound/effect ranges need no synchronous registration.
     fn configstring_modified(&mut self, index: u16) {
         self.apply_configstring_state(index, true);
+        if let Some(client) = index.checked_sub(CS_PLAYERS).filter(|&slot| usize::from(slot) < MAX_CLIENTS) {
+            let info = self.configstring(index).filter(|info| !info.is_empty());
+            let name = info.and_then(|info| info_value(info, b"n")).map(bytes_to_lossless_ascii);
+            let team = info.map(|info| {
+                info_value(info, b"t").and_then(parse_i32_ascii).unwrap_or(0)
+            });
+            self.notices.push_back(CgameNotice::ScoreClientChanged {
+                client: i32::from(client), name, team,
+            });
+        }
     }
 
     fn rebuild_configstring_state(&mut self) {
@@ -1413,7 +1431,13 @@ impl ClientGameState {
     }
 
     pub fn model_qpath(&self, model_index: i32) -> Option<String> {
+        // MVSDK SP_misc_shield_floor_unit registers its model as
+        // "/models/items/a_shield_converter.md3". The virtual asset namespace
+        // is package-relative, so discard the optional root separator before
+        // passing a registered model to an asset reader. Keep the received
+        // configstring unchanged for protocol/debugging purposes.
         configstring_resource(&self.configstrings, CS_MODELS, 512, model_index)
+            .map(|qpath| qpath.trim_start_matches('/').to_owned())
     }
 
     pub fn sound_qpath(&self, sound_index: i32) -> Option<String> {
@@ -4198,6 +4222,31 @@ mod tests {
     }
 
     #[test]
+    fn live_scoreboard_team_changes_arrive_between_score_responses() {
+        let mut game = ClientGameState::new();
+        game.set_configstring(CS_PLAYERS + 5, br"\n\starty\t\2".to_vec());
+        game.drain_notices();
+        game.execute_server_command(&ServerCommand {
+            sequence: 80,
+            text: b"scores 1 0 0 5 0 31 0 0 0 0 0 0 0 0 0 0 0".to_vec(),
+        }).unwrap();
+        let notices = game.drain_notices();
+        let CgameNotice::Scores { entries, .. } = &notices[0] else { panic!("expected scores"); };
+        assert_eq!(entries[0].team, TEAM_BLUE);
+
+        // A team switch has its own reliable `cs` command; the server need
+        // not send another `scores` for the clientinfo change to take effect.
+        game.execute_server_command(&ServerCommand {
+            sequence: 81,
+            text: b"cs 1136 \"\\n\\starty\\t\\3\"".to_vec(),
+        }).unwrap();
+        let notices = game.drain_notices();
+        assert_eq!(notices, vec![CgameNotice::ScoreClientChanged {
+            client: 5, name: Some("starty".to_owned()), team: Some(TEAM_SPECTATOR),
+        }]);
+    }
+
+    #[test]
     fn japro_scores_use_15_int_records_with_trailing_deaths() {
         let mut game = ClientGameState::new();
         game.configstrings.insert(CS_SERVERINFO, br"\gamename\japro 1.4".to_vec());
@@ -4892,6 +4941,20 @@ mod tests {
         cg.configstrings
             .insert(CS_EFFECTS + 2, b"effects/test.efx".to_vec());
         assert_eq!(cg.model_qpath(7).as_deref(), Some("models/map_objects/test.md3"));
+        // MVSDK's misc_shield_floor_unit includes a leading slash in
+        // CS_MODELS. It is a virtual root, not part of the PK3 asset name.
+        cg.configstrings.insert(
+            CS_MODELS + 8,
+            b"/models/items/a_shield_converter.md3".to_vec(),
+        );
+        assert_eq!(
+            cg.model_qpath(8).as_deref(),
+            Some("models/items/a_shield_converter.md3"),
+        );
+        assert_eq!(
+            cg.configstring(CS_MODELS + 8),
+            Some(b"/models/items/a_shield_converter.md3".as_slice()),
+        );
         assert_eq!(cg.sound_qpath(3).as_deref(), Some("sound/test.wav"));
         assert_eq!(cg.effect_qpath(2).as_deref(), Some("effects/test.efx"));
         assert!(cg.model_qpath(0).is_none());

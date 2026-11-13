@@ -158,6 +158,16 @@ impl Engine {
         download::parse_url(url).ok().and_then(|model| self.cached_file(&model).ok()).is_some_and(|path| path.is_file())
     }
 
+    /// Automatic feature restoration may load an existing file, but must not
+    /// start a download without the user's confirmation.
+    pub fn ensure_cached(&self, url: &str) -> bool {
+        if !self.cached(url) {
+            return false;
+        }
+        self.ensure(url);
+        true
+    }
+
     pub fn state(&self, url: &str) -> ModelState {
         let entries = lock(&self.shared.entries);
         match entries.get(url.trim()) {
@@ -287,16 +297,12 @@ impl Engine {
     }
 
     /// Run one job and wait for its answer. Call from a worker thread, never
-    /// from the frame loop. A model that is not ready is asked for and the
-    /// call fails at once with its current state.
+    /// from the frame loop. Loading is explicit: stale queued jobs must not
+    /// reload a model the user has unloaded.
     pub fn generate(&self, mut request: Generate) -> Result<String, String> {
         request.url = request.url.trim().to_owned();
         match self.state(&request.url) {
             ModelState::Ready => {}
-            ModelState::Idle | ModelState::Failed(_) => {
-                self.ensure(&request.url);
-                return Err(format!("model {}", self.state(&request.url).describe()));
-            }
             other => return Err(format!("model {}", other.describe())),
         }
         let (reply, answer) = mpsc::channel();
@@ -760,6 +766,46 @@ mod runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_generation_does_not_reload_a_released_model() {
+        let host = Engine {
+            shared: Arc::new(Shared {
+                entries: Mutex::new(HashMap::new()),
+                cache_dir: Mutex::new(None),
+                threads: AtomicI32::new(0),
+            }),
+            worker: Mutex::new(None),
+        };
+        let url = "https://example.com/model.gguf";
+        let download_cancel = Arc::new(AtomicBool::new(false));
+        lock(&host.shared.entries).insert(url.to_owned(), Entry {
+            state: ModelState::Ready,
+            progress: Arc::new(Progress::default()),
+            cancel: Arc::clone(&download_cancel),
+        });
+        host.retain(&[]);
+        assert!(download_cancel.load(Ordering::Relaxed));
+
+        let result = host.generate(Generate {
+            url: url.to_owned(),
+            system: None,
+            user: "queued chat".to_owned(),
+            max_tokens: 8,
+            context: 512,
+            sampling: Sampling::EXACT,
+            priority: Priority::Interactive,
+            cancel: Arc::new(AtomicBool::new(false)),
+        });
+        assert_eq!(result.unwrap_err(), "model not loaded");
+        assert_eq!(host.state(url), ModelState::Idle);
+        assert!(lock(&host.shared.entries).is_empty());
+        assert!(lock(&host.worker).is_none());
+        // Restoring a feature without a cached file also cannot restart it.
+        assert!(!host.ensure_cached(url));
+        assert_eq!(host.state(url), ModelState::Idle);
+        assert!(lock(&host.worker).is_none());
+    }
 
     #[test]
     fn states_describe_themselves_for_the_settings_page() {

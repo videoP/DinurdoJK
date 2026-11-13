@@ -10,6 +10,12 @@ pub(in crate::app) struct ConsolePoint {
     pub(in crate::app) col: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) enum DemoConsoleSource {
+    Indexed(usize),
+    Derived(i32),
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::app) struct ConsolePathLink {
     pub(in crate::app) start_col: usize,
@@ -29,16 +35,17 @@ pub(in crate::app) struct ConsoleWrappedRow {
 #[derive(Debug, Default)]
 pub(in crate::app) struct ConsoleReflow {
     pub columns: usize,
+    pub nwh_hex_colors: bool,
     pub valid: bool,
     pub rows: Vec<ConsoleWrappedRow>,
 }
 
 impl ConsoleReflow {
-    fn push(&mut self, line: &str, line_index: usize) -> usize {
+    fn push(&mut self, line: &str, line_index: usize, nwh_hex_colors: bool) -> usize {
         // Preserve original character offsets for selection, links and Ctrl+C.
         // Prefer a word boundary when a word would straddle the final column;
         // exceptionally long words still split to guarantee forward progress.
-        let plain = crate::logging::strip_jka_colors(line);
+        let plain = crate::logging::strip_jka_colors_with_hex(line, nwh_hex_colors);
         let chars: Vec<char> = plain.chars().collect();
         let capacity = self.columns.max(1);
         let mut start: usize = 0;
@@ -79,23 +86,31 @@ impl ConsoleReflow {
     }
 }
 
-/// Extract a physical segment without breaking JKA `^N` color codes. Repeat
-/// the active color at the beginning of a continuation row, like TaystJK's
-/// colored character buffer does after Con_Resize.
-pub(in crate::app) fn console_colored_fragment(raw: &str, start: usize, end: usize) -> String {
-    let mut chars = raw.chars().peekable();
-    let mut column = 0;
-    let mut active = None;
+/// Extract a physical row without splitting standard or NWH hex colors.
+/// A carried-over color must be the entire original code, not merely ^x.
+pub(in crate::app) fn console_colored_fragment(raw: &str, start: usize, end: usize, nwh_hex_colors: bool) -> String {
+    let mut chars = raw.char_indices().peekable();
+    let mut column = 0usize;
+    let mut active: Option<&str> = None;
     let mut out = String::new();
-    while let Some(ch) = chars.next() {
-        if ch == '^' && chars.peek().is_some_and(|next| next.is_ascii_digit()) {
-            let code = chars.next().expect("peeked digit");
+    while let Some((at, ch)) = chars.next() {
+        let skip = if ch == '^' {
+            nwh_hex_colors.then(|| crate::nwh_colors::parse_hex_escape(raw.as_bytes(), at, 1.0))
+                .flatten().map(|(bytes, _)| bytes)
+                .or_else(|| raw.as_bytes().get(at + 1)
+                    .filter(|byte| byte.is_ascii_digit()).map(|_| 2))
+        } else { None };
+        if let Some(skip) = skip.filter(|skip| raw.is_char_boundary(at + *skip)) {
+            let code = &raw[at..at + skip];
             active = Some(code);
-            if column >= start && column < end { out.push('^'); out.push(code); }
+            if column >= start && column < end { out.push_str(code); }
+            while chars.peek().is_some_and(|(index, _)| *index < at + skip) {
+                chars.next();
+            }
             continue;
         }
-        if column == start && start > 0 {
-            if let Some(code) = active { out.push('^'); out.push(code); }
+        if column == start && start > 0 && out.is_empty() {
+            if let Some(code) = active { out.push_str(code); }
         }
         if column >= start && column < end { out.push(ch); }
         column += 1;
@@ -122,6 +137,25 @@ pub(in crate::app) fn parse_console_notify_terms(value: &str) -> Vec<String> {
 }
 
 impl App {
+    /// A NWH server is established by the verification challenge, never by hostname.
+    pub(in crate::app) fn console_nwh_hex_colors(&self) -> bool {
+        self.game_session.as_ref().is_some_and(|session| session.live)
+            && self.net.as_ref().is_some_and(crate::net::NetClient::is_nwh_server)
+    }
+
+    fn console_strip_colors(&self, raw: &str) -> String {
+        crate::logging::strip_jka_colors_with_hex(raw, self.console_nwh_hex_colors())
+    }
+
+    pub(in crate::app) fn clear_session_chatbox(&mut self) {
+        self.chat_lines.clear();
+        self.last_clean_chat_message = None;
+        self.clear_player_translation_rules();
+        self.cancel_chat_translations();
+        self.last_chat_refresh = Instant::now();
+        self.publish_transient_ui();
+    }
+
     pub(in crate::app) fn clear_console_output(&mut self) {
         self.console_reflow.borrow_mut().valid = false;
         self.console_lines.clear();
@@ -134,6 +168,7 @@ impl App {
         self.last_console_notify_refresh = Instant::now();
         self.console_path_links.clear();
         self.console_chat_ids.clear();
+        self.console_demo_source.clear();
         self.console_scroll = 0;
         self.console_hl2_scroll_to = Some(0);
         self.console_hl2_page_delta = 0;
@@ -154,6 +189,17 @@ impl App {
         kind: crate::logging::ConsoleLineKind,
         chat_id: Option<u64>,
     ) {
+        self.append_console_line_with_demo_source(line, path_links, kind, chat_id, None);
+    }
+
+    fn append_console_line_with_demo_source(
+        &mut self,
+        line: String,
+        path_links: Vec<ConsolePathLink>,
+        kind: crate::logging::ConsoleLineKind,
+        chat_id: Option<u64>,
+        demo_source: Option<DemoConsoleSource>,
+    ) {
         const MAX_CONSOLE_LINES: usize = 10_000;
         let preserve_scroll = self.console_scroll > 0;
         if self.console_lines.len() >= MAX_CONSOLE_LINES {
@@ -162,6 +208,7 @@ impl App {
             self.console_line_kinds.pop_front();
             self.console_path_links.pop_front();
             self.console_chat_ids.pop_front();
+            self.console_demo_source.pop_front();
 
             let shift_point = |point: Option<ConsolePoint>| {
                 point.map(|point| ConsolePoint {
@@ -182,10 +229,14 @@ impl App {
             });
         }
         let added_rows = {
+            let nwh_hex_colors = self.console_nwh_hex_colors();
             let mut layout = self.console_reflow.borrow_mut();
+            if layout.valid && layout.nwh_hex_colors != nwh_hex_colors {
+                layout.valid = false; // rebuild with the new escape rules
+            }
             if layout.valid {
                 let index = self.console_lines.len();
-                layout.push(&line, index)
+                layout.push(&line, index, nwh_hex_colors)
             } else {
                 0
             }
@@ -194,6 +245,7 @@ impl App {
         self.console_line_kinds.push_back(kind);
         self.console_path_links.push_back(path_links);
         self.console_chat_ids.push_back(chat_id);
+        self.console_demo_source.push_back(demo_source);
         self.mark_companion_console_dirty();
 
         // If the user has scrolled up to inspect/select older output, keep the
@@ -211,6 +263,130 @@ impl App {
         } else {
             self.console_scroll = 0;
         }
+    }
+
+    /// Remove only demo-authored console rows. Local commands, errors, chat
+    /// from real servers and engine diagnostics are never discarded.
+    pub(in crate::app) fn clear_demo_console_history(&mut self) {
+        if self.console_demo_source.iter().any(Option::is_some) {
+            self.remove_demo_console_rows(|_| true);
+        }
+        self.demo_console_cursor = 0;
+        self.demo_console_pending_chats.clear();
+    }
+
+    pub(in crate::app) fn queue_demo_chat_console_row(
+        &mut self, original: String, displayed: String, id: u64,
+        kind: crate::logging::ConsoleLineKind,
+    ) {
+        if self.demo_console_pending_chats.len() >= 64 {
+            self.demo_console_pending_chats.pop_front();
+        }
+        self.demo_console_pending_chats.push_back((original, displayed, id, kind));
+    }
+
+    fn remove_demo_console_rows(&mut self, drop: impl Fn(DemoConsoleSource) -> bool) {
+        // All parallel metadata buffers must follow the same logical rows.
+        let keep: Vec<bool> = self.console_demo_source.iter()
+            .map(|source| match source { Some(source) => !drop(*source), None => true })
+            .collect();
+        if keep.iter().all(|&keep| keep) { return; }
+        let mut cursor = 0;
+        self.console_lines.retain(|_| { let keep = keep[cursor]; cursor += 1; keep });
+        let mut cursor = 0;
+        self.console_line_kinds.retain(|_| { let keep = keep[cursor]; cursor += 1; keep });
+        let mut cursor = 0;
+        self.console_path_links.retain(|_| { let keep = keep[cursor]; cursor += 1; keep });
+        let mut cursor = 0;
+        self.console_chat_ids.retain(|_| { let keep = keep[cursor]; cursor += 1; keep });
+        let mut cursor = 0;
+        self.console_demo_source.retain(|_| { let keep = keep[cursor]; cursor += 1; keep });
+        self.console_reflow.borrow_mut().valid = false;
+        // Row indices are no longer stable after removing timeline records.
+        self.console_selection_anchor = None;
+        self.console_selection_focus = None;
+        self.console_selecting = false;
+        self.console_last_click = None;
+        self.console_click_count = 0;
+        self.console_scroll = 0;
+        self.console_hl2_scroll_to = None;
+        self.mark_companion_console_dirty();
+        if self.console_search_open { self.rebuild_console_search(false); }
+    }
+
+    /// Derived CGame lines (kill/pickup/localized notices) only exist when
+    /// playback visits those frames. Still tag them so rewinding removes future
+    /// events; unlike the recorded server transcript they are not backfilled.
+    pub(in crate::app) fn push_demo_derived_console_line(&mut self, line: String) {
+        let at = self.current_demo_elapsed_ms(Instant::now()).unwrap_or(0.0).floor() as i32;
+        for segment in line.split('\n') {
+            self.append_console_line_with_demo_source(
+                segment.to_owned(), Vec::new(), crate::logging::ConsoleLineKind::Normal,
+                None, Some(DemoConsoleSource::Derived(at)),
+            );
+        }
+        if self.overlay == OverlayMode::Console { self.publish_ui(); }
+    }
+
+    pub(in crate::app) fn trim_demo_derived_console(&mut self, elapsed_ms: i32) {
+        if self.console_demo_source.iter().any(|source| {
+            matches!(source, Some(DemoConsoleSource::Derived(at)) if *at > elapsed_ms)
+        }) {
+            self.remove_demo_console_rows(|source| matches!(source,
+                DemoConsoleSource::Derived(at) if at > elapsed_ms));
+        }
+    }
+
+    /// Reconcile indexed demo output to the *current* playhead, never to the
+    /// furthest time visited. This is called on normal playback and explicit
+    /// seeks; nothing is emitted into the permanent logger or notify overlay.
+    pub(in crate::app) fn sync_demo_console(&mut self, elapsed_ms: i32) {
+        let Some(index) = self.game_session.as_ref()
+            .filter(|session| !session.live)
+            .and_then(|session| session.demo_index.as_ref()) else { return; };
+        let wanted = index.console.partition_point(|entry| entry.elapsed_ms <= elapsed_ms);
+        if wanted == self.demo_console_cursor { return; }
+        if wanted < self.demo_console_cursor {
+            self.remove_demo_console_rows(|source| match source {
+                DemoConsoleSource::Indexed(index) => index >= wanted,
+                DemoConsoleSource::Derived(at) => at > elapsed_ms,
+            });
+            self.demo_console_pending_chats.clear();
+        }
+        // Clone only the new entries, not the complete transcript at every frame.
+        let added = self.game_session.as_ref().and_then(|session| session.demo_index.as_ref())
+            .map(|index| index.console[self.demo_console_cursor.min(wanted)..wanted].to_vec())
+            .unwrap_or_default();
+        let from = self.demo_console_cursor.min(wanted);
+        for (offset, entry) in added.into_iter().enumerate() {
+            let mut kind = match entry.kind {
+                super::DemoConsoleKind::TeamChat => crate::logging::ConsoleLineKind::TeamChat,
+                _ => crate::logging::ConsoleLineKind::Normal,
+            };
+            let mut displayed = entry.text.clone();
+            let mut chat_id = None;
+            if matches!(entry.kind, super::DemoConsoleKind::Chat | super::DemoConsoleKind::TeamChat) {
+                if let Some(pos) = self.demo_console_pending_chats.iter()
+                    .position(|(original, _, _, _)| original == &entry.text)
+                {
+                    if let Some((_, text, id, chat_kind)) = self.demo_console_pending_chats.remove(pos) {
+                        displayed = text;
+                        kind = chat_kind;
+                        chat_id = Some(id);
+                    }
+                }
+            }
+            for text in displayed.split('\n') {
+                let text = text.strip_suffix('\r').unwrap_or(text);
+                self.append_console_line_with_demo_source(
+                    text.to_owned(), Vec::new(), kind, chat_id,
+                    Some(DemoConsoleSource::Indexed(from + offset)),
+                );
+            }
+        }
+        self.demo_console_cursor = wanted;
+        if self.console_search_open { self.rebuild_console_search(false); }
+        if self.overlay == OverlayMode::Console { self.publish_ui(); }
     }
 
     pub(in crate::app) fn sync_console_log(&mut self) -> bool {
@@ -237,7 +413,7 @@ impl App {
                 } else {
                     segment.to_owned()
                 };
-                let plain = crate::logging::strip_jka_colors(&line);
+                let plain = self.console_strip_colors(&line);
                 let path_links = record
                     .path_links
                     .iter()
@@ -408,7 +584,7 @@ impl App {
         let line = line.into();
         // The trusted local echo prefix is `] `, unlike arbitrary server text.
         // Preserve the normal amber command styling while marking team sends.
-        let plain = crate::logging::strip_jka_colors(&line);
+        let plain = self.console_strip_colors(&line);
         let command = plain.trim_start().strip_prefix(']').unwrap_or(&plain).trim_start();
         let kind = if crate::streamer::is_team_chat_command(command) {
             crate::logging::ConsoleLineKind::TeamChatCommandEcho
@@ -593,12 +769,14 @@ impl App {
             ui::console_wrap_columns(window.inner_size().width, self.console_scale)
         }).unwrap_or(98);
         {
+            let nwh_hex_colors = self.console_nwh_hex_colors();
             let mut layout = self.console_reflow.borrow_mut();
-            if !layout.valid || layout.columns != columns {
+            if !layout.valid || layout.columns != columns || layout.nwh_hex_colors != nwh_hex_colors {
                 layout.columns = columns;
+                layout.nwh_hex_colors = nwh_hex_colors;
                 layout.rows.clear();
                 for (index, line) in self.console_lines.iter().enumerate() {
-                    layout.push(line, index);
+                    layout.push(line, index, nwh_hex_colors);
                 }
                 layout.valid = true;
             }
@@ -670,7 +848,7 @@ impl App {
         point: ConsolePoint,
     ) -> Option<(ConsolePoint, ConsolePoint)> {
         let raw = self.console_selection_line(point.line)?;
-        let plain = crate::logging::strip_jka_colors(&raw);
+        let plain = self.console_strip_colors(&raw);
         let chars: Vec<char> = plain.chars().collect();
         if chars.is_empty() {
             return None;
@@ -712,7 +890,7 @@ impl App {
         point: ConsolePoint,
     ) -> Option<(ConsolePoint, ConsolePoint)> {
         let raw = self.console_lines.get(point.line)?;
-        let len = crate::logging::strip_jka_colors(raw).chars().count();
+        let len = self.console_strip_colors(raw).chars().count();
         (len > 0).then_some((
             ConsolePoint {
                 line: point.line,
@@ -800,7 +978,7 @@ impl App {
         };
         let last_col = self
             .console_selection_line(last_line)
-            .map(|raw| crate::logging::strip_jka_colors(&raw).chars().count())
+            .map(|raw| self.console_strip_colors(&raw).chars().count())
             .unwrap_or(0);
         self.console_selection_anchor = Some(ConsolePoint { line: 0, col: 0 });
         self.console_selection_focus = Some(ConsolePoint {
@@ -817,7 +995,7 @@ impl App {
             let Some(raw) = self.console_selection_line(line_index) else {
                 break;
             };
-            let plain = crate::logging::strip_jka_colors(&raw);
+            let plain = self.console_strip_colors(&raw);
             let chars: Vec<char> = plain.chars().collect();
             let left = if line_index == start.line {
                 start.col.min(chars.len())
@@ -913,7 +1091,7 @@ impl App {
         if !needle.is_empty() {
             for line in 0..self.console_lines.len() {
                 let Some(raw) = self.console_selection_line(line) else { continue; };
-                let plain = crate::logging::strip_jka_colors(&raw);
+                let plain = self.console_strip_colors(&raw);
                 let haystack = plain.to_ascii_lowercase();
                 for (byte_start, _) in haystack.match_indices(&needle) {
                     let byte_end = byte_start + needle.len();
@@ -993,18 +1171,24 @@ mod reflow_tests {
     #[test]
     fn reflow_preserves_source_columns_and_prefers_whole_words() {
         let mut layout = ConsoleReflow { columns: 7, ..Default::default() };
-        assert_eq!(layout.push("foo bar baz", 0), 2);
+        assert_eq!(layout.push("foo bar baz", 0, false), 2);
         assert_eq!((layout.rows[0].start_col, layout.rows[0].end_col), (0, 7));
         assert_eq!((layout.rows[1].start_col, layout.rows[1].end_col), (7, 11));
         assert_eq!(layout.row_for_point(ConsolePoint { line: 0, col: 7 }, false), 1);
         assert_eq!(layout.row_for_point(ConsolePoint { line: 0, col: 7 }, true), 0);
-        assert_eq!(layout.push("abcdefghijk", 1), 2); // a word longer than a row
-        assert_eq!(layout.push("", 2), 1); // empty messages retain one row
+        assert_eq!(layout.push("abcdefghijk", 1, false), 2); // a word longer than a row
+        assert_eq!(layout.push("", 2, false), 1); // empty messages retain one row
+        let mut nwh = ConsoleReflow { columns: 3, ..Default::default() };
+        assert_eq!(nwh.push("^XFF8000abcdef", 0, true), 2);
+        assert_eq!((nwh.rows[1].start_col, nwh.rows[1].end_col), (3, 6));
     }
 
     #[test]
     fn fragments_keep_the_color_active_at_a_wrap_boundary() {
-        assert_eq!(console_colored_fragment("^1hell^2oworld", 2, 7), "^1ll^2owo");
-        assert_eq!(console_colored_fragment("^4abcdef", 0, 3), "^4abc");
+        assert_eq!(console_colored_fragment("^1hell^2oworld", 2, 7, false), "^1ll^2owo");
+        assert_eq!(console_colored_fragment("^4abcdef", 0, 3, false), "^4abc");
+        assert_eq!(console_colored_fragment("^XFF8000abcdefgh", 2, 5, true), "^XFF8000cde");
+        assert_eq!(console_colored_fragment("^yF80Fabcdefgh", 0, 3, true), "^yF80Fabc");
+        assert_eq!(console_colored_fragment("^xF80abcdef", 2, 5, false), "F80");
     }
 }

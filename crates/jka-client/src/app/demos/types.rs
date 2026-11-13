@@ -75,6 +75,8 @@ pub(in crate::app) struct DemoFakeView {
     pub(in crate::app) view_angles: [f32; 3],
     pub(in crate::app) velocity: [f32; 3],
     pub(in crate::app) health: i32,
+    /// Remote entityState weapon (already mapped into JKA presentation IDs).
+    pub(in crate::app) weapon: i32,
     pub(in crate::app) legs_anim: i32,
 }
 

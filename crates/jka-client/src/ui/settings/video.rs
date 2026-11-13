@@ -66,7 +66,7 @@ pub struct VideoSettings {
     pub tint_hud: bool,
     /// Bucky MVSDK cg_drawInventory: owned JK2 items at upper right.
     pub jk2_draw_inventory: bool,
-    /// Bucky MVSDK cg_enhancedFlagStatus: 0 off, 1 carrier, 2 carrier + time.
+    /// Enhanced JK2/JKA CTF flag status: 0 off, 1 carrier, 2 carrier + time.
     pub jk2_enhanced_flag_status: u8,
     /// 0: DinurdoJK panels; 1: Native multiplayer HUD from active JK2/JKA protocol.
     pub hud_style: u8,
@@ -743,7 +743,7 @@ impl Default for VideoSettings {
             no_curves: false,
             speeds: 0,
             fullscreen: FullscreenMode::Exclusive,
-            renderer_backend: RendererBackend::Vulkan,
+            renderer_backend: RendererBackend::default(),
             gpu_adapter: 0,
             vsync: VsyncMode::Fast,
             max_frame_latency: 3,

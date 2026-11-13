@@ -1148,6 +1148,8 @@ pub(super) struct DemoIndex {
     pub kill_markers: Vec<DemoKillMarker>,
     /// Timeline-addressable transient notices used to rebuild HUD state after seeks.
     pub transient_notices: Vec<DemoConsoleEntry>,
+    /// All real console-bearing demo server commands, already in playback order.
+    pub console: Vec<DemoConsoleEntry>,
     /// Reliable `scores` payloads recorded in the demo, indexed by demo time.
     pub scoreboards: Vec<DemoScoreboardSample>,
     pub wallrun_camera_yaws: Vec<DemoWallrunYawSample>,
@@ -1637,6 +1639,7 @@ fn scan_demo_bytes(
     let mut private_duel = None::<ActivePrivateDuel>;
     let mut private_duels = Vec::<RawPrivateDuel>::new();
     let mut console = Vec::<(i32, DemoConsoleKind, String)>::new();
+    let mut console_raw = Vec::<(i32, DemoConsoleKind, String)>::new();
     let mut transient_notices = Vec::<(i32, DemoConsoleKind, String)>::new();
     let mut scoreboards = Vec::<(i32, [i32; 2], Vec<DemoScoreEntry>)>::new();
     let mut kill_count = 0usize;
@@ -1777,6 +1780,7 @@ fn scan_demo_bytes(
                         }
                         if name.eq_ignore_ascii_case(b"map_restart") {
                             console.push((server_time, DemoConsoleKind::Event, "map_restart".to_owned()));
+                            console_raw.push((server_time, DemoConsoleKind::Event, "map_restart".to_owned()));
                             // Do not let a pre-restart full scoreboard leak into
                             // the new round while we wait for the next recorded
                             // `scores` payload. CS_SCORES1/2 are reset by gamecode
@@ -1843,6 +1847,10 @@ fn scan_demo_bytes(
                                 let text = console_text(&args, start);
                                 if !text.is_empty() {
                                     console.push((server_time, kind, text));
+                                    let raw = crate::cgame::bytes_to_lossless_ascii(
+                                        &args.get(start..).unwrap_or_default().join(&b' '),
+                                    );
+                                    console_raw.push((server_time, kind, raw.trim_matches(|ch| matches!(ch, '\0' | '\r' | '\n')).to_owned()));
                                 }
                             }
                         }
@@ -2095,6 +2103,14 @@ fn scan_demo_bytes(
         kind,
         text,
     }).collect();
+    let mut raw_console: Vec<DemoConsoleEntry> = console_raw.into_iter()
+        .map(|(at, kind, text)| DemoConsoleEntry {
+            elapsed_ms: at.saturating_sub(first).max(0), kind, text,
+        }).collect();
+    // Some recordings contain an out-of-order serverTime around map_restart.
+    // A stable sort makes time-based binary search safe while retaining order
+    // for commands that share one snapshot timestamp.
+    raw_console.sort_by_key(|entry| entry.elapsed_ms);
     let scoreboards = scoreboards
         .into_iter()
         .map(|(at, team_scores, entries)| DemoScoreboardSample {
@@ -2108,6 +2124,7 @@ fn scan_demo_bytes(
         last_server_time: Some(last),
         kill_markers,
         transient_notices,
+        console: raw_console,
         scoreboards,
         wallrun_camera_yaws,
     };

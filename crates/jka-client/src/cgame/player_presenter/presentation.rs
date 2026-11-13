@@ -484,7 +484,7 @@ impl PlayerPresenter {
 
             let look_target_origin = openjk_look_target_origin(entity, &entity_origins);
             let hidden = hidden_first_person_entity == Some(entity.number);
-            // cg_fpls for a Studio first-person view of this player: keep the
+            // cg_fpls for first-person demo follow/Studio views: keep the
             // Ghoul2 instance and its saber, turn the body surfaces off.
             let weapon = entity.state.field_i32("weapon").unwrap_or(0);
             let fpls = hidden && self.studio_fpls && matches!(weapon, 2 | 3);

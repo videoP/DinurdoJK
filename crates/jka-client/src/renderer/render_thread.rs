@@ -365,6 +365,7 @@ impl RenderThread {
         instance_desc.backends = match backend {
             RendererBackend::Vulkan => wgpu::Backends::VULKAN,
             RendererBackend::Dx12 => wgpu::Backends::DX12,
+            RendererBackend::Metal => wgpu::Backends::METAL,
         };
         // DX12 prefers the DXC runtime in DinurdoJK/dependencies (loaded by
         // absolute path so no other dxcompiler.dll on the system can shadow it).

@@ -1,4 +1,4 @@
-//! Developer "riversource" patches on the render thread: spawn, per-frame
+//! Developer "spawnriver" patches on the render thread: spawn, per-frame
 //! native solver encoding and the water body's per-frame inputs. See
 //! river_runtime.rs and river_surface.rs.
 use crate::river_runtime::LiveRiver;

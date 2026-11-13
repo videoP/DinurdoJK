@@ -474,6 +474,14 @@ impl App {
                                 let origin = egui::pos2(rect.left(), rect.center().y - galley.size().y * 0.5);
                                 let clip = ui.clip_rect().intersect(rect);
                                 let painter = ui.painter().with_clip_rect(clip);
+                                if self.console_demo_source.get(index).is_some_and(|source| source.is_some()) {
+                                    painter.rect_filled(rect, 0.0,
+                                        egui::Color32::from_rgba_unmultiplied(133, 35, 44, 32));
+                                    painter.rect_filled(egui::Rect::from_min_size(
+                                        egui::pos2(rect.left() + 1.0, rect.top()),
+                                        egui::vec2(2.0, rect.height()),
+                                    ), 0.0, egui::Color32::from_rgb(190, 69, 78));
+                                }
                                 // Show current search hit(s) underneath the
                                 // shared selection; navigation moves this list.
                                 let hits = &self.console_search_matches;

@@ -456,14 +456,34 @@ pub fn subscribe() -> Receiver<LogRecord> {
 }
 
 pub(crate) fn strip_jka_colors(text: &str) -> String {
+    strip_jka_colors_with_hex(text, true)
+}
+
+/// Console display and selection use the same session-scoped syntax as its renderer.
+pub(crate) fn strip_jka_colors_with_hex(text: &str, allow_hex: bool) -> String {
+    // Plain-text identity matching (translation, muting, scoreboard search,
+    // logging) must not leave RGB digits inside a player's name. Recognize
+    // complete NWH escapes here even when not rendering; actual *display*
+    // remains gated on the verified live JK2 1.02 NWH session.
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '^' && chars.peek().is_some_and(|next| next.is_ascii_digit()) {
-            chars.next();
-            continue;
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
+        let skip = if ch == '^' {
+            allow_hex.then(|| crate::nwh_colors::parse_hex_escape(text.as_bytes(), at, 1.0))
+                .flatten().filter(|(skip, _)| text.is_char_boundary(at + *skip))
+                .map(|(skip, _)| skip)
+                .or_else(|| text.as_bytes().get(at + 1)
+                    .filter(|c| c.is_ascii_digit()).map(|_| 2))
+        } else {
+            None
+        };
+        if let Some(skip) = skip {
+            while chars.peek().is_some_and(|(index, _)| *index < at + skip) {
+                chars.next();
+            }
+        } else {
+            out.push(ch);
         }
-        out.push(ch);
     }
     out
 }
@@ -611,6 +631,10 @@ mod tests {
     #[test]
     fn strips_jka_color_codes_from_log_file_text() {
         assert_eq!(strip_jka_colors("^1error ^7normal ^2ok"), "error normal ok");
+        assert_eq!(strip_jka_colors("^xF80Red^X1199FFBlue"), "RedBlue");
+        assert_eq!(strip_jka_colors("^yF80FOrange^Y11223344Blue"), "OrangeBlue");
+        assert_eq!(strip_jka_colors("^xF8"), "^xF8");
+        assert_eq!(super::strip_jka_colors_with_hex("^xF80Name", false), "^xF80Name");
     }
 
     #[test]

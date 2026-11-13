@@ -125,9 +125,13 @@ commands! {
             crate::renderer::gpu_adapter::label(self.video.gpu_adapter)));
         CommandResult::Handled
     }
-    cmd_gpu_list ["gpu_list"] ("gpu_list", "Enumerate graphics adapters available on the current DX12/Vulkan backend.", CommandScope::Always) |self, line| {
+    cmd_gpu_list ["gpu_list"] ("gpu_list", "Enumerate graphics adapters available on the selected graphics backend.", CommandScope::Always) |self, line| {
         if line.split_whitespace().count() != 1 { self.push_console_line("usage: gpu_list".to_owned()); return CommandResult::Handled; }
-        let backend = if self.video.renderer_backend == crate::ui::RendererBackend::Dx12 { wgpu::Backends::DX12 } else { wgpu::Backends::VULKAN };
+        let backend = match self.video.renderer_backend {
+            crate::ui::RendererBackend::Vulkan => wgpu::Backends::VULKAN,
+            crate::ui::RendererBackend::Dx12 => wgpu::Backends::DX12,
+            crate::ui::RendererBackend::Metal => wgpu::Backends::METAL,
+        };
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: backend, ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
@@ -700,7 +704,7 @@ commands! {
         CommandResult::Handled
     }
 
-    cmd_spawnriver ["spawnriver", "riversource"] ("spawnriver [height above ground] [patch radius] [source width] [cells] [simulation speed] [CFS|level|discharge:<CFS>]", "Developer test: pour water in at the crosshair using the native Unreal river solver (simulation-first, no spline). Defaults come from Video > River > New river defaults. Optional CFS caps supply while filling toward the target level; level selects unlimited held-water-level mode. Simulation speed is the fast-solve rate and automatically returns to 1x after steady-flow detection. Draws the ported Single Layer Water body with sky and screen-space reflections; foam uses textures/japro/river_foam_detail. 'spawndrain' adds drains; 'riverclear' removes all rivers and drains.", CommandScope::Always) |self, command| {
+    cmd_spawnriver ["spawnriver", ] ("spawnriver [height above ground] [patch radius] [source width] [cells] [simulation speed] [CFS|level|discharge:<CFS>]", "Developer test: pour water in at the crosshair using the native Unreal river solver (simulation-first, no spline). Defaults come from Video > River > New river defaults. Optional CFS caps supply while filling toward the target level; level selects unlimited held-water-level mode. Simulation speed is the fast-solve rate and automatically returns to 1x after steady-flow detection. Draws the ported Single Layer Water body with sky and screen-space reflections; foam uses textures/japro/river_foam_detail. 'spawndrain' adds drains; 'riverclear' removes all rivers and drains.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         let defaults=self.river_editor.defaults;
         let parsed=(||->Result<crate::river_authoring::SourceParameters,String> {
@@ -1096,7 +1100,7 @@ commands! {
         CommandResult::Handled
     }
 
-    cmd_quick_rundown ["quickRundown", ] ("quickRundown [minutes] [truth|cleanse]", "Summarize recent chat with the local model. Without minutes it covers the time since you last touched the game (window in the background or away); if you were not away, the last 10 minutes. truth (default) is written from the chat as sent; cleanse is a clean version with disclaimers for hostile stretches.", CommandScope::Always) |self, command| {
+    cmd_quick_rundown ["chatQRD", ] ("chatQRD [minutes] [truth|cleanse]", "Summarize recent chat with the local model. Without minutes it covers the time since you last touched the game (window in the background or away); if you were not away, the last 10 minutes. truth (default) is written from the chat as sent; cleanse is a clean version with disclaimers for hostile stretches.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match crate::chat_llm::history::parse_args(&words[1..]) {
             Ok((minutes, pass)) => self.start_quick_rundown(minutes, pass),
@@ -1111,6 +1115,24 @@ commands! {
         }
         for line in self.chat_llm_status_lines() {
             self.push_console_line(line);
+        }
+        CommandResult::Handled
+    }
+
+    cmd_chat_llm_unload ["chatLlmUnload", ] ("chatLlmUnload", "Stop local chat features, cancel model downloads and quickRundown, and unload models. Cached files and partial downloads are kept. Enable a feature to resume.", CommandScope::Always) |self, command| {
+        if command.split_whitespace().count() != 1 {
+            return CommandResult::Unhandled;
+        }
+        self.unload_chat_model(None);
+        self.push_console_line("^5CHAT MODELS:^7 unload requested; local chat features stopped, downloaded files kept");
+        CommandResult::Handled
+    }
+
+    cmd_chat_llm_download ["chatLlmDownload", ] ("chatLlmDownload confirm|cancel", "Confirm or dismiss the pending local chat model download. Setup > Interface shows the selected model and download size before confirmation.", CommandScope::Always) |self, command| {
+        match command.split_whitespace().skip(1).collect::<Vec<_>>().as_slice() {
+            ["confirm"] => self.confirm_chat_model_download(),
+            ["cancel"] => { self.chat_llm.edits.download = None; },
+            _ => self.push_console_line("^3CHAT MODEL:^7 usage: chatLlmDownload confirm|cancel"),
         }
         CommandResult::Handled
     }

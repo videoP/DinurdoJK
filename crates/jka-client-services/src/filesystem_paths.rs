@@ -18,14 +18,18 @@ pub fn installation_directory() -> Result<PathBuf, String> {
     Ok(executable.parent().ok_or("Cannot locate executable")?.to_path_buf())
 }
 
-/// Lowercased components, so containment is case-insensitive like Windows.
-fn components_lower(path: &Path) -> Vec<String> {
-    path.components().map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase()).collect()
+/// On Linux, different filename case can refer to independent game roots.
+/// Preserve Windows/macOS's existing case-insensitive validation policy.
+fn components_for_containment(path: &Path) -> Vec<String> {
+    path.components().map(|c| {
+        let component = c.as_os_str().to_string_lossy().into_owned();
+        if cfg!(target_os = "linux") { component } else { component.to_ascii_lowercase() }
+    }).collect()
 }
 
 /// `inner` is `outer` or lies beneath it.
 fn is_within(inner: &Path, outer: &Path) -> bool {
-    let (inner, outer) = (components_lower(inner), components_lower(outer));
+    let (inner, outer) = (components_for_containment(inner), components_for_containment(outer));
     inner.starts_with(&outer)
 }
 
@@ -277,7 +281,11 @@ mod tests {
         let check = |roots: FilesystemRoots| validate_root_layout(&install.join("base"), &roots, &install);
         assert!(check(layout(None, Some(home.join("jka")), Some(home.join("jk2")))).is_ok());
         assert!(check(layout(None, Some(home.join("jka")), None)).is_ok());
-        assert!(check(layout(None, Some(home.join("jka")), Some(home.join("JKA")))).is_err());
+        if cfg!(target_os = "linux") {
+            assert!(check(layout(None, Some(home.join("jka")), Some(home.join("JKA")))).is_ok());
+        } else {
+            assert!(check(layout(None, Some(home.join("jka")), Some(home.join("JKA")))).is_err());
+        }
         assert!(check(layout(None, None, Some(install.clone()))).is_err());
         assert!(check(layout(None, Some(install.join("DinurdoJK/home")), None)).is_err());
         let jk2 = home.join("outcast");

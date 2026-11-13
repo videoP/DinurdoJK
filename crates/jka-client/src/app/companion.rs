@@ -522,12 +522,21 @@ impl App {
                     let Some(line) = self.console_lines.get(index) else {
                         continue;
                     };
-                    ui.label(
-                        egui::RichText::new(crate::logging::strip_jka_colors(line))
-                            .monospace()
-                            .size(12.0)
-                            .color(theme::TEXT()),
-                    );
+                    if self.console_demo_source.get(index).is_some_and(|source| source.is_some()) {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_rgba_unmultiplied(133, 35, 44, 32))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(crate::logging::strip_jka_colors(line))
+                                        .monospace().size(12.0).color(theme::TEXT()),
+                                );
+                            });
+                    } else {
+                        ui.label(
+                            egui::RichText::new(crate::logging::strip_jka_colors(line))
+                                .monospace().size(12.0).color(theme::TEXT()),
+                        );
+                    }
                 }
             });
     }

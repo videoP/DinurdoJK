@@ -10,7 +10,7 @@
 
 ## Build artifact policy
 
-- Prefer `build.ps1 -Fast` (or `build.cmd -Fast`) for routine builds. Use `--profile fast` for direct Cargo builds, checks, tests, and Clippy. The build cache is `target/fast`. Without `-Output` the build script copies nothing: the exe stays in `target/<mode>/DinurdoJK.exe`. Pass `-Output target\release` to update the game folder.
+- Use `.\build.ps1 -Fast -Output C:\Games\JK` for routine builds in this checkout so the executable is updated in the user's game folder. Use `--profile fast` for direct Cargo builds, checks, tests, and Clippy. The build cache remains `target/fast`; `-Output` copies the runnable executable without creating another build cache.
 - Do not create feature-, task-, review-, benchmark-, or session-specific target directories. Do not override `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, or `--target-dir` to isolate work.
 - Keep both `target/fast` and `target/release`. Use full release builds for shipping or final performance measurements when needed. Do not use debug or additional custom profiles unless the user explicitly requests them.
 - Reuse the existing build cache. If another build holds Cargo's lock, wait or coordinate rather than creating another target directory. Worktrees must reuse the main checkout's target directory instead of creating another build cache.

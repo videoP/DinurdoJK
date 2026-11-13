@@ -87,6 +87,11 @@ impl App {
                     self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2());
                 if self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2() {
                     ui::append_jk2_ctf_images(&mut images);
+                } else if self.video.jk2_enhanced_flag_status != 0 {
+                    ui::append_flag_status_images(&mut images);
+                }
+                if self.japro_cg.spec_hud >= 2 {
+                    ui::append_broadcast_flag_images(&mut images);
                 }
                 ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
                 images }, self.extensions.hud_shaders.clone()));
@@ -316,6 +321,8 @@ impl App {
                         return;
                     }
                     self.game_session = None;
+                    self.clear_demo_console_history();
+                    self.clear_session_chatbox();
                     self.set_overlay(OverlayMode::Game);
                     self.publish_ui();
                 }
@@ -349,6 +356,9 @@ impl App {
             }
             self.combat_ui_was_active = active;
             self.drain_cgame_notices();
+            if let Some(elapsed_ms) = self.current_demo_elapsed_ms(now) {
+                self.sync_demo_console(elapsed_ms.floor() as i32);
+            }
             self.drain_siege_server_actions();
             // jaPRO calls CG_DoAsync at the end of each CGame frame, after
             // CG_DrawActive. Queue any due vstr now; it executes next App tick.

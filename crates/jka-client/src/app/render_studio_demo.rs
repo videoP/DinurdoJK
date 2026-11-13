@@ -550,6 +550,7 @@ impl StudioDemoSource {
         let target = clip.source_time_ms(time);
         let scene_view = observer.is_some();
         let session = &mut self.playback;
+        session.studio_camera_active = true;
         session.player_presenter.studio_fpls = fpls;
         session.studio_external_player_entities.clear();
         session.studio_external_player_entities.extend_from_slice(composite_entity_numbers);

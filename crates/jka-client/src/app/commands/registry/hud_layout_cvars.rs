@@ -1436,6 +1436,29 @@ app_cvars! {
         implementations: []
     }
 
+    APP_CG_HUDFLAGSTATUS {
+        runtime: CvarDef::new("cg_hudFlagStatus", "tl 0 0 1", "anchor x y scale",
+            "JK2/JKA CTF flag-status overlay layout (HUD Edit Mode).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.hud_layout.element(HudElementId::FlagStatus).to_config()),
+            |app, value| {
+                let layout = HudElementLayout::from_config(&value.to_string())
+                    .ok_or_else(|| "expected anchor x y scale".to_owned())?;
+                *app.hud_layout.element_mut(HudElementId::FlagStatus) = layout;
+                app.mark_config_dirty(); app.publish_ui(); Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(layout) = HudElementLayout::from_config(value) {
+                    *settings.hud_layout.element_mut(HudElementId::FlagStatus) = layout;
+                }
+            }),
+            archive: Some((815, |state| state.presentation.hud_layout.element(HudElementId::FlagStatus).to_config())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
     APP_CG_HUDKILLFEED {
         runtime: CvarDef::new("cg_hudKillFeed", "tl 0 0 1", "anchor x y scale", "KILL FEED layout (HUD Edit Mode).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.hud_layout.element(HudElementId::KillFeed).to_config()),

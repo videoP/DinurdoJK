@@ -534,7 +534,12 @@ impl App {
     }
 
     pub(in crate::app) fn cycle_renderer_backend(&mut self, direction: i32) {
+        #[cfg(target_os = "macos")]
+        const BACKENDS: [RendererBackend; 1] = [RendererBackend::Metal];
+        #[cfg(target_os = "windows")]
         const BACKENDS: [RendererBackend; 2] = [RendererBackend::Vulkan, RendererBackend::Dx12];
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        const BACKENDS: [RendererBackend; 1] = [RendererBackend::Vulkan];
         let current = BACKENDS
             .iter()
             .position(|backend| *backend == self.video.renderer_backend)

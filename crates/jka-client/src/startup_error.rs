@@ -6,7 +6,15 @@ use std::path::{Path, PathBuf};
 /// Everything the client needs beside the executable before anything else can
 /// run. Game assets are NOT checked here: missing game files are recoverable
 /// through the Asset Mapping screen.
+// Windows and Linux have different native Steam Audio dependencies.
+// Linux executables also link libphonon.so before main(); the release runner
+// configures an $ORIGIN RUNPATH so this bundled file can be loaded at startup.
+#[cfg(windows)]
 const REQUIRED_DEPENDENCIES: &[&str] = &["phonon.dll"];
+#[cfg(target_os = "linux")]
+const REQUIRED_DEPENDENCIES: &[&str] = &["libphonon.so"];
+#[cfg(all(not(windows), not(target_os = "linux")))]
+const REQUIRED_DEPENDENCIES: &[&str] = &[];
 
 /// Show `message` in a native dialog (and on stderr for console launches).
 pub(crate) fn show(message: &str) {
@@ -31,9 +39,10 @@ pub(crate) fn fatal(message: impl std::fmt::Display) -> std::process::ExitCode {
 pub(crate) fn verify_client_folder(install: &Path) -> Option<String> {
     let folder = install.join(jka_assets::pk3::DINURDOJK_DIRECTORY);
     let dependencies = folder.join("dependencies");
+    let executable_name = if cfg!(windows) { "DinurdoJK.exe" } else { "DinurdoJK" };
     let expect = |detail: String| Some(format!(
-        "{detail}\n\nThe '{name}' folder must be in the same folder as DinurdoJK.exe ({install}). \
-         Keep the executable together with its '{name}' folder (including dependencies), or reinstall/update.",
+        "{detail}\n\nThe '{name}' folder must be in the same folder as {executable_name} ({install}). \
+         Keep the executable together with its '{name}' folder, or reinstall/update.",
         name = jka_assets::pk3::DINURDOJK_DIRECTORY, install = install.display(),
     ));
     if !folder.is_dir() {

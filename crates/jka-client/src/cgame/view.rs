@@ -5,7 +5,7 @@
 //! `PlayerViewPolicyState`, then use the same third-person decision and local-player alpha rules.
 
 use super::PM_INTERMISSION;
-use crate::camera::ThirdPersonSettings;
+use crate::camera::{SpectatorCameraMode, ThirdPersonSettings};
 use jka_assets::animation::AnimationSet;
 use jka_movement::{PlayerEntityView, PM_SPECTATOR};
 use jka_protocol::server::PlayerState;
@@ -166,6 +166,22 @@ pub fn rendering_third_person(
     third_person
 }
 
+/// Spectator first-person selection is the preferred camera, not permission to
+/// bypass OpenJK's mandatory third-person saber/melee rule. JK2 weapon IDs
+/// have already been translated into JKA presentation IDs by this point.
+/// Keep this single decision shared by live follow, demos, and their entity
+/// visibility, so changing the camera never leaves the followed body hidden.
+pub fn rendering_spectator_third_person(
+    mode: SpectatorCameraMode,
+    first_person_lightsaber: bool,
+    weapon: i32,
+) -> bool {
+    const WP_MELEE: i32 = 2;
+    const WP_SABER: i32 = 3;
+    mode != SpectatorCameraMode::FirstPerson
+        || (!first_person_lightsaber && matches!(weapon, WP_MELEE | WP_SABER))
+}
+
 /// OpenJK `CG_CheckThirdPersonAlpha` writes `cg_thirdPersonAlpha` through the
 /// refEntity shaderRGBA byte. Match the original 8-bit alpha quantization.
 pub fn local_player_alpha(alpha: f32) -> f32 {
@@ -232,6 +248,43 @@ mod tests {
                 state,
             ));
         }
+    }
+
+    #[test]
+    fn spectator_first_person_requires_fpls_for_saber_and_melee() {
+        for weapon in [2, 3] {
+            assert!(rendering_spectator_third_person(
+                SpectatorCameraMode::FirstPerson, false, weapon,
+            ));
+            assert!(!rendering_spectator_third_person(
+                SpectatorCameraMode::FirstPerson, true, weapon,
+            ));
+        }
+    }
+
+    #[test]
+    fn spectator_camera_modes_and_other_weapons_are_preserved() {
+        for fpls in [false, true] {
+            for weapon in [0, 4, 5, 17] {
+                assert!(!rendering_spectator_third_person(
+                    SpectatorCameraMode::FirstPerson, fpls, weapon,
+                ));
+            }
+            for mode in [SpectatorCameraMode::ThirdPerson, SpectatorCameraMode::Orbit] {
+                for weapon in [0, 2, 3, 4] {
+                    assert!(rendering_spectator_third_person(mode, fpls, weapon));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jk2_saber_presentation_id_obeys_spectator_camera_policy() {
+        let saber = jka_protocol::jk2::presentation::presented_weapon(2).unwrap();
+        assert_eq!(saber, 3);
+        assert!(rendering_spectator_third_person(
+            SpectatorCameraMode::FirstPerson, false, saber,
+        ));
     }
 
     #[test]

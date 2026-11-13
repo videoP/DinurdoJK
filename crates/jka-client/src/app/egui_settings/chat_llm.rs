@@ -2,6 +2,7 @@
 //! (`cg_chatCensor*`, `cg_chatLlm*`, the prompts).
 use crate::app::egui_settings::{theme, App};
 use crate::chat_llm::{self as cl, engine, CensorAction, ModelState};
+use crate::app::chat_llm::ChatModelUse;
 
 /// Which prompt a text box edits.
 #[derive(Clone, Copy)]
@@ -51,17 +52,21 @@ impl App {
                 "Qwen3.5 4B, 2.7 GB",
             )
         };
+        ui.push_id(if translate { "translation_model" } else { "assist_model" }, |ui| {
         theme::row(
             ui,
             "Model address",
-            &format!("{cvar}. A link to a .gguf file, e.g. from Hugging Face. Empty uses the default ({default_name}). Press Enter to apply. The file is downloaded once into DinurdoJK/cache/models and stays in memory while the feature is on."),
+            &format!("A link to a .gguf file. Empty uses {default_name}. Apply only changes the selection and stops features using the previous model; it does not download anything."),
             theme::Reset::None,
             |ui| {
                 let edits = &mut self.chat_llm.edits;
                 let input = if translate { &mut edits.translate_url } else { &mut edits.assist_url };
                 let input = input.get_or_insert_with(|| saved.clone());
-                let response = ui.add(egui::TextEdit::singleline(input).hint_text(default).desired_width(330.0));
-                if response.lost_focus() && input.trim() != saved {
+                let width = (ui.available_width() - 90.0).clamp(80.0, 330.0);
+                let response = ui.add(egui::TextEdit::singleline(input).hint_text(default).desired_width(width));
+                let edited = input.trim() != saved;
+                let enter = response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if (ui.add_enabled(edited, egui::Button::new("APPLY")).clicked() || enter) && edited {
                     let value = input.trim().to_owned();
                     self.chat_llm.edits.note = self.set_console_cvar(cvar, &value).err();
                 }
@@ -70,30 +75,107 @@ impl App {
         let host = engine();
         let state = host.state(&active);
         let cached = host.cached(&active);
-        theme::row(
-            ui,
-            "Model",
-            "Download state of the model above. Remove deletes the file from the cache; it is fetched again when needed.",
-            theme::Reset::None,
-            |ui| {
+        // Use a growing panel: status text and actions must not compete for
+        // the fixed-height settings row's narrow control column.
+        egui::Frame::group(ui.style()).inner_margin(10.0).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
                 let label = match &state {
-                    ModelState::Idle if cached => "on disk, not loaded".to_owned(),
+                    ModelState::Idle if cached => "Downloaded · unloaded".to_owned(),
+                    ModelState::Idle => "Not downloaded · stopped".to_owned(),
+                    ModelState::Ready => "Loaded in system RAM · CPU".to_owned(),
                     other => other.describe(),
                 };
-                ui.label(egui::RichText::new(label).color(theme::TEXT_DIM()));
-                ui.add_space(8.0);
-                if matches!(state, ModelState::Idle | ModelState::Failed(_))
-                    && theme::ghost_button(ui, if cached { "LOAD" } else { "DOWNLOAD" }).clicked()
+                let color = match &state {
+                    ModelState::Ready => egui::Color32::from_rgb(94, 192, 128),
+                    ModelState::Loading | ModelState::Downloading { .. } => theme::WARNING(),
+                    ModelState::Failed(_) => theme::DANGER(),
+                    ModelState::Idle => theme::TEXT_DIM(),
+                };
+                let (icon, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
+                ui.painter().circle_filled(icon.center(), 3.5, color);
+                ui.label(egui::RichText::new(label).color(color));
+            });
+            if let ModelState::Downloading { done, total } = state {
+                let fraction = if total > 0 { (done as f64 / total as f64).clamp(0.0, 1.0) as f32 } else { 0.0 };
+                ui.add(egui::ProgressBar::new(fraction).show_percentage());
+            }
+            ui.horizontal_wrapped(|ui| {
+                if self.chat_model_in_use(&active)
+                    || matches!(state, ModelState::Ready | ModelState::Loading | ModelState::Downloading { .. })
                 {
-                    host.ensure(&active);
-                    self.chat_llm_configure();
+                    let stop = match state {
+                        ModelState::Downloading { .. } => "CANCEL DOWNLOAD & TURN OFF",
+                        ModelState::Loading => "CANCEL LOAD & TURN OFF",
+                        _ => "STOP & UNLOAD",
+                    };
+                    if ui.button(stop).clicked() {
+                        self.unload_chat_model(Some(&active));
+                    }
                 }
-                if cached && theme::ghost_button(ui, "REMOVE").clicked() {
+                if cached && ui.button("DELETE DOWNLOADED FILE...").clicked() {
+                    self.chat_llm.edits.delete_model = Some(active.clone());
+                }
+            });
+            ui.label(egui::RichText::new(if translate {
+                "Enable translation to use this model. Stop turns local translation off and keeps the downloaded file."
+            } else {
+                "Enable Filter chat or use quickRundown to use this model. Stop turns filtering off, cancels summaries and keeps the downloaded file."
+            }).small().color(theme::TEXT_DIM()));
+            if matches!(state, ModelState::Downloading { .. }) {
+                ui.label(egui::RichText::new("Cancel keeps the partial download. Enable the feature again to confirm and resume.").small());
+            }
+            if let Some(pending) = self.chat_llm.edits.download.as_ref().filter(|pending| {
+                pending.url == active && matches!(pending.usage, ChatModelUse::Translation(_)) == translate
+            }) {
+                let action = match pending.usage {
+                    ChatModelUse::Filter => "DOWNLOAD & ENABLE FILTER",
+                    ChatModelUse::Translation(_) => "DOWNLOAD & ENABLE TRANSLATION",
+                    ChatModelUse::Summary { .. } => "DOWNLOAD & SUMMARIZE",
+                };
+                let size = if active == cl::DEFAULT_TRANSLATE_URL { "about 1.1 GB" }
+                    else if active == cl::DEFAULT_ASSIST_URL { "about 2.7 GB" }
+                    else if active == cl::LIGHT_ASSIST_URL { "about 1.3 GB" }
+                    else { "size depends on the selected GGUF file" };
+                ui.separator();
+                ui.label(egui::RichText::new(format!("Download this model? {size}.")).color(theme::WARNING()));
+                ui.add(egui::Label::new(egui::RichText::new(&active).small()).wrap());
+                ui.label("The file is saved in DinurdoJK/cache/models. A partial file is resumed when the server supports it.");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(action).clicked() {
+                        self.confirm_chat_model_download();
+                    }
+                    if ui.button("CANCEL").clicked() {
+                        self.chat_llm.edits.download = None;
+                    }
+                });
+            } else if self.chat_model_in_use(&active) && matches!(state, ModelState::Idle) && !cached {
+                ui.label("Download required. Nothing will download until you confirm.");
+                if ui.button("REVIEW DOWNLOAD...").clicked() {
+                    let usage = if translate { ChatModelUse::Translation(self.chat_translation.settings.mode) } else { ChatModelUse::Filter };
+                    self.request_chat_model_download(usage);
+                }
+            }
+            if self.chat_llm.edits.delete_model.as_deref() == Some(active.as_str()) {
+                ui.separator();
+                ui.label("Delete this model from disk? This also stops features using it. Using it later will need a new download.");
+                let mut delete = false;
+                ui.horizontal_wrapped(|ui| {
+                    delete = ui.button("DELETE FILE & TURN OFF").clicked();
+                    if ui.button("KEEP FILE").clicked() {
+                        self.chat_llm.edits.delete_model = None;
+                    }
+                });
+                if delete {
+                    self.unload_chat_model(Some(&active));
                     self.chat_llm.edits.note = host.delete_cached(&active).err();
-                    self.chat_llm_configure();
                 }
-            },
-        );
+            }
+            if let Some(note) = &self.chat_llm.edits.note {
+                ui.label(egui::RichText::new(note).small().color(theme::DANGER()));
+            }
+        });
+        });
     }
 
     fn egui_chat_prompt(&mut self, ui: &mut egui::Ui, prompt: Prompt, label: &str, detail: &str) {
@@ -164,8 +246,28 @@ impl App {
         let settings = self.chat_llm.settings.clone();
         theme::row(
             ui,
+            "Filter model",
+            "cg_chatLlmModel. Accurate is Qwen3.5 4B: 2.7 GB of memory and about a second per message; it tells banter from abuse and follows the strictness setting. Light is Qwen3.5 2B: 1.3 GB and about half the time; it catches explicit words in any spelling but misjudges banter and barely reacts to strictness. Changing the selection cancels the old download and turns filtering off. It never starts a download. Enable Filter chat afterward to use the new selection.",
+            theme::Reset::None,
+            |ui| {
+                let light = settings.assist_url.trim() == cl::LIGHT_ASSIST_URL;
+                let accurate = settings.assist_url.trim().is_empty() || settings.assist_url.trim() == cl::DEFAULT_ASSIST_URL;
+                for (label, selected, value) in [("Accurate (4B)", accurate, ""), ("Light (2B)", light, cl::LIGHT_ASSIST_URL)] {
+                    if theme::chip(ui, label, selected).clicked() && !selected {
+                        self.chat_llm.edits.note = self.set_console_cvar("cg_chatLlmModel", value).err();
+                    }
+                    ui.add_space(3.0);
+                }
+                if !light && !accurate {
+                    ui.label(egui::RichText::new("custom").color(theme::TEXT_DIM()));
+                }
+            },
+        );
+        let settings = self.chat_llm.settings.clone();
+        theme::row(
+            ui,
             "Filter chat",
-            "cg_chatCensor. Downloads the model below once (2.7 GB, or 1.3 GB for the light one), then runs on the CPU. Nothing is sent anywhere.",
+            "Enable to use the selected model on the CPU. If its file is missing, you will be asked to confirm the download first. Stop & Unload below also cancels summaries and releases the model.",
             theme::Reset::None,
             |ui| {
                 if let Some(value) = theme::switch(ui, settings.censor) {
@@ -173,6 +275,7 @@ impl App {
                 }
             },
         );
+        self.egui_chat_model_rows(ui, false);
         if !engine().available() {
             theme::banner(ui, "This build has no local model runtime (built without local-llm).", theme::TEXT_DIM());
         }
@@ -236,26 +339,6 @@ impl App {
         );
         theme::row(
             ui,
-            "Filter model",
-            "cg_chatLlmModel. Accurate is Qwen3.5 4B: 2.7 GB of memory and about a second per message; it tells banter from abuse and follows the strictness setting. Light is Qwen3.5 2B: 1.3 GB and about half the time; it catches explicit words in any spelling but misjudges banter and barely reacts to strictness. Or paste any other model address below.",
-            theme::Reset::None,
-            |ui| {
-                let light = settings.assist_url.trim() == cl::LIGHT_ASSIST_URL;
-                let accurate = settings.assist_url.trim().is_empty() || settings.assist_url.trim() == cl::DEFAULT_ASSIST_URL;
-                for (label, selected, value) in [("Accurate (4B)", accurate, ""), ("Light (2B)", light, cl::LIGHT_ASSIST_URL)] {
-                    if theme::chip(ui, label, selected).clicked() && !selected {
-                        self.chat_llm.edits.note = self.set_console_cvar("cg_chatLlmModel", value).err();
-                    }
-                    ui.add_space(3.0);
-                }
-                if !light && !accurate {
-                    ui.label(egui::RichText::new("custom").color(theme::TEXT_DIM()));
-                }
-            },
-        );
-        self.egui_chat_model_rows(ui, false);
-        theme::row(
-            ui,
             "CPU threads",
             "cg_chatLlmThreads. Threads the chat models may use. Auto takes about a third of the cores.",
             theme::Reset::None,
@@ -284,7 +367,7 @@ impl App {
             ui,
             Prompt::Summary,
             "Summary prompt",
-            "Used by the quickRundown [minutes] [truth|cleanse] console command. {player} and {language} are filled in.",
+            "Used by the chatQRD [minutes] [truth|cleanse] console command. {player} and {language} are filled in.",
         );
         if let Some(note) = &self.chat_llm.edits.note {
             theme::hint(ui, note, theme::TEXT_DIM());

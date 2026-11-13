@@ -1349,11 +1349,17 @@ impl PlanarReflectionMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RendererBackend {
-    #[default]
     Vulkan,
     Dx12,
+    Metal,
+}
+
+impl Default for RendererBackend {
+    fn default() -> Self {
+        if cfg!(target_os = "macos") { Self::Metal } else { Self::Vulkan }
+    }
 }
 
 impl RendererBackend {
@@ -1361,6 +1367,7 @@ impl RendererBackend {
         match self {
             Self::Vulkan => "VULKAN",
             Self::Dx12 => "DX12",
+            Self::Metal => "METAL",
         }
     }
 
@@ -1368,13 +1375,15 @@ impl RendererBackend {
         match self {
             Self::Vulkan => "vulkan",
             Self::Dx12 => "dx12",
+            Self::Metal => "metal",
         }
     }
 
     pub fn from_config(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "vulkan" | "vk" => Some(Self::Vulkan),
-            "dx12" | "d3d12" | "directx12" => Some(Self::Dx12),
+            "metal" | "mtl" if cfg!(target_os = "macos") => Some(Self::Metal),
+            "vulkan" | "vk" if !cfg!(target_os = "macos") => Some(Self::Vulkan),
+            "dx12" | "d3d12" | "directx12" if cfg!(windows) => Some(Self::Dx12),
             _ => None,
         }
     }

@@ -1,5 +1,5 @@
 //! Declarative command handlers.
-use crate::app::{split_console_script, App, ChatMode, ConsoleCvarSetResult};
+use crate::app::{split_console_script, App, ConsoleCvarSetResult};
 
 use super::{CommandDef, CommandResult, CommandScope};
 
@@ -478,37 +478,24 @@ commands! {
     }
 
     cmd_say ["say", "say_team"] ("say <message>", "Send a global chat message: say <message>.", CommandScope::Always) |self, command| {
-        let words: Vec<_> = command.split_whitespace().collect();
-        if self.execute_game_command(command) {
-            return CommandResult::Handled;
+        if self.chat_unavailable() {
+            self.console_status = "^3Chat is only available on multiplayer servers".to_owned();
+            return CommandResult::Status;
         }
         if let Some((verb, message)) = command.split_once(char::is_whitespace) {
-            let message = message.trim();
-            if message.is_empty() {
+            if message.trim().is_empty() {
                 self.push_console_line(format!(
                     "^3{}^7 [command] - Message text is required.",
                     verb
                 ));
-            } else {
-                self.push_chat_line(
-                    if verb.eq_ignore_ascii_case("say_team") {
-                        ChatMode::Team
-                    } else {
-                        ChatMode::Global
-                    },
-                    message,
-                );
+                return CommandResult::Handled;
             }
-            self.publish_ui();
+            self.forward_command_to_server(command);
             return CommandResult::Handled;
         }
-        match words.as_slice() {
-            [verb] => {
-                self.console_status = format!("USAGE: {} <MESSAGE>", verb.to_ascii_uppercase());
-                CommandResult::Status
-            }
-            _ => return CommandResult::Unhandled,
-        }
+        let verb = command.trim();
+        self.console_status = format!("USAGE: {} <MESSAGE>", verb.to_ascii_uppercase());
+        CommandResult::Status
     }
 
     // OpenJK CL_ServerStatus_f: an engine-side OOB query, not a command sent

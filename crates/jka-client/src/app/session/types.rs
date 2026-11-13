@@ -133,6 +133,8 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) client_game: ClientGameState,
     /// Live-only, independently clocked remote-player visual snapshot ring.
     pub(in crate::app) remote_smoothing: crate::cgame::remote_smoothing::RemoteSmoothing,
+    /// Only fills short gaps between live follow snapshots, before camera damping.
+    pub(in crate::app) spectator_follow_hold: super::sampling::SpectatorFollowHold,
     pub(in crate::app) siege_catalog: jka_assets::siege::SiegeCatalog,
     pub(in crate::app) siege_classes: Vec<jka_assets::siege::SiegeClassVisual>,
     /// TaystJK `sxd` teammate stat-viewer cache. Entries are server-time stamped
@@ -189,6 +191,9 @@ pub(in crate::app) struct GameSession {
     pub(in crate::app) studio_external_player_entities: Vec<u16>,
     /// Render Studio "Hide other players": only these clients are presented.
     pub(in crate::app) studio_visible_players: Option<Vec<u16>>,
+    /// Studio follow camera is explicitly authored, even when there is no
+    /// observer override and studio_presentation_view is None.
+    pub(in crate::app) studio_camera_active: bool,
     /// Current Studio observer, supplied before camera-dependent presentation.
     /// Unlike gameplay's previous-frame camera hint, this survives teleports.
     pub(in crate::app) studio_presentation_view: Option<crate::cgame::player_presenter::Ghoul2PresentationView>,

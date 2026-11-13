@@ -103,7 +103,7 @@ pub(in crate::renderer) enum GpuPass {
     BlueWaterAtmoTables = 47,
     BlueWaterEnvironment = 48,
     BlueWaterAerialBuild = 49,
-    // Live river (riversource) diagnostics. RiverSim is the whole per-frame
+    // Live river (spawnriver) diagnostics. RiverSim is the whole per-frame
     // river compute (FFT detail, solver frames, window gather, material,
     // foam); it is encoded inside the OceanSim interval when an ocean exists,
     // so it stays out of the fallback frame sum. RiverSolve is nested in

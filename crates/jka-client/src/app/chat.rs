@@ -1,5 +1,5 @@
 //! Chat.
-use crate::app::{App, ChatMode, ChatPlayerCompletionCycle, ChatRecord, Instant, OverlayMode};
+use crate::app::{App, ChatMode, ChatPlayerCompletionCycle, Instant, OverlayMode};
 
 /// TaystJK `Message_Key` wire sanitization. JKA reliable commands are tokenized
 /// text, so a literal double quote cannot safely be embedded inside the quoted
@@ -64,7 +64,16 @@ impl App {
         Ok(target.len() != before)
     }
 
+    /// Only a connected multiplayer server can receive chat. Demo playback,
+    /// in-process solo games, and the menus must never manufacture local chat.
+    pub(in crate::app) fn chat_unavailable(&self) -> bool {
+        !self.live_connected()
+    }
+
     pub(in crate::app) fn begin_chat(&mut self, mode: ChatMode) {
+        if self.chat_unavailable() {
+            return;
+        }
         self.chat_mode = mode;
         self.chat_input.clear();
         self.chat_player_completion = None;
@@ -130,43 +139,6 @@ impl App {
         if let Err(error) = self.queue_server_command(&format!("tell {client} {safe}")) {
             self.push_console_line(format!("^1tell:^7 {error}"));
         }
-    }
-
-    pub(in crate::app) fn push_chat_line(&mut self, mode: ChatMode, message: &str) {
-        let rendered = match mode {
-            // Match JKA/OpenJK chat coloring: the name/punctuation finish in
-            // white, then the server inserts the chat-mode color before text.
-            ChatMode::Global => format!("^7YOU:^2 {message}"),
-            ChatMode::Team => format!("^5(TEAM) ^7YOU:^5 {message}"),
-            ChatMode::Direct(client) => format!("^6(TO #{client}) ^7YOU:^6 {message}"),
-        };
-        // A solo `say` never round-trips through a server `chat`/`tchat`
-        // command, so the CG_ServerCommand beep has to be played here.
-        let kind = match mode {
-            ChatMode::Global => crate::cgame::ChatKind::Say,
-            ChatMode::Team => crate::cgame::ChatKind::Team,
-            ChatMode::Direct(_) => crate::cgame::ChatKind::Say,
-        };
-        self.play_chat_sound(kind, &rendered);
-        if matches!(mode, ChatMode::Team) {
-            self.push_console_team_chat_line(rendered.clone());
-        } else {
-            self.push_console_line(rendered.clone());
-        }
-        if self.chat_lines.len() >= crate::app::chat_anim::KEEP_LINES {
-            self.chat_lines.pop_front();
-        }
-        let now = Instant::now();
-        self.chat_lines.push_back(ChatRecord {
-            text: rendered,
-            team: matches!(mode, ChatMode::Team),
-            created: now,
-            demo_elapsed_ms: self.current_demo_elapsed_ms(now),
-            chat_id: None,
-            translation: None,
-            censor: None,
-        });
-        self.last_chat_refresh = Instant::now();
     }
 
     /// Names of every connected client except the local player, colour codes intact.
@@ -251,6 +223,14 @@ impl App {
     }
 
     pub(in crate::app) fn submit_chat(&mut self) {
+        // An input opened while connected cannot be submitted after a
+        // disconnect or transition to a demo or in-process solo game.
+        if self.chat_unavailable() {
+            self.chat_input.clear();
+            self.chat_player_completion = None;
+            self.set_overlay(OverlayMode::None);
+            return;
+        }
         self.chat_player_completion = None;
         let message = std::mem::take(&mut self.chat_input);
         if !message.is_empty() {
@@ -258,16 +238,10 @@ impl App {
             // generic unquoted command path. Do not trim the field: the stock
             // edit field preserves leading/trailing spaces inside the quoted
             // say argument.
-            if self.live_connected() {
-                // As with TaystJK, only the server echoes the `tell` (or say).
-                self.forward_command_to_server(&taystjk_chat_command(self.chat_mode, &message));
-            } else {
-                // The solo shim has no server command round-trip.
-                self.push_chat_line(self.chat_mode, &taystjk_chat_wire_text(&message));
-            }
+            // The server is the sole source of authoritative chat echoes.
+            self.forward_command_to_server(&taystjk_chat_command(self.chat_mode, &message));
         }
-        // set_overlay publishes the retained UI once; the new chat line is
-        // already included in that snapshot, so avoid a duplicate full publish.
+        // Closing the chat overlay publishes the cleared input once.
         self.set_overlay(OverlayMode::None);
     }
 

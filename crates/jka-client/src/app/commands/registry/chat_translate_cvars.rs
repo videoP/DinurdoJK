@@ -12,6 +12,12 @@ app_cvars! {
             |app: &App| CvarValue::Int(app.chat_translation.settings.mode.index()),
             |app, value| {
                 let CvarValue::Int(v) = value else { unreachable!("validated cvar type") };
+                if v != 0 && app.chat_translation.settings.provider == ct::ProviderKind::Local
+                    && !app.chat_model_can_start(app.chat_llm.settings.translate_model())
+                {
+                    app.request_chat_model_download(crate::app::chat_llm::ChatModelUse::Translation(ct::Mode::from_index(v)));
+                    return Ok(());
+                }
                 app.chat_translation.settings.mode = ct::Mode::from_index(v);
                 app.chat_translation_settings_changed();
                 Ok(())
@@ -83,6 +89,13 @@ app_cvars! {
             |app, value| {
                 let provider = ct::ProviderKind::from_name(&value.to_string())
                     .ok_or_else(|| "cg_chatTranslateProvider expects mymemory, deepl, libretranslate or local".to_owned())?;
+                if provider != app.chat_translation.settings.provider
+                    && (provider == ct::ProviderKind::Local || app.chat_translation.settings.provider == ct::ProviderKind::Local)
+                {
+                    let old = app.chat_llm.settings.translate_model().to_owned();
+                    app.unload_chat_model(Some(&old));
+                    app.chat_translation.settings.mode = ct::Mode::Off;
+                }
                 app.chat_translation.settings.provider = provider;
                 app.chat_translation.key_note = None;
                 app.chat_translation_settings_changed();

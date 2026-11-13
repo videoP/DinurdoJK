@@ -21,6 +21,7 @@ pub fn build_vertices(
     if width == 0 || height == 0 {
         return Vec::new();
     }
+    let _nwh_scope = super::text::NwhColorScope::enter(ui.jk2_mode && ui.nwh_hex_colors);
     let mut out = Vec::with_capacity(16_384);
     if ui.startup_splash {
         build_splash_background(&mut out, width, height, splash_size.filter(|_| ui.startup_splash_art));
@@ -149,6 +150,7 @@ pub fn build_dynamic_static_vertices(
     width: u32,
     height: u32,
 ) {
+    let _nwh_scope = super::text::NwhColorScope::enter(ui.jk2_mode && ui.nwh_hex_colors);
     if !gameplay_hud_visible(ui, width, height) {
         return;
     }
@@ -170,6 +172,7 @@ pub fn build_dynamic_static_vertices(
 /// Hot movement-driven HUD geometry. Strafehelper and MovementKeys are the only
 /// legacy-HUD pieces that need to follow every new input/simulation snapshot.
 pub fn build_movement_vertices(out: &mut Vec<UiVertex>, ui: &UiSnapshot, width: u32, height: u32) {
+    let _nwh_scope = super::text::NwhColorScope::enter(ui.jk2_mode && ui.nwh_hex_colors);
     if !gameplay_hud_visible(ui, width, height) {
         return;
     }
@@ -188,6 +191,7 @@ pub fn build_transient_vertices(
     width: u32,
     height: u32,
 ) {
+    let _nwh_scope = super::text::NwhColorScope::enter(ui.jk2_mode && ui.nwh_hex_colors);
     // A 1x1 renderer placeholder can be used while Render Studio sources or
     // output settings are initialized. Defer all transient HUD layout until
     // there is a usable viewport (especially docked chat's width constraints).
@@ -222,14 +226,14 @@ pub fn build_transient_vertices(
         draw_placed(out, ui, HudElementId::CrosshairName, width, height, |out| {
             build_crosshair_name(out, ui, small_font, width, height);
         });
-        if ui.jk2_mode && ui.video.hud_style == 1 {
-            // Animated chrome was drawn behind the status HUD in the stable batch;
-            // only source icons and labels overlay it here.
-            build_force_select(out, ui, small_font, width, height);
+        build_force_select(out, ui, small_font, width, height);
+        if ui.jk2_mode {
+            // The protocol, not the status-HUD style, determines selector IDs.
+            // JK2 WP_SABER=2 / WP_TRIP_MINE=12 are JKA melee / thermal IDs.
+            // Retail-only animated prongs remain in the stable batch above.
             crate::ui::hud::jk2_retail::build_weapon_select(out, ui, small_font, width, height);
             crate::ui::hud::jk2_retail::build_inventory_select(out, ui, small_font, width, height);
         } else {
-            build_force_select(out, ui, small_font, width, height);
             build_weapon_select(out, ui, small_font, width, height);
             build_inventory_select(out, ui, small_font, width, height);
         }
@@ -241,8 +245,15 @@ pub fn build_transient_vertices(
             build_follow_indicator(out, ui, small_font, width, height);
         });
         build_team_overlay(out, ui, small_font, width, height);
+        // JK2 and JKA use the same CTF flag-status placement. While specHud
+        // cards are active they own flag information; don't draw the separate
+        // overlay or leave a second moveable element on screen.
+        if ui.spectator_broadcast.is_none() {
+            draw_placed(out, ui, HudElementId::FlagStatus, width, height, |out| {
+                crate::ui::hud::jk2_retail::build_enhanced_flag_status(out, ui, small_font, width, height);
+            });
+        }
         if ui.jk2_mode {
-            crate::ui::hud::jk2_retail::build_enhanced_flag_status(out, ui, small_font, width, height);
             crate::ui::hud::jk2_retail::build_persistent_inventory(out, ui, width, height);
         }
         super::broadcast::draw(out, ui, small_font, width, height);
@@ -326,6 +337,62 @@ pub fn build_transient_vertices(
 #[cfg(test)]
 mod draw2d_tests {
     use super::*;
+
+    #[test]
+    fn jk2_custom_hud_uses_jk2_weapon_and_inventory_icons() {
+        use crate::ui::{
+            hud::extensions::EXT_IMAGE_TEXTURE_SOURCE,
+            hud::movement::ICON_TEXTURE_SOURCE,
+            UiInventorySelect, UiWeaponSelect,
+        };
+        let mut ui = UiSnapshot::default();
+        ui.jk2_mode = true;
+        ui.video.hud_style = 0; // Custom status panels, not native retail HUD.
+        ui.crosshair.style = 0;
+        crate::ui::append_native_hud_images(&mut ui.extension_images, 0, true);
+        assert!(ui.extension_images.iter().any(|name| name == "gfx/hud/w_icon_lightsaber"));
+        assert!(ui.extension_images.iter().any(|name| name == "gfx/hud/w_icon_tripmine"));
+
+        for weapon in [2, 12] { // JK2 saber and trip mine; JKA calls these melee/thermal.
+            ui.weapon_select = Some(UiWeaponSelect {
+                selected: weapon, owned_bits: 1 << weapon,
+                selectable_bits: 1 << weapon, ammo_available_bits: 1 << weapon,
+                saber_style: 1, remaining_ms: 1000,
+            });
+            let mut vertices = Vec::new();
+            build_transient_vertices(&mut vertices, &ui, None, 1280, 720);
+            assert!(vertices.iter().any(|v| v.textured == EXT_IMAGE_TEXTURE_SOURCE),
+                "JK2 weapon {weapon} did not draw native icon artwork");
+            assert!(!vertices.iter().any(|v| v.textured == ICON_TEXTURE_SOURCE),
+                "JK2 weapon {weapon} passed through the JKA icon atlas");
+        }
+        ui.weapon_select = None;
+        ui.inventory_select = Some(UiInventorySelect {
+            selected: 3, owned_bits: 1 << 3, remaining_ms: 1000,
+        });
+        let mut vertices = Vec::new();
+        build_transient_vertices(&mut vertices, &ui, None, 1280, 720);
+        assert!(vertices.iter().any(|v| v.textured == EXT_IMAGE_TEXTURE_SOURCE),
+            "JK2 inventory selector did not draw native artwork");
+        assert!(!vertices.iter().any(|v| v.textured == ICON_TEXTURE_SOURCE),
+            "JK2 inventory tags passed through the JKA icon atlas");
+    }
+
+    #[test]
+    fn jka_custom_hud_keeps_jka_weapon_icon_atlas() {
+        let mut ui = UiSnapshot::default();
+        ui.video.hud_style = 0;
+        ui.crosshair.style = 0;
+        ui.weapon_select = Some(crate::ui::UiWeaponSelect {
+            selected: 3, owned_bits: 1 << 3,
+            selectable_bits: 1 << 3, ammo_available_bits: 1 << 3,
+            saber_style: 1, remaining_ms: 1000,
+        });
+        let mut vertices = Vec::new();
+        build_transient_vertices(&mut vertices, &ui, None, 1280, 720);
+        assert!(vertices.iter().any(|v| v.textured == crate::ui::hud::movement::ICON_TEXTURE_SOURCE));
+        assert!(!vertices.iter().any(|v| v.textured == crate::ui::hud::extensions::EXT_IMAGE_TEXTURE_SOURCE));
+    }
 
     #[test]
     fn transient_ui_skips_placeholder_viewports_used_during_renderer_init() {
@@ -440,6 +507,41 @@ mod draw2d_tests {
         ui.scoreboard = None;
         let console_only = build_vertices(&ui, 1920, 1080, None, None).len();
         assert!(with_scoreboard > console_only);
+    }
+
+    #[test]
+    fn broadcast_suppresses_native_vitals_even_without_an_observed_player() {
+        use crate::extensions::NativeHud;
+        use crate::ui::SpectatorBroadcastUi;
+        let mut ui = UiSnapshot::default();
+        ui.hud = Some(crate::ui::HudState {
+            health: 100, max_health: 100, armor: 50,
+            force_power: Some(75), force_power_max: 100, ammo: Some(30),
+            ..Default::default()
+        });
+        let native_count = |ui: &UiSnapshot| {
+            let mut vertices = Vec::new();
+            build_dynamic_static_vertices(&mut vertices, ui, 1920, 1080);
+            vertices.len()
+        };
+        let unmodified = native_count(&ui);
+        assert!(unmodified > 0);
+        ui.spectator_broadcast = Some(SpectatorBroadcastUi {
+            team_scores: [0, 0], game_type: 8, clock: None, score_limit: None,
+            players: Vec::new(), observed: None, scanning: true,
+            map_mode: 0, minimap: None, camera: None,
+        });
+        assert!(ui.spectator_broadcast.as_ref().unwrap().replaces_native_vitals());
+        for element in [NativeHud::Health, NativeHud::Shield, NativeHud::Ammo, NativeHud::Force] {
+            assert!(ui.native_replaced(element));
+        }
+        assert!(!ui.native_replaced(NativeHud::Speedometer));
+        assert_eq!(native_count(&ui), 0);
+        // A probe completing must not make the status HUD come back either.
+        ui.spectator_broadcast.as_mut().unwrap().scanning = false;
+        assert_eq!(native_count(&ui), 0);
+        ui.spectator_broadcast = None;
+        assert_eq!(native_count(&ui), unmodified);
     }
 
     #[test]

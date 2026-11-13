@@ -12,6 +12,21 @@ impl App {
         let settings = self.chat_translation.settings.clone();
         theme::row(
             ui,
+            "Service",
+            "cg_chatTranslateProvider. MyMemory is free without a key (limited characters per day). DeepL needs a free or paid API key. LibreTranslate is a server you run or choose. Selecting Local model stops translation. Enable translation afterward to load its cached model or confirm a download (about 1.1 GB).",
+            theme::Reset::None,
+            |ui| {
+                for provider in ProviderKind::ALL {
+                    if theme::chip(ui, provider.label(), settings.provider == provider).clicked() && settings.provider != provider {
+                        let _ = self.set_console_cvar("cg_chatTranslateProvider", provider.name());
+                    }
+                    ui.add_space(3.0);
+                }
+            },
+        );
+        let settings = self.chat_translation.settings.clone();
+        theme::row(
+            ui,
             "Translate chat",
             "cg_chatTranslate. Off sends nothing anywhere. Manual translates only messages you pick in the console. Automatic translates every message detected as another language.",
             theme::Reset::None,
@@ -25,6 +40,9 @@ impl App {
             },
         );
         if settings.mode == Mode::Off {
+            if settings.provider == ProviderKind::Local {
+                self.egui_chat_local_translation_settings(ui);
+            }
             return;
         }
         let sent_to = match settings.provider {
@@ -69,20 +87,6 @@ impl App {
                 for (display, label) in [(Display::Translated, "Translated"), (Display::Both, "Both"), (Display::Original, "Original")] {
                     if theme::chip(ui, label, settings.display == display).clicked() && settings.display != display {
                         let _ = self.set_console_cvar("cg_chatTranslateDisplay", &display.index().to_string());
-                    }
-                    ui.add_space(3.0);
-                }
-            },
-        );
-        theme::row(
-            ui,
-            "Service",
-            "cg_chatTranslateProvider. MyMemory is free without a key (limited characters per day). DeepL needs a free or paid API key. LibreTranslate is a server you run or choose. Local model downloads a translation model once (about 1.1 GB) and runs it on this computer.",
-            theme::Reset::None,
-            |ui| {
-                for provider in ProviderKind::ALL {
-                    if theme::chip(ui, provider.label(), settings.provider == provider).clicked() && settings.provider != provider {
-                        let _ = self.set_console_cvar("cg_chatTranslateProvider", provider.name());
                     }
                     ui.add_space(3.0);
                 }

@@ -54,7 +54,7 @@ video_cvars! {
     |app| { app.mark_config_dirty(); app.publish_ui(); };
 
     JK2_ENHANCED_FLAGS, APP_JK2_ENHANCED_FLAGS, "cg_enhancedFlagStatus", "2", "0|1|2",
-    "MVSDK JK2 CTF: 0 off, 1 flag icons/carriers, 2 also show carry time. Supports the optional yellow/TEAM_FREE flag.",
+    "JK2/JKA CTF: 0 off, 1 flag icons/carriers, 2 also show carry time. JK2 MVSDK also supports the optional yellow flag.",
     CvarType::Int { min: 0, max: 2 }, Int, jk2_enhanced_flag_status, |value: i32| value as u8,
     |app| { app.mark_config_dirty(); app.publish_ui(); };
 

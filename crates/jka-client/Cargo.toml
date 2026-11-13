@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "DinurdoJK"
 version = "0.1.0"
 edition.workspace = true
@@ -58,7 +58,7 @@ serde = { version = "=1.0.228", features = ["derive"] }
 toml = "=0.9.8"
 rapier3d = "=0.35.3"
 rapier-cloth-core = { path = "../jka-cloth-core" }
-wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "spirv", "dx12", "vulkan"] }
+wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "spirv", "dx12", "vulkan", "metal"] }
 naga = { version = "=30.0.0", features = ["wgsl-in", "spv-out", "spv-in"] }
 winit = "=0.30.13"
 # NVIDIA DLAA (feature nvidia-dlss). Building it needs the DLSS SDK 310.9.1,
@@ -69,7 +69,7 @@ uuid = { version = "=1.26.1", optional = true }
 [features]
 default = ["local-llm"]
 # In-process llama.cpp (CPU) for local chat translation, the chat filter and
-# quickRundown. Building it needs CMake and libclang; `--no-default-features`
+# chatQRD. Building it needs CMake and libclang; `--no-default-features`
 # builds the client without it and those features report that it is missing.
 local-llm = ["jka-llm/llama"]
 # Opt-in: `build.ps1 -Fast -Dlss` (see DLAA_VULKAN.md).

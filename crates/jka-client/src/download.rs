@@ -211,6 +211,38 @@ pub fn server_allows_udp(serverinfo: &[u8], jk2: bool) -> bool {
     }
 }
 
+/// TaystJK CL_InitDownloads: a server which explicitly sets
+/// sv_allowDownload=0 and does not enable sv_httpDownloads must not trigger
+/// a referenced-PK3 download prompt. Absent keys do *not* mean a refusal.
+/// This is intentionally separate from whether an actual transport is usable.
+pub fn server_disallows_downloads(serverinfo: &[u8]) -> bool {
+    info_value(serverinfo, b"sv_allowDownload")
+        .is_some_and(|value| !value.is_empty() && jka_protocol::commands::atoi(value) == 0)
+        && info_value(serverinfo, b"sv_httpDownloads")
+            .is_none_or(|value| jka_protocol::commands::atoi(value) == 0)
+}
+
+/// The transports DinurdoJK can actually use after applying TaystJK's
+/// server-side download gate, the client's preferences, and HTTP discovery.
+/// An advertised sv_httpDownloads=1 is not an endpoint by itself.
+pub fn available_download_transports(
+    serverinfo: &[u8],
+    jk2: bool,
+    http_endpoint_advertised: bool,
+    client_http: bool,
+    client_legacy: bool,
+) -> (bool, bool) {
+    if server_disallows_downloads(serverinfo) {
+        return (false, false);
+    }
+    let server_http = jk2 || info_value(serverinfo, b"sv_httpDownloads")
+        .is_none_or(|value| jka_protocol::commands::atoi(value) != 0);
+    (
+        client_http && http_endpoint_advertised && server_http,
+        client_legacy && server_allows_udp(serverinfo, jk2),
+    )
+}
+
 /// TaystJK advertises its usable HTTP endpoint in the connectionless
 /// `infoResponse`: `mvhttp` is the actual bound TCP port on the game-server
 /// host, while `mvhttpurl` is an external absolute `http://` root.  The server
@@ -557,6 +589,35 @@ mod tests {
         assert!(server_allows_udp(b"", false));
         assert!(server_allows_udp(br"\sv_allowDownload\1", true));
         assert!(!server_allows_udp(br"\sv_allowDownload\0", false));
+    }
+
+    #[test]
+    fn taystjk_server_download_gate_and_available_transports() {
+        // Retail base JKA: the server has referenced extra map PK3s but
+        // explicitly disables downloads (and does not advertise HTTP).
+        let retail = br"\sv_allowDownload\0";
+        assert!(server_disallows_downloads(retail));
+        assert!(server_disallows_downloads(br"\sv_allowDownload\0\sv_httpDownloads\0"));
+        assert_eq!(available_download_transports(retail, false, false, true, true), (false, false));
+        assert_eq!(available_download_transports(retail, false, true, true, true), (false, false));
+        // An explicitly enabled HTTP path is independent of disabled UDP.
+        let http_only = br"\sv_allowDownload\0\sv_httpDownloads\1";
+        assert!(!server_disallows_downloads(http_only));
+        assert_eq!(available_download_transports(http_only, false, true, true, true), (true, false));
+        assert_eq!(available_download_transports(http_only, false, false, true, true), (false, false));
+        // Legacy UDP is offered when enabled by the server.
+        let udp = br"\sv_allowDownload\1\sv_httpDownloads\0";
+        assert!(!server_disallows_downloads(udp));
+        assert_eq!(available_download_transports(udp, false, false, true, true), (false, true));
+        assert_eq!(available_download_transports(udp, false, false, true, false), (false, false));
+        // TaystJK intentionally does NOT interpret absent cvars as refusal.
+        assert!(!server_disallows_downloads(b""));
+        assert_eq!(available_download_transports(b"", false, false, false, true), (false, true));
+        // JK2's legacy path still needs an explicit server approval.
+        assert_eq!(available_download_transports(b"", true, false, true, true), (false, false));
+        assert_eq!(available_download_transports(br"\sv_allowDownload\1", true, false, true, true), (false, true));
+        // Client download settings must still be respected.
+        assert_eq!(available_download_transports(udp, false, true, false, false), (false, false));
     }
 
     #[test]

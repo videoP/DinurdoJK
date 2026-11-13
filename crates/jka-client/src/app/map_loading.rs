@@ -567,7 +567,7 @@ impl App {
         ui.connection_prompt = if let Some(prompt) = self.missing_map_prompt.as_ref() {
             Some(crate::ui::loading_layout::ConnectionPromptUi::MissingMap {
                 map_name: prompt.map_name.clone(), reason: prompt.reason.clone(),
-                can_download: self.network.allow_http_downloads || self.network.allow_legacy_downloads,
+                can_download: self.live_can_autodownload(),
             })
         } else {
             self.server_password_prompt.as_ref().map(|prompt| {

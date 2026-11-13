@@ -27,9 +27,13 @@ fn wrap(txt: &UiText, value: &str, px: f32, max_width: f32) -> Vec<String> {
         }
         // Remember the last colour code seen, for the continuation line.
         let bytes = word.as_bytes();
-        for i in 0..bytes.len().saturating_sub(1) {
-            if bytes[i] == b'^' && bytes[i + 1].is_ascii_alphanumeric() {
-                colour = format!("^{}", bytes[i + 1] as char);
+        let mut at = 0;
+        while at < bytes.len() {
+            if let Some((skip, _)) = crate::ui::color_escape(bytes, at, 1.0) {
+                colour = word[at..at + skip].to_owned();
+                at += skip;
+            } else {
+                at += 1;
             }
         }
     }

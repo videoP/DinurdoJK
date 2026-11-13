@@ -313,7 +313,7 @@ app_cvars! {
         runtime: CvarDef::new(
                 "r_backend",
                 "",
-                "vulkan|dx12",
+                if cfg!(target_os = "macos") { "metal" } else if cfg!(windows) { "vulkan|dx12" } else { "vulkan" },
                 "Graphics backend selected for the next vid_restart.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
@@ -326,7 +326,7 @@ app_cvars! {
                 Some(|name, value| {
                     RendererBackend::from_config(value)
                         .map(|backend| backend.config_value().to_owned())
-                        .ok_or_else(|| format!("{name}: expected vulkan or dx12"))
+                        .ok_or_else(|| format!("{name}: expected {}", if cfg!(target_os = "macos") { "metal" } else if cfg!(windows) { "vulkan or dx12" } else { "vulkan" }))
                 }),
             ),
         config: CvarBinding {
@@ -355,7 +355,7 @@ app_cvars! {
                 fn cvar_set_r_backend(&mut self, name: &str, value: &str) -> Result<(), String> {
                     {
                         self.video.renderer_backend = RendererBackend::from_config(value)
-                            .ok_or_else(|| format!("{name}: expected vulkan or dx12"))?;
+                            .ok_or_else(|| format!("{name}: expected {}", if cfg!(target_os = "macos") { "metal" } else if cfg!(windows) { "vulkan or dx12" } else { "vulkan" }))?;
                         self.mark_config_dirty();
                         self.console_status = format!(
                             "RENDER BACKEND: {} (RUN VID_RESTART TO APPLY)",

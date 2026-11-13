@@ -897,10 +897,56 @@ mod platform {
     use super::*;
     use std::io::{BufRead, BufReader};
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn unix_https_get(url: &str, headers: &[(String, String)], max_bytes: usize) -> Result<HttpResponse, String> {
+        use std::{io::Read, process::{Command, Stdio}};
+        if !url.starts_with("https://") || url.bytes().any(|b| b.is_ascii_control()) {
+            return Err("race-ghost HTTPS URL is invalid".into());
+        }
+        // Do not follow redirects (the Windows path also refuses them), and
+        // never invoke a shell. The caller validates origin and allowed paths.
+        let mut command = Command::new("/usr/bin/curl");
+        command.args(["--silent", "--show-error", "--max-redirs", "0", "--proto", "=https",
+            "--connect-timeout", "15", "--max-time", "120", "--header", "Accept-Encoding: identity",
+            "--dump-header", "-", "--output", "-", "--url", url]);
+        for (name, value) in headers {
+            if !valid_header_value(value) || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                return Err("invalid race-ghost request header".into());
+            }
+            command.arg("--header").arg(format!("{name}: {value}"));
+        }
+        let mut child = command.stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().map_err(|e| format!("run system curl: {e}"))?;
+        let result = (|| -> Result<HttpResponse, String> {
+            const MAX_HEADERS: usize = 32 * 1024;
+            let mut reader = child.stdout.take().ok_or("curl stdout unavailable")?;
+            let mut bytes = Vec::new();
+            reader.take(max_bytes as u64 + MAX_HEADERS as u64 + 1)
+                .read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+            if bytes.len() > max_bytes + MAX_HEADERS { return Err("ghost HTTP response exceeds limit".into()); }
+            let split = bytes.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                .ok_or("ghost HTTPS response missing headers")?;
+            if split > MAX_HEADERS { return Err("ghost HTTPS headers too large".into()); }
+            let raw_headers = std::str::from_utf8(&bytes[..split]).map_err(|_| "bad ghost HTTPS headers")?;
+            let status = raw_headers.lines().next().and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|s| s.parse::<u16>().ok()).ok_or("invalid ghost HTTPS status")?;
+            let body = bytes[split + 4..].to_vec();
+            if body.len() > max_bytes { return Err("ghost HTTPS body too large".into()); }
+            Ok(HttpResponse {status, headers: parse_header_lines(raw_headers), body})
+        })();
+        if result.is_err() { let _ = child.kill(); }
+        let waited = child.wait().map_err(|e| e.to_string())?;
+        if !waited.success() { return Err(format!("ghost HTTPS curl failed: {waited}")); }
+        result
+    }
+
     pub(super) fn http_get(url: &str, headers: &[(String, String)], max_bytes: usize) -> Result<HttpResponse, String> {
         let parsed = parse_url(url)?;
         if parsed.secure {
-            return Err("HTTPS race-ghost downloads currently use Windows WinHTTP; this build only has the plain HTTP fallback".to_owned());
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            return unix_https_get(url, headers, max_bytes);
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            return Err("HTTPS race-ghost downloads unsupported on this platform".to_owned());
         }
         let mut stream = TcpStream::connect((parsed.host.as_str(), parsed.port))
             .map_err(|error| format!("HTTP connect to {}:{} failed: {error}", parsed.host, parsed.port))?;

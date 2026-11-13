@@ -38,6 +38,11 @@ impl App {
             Shield | Force => self.video.draw_hud && self.video.hud_style == 0,
             Score => self.video.draw_hud && self.draw_score != 0,
             MiniScores => self.draw_scores != 0,
+            FlagStatus => self.video.jk2_enhanced_flag_status != 0
+                && !(self.japro_cg.spec_hud >= 2
+                    && (self.demo_playback_active() || self.live_spec_hud_eligible()))
+                && self.game_session.as_ref().is_some_and(|session|
+                    matches!(session.client_game.gametype(), 8 | 9)),
             EnemyInfo => self.draw_enemy_info,
             MovementKeys => self.movement_keys_hud.mode != 0,
             Fps => self.video.draw_fps != 0,
@@ -79,10 +84,14 @@ impl App {
         let console_lines: Vec<String> = visible_rows.iter().map(|row| {
             super::console_state::console_colored_fragment(
                 &self.console_lines[row.line], row.start_col, row.end_col,
+                self.console_nwh_hex_colors(),
             )
         }).collect();
         let console_line_kinds: Vec<crate::logging::ConsoleLineKind> = visible_rows.iter()
             .map(|row| self.console_line_kinds.get(row.line).copied().unwrap_or_default())
+            .collect();
+        let console_demo_rows: Vec<bool> = visible_rows.iter()
+            .map(|row| self.console_demo_source.get(row.line).is_some_and(|source| source.is_some()))
             .collect();
         let console_translate_checked: Vec<Option<bool>> = if self.overlay == OverlayMode::Console
             && !self.console_hl2
@@ -220,6 +229,7 @@ impl App {
 
         let mut snapshot = UiSnapshot {
             jk2_mode: self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2(),
+            nwh_hex_colors: self.console_nwh_hex_colors(),
             falling_death_fade: self.falling_death_alpha(),
             falling_death_active: self.falling_death.is_some(),
             studio_race: None,
@@ -234,6 +244,7 @@ impl App {
             console_status: self.console_status.clone(),
             console_lines,
             console_line_kinds,
+            console_demo_rows,
             console_translate_checked,
             console_scroll: 0,
             console_size: self.console_size,
@@ -299,6 +310,11 @@ impl App {
                     self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2());
                 if self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2() {
                     ui::append_jk2_ctf_images(&mut images);
+                } else if self.video.jk2_enhanced_flag_status != 0 {
+                    ui::append_flag_status_images(&mut images);
+                }
+                if self.japro_cg.spec_hud >= 2 {
+                    ui::append_broadcast_flag_images(&mut images);
                 }
                 ui::append_mp_timer_image(&mut images, self.siege_timer_menu.as_ref());
                 images
@@ -1451,22 +1467,33 @@ impl App {
         })
     }
 
-    /// Enhanced CTF status. The CS_FLAGSTATUS change is authoritative for
+    /// JK2/JKA enhanced CTF status. The CS_FLAGSTATUS change is authoritative for
     /// taken/dropped; only actually observed powerups identify a carrier.
     /// For off-PVS enemies the icon remains visible without fabricating a name.
     pub(in crate::app) fn jk2_flags_ui(&self) -> Vec<ui::Jk2FlagUi> {
-        if !(self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2())
-            || self.video.jk2_enhanced_flag_status == 0
-        { return Vec::new(); }
+        // Broadcast cards own flag status even when the separate
+        // cg_enhancedFlagStatus overlay is disabled.
+        let broadcast = self.japro_cg.spec_hud >= 2
+            && (self.demo_playback_active() || self.live_spec_hud_eligible());
+        if !broadcast && self.video.jk2_enhanced_flag_status == 0 { return Vec::new(); }
         let Some(session) = self.game_session.as_ref() else { return Vec::new(); };
         if !matches!(session.client_game.gametype(), 8 | 9) { return Vec::new(); }
+        // CS_FLAGSTATUS and the red/blue powerup indices are shared between
+        // JK2 and JKA. Only JK2/MVSDK can enable the optional third flag.
         let flags = session.client_game.jk2_ctf_flags();
+        let is_jk2 = self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2();
+        let editor_preview = self.overlay == OverlayMode::HudEdit && !broadcast;
         let local_team = session.current_snapshot.as_ref()
             .map(|snap| snap.player_state.persistant[3]).unwrap_or(3);
         let ps = session.presented_player_state();
         let local_client = ps.and_then(|ps| ps.field_i32("clientNum"));
         flags.into_iter().enumerate().filter_map(|(index, (status, taken_since))| {
-            if !matches!(status, 1 | 4) { return None; }
+            if index == 2 && !is_jk2 { return None; }
+            // Keep base status for spectator cards too: a returned flag
+            // must clear any stale entity powerup that still says 'carried'.
+            if !matches!(status, 1 | 4) && !((broadcast || editor_preview) && status == 0) {
+                return None;
+            }
             let powerup = (4 + index) as usize;
             let carrier_client = if status == 1 {
                 // Current POV may not be represented in presented_entities.
@@ -1496,6 +1523,7 @@ impl App {
             Some(ui::Jk2FlagUi {
                 team: match index { 0 => 1, 1 => 2, _ => 0 },
                 status,
+                carrier_client,
                 carrier,
                 carrier_team,
                 health_armor,

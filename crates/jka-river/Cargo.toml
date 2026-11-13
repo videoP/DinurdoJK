@@ -17,7 +17,7 @@ serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.151"
 sha2 = "=0.10.9"
 zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
-wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "spirv", "dx12", "vulkan"] }
+wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "spirv", "dx12", "vulkan", "metal"] }
 
 [features]
 # Test-only hooks for the client's GPU integration tests; never enabled by a game build.

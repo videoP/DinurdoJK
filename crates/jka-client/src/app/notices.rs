@@ -2,6 +2,32 @@
 use crate::app::{App, Instant, UiScoreEntry, UiScoreboard};
 use winit::window::UserAttentionType;
 
+/// Keep retained `scores` rows aligned with the current CS_PLAYERS state.
+/// JKA score commands contain no team field; TaystJK uses live clientinfo.
+fn update_scoreboard_client(board: &mut UiScoreboard, client: i32, name: Option<String>, team: Option<i32>) -> bool {
+    if let Some(team) = team {
+        let Some(entry) = board.entries.iter_mut().find(|entry| entry.client == client) else { return false; };
+        let mut changed = false;
+        if entry.team != team {
+            entry.team = team;
+            entry.spectating_you = false;
+            changed = true;
+        }
+        if let Some(name) = name {
+            if entry.name != name {
+                entry.name = name;
+                changed = true;
+            }
+        }
+        changed
+    } else {
+        // The client has disconnected; remove the obsolete row.
+        let before = board.entries.len();
+        board.entries.retain(|entry| entry.client != client);
+        board.entries.len() != before
+    }
+}
+
 /// jaPRO `cg.crosshairClientNum` / `cg.crosshairClientTime`: the last entity the
 /// crosshair was on. Names read it, so it keeps fading after aiming away.
 #[derive(Debug, Clone, Copy)]
@@ -486,6 +512,7 @@ impl App {
                     }
                     let text = self.translate_server_text(&text);
                     for line in text.lines().filter(|line| !line.is_empty()) {
+                        if chat_from_demo { continue; } // Indexed timeline owns demo prints.
                         if line_kind == crate::logging::ConsoleLineKind::Normal {
                             self.push_console_line(line.to_owned());
                         } else {
@@ -578,7 +605,13 @@ impl App {
                     // The chat filter may hold the text back until it has
                     // been checked; the console row then starts out held too.
                     let filtered_line = self.chat_llm_received(chat_id);
-                    self.push_console_chat_line(filtered_line.unwrap_or_else(|| text.clone()), console_kind, chat_id);
+                    if chat_from_demo {
+                        self.queue_demo_chat_console_row(
+                            text.clone(), filtered_line.unwrap_or_else(|| text.clone()), chat_id, console_kind,
+                        );
+                    } else {
+                        self.push_console_chat_line(filtered_line.unwrap_or_else(|| text.clone()), console_kind, chat_id);
+                    }
                     if self.chat_lines.len() >= crate::app::chat_anim::KEEP_LINES {
                         self.chat_lines.pop_front();
                     }
@@ -686,7 +719,8 @@ impl App {
                     } else {
                         format!("{target} {localized}")
                     };
-                    self.push_console_line(line);
+                    if chat_from_demo { self.push_demo_derived_console_line(line); }
+                    else { self.push_console_line(line); }
                 }
                 crate::cgame::CgameNotice::KillMessage {
                     target,
@@ -769,7 +803,9 @@ impl App {
                         })
                         .filter(|text| !text.is_empty())
                         .unwrap_or(classname);
-                    self.push_console_line(format!("{pickup} {name}"));
+                    let line = format!("{pickup} {name}");
+                    if chat_from_demo { self.push_demo_derived_console_line(line); }
+                    else { self.push_console_line(line); }
                 }
                 crate::cgame::CgameNotice::StringEd {
                     key,
@@ -808,8 +844,28 @@ impl App {
                         });
                         self.last_center_refresh = Instant::now();
                         self.publish_transient_ui();
+                    } else if chat_from_demo {
+                        self.push_demo_derived_console_line(text);
                     } else {
                         self.push_console_line(text);
+                    }
+                }
+                crate::cgame::CgameNotice::ScoreClientChanged { client, name, team } => {
+                    // `scores` supplies the numerical columns, but TaystJK
+                    // reads current CS_PLAYERS for the name and team each
+                    // time it draws a row. Update the retained scoreboard on
+                    // the reliable `cs` event, without sending another score
+                    // request or waiting for the server's next score push.
+                    let changed = self.scoreboard.as_mut().is_some_and(|board| {
+                        update_scoreboard_client(board, client, name, team)
+                    });
+                    if changed {
+                        if self.scoreboard_should_show() {
+                            self.publish_transient_ui();
+                        }
+                        if self.companion_scoreboard_visible() {
+                            self.mark_companion_dirty();
+                        }
                     }
                 }
                 crate::cgame::CgameNotice::Scores {
@@ -928,7 +984,9 @@ impl App {
                         session.siege_respawn_time = 0;
                         session.siege_last_countdown = 0;
                     }
-                    self.push_console_line("^3map_restart");
+                    // An indexed map_restart entry is already available on
+                    // the demo timeline; do not produce a second row.
+                    if !chat_from_demo { self.push_console_line("^3map_restart"); }
                 }
             }
         }
@@ -969,6 +1027,40 @@ fn clean_chatbox_colors(text: &str, mode: u8) -> String {
         return format!("{prefix}^2{}", &body[2..]);
     }
     text.to_owned()
+}
+
+#[cfg(test)]
+mod scoreboard_client_tests {
+    use super::*;
+
+    fn row() -> UiScoreEntry {
+        UiScoreEntry {
+            client: 5, name: "starty".to_owned(), team: 2, score: 7,
+            powerups: 0, captures: 0, assists: 0, defends: 0, deaths: None,
+            ping: 31, time: 12, siege_class: String::new(), siege_icon: None,
+            spectating_you: true, muted: false, translate_checked: None,
+            translate_source: None, crowned: false, model: String::new(),
+            model_fallback: String::new(), h2h: None, accuracy: 0,
+            excellent: 0, gauntlet: 0, perfect: 0,
+        }
+    }
+
+    #[test]
+    fn client_team_change_reclassifies_retained_row_without_new_scores() {
+        let mut board = UiScoreboard {
+            team_scores: [1, 2], ready_clients: 0, team_game: true,
+            ctf: false, siege: false, siege_win_team: 0,
+            spectator_scores: false, show_deaths: false,
+            icon_paths: Vec::new(), entries: vec![row()], chrome: Default::default(),
+        };
+        assert!(update_scoreboard_client(&mut board, 5, Some("starty".into()), Some(3)));
+        assert_eq!(board.entries[0].team, 3);
+        assert_eq!(board.entries[0].score, 7);
+        assert!(!board.entries[0].spectating_you);
+        assert!(!update_scoreboard_client(&mut board, 5, Some("starty".into()), Some(3)));
+        assert!(update_scoreboard_client(&mut board, 5, None, None));
+        assert!(board.entries.is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -57,25 +57,21 @@ impl App {
         }
 
         let jk2 = self.net.as_ref().is_some_and(|net| net.session().jk2_version().is_some());
-        // JK2MV requires sv_allowDownload != 0, advertised in CS_SERVERINFO.
-        // Its HTTP availability comes from mvhttp/mvhttpurl in getinfo and is
-        // independent of the JKA-only sv_httpDownloads serverinfo cvar.
-        let server_allows_legacy = crate::download::server_allows_udp(serverinfo, jk2);
-        let server_allows_http = jk2 ||
-            jka_protocol::commands::info_value(serverinfo, b"sv_httpDownloads")
-                .is_none_or(|value| jka_protocol::commands::atoi(value) != 0);
-        let http_base = if self.network.allow_http_downloads && server_allows_http {
-            self.live_http_base.clone()
-        } else {
-            None
-        };
-        let can_legacy = self.network.allow_legacy_downloads && server_allows_legacy;
+        // Use the same server/client policy as the gamestate prompt and map
+        // preflight. HTTP needs a discovered endpoint, not merely a cvar.
+        let (can_http, can_legacy) = crate::download::available_download_transports(
+            serverinfo, jk2, self.live_http_base.is_some(),
+            self.network.allow_http_downloads, self.network.allow_legacy_downloads,
+        );
+        let http_base = if can_http { self.live_http_base.clone() } else { None };
+        let server_allows_legacy = crate::download::server_allows_udp(serverinfo, jk2)
+            && !crate::download::server_disallows_downloads(serverinfo);
         devprintln!(
             1,
             "[DOWNLOAD] transports: client http={} legacy={}, server http={} legacy={}, endpoint={}",
             self.network.allow_http_downloads,
             self.network.allow_legacy_downloads,
-            server_allows_http,
+            can_http,
             server_allows_legacy,
             http_base.as_deref().unwrap_or("none")
         );

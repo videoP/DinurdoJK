@@ -2420,6 +2420,7 @@ impl Renderer {
                         self.ui_small_font_metrics.as_ref(),
                         self.config.width,
                         self.config.height,
+                        self.ui_state.jk2_mode && self.ui_state.nwh_hex_colors,
                     );
                 }
             }

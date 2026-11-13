@@ -317,7 +317,7 @@ fn finish_studio_export_blocking(mut export: RenderStudioExport) -> StudioExport
         (||->Result<(),String> {
             let video=export.encoded_video.as_ref().ok_or("Encoded video was lost")?;
             let wav=export.audio_wav.as_ref().ok_or("Captured audio WAV was lost")?;
-            let ffmpeg=dependency_ffmpeg_path().ok_or("ffmpeg.exe missing at mux stage")?;
+            let ffmpeg=dependency_ffmpeg_path().ok_or("ffmpeg missing at mux stage")?;
             let mut command=Command::new(ffmpeg);
             command.args(["-hide_banner","-loglevel","error","-y"])
                 .arg("-i").arg(video).arg("-i").arg(wav)
@@ -2099,7 +2099,11 @@ impl App {
             return;
         }
         let Some(ffmpeg) = dependency_ffmpeg_path() else {
-            self.render_studio.status = "Place ffmpeg.exe in DinurdoJK/dependencies/".into();
+            self.render_studio.status = if cfg!(unix) {
+                "Install ffmpeg or place it in DinurdoJK/dependencies/"
+            } else {
+                "Place ffmpeg.exe in DinurdoJK/dependencies/"
+            }.into();
             return;
         };
         if let Some(codec) = self.render_studio.preset.nvenc_codec() {
@@ -2219,7 +2223,11 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
         let output = folder.join(format!("studio_{stamp}.png"));
         if self.render_studio.screenshot_depth && dependency_ffmpeg_path().is_none() {
-            self.render_studio.status = "ffmpeg.exe required in DinurdoJK/dependencies/ for depth EXR".into();
+            self.render_studio.status = if cfg!(unix) {
+                "ffmpeg required for depth EXR (install it or place it in DinurdoJK/dependencies/)"
+            } else {
+                "ffmpeg.exe required in DinurdoJK/dependencies/ for depth EXR"
+            }.into();
             return;
         }
         let current_time = self.render_studio.timeline_time();
@@ -2416,7 +2424,7 @@ impl App {
                 let pixels = depth.ok_or("Depth capture returned no depth pixels")?;
                 let depth_path = output.with_file_name(format!("{}_depth.exr",
                     output.file_stem().and_then(|name| name.to_str()).unwrap_or("studio")));
-                let ffmpeg = dependency_ffmpeg_path().ok_or("ffmpeg.exe required to write depth EXR")?;
+                let ffmpeg = dependency_ffmpeg_path().ok_or("ffmpeg required to write depth EXR")?;
                 let mut child = Command::new(ffmpeg)
                     .args(["-hide_banner", "-loglevel", "error", "-y",
                         "-f", "rawvideo", "-pix_fmt", "grayf32le"])
@@ -2540,7 +2548,7 @@ impl App {
                 Some(_) => {}
             }
             if export.child.is_none() {
-                let ffmpeg = dependency_ffmpeg_path().ok_or("ffmpeg.exe disappeared")?;
+                let ffmpeg = dependency_ffmpeg_path().ok_or("ffmpeg disappeared")?;
                 let mut command = Command::new(ffmpeg);
                 command.args(["-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgra"])
                     .arg("-s").arg(format!("{width}x{height}"))
@@ -2620,7 +2628,7 @@ impl App {
                 let pixels = depth_f32le.ok_or("Studio depth readback missing")?;
                 if pixels.len() != color_bytes { return Err("Studio depth readback size mismatch".into()); }
                 if export.depth_child.is_none() {
-                    let ffmpeg = dependency_ffmpeg_path().ok_or("ffmpeg.exe not found for depth")?;
+                    let ffmpeg = dependency_ffmpeg_path().ok_or("ffmpeg not found for depth")?;
                     let output = export.depth_dir.as_ref().ok_or("Missing depth output directory")?
                         .join("depth_%06d.exr");
                     let mut child = Command::new(ffmpeg)

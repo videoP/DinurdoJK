@@ -68,9 +68,27 @@ const JK2_ITEM_NAMES: [&str; 7] = [
 const JK2_FLAG_ICONS: [&str; 3] = [
     "gfx/hud/mpi_rflag", "gfx/hud/mpi_bflag", "icons/iconf_neutral1",
 ];
+
+/// The exact carried-flag icon used by the JK2 flag-status HUD and the JKA
+/// Siege scoreboard. Input is the flag's team, *not* its carrier's team.
+pub(crate) fn flag_carrier_icon(flag_team: i32) -> Option<&'static str> {
+    match flag_team {
+        1 => Some(JK2_FLAG_ICONS[0]),
+        2 => Some(JK2_FLAG_ICONS[1]),
+        0 => Some(JK2_FLAG_ICONS[2]),
+        _ => None,
+    }
+}
 const JK2_FLAG_TAKEN: [&str; 3] = [
     "gfx/hud/mpi_rflag_x", "gfx/hud/mpi_bflag_x", "icons/iconf_neutral1_x",
 ];
+
+/// Exact MVSDK enhanced-flag-status imagery. `status=1` means taken,
+/// `status=4` means dropped; never substitute a fabricated flag glyph.
+pub(crate) fn flag_status_icon(team: i32, status: i32) -> Option<&'static str> {
+    let index = match team { 1 => 0, 2 => 1, 0 => 2, _ => return None };
+    Some(if status == 1 { JK2_FLAG_TAKEN[index] } else { JK2_FLAG_ICONS[index] })
+}
 const WHITE: [f32; 4] = [1.0; 4];
 const GREEN: [f32; 4] = [0.0, 0.613, 0.097, 1.0];
 const RED: [f32; 4] = [0.835, 0.015, 0.015, 1.0];
@@ -151,6 +169,16 @@ const AMMO_TICS: [Piece; 14] = [
 
 /// Appends only the assets for the active game; extension image slots retain their order.
 /// As with the JKA native HUD, loading/decoding stays on the existing image worker.
+/// JKA reuses the stock red/blue flag-status shaders without registering JK2
+/// inventory and weapon art in the JKA atlas.
+pub(crate) fn append_flag_status_images(images: &mut Vec<String>) {
+    for name in JK2_FLAG_ICONS[..2].iter() {
+        if !images.iter().any(|present| present == name) {
+            images.push((*name).to_owned());
+        }
+    }
+}
+
 pub(crate) fn append_jk2_ctf_images(images: &mut Vec<String>) {
     for name in JK2_FLAG_ICONS.into_iter().chain(JK2_FLAG_TAKEN)
         .chain(JK2_ITEM_ICONS.into_iter().filter(|name| !name.is_empty()))
@@ -163,20 +191,30 @@ pub(crate) fn append_jk2_ctf_images(images: &mut Vec<String>) {
 }
 
 pub(crate) fn append_jk2_hud_images(images: &mut Vec<String>, style: u8) {
-    if style != 1 { return; }
-    let names = [
-        LEFT_INNER, LEFT_FRAME, RIGHT_INNER, RIGHT_FRAME,
-        ARMOR_OUTER, ARMOR_INNER, ARMOR_TIC, HEALTH, HEALTH_TIC,
-    ].into_iter()
-        .chain(SABER_STYLES)
-        .chain(FORCE_TICS.iter().map(|piece| piece.0))
-        .chain(AMMO_TICS.iter().map(|piece| piece.0))
-        .chain(NUMBERS)
-        .chain(SELECT_ART)
-        .chain(JK2_WEAPON_ICONS.iter().copied().filter(|name| !name.is_empty()))
+    // Stock JK2 weapon/inventory selection is independent of the status HUD
+    // style: custom panels still need the native JK2 icons and ID ordering.
+    // Preserve the existing registration order in retail style so cached
+    // extension atlas indices are stable when that style is selected.
+    if style == 1 {
+        let retail = [
+            LEFT_INNER, LEFT_FRAME, RIGHT_INNER, RIGHT_FRAME,
+            ARMOR_OUTER, ARMOR_INNER, ARMOR_TIC, HEALTH, HEALTH_TIC,
+        ].into_iter()
+            .chain(SABER_STYLES)
+            .chain(FORCE_TICS.iter().map(|piece| piece.0))
+            .chain(AMMO_TICS.iter().map(|piece| piece.0))
+            .chain(NUMBERS)
+            .chain(SELECT_ART);
+        for name in retail {
+            if !images.iter().any(|present| present == name) {
+                images.push(name.to_owned());
+            }
+        }
+    }
+    let selectors = JK2_WEAPON_ICONS.iter().copied().filter(|name| !name.is_empty())
         .chain(JK2_WEAPON_ICONS_EMPTY.iter().copied().filter(|name| !name.is_empty()))
         .chain(JK2_ITEM_ICONS.iter().copied().filter(|name| !name.is_empty()));
-    for name in names {
+    for name in selectors {
         if !images.iter().any(|present| present == name) {
             images.push(name.to_owned());
         }
@@ -344,13 +382,22 @@ pub(in crate::ui) fn build_enhanced_flag_status(
     out: &mut Vec<UiVertex>, ui: &UiSnapshot,
     font: Option<&crate::ui::ProportionalFont>, w: u32, h: u32,
 ) {
-    if ui.video.jk2_enhanced_flag_status == 0 || ui.jk2_flags.is_empty() { return; }
+    // cg_specHud 2/3/4 draws these flags inside its player-card stacks.
+    // Do not retain the old free-floating MVSDK overlay under broadcast HUD.
+    if ui.spectator_broadcast.is_some()
+        || ui.video.jk2_enhanced_flag_status == 0 || ui.jk2_flags.is_empty() { return; }
     let scale = h as f32 / 480.0;
-    for (row, flag) in ui.jk2_flags.iter().enumerate() {
-        let index = match flag.team { 1 => 0, 2 => 1, 0 => 2, _ => continue };
+    // Also show the at-base flags as editing placeholders, so the element
+    // remains visible and draggable even when no player has taken a flag.
+    let edit_preview = ui.mode == crate::ui::OverlayMode::HudEdit;
+    for (row, flag) in ui.jk2_flags.iter().filter(|flag| matches!(flag.status, 1 | 4)
+        || (edit_preview && flag.status == 0)).enumerate()
+    {
+        // JKA reuses its known scoreboard icons. JK2 uses MVSDK's carried
+        // *_x variant when the flag is taken.
+        let Some(icon) = (if ui.jk2_mode { flag_status_icon(flag.team, flag.status) }
+            else { flag_carrier_icon(flag.team) }) else { continue };
         let y = 66.0 + 38.0 * row as f32;
-        let icon = if flag.status == 1 { JK2_FLAG_TAKEN[index] }
-            else { JK2_FLAG_ICONS[index] };
         {
             let mut painter = Painter {
                 out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags,
@@ -609,7 +656,10 @@ mod tests {
     fn jk2_native_assets_have_unique_source_paths() {
         let mut images = vec!["my/custom/hud".to_owned()];
         append_jk2_hud_images(&mut images, 0);
-        assert_eq!(images.len(), 1);
+        assert_eq!(images.len(), 32); // custom HUD still needs 31 native selector icons
+        assert!(images.iter().any(|name| name == "gfx/hud/w_icon_lightsaber"));
+        assert!(images.iter().any(|name| name == "gfx/hud/w_icon_tripmine"));
+        assert!(!images.iter().any(|name| name == LEFT_FRAME));
         append_jk2_hud_images(&mut images, 1);
         assert_eq!(images.len(), 76); // unique JK2 art, including carousel backgrounds and prongs
         assert_eq!(images[0], "my/custom/hud");
@@ -851,6 +901,15 @@ mod tests {
             assert_eq!(out.len(), if w as f32 > 640.0 * unit { 48 } else { 24 });
             assert!((px(out[0].position[0]) - 90.0 * unit).abs() < 0.01);
         }
+    }
+
+    #[test]
+    fn jk2_weapon_labels_match_native_ids() {
+        assert_eq!(JK2_WEAPON_NAMES[2], "Lightsaber");
+        assert_eq!(JK2_WEAPON_NAMES[11], "Thermal Detonator");
+        assert_eq!(JK2_WEAPON_NAMES[12], "Trip Mine");
+        assert_eq!(JK2_WEAPON_ICONS[2], "gfx/hud/w_icon_lightsaber");
+        assert_eq!(JK2_WEAPON_ICONS[12], "gfx/hud/w_icon_tripmine");
     }
 
     #[test]

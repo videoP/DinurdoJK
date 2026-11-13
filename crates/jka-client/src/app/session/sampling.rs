@@ -98,6 +98,23 @@ impl GameSession {
         if self.live && crate::cgame::remote_smoothing::mode() != 0 {
             self.remote_smoothing.apply_follow(&mut ps, std::time::Instant::now(), teleported);
         }
+        // The ordinary snapshot playerState is interpolated above when nextSnap
+        // exists. With no nextSnap, that interpolation holds the last origin
+        // while the live camera's damping clock continues to advance. Keep
+        // the missing-snapshot fix strictly in spectator follow, and only in
+        // legacy remote-smoothing mode: modes 1-4 already resample the followed
+        // player with their own visual clock/correction history.
+        if self.live && crate::cgame::remote_smoothing::mode() == 0 {
+            self.spectator_follow_hold.apply(
+                &mut ps,
+                self.current_snapshot.as_ref(),
+                self.next_snapshot.as_ref(),
+                presentation_time_ms,
+                teleported,
+            );
+        } else {
+            self.spectator_follow_hold.reset();
+        }
         // Prediction failures fall back to snapshots, which can themselves
         // contain NaNs. Keep those out of the camera, models and audio too.
         let fallback = self.current_snapshot.as_ref()
@@ -121,6 +138,132 @@ impl GameSession {
         self.scope_zoom.update(&ps, presentation_time_ms, teleported || self.seeking_demo);
         self.presented_player_state = Some(ps);
         Some(sample)
+    }
+}
+
+// Short, live-spectator-only extension of a held snapshot playerState.
+// Normal local prediction, recorded demos, and the third-person damping
+// functions must never use this state. Follow and camera geometry both consume
+// the same adjusted *presentation copy* of the playerState.
+//
+// These limits match the existing live remote-smoothing visual strategy:
+// extrapolate at most 35 ms; correct small extrapolation errors over 65 ms;
+// discard a correction larger than 32 world units instead of rubber-banding.
+const SPECTATOR_FOLLOW_EXTRAP_MS: f64 = 35.0;
+const SPECTATOR_FOLLOW_CORRECTION_MS: f32 = 65.0;
+const SPECTATOR_FOLLOW_MAX_CORRECTION: f32 = 32.0;
+
+#[derive(Clone, Copy)]
+struct SpectatorFollowFrame {
+    client_num: i32,
+    spawn_count: i32,
+    pm_type: i32,
+    vehicle_num: i32,
+    snapshot_time: i32,
+    sampled_at_ms: f64,
+    presented_origin: [f32; 3],
+    velocity: [f32; 3],
+    correction: [f32; 3],
+    extrapolated: bool,
+}
+
+#[derive(Default)]
+pub(in crate::app) struct SpectatorFollowHold {
+    last: Option<SpectatorFollowFrame>,
+}
+
+impl SpectatorFollowHold {
+    pub(in crate::app) fn reset(&mut self) { self.last = None; }
+
+    fn apply(
+        &mut self,
+        ps: &mut jka_protocol::server::PlayerState,
+        current: Option<&jka_protocol::server::Snapshot>,
+        next: Option<&jka_protocol::server::Snapshot>,
+        time_ms: f64,
+        teleported: bool,
+    ) {
+        const PMF_FOLLOW: i32 = 4096;
+        let Some(current) = current else { self.reset(); return; };
+        if ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW == 0
+            || !time_ms.is_finite()
+        {
+            self.reset();
+            return;
+        }
+        let Some(raw) = finite_playerstate_vec3(ps, "origin") else { self.reset(); return; };
+        let Some(velocity) = finite_playerstate_vec3(ps, "velocity") else { self.reset(); return; };
+        let client_num = ps.field_i32("clientNum").unwrap_or(-1);
+        let spawn_count = ps.persistant[4];
+        let pm_type = ps.field_i32("pm_type").unwrap_or(-1);
+        let vehicle_num = ps.field_i32("m_iVehicleNum").unwrap_or(0);
+        let previous = self.last.filter(|last| {
+            !teleported
+                && last.client_num == client_num
+                && last.spawn_count == spawn_count
+                && last.pm_type == pm_type
+                && last.vehicle_num == vehicle_num
+                && last.snapshot_time <= current.server_time
+                && time_ms >= last.sampled_at_ms
+                && time_ms - last.sampled_at_ms <= 200.0
+        });
+        let dt_ms = previous.map_or(0.0, |last| (time_ms - last.sampled_at_ms) as f32);
+        // A future snapshot means the ordinary playerState was interpolated.
+        // Never replace those coordinates with a parallel approximation.
+        // Also don't extend dead/vehicle camera states or a changed follow POV.
+        let held_ms = if previous.is_some() && next.is_none()
+            && vehicle_num == 0 && ps.stats[0] > 0
+        {
+            (time_ms - f64::from(current.server_time))
+                .clamp(0.0, SPECTATOR_FOLLOW_EXTRAP_MS)
+        } else { 0.0 };
+        let mut origin = raw;
+        if held_ms > 0.0 {
+            let extrapolated: [f32; 3] = std::array::from_fn(|axis| {
+                raw[axis] + velocity[axis] * (held_ms as f32 * 0.001)
+            });
+            let delta: [f32; 3] = std::array::from_fn(|axis| extrapolated[axis] - raw[axis]);
+            let length = delta.iter().map(|value| value * value).sum::<f32>().sqrt();
+            let scale = if length > SPECTATOR_FOLLOW_MAX_CORRECTION {
+                SPECTATOR_FOLLOW_MAX_CORRECTION / length
+            } else { 1.0 };
+            for axis in 0..3 { origin[axis] += delta[axis] * scale; }
+        }
+        let mut correction = [0.0; 3];
+        if let Some(last) = previous {
+            correction = std::array::from_fn(|axis| {
+                last.correction[axis] * (-dt_ms / SPECTATOR_FOLLOW_CORRECTION_MS).exp()
+            });
+            if last.extrapolated && current.server_time > last.snapshot_time {
+                // Reconcile a held/extrapolated pose with the newly arrived
+                // authoritative snapshot. The visual correction is discarded
+                // at teleports, follow switches, and large position jumps.
+                let elapsed = (dt_ms * 0.001).min(0.05);
+                correction = std::array::from_fn(|axis| {
+                    last.presented_origin[axis] + last.velocity[axis] * elapsed - origin[axis]
+                });
+            }
+            if correction.iter().map(|value| value * value).sum::<f32>()
+                > SPECTATOR_FOLLOW_MAX_CORRECTION.powi(2)
+            {
+                correction = [0.0; 3];
+            }
+            for axis in 0..3 { origin[axis] += correction[axis]; }
+        }
+        self.last = Some(SpectatorFollowFrame {
+            client_num, spawn_count, pm_type, vehicle_num,
+            snapshot_time: current.server_time,
+            sampled_at_ms: time_ms,
+            presented_origin: origin,
+            velocity,
+            correction,
+            extrapolated: held_ms > 0.0,
+        });
+        if held_ms > 0.0 || correction != [0.0; 3] {
+            for (axis, value) in origin.into_iter().enumerate() {
+                ps.set_field_bits(&format!("origin[{axis}]"), value.to_bits());
+            }
+        }
     }
 }
 
@@ -418,6 +561,103 @@ mod tests {
     use super::*;
     use crate::app::LivePredictionFrame;
     use jka_protocol::server::PlayerState;
+
+    fn live_follow_snapshot(time: i32, client: i32, spawn: i32, origin: f32, velocity: f32)
+        -> jka_protocol::server::Snapshot
+    {
+        use jka_protocol::server::Snapshot;
+        let mut ps = PlayerState::default();
+        ps.set_field_bits("pm_flags", 4096); // PMF_FOLLOW
+        ps.set_field_bits("clientNum", client as u32);
+        ps.persistant[4] = spawn;
+        ps.stats[0] = 100;
+        ps.set_field_bits("origin[0]", origin.to_bits());
+        ps.set_field_bits("velocity[0]", velocity.to_bits());
+        Snapshot {
+            server_time: time,
+            message_num: time,
+            delta_num: -1,
+            snap_flags: 0,
+            ping: 0,
+            server_command_num: 0,
+            area_mask: [0; 32],
+            player_state: ps,
+            vehicle_player_state: None,
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn spectator_follow_uses_existing_interpolated_origin_when_next_snapshot_exists() {
+        let a = live_follow_snapshot(100, 2, 1, 0.0, 400.0);
+        let b = live_follow_snapshot(150, 2, 1, 100.0, 400.0);
+        let mut ps = present_player_state(Some(&a), Some(&b), 125.0, None, None).unwrap();
+        assert_eq!(ps.field_f32("origin[0]"), Some(50.0));
+        let mut hold = SpectatorFollowHold::default();
+        hold.apply(&mut ps, Some(&a), Some(&b), 125.0, false);
+        assert_eq!(ps.field_f32("origin[0]"), Some(50.0));
+        // The snapshot-interpolated PS is also the followed-player body origin.
+        let sample = sample_player_state(&ps, 125, false, [0.0; 3]).unwrap();
+        let body = crate::cgame::presented_player_state_entity(&ps).unwrap();
+        assert_eq!(body.origin, sample.native_origin);
+    }
+
+    #[test]
+    fn spectator_follow_only_advances_missing_snapshot_for_35ms() {
+        let current = live_follow_snapshot(100, 2, 1, 0.0, 400.0);
+        let mut hold = SpectatorFollowHold::default();
+        let mut ps = current.player_state.clone();
+        hold.apply(&mut ps, Some(&current), None, 100.0, false);
+        assert_eq!(ps.field_f32("origin[0]"), Some(0.0));
+        let mut ps = current.player_state.clone();
+        hold.apply(&mut ps, Some(&current), None, 120.0, false);
+        assert_eq!(ps.field_f32("origin[0]"), Some(8.0));
+        let mut ps = current.player_state.clone();
+        hold.apply(&mut ps, Some(&current), None, 170.0, false);
+        assert_eq!(ps.field_f32("origin[0]"), Some(14.0)); // capped
+    }
+
+    #[test]
+    fn spectator_follow_corrects_new_snapshot_without_changing_network_state() {
+        let a = live_follow_snapshot(100, 2, 1, 0.0, 400.0);
+        let b = live_follow_snapshot(150, 2, 1, 18.0, 400.0);
+        let mut hold = SpectatorFollowHold::default();
+        let mut ps = a.player_state.clone();
+        hold.apply(&mut ps, Some(&a), None, 100.0, false);
+        let mut ps = a.player_state.clone();
+        hold.apply(&mut ps, Some(&a), None, 130.0, false);
+        assert_eq!(ps.field_f32("origin[0]"), Some(12.0));
+        let mut presented = b.player_state.clone();
+        hold.apply(&mut presented, Some(&b), None, 150.0, false);
+        // The camera doesn't snap instantly from the extrapolated 12 to 18.
+        assert!((presented.field_f32("origin[0]").unwrap() - 20.0).abs() < 0.001);
+        assert_eq!(b.player_state.field_f32("origin[0]"), Some(18.0));
+        let mut presented = b.player_state.clone();
+        hold.apply(&mut presented, Some(&b), None, 158.0, false);
+        let corrected = presented.field_f32("origin[0]").unwrap();
+        assert!(corrected > 22.0 && corrected < 23.2);
+    }
+
+    #[test]
+    fn spectator_follow_never_extrapolates_other_views_or_across_follow_switches() {
+        let a = live_follow_snapshot(100, 2, 1, 0.0, 400.0);
+        let b = live_follow_snapshot(150, 3, 1, 100.0, 400.0);
+        let mut hold = SpectatorFollowHold::default();
+        let mut ps = a.player_state.clone();
+        hold.apply(&mut ps, Some(&a), None, 100.0, false);
+        let mut ps = a.player_state.clone();
+        hold.apply(&mut ps, Some(&a), None, 120.0, false);
+        assert_eq!(ps.field_f32("origin[0]"), Some(8.0));
+        let mut switched = b.player_state.clone();
+        hold.apply(&mut switched, Some(&b), None, 180.0, false);
+        assert_eq!(switched.field_f32("origin[0]"), Some(100.0));
+        switched.set_field_bits("pm_flags", 0);
+        hold.apply(&mut switched, Some(&b), None, 190.0, false);
+        assert_eq!(switched.field_f32("origin[0]"), Some(100.0));
+        let mut teleported = a.player_state.clone();
+        hold.apply(&mut teleported, Some(&a), None, 200.0, true);
+        assert_eq!(teleported.field_f32("origin[0]"), Some(0.0));
+    }
 
     #[test]
     fn disruptor_optical_zoom_animates_and_locks_without_using_networked_fov() {

@@ -1,7 +1,7 @@
 //! Session advance.
 use crate::app::{
     event_debug, event_workers, local_player_alpha, playerstate_vec3, race_ghost,
-    attacker_damage_transition, rendering_third_person, scene, snapshot_discontinuity,
+    attacker_damage_transition, rendering_spectator_third_person, rendering_third_person, scene, snapshot_discontinuity,
     snapshot_owns_playerstate_events, Arc,
     ClientFramePerf, DemoAdvance, DemoCameraSample, EventCheckDisposition, GameSession,
     Ghoul2PresentationView, Instant, LivePredictionFrame, PlayerPresentationInput, PresentedEntity,
@@ -382,9 +382,17 @@ impl GameSession {
         let presentation_client = self.client_game.presentation_client_num();
         let sample_owns_camera = presentation_client == Some(sample.client_num);
         let sample_third_person = if self.live && sample.following {
-            spectator_camera.mode != SpectatorCameraMode::FirstPerson
+            rendering_spectator_third_person(
+                spectator_camera.mode, first_person_lightsaber, sample.policy.weapon,
+            )
         } else if let Some(mode) = self.demo_spectator_camera_mode {
-            mode != SpectatorCameraMode::FirstPerson
+            if self.studio_camera_active {
+                // Studio owns an explicitly authored camera; cg_fpls must not
+                // silently change a cinematic first-person follow shot.
+                mode != SpectatorCameraMode::FirstPerson
+            } else {
+                rendering_spectator_third_person(mode, first_person_lightsaber, sample.policy.weapon)
+            }
         } else {
             rendering_third_person(third_person, first_person_lightsaber, sample.policy)
         };
@@ -847,6 +855,27 @@ impl GameSession {
         }).unwrap_or_default();
         self.player_presenter.set_breath_talking(talking);
         let player_present_started = Instant::now();
+        if !self.studio_camera_active {
+            // Normal demo fake-follow can use the same Ghoul2 surface-only FPLS
+            // path as a locally followed saber. Studio has its own shot setting.
+            self.player_presenter.studio_fpls = first_person_lightsaber;
+        }
+        // A fake-follow demo POV uses remote entityState, not the recorder's
+        // playerState. If that target draws a saber, suppressing its body for
+        // an alleged first-person shot would hide it after the camera has
+        // correctly switched to third person.
+        let hidden_demo_client = self.demo_hidden_view_client.filter(|&client| {
+            self.studio_camera_active || {
+                let weapon = self.presented_entities.iter()
+                    .find(|entity| entity.entity_type == crate::cgame::ET_PLAYER
+                        && i32::from(entity.number) == client)
+                    .and_then(|entity| entity.state.field_i32("weapon"))
+                    .unwrap_or(0);
+                !rendering_spectator_third_person(
+                    SpectatorCameraMode::FirstPerson, first_person_lightsaber, weapon,
+                )
+            }
+        });
         dynamic_models.extend(
             self.player_presenter.present_snapshot_players(
                 &self.presented_entities,
@@ -854,8 +883,7 @@ impl GameSession {
                 &self.siege_classes,
                 target_server_time,
                 followed_entity_num,
-                self.demo_hidden_view_client
-                    .and_then(|client| u16::try_from(client).ok()),
+                hidden_demo_client.and_then(|client| u16::try_from(client).ok()),
                 ghoul2_view,
                 self.forced_player_models.as_ref(),
             ),
@@ -899,13 +927,12 @@ impl GameSession {
         // use the separate CG_AddViewWeapon-style first-person viewmodel path.
         const WP_MELEE: i32 = 2;
         const WP_SABER: i32 = 3;
-        // EternalJK only applies cg_fpls to the local non-followed player;
-        // spectator/follow presentation disables it rather than putting the
-        // followed player's Ghoul2 instance around the camera.
+        // FPLS also applies when following a saber player: in spectator
+        // first-person mode it hides the actor's body surfaces but keeps the
+        // weapon hilt/blade. With cg_fpls 0 the camera is third person instead.
         let first_person_saber = sample_owns_camera
             && !sample_third_person
             && first_person_lightsaber
-            && !sample.following
             && matches!(sample.policy.weapon, WP_MELEE | WP_SABER);
         // The snapshot/predicted entity is special only while it actually owns
         // the camera. In demo fake-follow and freecam it is just another world

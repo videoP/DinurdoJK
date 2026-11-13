@@ -1,6 +1,6 @@
 //! Chat.
 use crate::ui::{
-    color_code, fixed_charset_text, proportional_text_uniform, rect, visible_jka_chars,
+    color_escape, fixed_charset_text, proportional_text_uniform, rect, visible_jka_chars,
     wrap_proportional_text, ChatMode, ProportionalFont, UiSnapshot, UiVertex, CHATBOX_CUTOFF,
     CHATBOX_FONT_HEIGHT, CHATBOX_FONT_SCALE, CHATBOX_Y,
 };
@@ -46,13 +46,9 @@ pub(in crate::ui) fn wrap_fixed_chat_text(value: &str, max_columns: usize) -> St
     let mut index = 0usize;
 
     while index < bytes.len() {
-        if bytes[index] == b'^'
-            && index + 1 < bytes.len()
-            && color_code(bytes[index + 1] as char, 1.0).is_some()
-        {
-            out.push(bytes[index] as char);
-            out.push(bytes[index + 1] as char);
-            index += 2;
+        if let Some((skip, _)) = color_escape(&bytes, index, 1.0) {
+            out.extend(bytes[index..index + skip].iter().map(|&byte| byte as char));
+            index += skip;
             continue;
         }
         let byte = bytes[index];

@@ -78,6 +78,8 @@ impl App {
         if self.net.is_some() || self.game_session.is_some() {
             self.disconnect_to_main_menu();
         }
+        self.clear_session_chatbox();
+        self.clear_demo_console_history();
         self.select_demo_asset_game(jk2.map(|v| if v == jka_protocol::jk2::Version::V102 { 2 } else { 4 }));
         self.disconnect_notice = None;
         self.server_password_prompt = None;
@@ -604,6 +606,9 @@ impl App {
                 // ClientSession; only informational post-gamestate prints land here.
             }
             SessionEvent::Gamestate => {
+                // The packet's DemoMessage arrives after Gamestate; use those
+                // original bytes to start the next standalone recording.
+                self.mark_demo_recording_map_change();
                 self.reset_remote_emotes();
                 let elapsed = self
                     .live_join_timing
@@ -952,10 +957,9 @@ impl App {
         }
         self.update_chat_log_live_metadata(&map_name);
 
-        // JK2MV CL_InitDownloads runs FS_ComparePaks on *every* gamestate,
-        // not only when the BSP is absent. A server can reference missing
-        // model/sound/mod PK3s while its map is already locally installed.
-        // Keep the existing explicit download consent UI for both games.
+        // TaystJK CL_InitDownloads compares PK3s on every gamestate, but
+        // refuses to prompt if the server disabled downloads. Referenced PK3s
+        // are not necessarily necessary for the currently loaded BSP.
         let systeminfo = configstrings.get(&jka_protocol::session::CS_SYSTEMINFO)
             .map(Vec::as_slice).unwrap_or_default();
         let missing_paks = match crate::download::referenced_downloads(
@@ -968,7 +972,13 @@ impl App {
                 return;
             }
         };
-        if self.live_auto_download_requested && !missing_paks.is_empty() {
+        let serverinfo = configstrings.get(&0).map(Vec::as_slice).unwrap_or_default();
+        let (http_available, udp_available) = crate::download::available_download_transports(
+            serverinfo, jk2, self.live_http_base.is_some(),
+            self.network.allow_http_downloads, self.network.allow_legacy_downloads,
+        );
+        let can_download = http_available || udp_available;
+        if self.live_auto_download_requested && !missing_paks.is_empty() && can_download {
             self.begin_live_autodownload(&map_name, &configstrings);
             return;
         }
@@ -977,11 +987,32 @@ impl App {
                 .map(|spec| spec.remote_name.as_str())
                 .collect::<Vec<_>>().join(", ");
             let tail = if missing_paks.len() > 6 { " ..." } else { "" };
-            self.show_missing_map_prompt(&map_name, format!(
-                "Missing server-referenced PK3{} ({}): {names}{tail}",
-                if missing_paks.len() == 1 { "" } else { "s" }, missing_paks.len(),
-            ));
-            return;
+            if can_download {
+                self.show_missing_map_prompt(&map_name, format!(
+                    "Missing server-referenced PK3{} ({}): {names}{tail}",
+                    if missing_paks.len() == 1 { "" } else { "s" }, missing_paks.len(),
+                ));
+                return;
+            }
+            // TaystJK skips the downloads and carries on with the gamestate;
+            // a missing PK3 reference alone must not block an installed map.
+            if !self.pending_live_gamestate {
+                if crate::download::server_disallows_downloads(serverinfo) {
+                    self.push_console_line("^3Skipping downloads, because the server does not allow downloads.");
+                } else {
+                    self.push_console_line("^3Skipping downloads, because no enabled download transport is available.");
+                }
+                self.push_console_line(format!(
+                    "^3Missing server-referenced PK3{} ({}): {names}{tail}",
+                    if missing_paks.len() == 1 { "" } else { "s" }, missing_paks.len(),
+                ));
+            }
+        }
+        if self.live_auto_download_requested && !can_download {
+            // Preflight can offer autodownload before the authoritative
+            // CS_SERVERINFO arrives. Do not leave its checking UI active.
+            self.live_auto_download_requested = false;
+            self.live_join_ui = None;
         }
 
         let source = scene::MapSource::Bsp(map_name.clone());

@@ -369,11 +369,28 @@ impl App {
         self.continue_live_after_missing_map_choice();
     }
 
+    /// A speculative map preflight can run before CS_SERVERINFO exists.
+    /// Once the gamestate arrives, only advertise a download action if the
+    /// server permits it *and* an enabled transport is available.
+    pub(in crate::app) fn live_can_autodownload(&self) -> bool {
+        let client_enabled = self.network.allow_http_downloads || self.network.allow_legacy_downloads;
+        let Some(net) = self.net.as_ref() else { return client_enabled };
+        let Some(serverinfo) = net.session().decoder().configstrings.get(&0) else {
+            return client_enabled;
+        };
+        let jk2 = net.session().jk2_version().is_some();
+        let (http, legacy) = crate::download::available_download_transports(
+            serverinfo, jk2, self.live_http_base.is_some(),
+            self.network.allow_http_downloads, self.network.allow_legacy_downloads,
+        );
+        http || legacy
+    }
+
     pub(in crate::app) fn choose_missing_map_autodownload(&mut self) {
-        if !self.network.allow_http_downloads && !self.network.allow_legacy_downloads {
-            self.console_status = "AUTODOWNLOAD IS DISABLED IN SETUP > NETWORK".into();
+        if !self.live_can_autodownload() {
+            self.console_status = "AUTODOWNLOAD IS NOT AVAILABLE FOR THIS SERVER".into();
             self.push_console_line(
-                "^3Enable HTTP downloads and/or Legacy server downloads in Setup > Network."
+                "^3No enabled download transport is offered by this server."
                     .to_owned(),
             );
             self.egui_repaint_requested = true;

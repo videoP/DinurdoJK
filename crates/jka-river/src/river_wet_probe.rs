@@ -1,5 +1,5 @@
 //! Debug-only, asynchronous readback of the *actual GPU result* at a live
-//! riversource. It inspects a tiny 16x16 tile centred on the source, not the
+//! spawnriver. It inspects a tiny 16x16 tile centred on the source, not the
 //! complete river grid: the effective cost is independent of map size.
 //! Nothing is allocated or copied unless r_riverDebug is set to 2.
 use std::sync::mpsc::{self, Receiver};

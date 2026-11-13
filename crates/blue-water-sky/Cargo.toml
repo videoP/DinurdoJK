@@ -9,7 +9,7 @@ license = "MIT"
 bytemuck = { version = "=1.25.2", features = ["derive"] }
 glam.workspace = true
 naga_oil = { version = "0.23.0", default-features = false }
-wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "naga-ir", "dx12", "vulkan"] }
+wgpu = { version = "=30.0.0", default-features = false, features = ["std", "wgsl", "naga-ir", "dx12", "vulkan", "metal"] }
 naval-render = { package = "blue-water-render", path = "../blue-water-render" }
 naval-sim = { package = "blue-water-sim", path = "../blue-water-sim" }
 

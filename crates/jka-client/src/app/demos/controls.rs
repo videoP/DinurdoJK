@@ -127,6 +127,9 @@ impl App {
     }
 
     pub(in crate::app) fn restore_demo_transients(&mut self, elapsed_ms: i32, now: Instant) {
+        self.demo_console_pending_chats.clear();
+        self.trim_demo_derived_console(elapsed_ms);
+        self.sync_demo_console(elapsed_ms);
         let notices = self
             .game_session
             .as_ref()
@@ -138,7 +141,9 @@ impl App {
         self.center_print = None;
         self.cancel_chat_translations();
 
-        let chat_start = elapsed_ms.saturating_sub(10_000);
+        let chat_window_ms = (self.chat_settings.history_time.max(self.chat_settings.fade_time)
+            .max(1.0) * 1000.0) as i32;
+        let chat_start = elapsed_ms.saturating_sub(chat_window_ms);
         for entry in notices
             .iter()
             .filter(|entry| {
@@ -147,7 +152,7 @@ impl App {
                     && entry.elapsed_ms <= elapsed_ms
             })
             .rev()
-            .take(16)
+            .take(crate::app::chat_anim::KEEP_LINES)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()

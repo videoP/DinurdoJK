@@ -608,6 +608,21 @@ mod tests {
     }
 
     #[test]
+    fn summary_and_river_commands_expose_only_their_current_names() {
+        let registry = command_registry();
+        for name in ["chatQRD", "spawnriver"] {
+            let def = registry.find(name).expect("new command registered");
+            assert_eq!(def.scope, CommandScope::Always);
+            assert_eq!(crate::console::find_command(name, false).unwrap().name, name);
+        }
+        for old in ["quickRundown", "riversource"] {
+            assert!(registry.find(old).is_none(), "obsolete command: {old}");
+            assert!(crate::console::find_command(old, false).is_none());
+        }
+        assert!(registry.find("chatQRD").unwrap().usage.starts_with("chatQRD "));
+    }
+
+    #[test]
     fn in_restart_is_a_local_discoverable_command() {
         let def = command_registry().find("IN_RESTART").expect("in_restart registered");
         assert_eq!(def.scope, CommandScope::Always);

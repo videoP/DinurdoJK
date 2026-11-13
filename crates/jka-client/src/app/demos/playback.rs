@@ -1,7 +1,7 @@
 //! Demo playback.
 use crate::app::{
     charset_glyph_uv, generic_timer_bar, offset_third_person_view, playerstate_vec3,
-    probe_demo_gamestate, rendering_third_person, scene, ui, ActiveReward, App, ApplyLatchedScope,
+    probe_demo_gamestate, rendering_spectator_third_person, rendering_third_person, scene, ui, ActiveReward, App, ApplyLatchedScope,
     Arc, ClientGameState, ClothConfig, Cursor, DemoAdvance, DemoCameraSample, DemoFakeView,
     DemoReader, DemoViewMode, Duration, DynamicLightsMode,
     EntityEvent, FrontendPage, FxGeometryMode, GameSession, Ghoul2PresentationView, Instant,
@@ -314,6 +314,7 @@ impl GameSession {
                 entity.state.field_f32("pos.trDelta[2]").unwrap_or(0.0),
             ],
             health: entity.state.field_i32("health").unwrap_or(100),
+            weapon: entity.state.field_i32("weapon").unwrap_or(0),
             legs_anim: entity.state.field_i32("legsAnim").unwrap_or(0),
         })
     }
@@ -705,6 +706,8 @@ impl App {
             || self.local_server.is_some()
             || !self.front_end;
         if transitioning_from_active_session { self.disconnect_for_demo_transition(); }
+        self.clear_session_chatbox();
+        self.clear_demo_console_history();
         self.select_demo_asset_game(jk2);
         if let Err(error) =
             self.set_session_fs_game_preserving_rendered_world(&probe.fs_game, "demo gamestate")
@@ -802,6 +805,8 @@ impl App {
             .map(|prompt| prompt.map_name)
             .unwrap_or_else(|| "unknown map".to_owned());
         self.game_session = None;
+        self.clear_demo_console_history();
+        self.clear_session_chatbox();
         self.live_without_world = false;
         self.demo_without_world = false;
         self.restore_startup_game();
@@ -937,6 +942,8 @@ impl App {
                 self.push_console_line(format!("^1{}", self.console_status));
                 eprintln!("{}", self.console_status);
                 self.game_session = None;
+                self.clear_demo_console_history();
+                self.clear_session_chatbox();
             }
         }
     }
@@ -976,8 +983,9 @@ impl App {
         self.update_falling_death(&sample);
         let spectator_mode = spectator_view.then_some(self.spectator_camera.mode);
         let render_third_person = match spectator_mode {
-            Some(SpectatorCameraMode::FirstPerson) => false,
-            Some(SpectatorCameraMode::ThirdPerson) | Some(SpectatorCameraMode::Orbit) => true,
+            Some(mode) => rendering_spectator_third_person(
+                mode, self.first_person_lightsaber, sample.policy.weapon,
+            ),
             None => rendering_third_person(
                 self.third_person,
                 self.first_person_lightsaber,
@@ -998,8 +1006,7 @@ impl App {
             if let Some(mode) = spectator_mode {
                 third_person.enabled = true;
                 match mode {
-                    SpectatorCameraMode::FirstPerson => unreachable!("handled above"),
-                    SpectatorCameraMode::ThirdPerson => {
+                    SpectatorCameraMode::FirstPerson | SpectatorCameraMode::ThirdPerson => {
                         third_person.angle = if self.spectator_camera.motion_direction {
                             // TaystJK cg_thirdPersonAngle -1 semantics: use
                             // the followed player's presented velocity directly.
@@ -1135,70 +1142,69 @@ impl App {
         );
         self.render_view_latch = ViewLatchMode::Disabled;
         self.camera.clear_first_person_bob();
-        match self.spectator_camera.mode {
-            SpectatorCameraMode::FirstPerson => {
+        let render_third_person = rendering_spectator_third_person(
+            self.spectator_camera.mode, self.first_person_lightsaber, fake.weapon,
+        );
+        if !render_third_person {
+            self.camera.position = glam::Vec3::from_array(fake.eye_position);
+            self.camera.yaw = fake.view_angles[1].to_radians();
+            self.camera.pitch = -fake.view_angles[0].to_radians();
+        } else {
+            let mut third_person = self.third_person;
+            third_person.enabled = true;
+            let mut camera_angles = fake.view_angles;
+            match self.spectator_camera.mode {
+                SpectatorCameraMode::FirstPerson | SpectatorCameraMode::ThirdPerson => {
+                    third_person.angle = if self.spectator_camera.motion_direction {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                }
+                SpectatorCameraMode::Orbit => {
+                    third_person.angle = 0.0;
+                    third_person.range = self.spectator_camera.orbit_range;
+                    third_person.camera_damp = 1.0;
+                    camera_angles = self.spectator_camera_state.orbit_angles(fake.view_angles);
+                }
+            }
+            if self.live_buttons.contains("+zoom") {
+                third_person.range = self.japro_zoom_third_person_range(third_person.range);
+            }
+            if let Some(world) = self.map_collision.as_mut() {
+                let view = offset_third_person_view(
+                    world,
+                    third_person,
+                    &mut self.third_person_camera,
+                    ThirdPersonViewInput {
+                        origin: fake.native_origin,
+                        view_angles: camera_angles,
+                        velocity: fake.velocity,
+                        // Remote EntityState has no viewheight/dead_yaw.
+                        // 26 is JKA's standing viewheight and matches the
+                        // first-person approximation used by demo_fake_view.
+                        view_height: 26,
+                        // Same rule for reconstructed remote demo POVs: Orbit
+                        // owns yaw even if remote health is unavailable/zero.
+                        health: if self.spectator_camera.mode == SpectatorCameraMode::Orbit {
+                            fake.health.max(1)
+                        } else {
+                            fake.health
+                        },
+                        dead_yaw: fake.view_angles[1],
+                        client_num: fake.client_num,
+                        time: sample.presentation_time_ms,
+                        teleported: false,
+                    },
+                );
+                self.camera.position =
+                    glam::Vec3::from_array(scene::render_position(view.origin));
+                self.camera.yaw = view.angles[1].to_radians();
+                self.camera.pitch = -view.angles[0].to_radians();
+            } else {
                 self.camera.position = glam::Vec3::from_array(fake.eye_position);
                 self.camera.yaw = fake.view_angles[1].to_radians();
                 self.camera.pitch = -fake.view_angles[0].to_radians();
-            }
-            SpectatorCameraMode::ThirdPerson | SpectatorCameraMode::Orbit => {
-                let mut third_person = self.third_person;
-                third_person.enabled = true;
-                let mut camera_angles = fake.view_angles;
-                match self.spectator_camera.mode {
-                    SpectatorCameraMode::FirstPerson => unreachable!("handled above"),
-                    SpectatorCameraMode::ThirdPerson => {
-                        third_person.angle = if self.spectator_camera.motion_direction {
-                            -1.0
-                        } else {
-                            0.0
-                        };
-                    }
-                    SpectatorCameraMode::Orbit => {
-                        third_person.angle = 0.0;
-                        third_person.range = self.spectator_camera.orbit_range;
-                        third_person.camera_damp = 1.0;
-                        camera_angles = self.spectator_camera_state.orbit_angles(fake.view_angles);
-                    }
-                }
-                if self.live_buttons.contains("+zoom") {
-                    third_person.range = self.japro_zoom_third_person_range(third_person.range);
-                }
-                if let Some(world) = self.map_collision.as_mut() {
-                    let view = offset_third_person_view(
-                        world,
-                        third_person,
-                        &mut self.third_person_camera,
-                        ThirdPersonViewInput {
-                            origin: fake.native_origin,
-                            view_angles: camera_angles,
-                            velocity: fake.velocity,
-                            // Remote EntityState has no viewheight/dead_yaw.
-                            // 26 is JKA's standing viewheight and matches the
-                            // first-person approximation used by demo_fake_view.
-                            view_height: 26,
-                            // Same rule for reconstructed remote demo POVs: Orbit
-                            // owns yaw even if remote health is unavailable/zero.
-                            health: if self.spectator_camera.mode == SpectatorCameraMode::Orbit {
-                                fake.health.max(1)
-                            } else {
-                                fake.health
-                            },
-                            dead_yaw: fake.view_angles[1],
-                            client_num: fake.client_num,
-                            time: sample.presentation_time_ms,
-                            teleported: false,
-                        },
-                    );
-                    self.camera.position =
-                        glam::Vec3::from_array(scene::render_position(view.origin));
-                    self.camera.yaw = view.angles[1].to_radians();
-                    self.camera.pitch = -view.angles[0].to_radians();
-                } else {
-                    self.camera.position = glam::Vec3::from_array(fake.eye_position);
-                    self.camera.yaw = fake.view_angles[1].to_radians();
-                    self.camera.pitch = -fake.view_angles[0].to_radians();
-                }
             }
         }
     }

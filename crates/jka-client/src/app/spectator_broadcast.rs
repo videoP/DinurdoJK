@@ -102,9 +102,19 @@ pub(in crate::app) struct PlayerTelemetry {
     weapon: Option<i32>,
     /// Ammo of `weapon` (None for the saber/melee or unknown).
     ammo: Option<i32>,
+    /// Horizontal playerState velocity, sampled during a real follow.
+    speed: Option<i32>,
     score: i32,
     deaths: i32,
     sampled_at: Instant,
+}
+
+/// Same XY speed definition as the spectator follow/fastest readout.
+/// No speed is invented when the underlying protocol fields are missing.
+fn horizontal_speed(x: Option<f32>, y: Option<f32>) -> Option<i32> {
+    let (x, y) = (x?, y?);
+    (x.is_finite() && y.is_finite())
+        .then(|| x.hypot(y).round().clamp(0.0, i32::MAX as f32) as i32)
 }
 
 impl PlayerTelemetry {
@@ -122,6 +132,7 @@ impl PlayerTelemetry {
                 let index = usize::try_from(index).ok().filter(|index| *index > 0)?;
                 (energy > 0 || alt_energy > 0).then(|| ps.ammo.get(index).copied()).flatten()
             }),
+            speed: horizontal_speed(ps.field_f32("velocity[0]"), ps.field_f32("velocity[1]")),
             score: ps.persistant[PERS_SCORE],
             deaths: ps.persistant[PERS_KILLED],
             sampled_at: now,
@@ -1384,6 +1395,19 @@ impl App {
                 .map(|s| PlayerTelemetry::from_player_state(&s.player_state, now));
             let observed = followed.or(self.spectator_broadcast.samples[client]);
             let age_ms = |at: Instant| now.saturating_duration_since(at).as_millis().min(u32::MAX as u128) as u32;
+            // Prefer the real followed playerState, then the currently
+            // presented entity trajectory. Out of PVS, use a short-lived
+            // real sample from mode 4; never treat absence as zero speed.
+            let (speed, speed_stale) = if let Some(sample) = followed {
+                (sample.speed, false)
+            } else if let Some(entity) = entity {
+                (horizontal_speed(entity.state.field_f32("pos.trDelta[0]"),
+                    entity.state.field_f32("pos.trDelta[1]")), false)
+            } else if let Some(sample) = observed.filter(|sample| age_ms(sample.sampled_at) <= 5_000) {
+                (sample.speed, true)
+            } else {
+                (None, false)
+            };
             // `tinfo` wins when it is newer than the last playerState sample;
             // Force only exists in playerStates, so keep it while still fresh.
             let team_info = self.spectator_broadcast.team_info[client]
@@ -1468,6 +1492,8 @@ impl App {
                 score, deaths,
                 weapon,
                 ammo,
+                speed,
+                speed_stale,
                 alive: alive_now,
                 vitals,
                 model: format!("{}/{}", info.model_name, info.skin_name),
@@ -1502,6 +1528,7 @@ impl App {
             .filter(|client| players.iter().any(|player| player.client == *client))
             .map(|client| {
                 // Ammo/style need the real presented playerState of that client.
+                // Missing ps never changes whether broadcast owns native vitals.
                 let ps = session.current_snapshot.as_ref()
                     .map(|snapshot| &snapshot.player_state)
                     .filter(|ps| !sweeping && ps.field_i32("clientNum") == Some(client));
@@ -1518,8 +1545,6 @@ impl App {
                     client,
                     ammo,
                     saber_style,
-                    // Only when the native meters would show this same player.
-                    replaces_native: ps.is_some(),
                 }
             });
 
@@ -1573,6 +1598,18 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn player_speed_matches_xy_spectator_units_per_second() {
+        assert_eq!(horizontal_speed(Some(300.0), Some(400.0)), Some(500));
+        assert_eq!(horizontal_speed(Some(0.0), Some(0.0)), Some(0));
+        assert_eq!(horizontal_speed(None, Some(2.0)), None);
+        assert_eq!(horizontal_speed(Some(f32::NAN), Some(2.0)), None);
+        let now = Instant::now();
+        let mut ps = PlayerState::default();
+        set_vec3_ps(&mut ps, "velocity", [300.0, 400.0, 700.0]);
+        assert_eq!(PlayerTelemetry::from_player_state(&ps, now).speed, Some(500));
+    }
 
     fn ps_following(client: i32) -> PlayerState {
         let mut ps = PlayerState::default();

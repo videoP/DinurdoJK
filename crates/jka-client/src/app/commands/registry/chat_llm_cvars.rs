@@ -26,7 +26,12 @@ app_cvars! {
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.chat_llm.settings.translate_url.clone()),
             |app, value| {
-                app.chat_llm.settings.translate_url = model_address("cg_chatTranslateModel", &value.to_string())?;
+                let url = model_address("cg_chatTranslateModel", &value.to_string())?;
+                if url != app.chat_llm.settings.translate_url {
+                    let old = app.chat_llm.settings.translate_model().to_owned();
+                    app.unload_chat_model(Some(&old));
+                }
+                app.chat_llm.settings.translate_url = url;
                 app.chat_llm.edits.translate_url = None;
                 app.chat_llm_settings_changed();
                 Ok(())
@@ -91,6 +96,10 @@ app_cvars! {
             |app: &App| CvarValue::Bool(app.chat_llm.settings.censor),
             |app, value| {
                 let CvarValue::Bool(v) = value else { unreachable!("validated cvar type") };
+                if v && !app.chat_model_can_start(app.chat_llm.settings.assist_model()) {
+                    app.request_chat_model_download(crate::app::chat_llm::ChatModelUse::Filter);
+                    return Ok(());
+                }
                 app.chat_llm.settings.censor = v;
                 app.chat_llm_settings_changed();
                 Ok(())
@@ -191,11 +200,16 @@ app_cvars! {
 
     APP_CG_CHATLLMMODEL {
         runtime: CvarDef::new("cg_chatLlmModel", "", "https URL of a .gguf file",
-            "General model for the chat filter and quickRundown. Empty uses Qwen3.5 4B (about 2.7 GB, about a second per message); Setup offers the lighter 2B model (1.3 GB), which misjudges banter. Set it to the same address as cg_chatTranslateModel to keep one model in memory for everything.",
+            "General model for the chat filter and chatQRD. Empty uses Qwen3.5 4B (about 2.7 GB, about a second per message); Setup offers the lighter 2B model (1.3 GB), which misjudges banter. Set it to the same address as cg_chatTranslateModel to keep one model in memory for everything.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.chat_llm.settings.assist_url.clone()),
             |app, value| {
-                app.chat_llm.settings.assist_url = model_address("cg_chatLlmModel", &value.to_string())?;
+                let url = model_address("cg_chatLlmModel", &value.to_string())?;
+                if url != app.chat_llm.settings.assist_url {
+                    let old = app.chat_llm.settings.assist_model().to_owned();
+                    app.unload_chat_model(Some(&old));
+                }
+                app.chat_llm.settings.assist_url = url;
                 app.chat_llm.edits.assist_url = None;
                 app.chat_llm_settings_changed();
                 Ok(())
@@ -233,7 +247,7 @@ app_cvars! {
 
     APP_CG_QUICKRUNDOWNPROMPT {
         runtime: CvarDef::new("cg_quickRundownPrompt", "", "text",
-            "Instruction given to the model for quickRundown. {player} and {language} are filled in. Empty uses the built-in prompt.",
+            "Instruction given to the model for chatQRD. {player} and {language} are filled in. Empty uses the built-in prompt.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.chat_llm.settings.summary_prompt.clone()),
             |app, value| {

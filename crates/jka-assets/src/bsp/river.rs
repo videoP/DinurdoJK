@@ -268,7 +268,7 @@ pub fn collision_triangles(bsp: &Bsp) -> Result<Vec<[[f32; 3]; 3]>, String> {
 }
 
 /// Detailed developer-river collision, built once per map and reused by each
-/// `riversource` placement without touching collision on the render loop.
+/// `spawnriver` placement without touching collision on the render loop.
 pub fn collision_surfaces(bsp: &Bsp) -> Result<Vec<CollisionSurface>, String> {
     use super::{brush_side_polygon, CONTENTS_SOLID, CONTENTS_TERRAIN, SURF_SKY};
     const LIQUIDS: u32 = super::bathymetry::CONTENTS_WATER | 0x0000_0002 | 0x0002_0000;

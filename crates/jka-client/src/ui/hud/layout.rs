@@ -12,6 +12,7 @@ pub enum HudElementId {
     Force,
     Score,
     MiniScores,
+    FlagStatus,
     EnemyInfo,
     MovementKeys,
     Fps,
@@ -44,13 +45,14 @@ impl HudElementId {
     // position is now the clickable `OverlayMode::Trace` egui menu, which
     // isn't a draggable HUD element. The variant, its cvar prefix and its
     // offset field stay (see `element`/`element_mut`) so old configs still load.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::Health,
         Self::Shield,
         Self::Ammo,
         Self::Force,
         Self::Score,
         Self::MiniScores,
+        Self::FlagStatus,
         Self::EnemyInfo,
         Self::MovementKeys,
         Self::Fps,
@@ -84,6 +86,7 @@ impl HudElementId {
             Self::Force => "FORCE",
             Self::Score => "HUD SCORE",
             Self::MiniScores => "TEAM / DUEL SCORES",
+            Self::FlagStatus => "FLAG STATUS",
             Self::EnemyInfo => "ENEMY INFO",
             Self::MovementKeys => "MOVEMENT KEYS",
             Self::Fps => "FPS / PERF",
@@ -120,6 +123,7 @@ impl HudElementId {
             Self::Force => "cg_hudForce",
             Self::Score => "cg_hudScore",
             Self::MiniScores => "cg_hudMiniScores",
+            Self::FlagStatus => "cg_hudFlagStatus",
             Self::EnemyInfo => "cg_hudEnemyInfo",
             Self::MovementKeys => "cg_hudMovementKeys",
             Self::Fps => "cg_hudFps",
@@ -293,6 +297,7 @@ pub struct HudLayout {
     pub force: HudElementLayout,
     pub score: HudElementLayout,
     pub mini_scores: HudElementLayout,
+    pub flag_status: HudElementLayout,
     pub enemy_info: HudElementLayout,
     pub movement_keys: HudElementLayout,
     pub fps: HudElementLayout,
@@ -335,6 +340,7 @@ impl Default for HudLayout {
         Self {
             score: HUD_UNMOVED,
             mini_scores: HUD_UNMOVED,
+            flag_status: HUD_UNMOVED,
             enemy_info: HUD_UNMOVED,
             movement_keys: HUD_UNMOVED,
             fps: HUD_UNMOVED,
@@ -400,6 +406,7 @@ impl HudLayout {
             HudElementId::Force => self.force,
             HudElementId::Score => self.score,
             HudElementId::MiniScores => self.mini_scores,
+            HudElementId::FlagStatus => self.flag_status,
             HudElementId::EnemyInfo => self.enemy_info,
             HudElementId::MovementKeys => self.movement_keys,
             HudElementId::Fps => self.fps,
@@ -436,6 +443,7 @@ impl HudLayout {
             HudElementId::Force => &mut self.force,
             HudElementId::Score => &mut self.score,
             HudElementId::MiniScores => &mut self.mini_scores,
+            HudElementId::FlagStatus => &mut self.flag_status,
             HudElementId::EnemyInfo => &mut self.enemy_info,
             HudElementId::MovementKeys => &mut self.movement_keys,
             HudElementId::Fps => &mut self.fps,
@@ -515,6 +523,8 @@ pub struct HudRectContext {
     pub hud_style: u8,
     /// Whether Native HUD uses the 80x80 JK2 panels (versus JKA 128x124).
     pub jk2_mode: bool,
+    /// Two normal CTF flags, or three for MVSDK opt-in JK2 CTF3.
+    pub flag_status_rows: u8,
     pub draw_timer: bool,
     /// The independently placed cg_drawScores display (Tayst mode 1/2 vs 3).
     pub mini_scores_mode: i32,
@@ -552,6 +562,7 @@ impl HudRectContext {
             draw_fps: video.draw_fps,
             hud_style: video.hud_style,
             jk2_mode: false,
+            flag_status_rows: 2,
             draw_timer,
             mini_scores_mode,
             score_offset,
@@ -595,6 +606,7 @@ impl HudRectContext {
             },
         );
         context.jk2_mode = ui.jk2_mode;
+        context.flag_status_rows = ui.jk2_flags.len().clamp(2, 3) as u8;
         context.enemy_info = ui.enemy_info.is_some();
         context.corner_rows = crate::ui::killfeed::corner_rows(ui);
         context
@@ -688,6 +700,12 @@ pub(crate) fn hud_stock_rect(
                 }
             }
         }
+        // Match build_enhanced_flag_status: both icon and carrier text use
+        // the 640x480 vertical unit, including on widescreen displays.
+        HudElementId::FlagStatus => HudRect {
+            x: 3.0 * sy, y: 66.0 * sy, width: 310.0 * sy,
+            height: (32.0 + 38.0 * (ctx.flag_status_rows.clamp(2, 3) - 1) as f32) * sy,
+        },
         HudElementId::EnemyInfo => {
             let rows = (ctx.draw_fps != 0) as u8 + ctx.draw_timer as u8;
             // Matches CG_DrawUpperRight stacking. An editor-sized rectangle
@@ -1134,6 +1152,29 @@ pub fn hud_element_rect(
 mod neighbor_resize_tests {
     use super::{snap_hud_neighbor_size, snap_hud_rect_position, HudRect};
 
+
+    #[test]
+    fn flag_status_has_independent_archived_layout_and_stock_bounds() {
+        use super::{hud_element_rect, HudElementId, HudElementLayout, HudLayout, HudRectContext};
+        let id = HudElementId::from_cvar("CG_HUDFLAGSTATUS").unwrap();
+        assert_eq!(id, HudElementId::FlagStatus);
+        let mut layout = HudLayout::default();
+        assert_eq!(layout.element(id), super::HUD_UNMOVED);
+        let saved = HudElementLayout::from_config("tl 28 16 1.25").unwrap();
+        *layout.element_mut(id) = saved;
+        assert_eq!(layout.element(id).to_config(), saved.to_config());
+
+        let mut ctx = HudRectContext::new(
+            Default::default(), &Default::default(), &Default::default(),
+            1, &Default::default(), Default::default(), false, [0.0; 2], 0,
+        );
+        let stock = hud_element_rect(id, super::HUD_UNMOVED, &ctx, 1280, 720);
+        assert_eq!([stock.x, stock.y], [4.5, 99.0]);
+        assert_eq!([stock.width, stock.height], [465.0, 105.0]);
+        ctx.flag_status_rows = 3;
+        let triple = hud_element_rect(id, super::HUD_UNMOVED, &ctx, 1280, 720);
+        assert_eq!(triple.height, 162.0);
+    }
 
     #[test]
     fn snaps_real_edges_to_grid_not_a_stock_relative_offset() {

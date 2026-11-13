@@ -184,6 +184,8 @@ impl App {
         // authority so this always becomes a local solo world.
         self.net = None;
         self.game_session = None;
+        self.clear_demo_console_history();
+        self.clear_session_chatbox();
         self.local_server = None;
         self.predictor.reset();
         self.live_without_world = false;

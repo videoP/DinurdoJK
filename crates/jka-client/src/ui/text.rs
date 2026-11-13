@@ -4,6 +4,60 @@ use crate::ui::{
     Zeroable, CONSOLE_CHAR_HEIGHT, CONSOLE_CHAR_WIDTH,
 };
 
+// The renderer composes several UI batches independently (sometimes on separate
+// threads). Scope NWH parsing to each snapshot's build, rather than enabling a
+// global flag that could leak into JKA/ordinary JK2 or demo playback.
+thread_local! {
+    static NWH_RGB_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) struct NwhColorScope(bool);
+
+impl NwhColorScope {
+    pub(crate) fn enter(enabled: bool) -> Self {
+        Self(NWH_RGB_ENABLED.with(|cell| cell.replace(enabled)))
+    }
+}
+
+impl Drop for NwhColorScope {
+    fn drop(&mut self) {
+        NWH_RGB_ENABLED.with(|cell| cell.set(self.0));
+    }
+}
+
+/// The number of bytes in the code and the new active color. Normal ^0-^9
+/// handling is unchanged; NWH's 3/4/6/8-digit escapes take priority only
+/// inside an NWH JK2 UI build.
+#[inline]
+pub(in crate::ui) fn color_escape(bytes: &[u8], index: usize, alpha: f32) -> Option<(usize, [f32; 4])> {
+    if bytes.get(index) != Some(&b'^') { return None; }
+    if NWH_RGB_ENABLED.with(std::cell::Cell::get) {
+        if let Some(code) = crate::nwh_colors::parse_hex_escape(bytes, index, alpha) {
+            return Some(code);
+        }
+    }
+    color_code(*bytes.get(index + 1)? as char, alpha).map(|code| (2, code))
+}
+
+/// Same parser over a `char` array (the legacy centerprint word-wrapper).
+pub(in crate::ui) fn color_escape_chars(chars: &[char], index: usize, alpha: f32) -> Option<(usize, [f32; 4])> {
+    if chars.get(index) != Some(&'^') { return None; }
+    if NWH_RGB_ENABLED.with(std::cell::Cell::get) {
+        let digits = match chars.get(index + 1)? {
+            'x' => 3, 'X' => 6, 'y' => 4, 'Y' => 8, _ => 0,
+        };
+        if digits > 0 && chars.get(index + 1 + digits).is_some() {
+            // ASCII escapes: convert only their at-most-ten characters.
+            let mut bytes = [0u8; 10];
+            for (dest, ch) in bytes.iter_mut().zip(chars[index..index + 2 + digits].iter()) {
+                *dest = u8::try_from(*ch as u32).ok()?;
+            }
+            return crate::nwh_colors::parse_hex_escape(&bytes[..2 + digits], 0, alpha);
+        }
+    }
+    color_code(*chars.get(index + 1)?, alpha).map(|code| (2, code))
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct UiVertex {
@@ -163,12 +217,9 @@ pub(in crate::ui) fn truncate_jka_text(value: &str, max_visible: usize) -> Strin
     let mut visible = 0usize;
     let mut index = 0usize;
     while index < bytes.len() && visible < max_visible {
-        if bytes[index] == b'^'
-            && index + 1 < bytes.len()
-            && color_code(bytes[index + 1] as char, 1.0).is_some()
-        {
-            out.extend_from_slice(&bytes[index..index + 2]);
-            index += 2;
+        if let Some((skip, _)) = color_escape(&bytes, index, 1.0) {
+            out.extend_from_slice(&bytes[index..index + skip]);
+            index += skip;
             continue;
         }
         out.push(bytes[index]);
@@ -202,12 +253,10 @@ pub(in crate::ui) fn text(
             index += 1;
             continue;
         }
-        if byte == b'^' && index + 1 < bytes.len() {
-            if let Some(code) = color_code(bytes[index + 1] as char, color[3]) {
-                active_color = code;
-                index += 2;
-                continue;
-            }
+        if let Some((skip, code)) = color_escape(&bytes, index, color[3]) {
+            active_color = code;
+            index += skip;
+            continue;
         }
         if byte == b' ' {
             cursor_x += 6.0 * scale;
@@ -238,11 +287,8 @@ pub(in crate::ui) fn proportional_text_width(
     let mut width = 0.0f32;
     let mut index = 0usize;
     while index < bytes.len() {
-        if bytes[index] == b'^'
-            && index + 1 < bytes.len()
-            && color_code(bytes[index + 1] as char, 1.0).is_some()
-        {
-            index += 2;
+        if let Some((skip, _)) = color_escape(&bytes, index, 1.0) {
+            index += skip;
             continue;
         }
         if bytes[index] == b'\n' {
@@ -272,13 +318,9 @@ pub(in crate::ui) fn wrap_proportional_text(
     let mut index = 0usize;
 
     while index < bytes.len() {
-        if bytes[index] == b'^'
-            && index + 1 < bytes.len()
-            && color_code(bytes[index + 1] as char, 1.0).is_some()
-        {
-            out.push(bytes[index] as char);
-            out.push(bytes[index + 1] as char);
-            index += 2;
+        if let Some((skip, _)) = color_escape(&bytes, index, 1.0) {
+            out.extend(bytes[index..index + skip].iter().map(|&byte| byte as char));
+            index += skip;
             continue;
         }
         let byte = bytes[index];
@@ -393,12 +435,10 @@ fn proportional_text_with_x_scale(
                 index += 1;
                 continue;
             }
-            if byte == b'^' && index + 1 < bytes.len() {
-                if let Some(code) = color_code(bytes[index + 1] as char, color[3]) {
-                    active_color = code;
-                    index += 2;
-                    continue;
-                }
+            if let Some((skip, code)) = color_escape(&bytes, index, color[3]) {
+                active_color = code;
+                index += skip;
+                continue;
             }
 
             let glyph = font.glyphs[byte as usize];
@@ -460,7 +500,9 @@ pub fn build_world_player_label_vertices(
     font: Option<&ProportionalFont>,
     width: u32,
     height: u32,
+    nwh_hex_colors: bool,
 ) {
+    let _nwh_scope = NwhColorScope::enter(nwh_hex_colors);
     let sy = height.max(1) as f32 / 480.0;
     let scale = scale.clamp(0.05, 4.0);
 
@@ -499,10 +541,7 @@ pub fn build_world_player_label_vertices(
         // proportional JKA font by the time a game snapshot can exist.
         let fallback_scale = (1.25 * scale).max(0.25);
         for (line, value) in label.text.split('\n').enumerate() {
-            let visible = crate::cgame::text_to_jka_bytes(value)
-                .iter()
-                .filter(|&&c| c != b'^')
-                .count() as f32;
+            let visible = crate::ui::visible_jka_chars(value) as f32;
             text(
                 out,
                 value,
@@ -585,11 +624,8 @@ pub(in crate::ui) fn fixed_charset_text(
                 index += 1;
                 continue;
             }
-            if byte == b'^'
-                && index + 1 < bytes.len()
-                && color_code(bytes[index + 1] as char, color[3]).is_some()
-            {
-                index += 2;
+            if let Some((skip, _)) = color_escape(&bytes, index, color[3]) {
+                index += skip;
                 continue;
             }
             if byte != b' ' {
@@ -623,12 +659,10 @@ pub(in crate::ui) fn fixed_charset_text(
             index += 1;
             continue;
         }
-        if byte == b'^' && index + 1 < bytes.len() {
-            if let Some(code) = color_code(bytes[index + 1] as char, color[3]) {
-                active_color = code;
-                index += 2;
-                continue;
-            }
+        if let Some((skip, code)) = color_escape(&bytes, index, color[3]) {
+            active_color = code;
+            index += skip;
+            continue;
         }
         if byte != b' ' {
             glyph_quad_sized(
@@ -680,12 +714,10 @@ pub(in crate::ui) fn console_text_sized(
             index += 1;
             continue;
         }
-        if byte == b'^' && index + 1 < bytes.len() {
-            if let Some(code) = color_code(bytes[index + 1] as char, color[3]) {
-                active_color = code;
-                index += 2;
-                continue;
-            }
+        if let Some((skip, code)) = color_escape(&bytes, index, color[3]) {
+            active_color = code;
+            index += skip;
+            continue;
         }
         if byte != b' ' {
             glyph_quad_sized(
@@ -920,7 +952,7 @@ pub fn build_studio_label_vertices(
         proportional_text_uniform(out, &label.text, font, x - text_width * 0.5, y, scale, [label.color[0],label.color[1],label.color[2],alpha], true, width, height);
     } else {
         let fallback = (1.25 * scale).max(0.25);
-        let visible = crate::cgame::text_to_jka_bytes(&label.text).iter().filter(|&&c| c != b'^').count() as f32;
+        let visible = crate::ui::visible_jka_chars(&label.text) as f32;
         text(out, &label.text, x - visible * 3.0 * fallback, y - 4.0 * fallback, fallback, [label.color[0],label.color[1],label.color[2],alpha], width, height);
     }
 }
@@ -964,11 +996,11 @@ fn wide_runs(value: &str) -> Vec<(bool, &str)> {
 
 /// The colour in force after `run`, given the one before it.
 fn colour_after(run: &str, mut active: [f32; 4], alpha: f32) -> [f32; 4] {
-    let mut chars = run.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '^' {
-            if let Some(code) = chars.peek().and_then(|next| color_code(*next, alpha)) {
-                active = code;
+    let mut chars = run.char_indices().peekable();
+    while let Some((index, _)) = chars.next() {
+        if let Some((skip, code)) = color_escape(run.as_bytes(), index, alpha) {
+            active = code;
+            while chars.peek().is_some_and(|(at, _)| *at < index + skip) {
                 chars.next();
             }
         }
@@ -1001,10 +1033,12 @@ impl<'a> UiText<'a> {
     fn clean_width(font: &ProportionalFont, value: &str, px: f32) -> f32 {
         let scale = px / f32::from(font.height.max(1));
         let mut width = 0.0;
-        let mut chars = value.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '^' && chars.peek().is_some_and(|next| color_code(*next, 1.0).is_some()) {
-                chars.next();
+        let mut chars = value.char_indices().peekable();
+        while let Some((index, ch)) = chars.next() {
+            if let Some((skip, _)) = color_escape(value.as_bytes(), index, 1.0) {
+                while chars.peek().is_some_and(|(at, _)| *at < index + skip) {
+                    chars.next();
+                }
                 continue;
             }
             width += f32::from(font.glyph_for(ch).horiz_advance.max(0)) * scale;
@@ -1023,14 +1057,14 @@ impl<'a> UiText<'a> {
         for pass in [true, false] {
             let mut cursor = x;
             let mut active = start;
-            let mut chars = value.chars().peekable();
-            while let Some(ch) = chars.next() {
-                if ch == '^' {
-                    if let Some(code) = chars.peek().and_then(|next| color_code(*next, color[3])) {
-                        active = code;
+            let mut chars = value.char_indices().peekable();
+            while let Some((index, ch)) = chars.next() {
+                if let Some((skip, code)) = color_escape(value.as_bytes(), index, color[3]) {
+                    active = code;
+                    while chars.peek().is_some_and(|(at, _)| *at < index + skip) {
                         chars.next();
-                        continue;
                     }
+                    continue;
                 }
                 let glyph = font.glyph_for(ch);
                 if glyph.width > 0 && glyph.height > 0 && ch != ' ' {
@@ -1202,6 +1236,30 @@ mod widescreen_font_tests {
     }
 
     #[test]
+    fn nwh_hex_names_are_zero_width_codes_only_in_nwh_scope() {
+        let font = test_font();
+        let name = "^XFF8000Bo^x0F0b^7!";
+        // The same bytes are ordinary text outside a verified NWH build.
+        assert_eq!(proportional_text_width(name, &font, 1.0), 17.0 * 9.0);
+        {
+            let _scope = NwhColorScope::enter(true);
+            assert_eq!(proportional_text_width(name, &font, 1.0), 4.0 * 9.0);
+            assert_eq!(UiText::clean_width(&font, name, 12.0), 4.0 * 9.0);
+            assert_eq!(crate::ui::visible_jka_chars(name), 4);
+            assert_eq!(crate::ui::console::visible_text_len(name), 4);
+            assert_eq!(truncate_jka_text(name, 3), "^XFF8000Bo^x0F0b");
+            let mut vertices = Vec::new();
+            proportional_text_uniform(&mut vertices, name, &font, 10.0, 30.0, 1.0,
+                [1.0, 1.0, 1.0, 0.6], true, 640, 480);
+            assert_eq!(vertices.len(), 4 * 6 * 2);
+            assert_eq!(vertices[24].color, UiVertex::pack_color([1.0, 128.0 / 255.0, 0.0, 0.6]));
+            assert_eq!(vertices[36].color, UiVertex::pack_color([0.0, 1.0, 0.0, 0.6]));
+            assert_eq!(vertices[42].color, UiVertex::pack_color([1.0, 1.0, 1.0, 0.6]));
+        }
+        assert_eq!(proportional_text_width(name, &font, 1.0), 17.0 * 9.0);
+    }
+
+    #[test]
     fn projected_player_name_stays_centered_in_widescreen() {
         let font = test_font();
         let label = UiWorldPlayerLabel {
@@ -1211,7 +1269,7 @@ mod widescreen_font_tests {
         for (w, h) in [(640, 480), (1920, 1080), (2560, 1080)] {
             let mut out = Vec::new();
             build_world_player_label_vertices(&mut out, &label, w as f32 / 2.0, 120.0,
-                0.5, Some(&font), w, h);
+                0.5, Some(&font), w, h, false);
             // The glyph width is slightly smaller than advance. Shadow adds
             // one pixel to the right; the computed center is advance-based.
             let (x0, x1) = x_bounds(&out, w);

@@ -366,7 +366,7 @@ fn paint_connection_prompt(txt: &UiText<'_>, out: &mut Vec<UiVertex>, prompt: &C
             draw_line(txt, out, if missing_paks { "SERVER-REFERENCED CONTENT IS MISSING" }
                 else { "THE SERVER USES A MAP NOT INSTALLED LOCALLY" },
                 g.kicker, 12.5*s, LOAD_CYAN, w, h);
-            title(txt, out, if missing_paks { "PK3 DOWNLOAD REQUIRED" } else { "MAP NOT FOUND" },
+            title(txt, out, if missing_paks { "SERVER PACKAGES MISSING" } else { "MAP NOT FOUND" },
                 g.title, 24.0*s, [0.90, 0.97, 1.0, 1.0], w, h);
             rect(out, g.subject[0], g.subject[1], g.subject[2], g.subject[3], [0.045, 0.065, 0.12, 0.99], w, h);
             draw_line(txt, out, map_name, [g.subject[0]+13.0*s, g.subject[1], g.subject[2]-26.0*s, g.subject[3]],
@@ -376,7 +376,7 @@ fn paint_connection_prompt(txt: &UiText<'_>, out: &mut Vec<UiVertex>, prompt: &C
             let half = g.help[3] * 0.5;
             draw_line(txt, out, "Choose how to continue:", [g.help[0],g.help[1],g.help[2],half], 13.0*s, LOAD_LABEL, w, h);
             draw_line(txt, out, if *can_download { "HTTP preferred; legacy UDP used when enabled." }
-                else { "Autodownload is disabled in Setup > Network." },
+                else { "No enabled download transport is available." },
                 [g.help[0],g.help[1]+half,g.help[2],half], 12.0*s,
                 if *can_download { LOAD_FAINT } else { LOAD_AMBER }, w, h);
             paint_button(txt, out, g.primary, "AUTO-DOWNLOAD & CONNECT", true, *can_download,

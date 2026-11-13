@@ -21,9 +21,50 @@ const DEPENDENCY_RELEASE_FILES: &[&str] = &[
     "msvcp140.dll", "msvcp140_atomic_wait.dll",
     "vcruntime140.dll", "vcruntime140_1.dll",
 ];
+const LINUX_DEPENDENCY_FILES: &[&str] = &["libphonon.so"];
 
+// Windows' signed dependency names are unchanged. Linux grants precisely one
+// different path; neither platform accepts the other's native runtime files.
+fn allowed_dependency(name: &str) -> bool {
+    let Some(file) = name.strip_prefix("DinurdoJK/dependencies/") else { return false; };
+    (cfg!(windows) && DEPENDENCY_RELEASE_FILES.contains(&file))
+        || (cfg!(target_os = "linux") && LINUX_DEPENDENCY_FILES.contains(&file))
+}
+
+#[cfg(windows)]
 const MANIFEST_NAME: &str = "release-manifest.json";
+#[cfg(windows)]
 const SIGNATURE_NAME: &str = "release-manifest.sig";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MANIFEST_NAME: &str = "release-manifest-macos-arm64.json";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SIGNATURE_NAME: &str = "release-manifest-macos-arm64.sig";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const MANIFEST_NAME: &str = "release-manifest-macos-x86_64.json";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const SIGNATURE_NAME: &str = "release-manifest-macos-x86_64.sig";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const MANIFEST_NAME: &str = "release-manifest-linux-x86_64.json";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const SIGNATURE_NAME: &str = "release-manifest-linux-x86_64.sig";
+#[cfg(all(not(windows), not(target_os = "macos"), not(all(target_os = "linux", target_arch = "x86_64"))))]
+const MANIFEST_NAME: &str = "release-manifest-unsupported.json";
+#[cfg(all(not(windows), not(target_os = "macos"), not(all(target_os = "linux", target_arch = "x86_64"))))]
+const SIGNATURE_NAME: &str = "release-manifest-unsupported.sig";
+
+#[cfg(windows)]
+const GAME_BINARY: &str = "DinurdoJK.exe";
+#[cfg(not(windows))]
+const GAME_BINARY: &str = "DinurdoJK";
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MACOS_BINARY_ASSET: &str = "DinurdoJK-macos-arm64";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const MACOS_BINARY_ASSET: &str = "DinurdoJK-macos-x86_64";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const LINUX_BINARY_ASSET: &str = "DinurdoJK-linux-x86_64";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const LINUX_PHONON_ASSET: &str = "libphonon-linux-x86_64.so";
 const LAST_ERROR_NAME: &str = "last-error.txt";
 // New files are written beside their targets while the game is still running;
 // the displaced originals are renamed (not copied) to OLD_SUFFIX during the swap.
@@ -164,17 +205,22 @@ fn parse_signed_manifest_with_key(raw: &[u8], signature: &[u8], key: &VerifyingK
     if manifest.format != 2 || stable_version(&manifest.tag).is_none() {
         return Err("unsupported signed per-file release manifest format or tag".into());
     }
-    if !manifest.files.contains_key("DinurdoJK.exe") || manifest.files.len() > DEPENDENCY_RELEASE_FILES.len() + 2 {
-        return Err("signed file allowlist must contain DinurdoJK.exe".into());
+    let max_files = if cfg!(windows) { DEPENDENCY_RELEASE_FILES.len() + 2 }
+        else if cfg!(target_os = "linux") { 3 } else { 2 };
+    if !manifest.files.contains_key(GAME_BINARY) || manifest.files.len() > max_files {
+        return Err(format!("signed file allowlist must contain {GAME_BINARY}"));
+    }
+    #[cfg(target_os = "linux")]
+    if !manifest.files.contains_key("DinurdoJK/dependencies/libphonon.so")
+        || !manifest.files.contains_key("DinurdoJK/shared/dinurdo-assets.pk4") {
+        return Err("Linux manifest must contain the native Steam Audio library and shared assets".into());
     }
     let mut total = 0u64;
     for (name, info) in &manifest.files {
         // The updater is intentionally runtime-only. License and attribution
         // notices belong to the manual full ZIP, never signed install targets.
-        let allowed_root = matches!(name.as_str(), "DinurdoJK.exe"
-            | "DinurdoJK/shared/dinurdo-assets.pk4");
-        let allowed_dependency = name.strip_prefix("DinurdoJK/dependencies/")
-            .is_some_and(|file| DEPENDENCY_RELEASE_FILES.contains(&file));
+        let allowed_root = name == GAME_BINARY || name == "DinurdoJK/shared/dinurdo-assets.pk4";
+        let allowed_dependency = allowed_dependency(name);
         if !allowed_root && !allowed_dependency {
             return Err(format!("signed manifest contains an unexpected file: {name:?}"));
         }
@@ -197,6 +243,13 @@ fn check_digest(hash: &str) -> Result<(), String> {
 // GitHub release asset names are flat; signed install paths may be nested.
 // The asset PK4 and runtime dependencies have fixed, validated destinations.
 fn release_asset_name(installed_name: &str) -> &str {
+    #[cfg(target_os = "macos")]
+    if installed_name == GAME_BINARY { return MACOS_BINARY_ASSET; }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        if installed_name == GAME_BINARY { return LINUX_BINARY_ASSET; }
+        if installed_name == "DinurdoJK/dependencies/libphonon.so" { return LINUX_PHONON_ASSET; }
+    }
     installed_name.strip_prefix("DinurdoJK/dependencies/")
         .or_else(|| installed_name.strip_prefix("DinurdoJK/shared/"))
         .unwrap_or(installed_name)
@@ -235,6 +288,17 @@ fn parse_release_json(bytes: &[u8], installed: &str) -> Result<Option<Release>, 
     let local = stable_version(installed).ok_or("installed version must be MAJOR.MINOR.PATCH")?;
     if remote <= local { return Ok(None); }
 
+    // Other OS releases may appear before this architecture has been published.
+    // Do not interpret a Windows or Mac release as a Linux update. A partially
+    // published signature/manifest pair is still an error, never a fallback.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let assets = value["assets"].as_array().ok_or("GitHub release has no assets")?;
+        let has_manifest = assets.iter().any(|a| a["name"].as_str() == Some(MANIFEST_NAME));
+        let has_signature = assets.iter().any(|a| a["name"].as_str() == Some(SIGNATURE_NAME));
+        if !has_manifest && !has_signature { return Ok(None); }
+        if has_manifest != has_signature { return Err("platform release signature or manifest missing".into()); }
+    }
     let manifest_url = exact_asset_url(&value, tag, MANIFEST_NAME)?;
     let signature_url = exact_asset_url(&value, tag, SIGNATURE_NAME)?;
     // Verify the publisher signature before trusting any file, SHA-256 or
@@ -315,16 +379,32 @@ fn assert_no_reparse(path: &Path) -> Result<(), String> {
 // pending.txt or last-error.txt. The helper is a copy of the EXE in the same
 // directory, so it derives the same key.
 fn staging_root() -> Result<PathBuf, String> {
-    let home = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unavailable")?;
+    #[cfg(windows)]
+    let home = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA is unavailable")?);
+    #[cfg(target_os = "macos")]
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or("HOME is unavailable")?)
+        .join("Library").join("Caches");
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let home = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from)
+            .filter(|p| p.is_absolute()).map(|p| p.join(".cache")))
+        .ok_or("XDG_CACHE_HOME or HOME is required for Linux update staging")?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let dir = exe.parent().ok_or("game directory is unavailable")?;
-    let root = PathBuf::from(home).join("DinurdoJK").join("updates").join(install_key(dir));
+    let root = home.join("DinurdoJK").join("updates").join(install_key(dir));
     assert_no_reparse(&root)?;
     Ok(root)
 }
 
 fn install_key(dir: &Path) -> String {
-    let digest = Sha256::digest(dir.to_string_lossy().to_lowercase().as_bytes());
+    // Windows install paths are case-insensitive; macOS paths may be case-sensitive.
+    let path = dir.to_string_lossy();
+    let digest = if cfg!(windows) {
+        Sha256::digest(path.to_lowercase().as_bytes())
+    } else {
+        Sha256::digest(path.as_bytes())
+    };
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -333,6 +413,16 @@ fn take_last_error(root: &Path) -> Option<String> {
     let text = fs::read_to_string(&path).ok()?;
     let _ = fs::remove_file(&path);
     Some(text.chars().take(2000).collect())
+}
+
+#[cfg(target_os = "macos")]
+fn reject_app_bundle(exe: &Path) -> Result<(), String> {
+    let parent = exe.parent().ok_or("game directory is unavailable")?;
+    if parent.file_name().is_some_and(|part| part == "MacOS")
+        && parent.parent().is_some_and(|p| p.file_name().is_some_and(|part| part == "Contents")) {
+        return Err("macOS .app bundles cannot be updated in place; use the standalone distribution".into());
+    }
+    Ok(())
 }
 
 fn stage_for(tag: &str) -> Result<PathBuf, String> {
@@ -370,7 +460,7 @@ fn stage_filename(signed_name: &str) -> String {
 
 fn signed_name_from_stage(staged_name: &str) -> String {
     if let Some(name) = staged_name.strip_prefix("deps__") {
-        if DEPENDENCY_RELEASE_FILES.contains(&name) {
+        if allowed_dependency(&format!("DinurdoJK/dependencies/{name}")) {
             return format!("DinurdoJK/dependencies/{name}");
         }
     }
@@ -382,8 +472,7 @@ fn signed_name_from_stage(staged_name: &str) -> String {
 fn ensure_install_parent(root: &Path, signed_name: &str) -> Result<(), String> {
     let destination = if signed_name == "DinurdoJK/shared/dinurdo-assets.pk4" {
         Some("shared")
-    } else if signed_name.strip_prefix("DinurdoJK/dependencies/")
-        .is_some_and(|file| DEPENDENCY_RELEASE_FILES.contains(&file)) {
+    } else if allowed_dependency(signed_name) {
         Some("dependencies")
     } else {
         None
@@ -448,8 +537,13 @@ fn sibling(target: &Path, suffix: &str) -> PathBuf {
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
-    a.parent().zip(b.parent()).is_some_and(|(x, y)|
-        x.to_string_lossy().eq_ignore_ascii_case(&y.to_string_lossy()))
+    a.parent().zip(b.parent()).is_some_and(|(x, y)| {
+        if cfg!(windows) {
+            x.to_string_lossy().eq_ignore_ascii_case(&y.to_string_lossy())
+        } else {
+            x == y
+        }
+    })
 }
 
 // Authorization and structure of a stage: publisher signature, tag, ready
@@ -517,6 +611,15 @@ fn copy_verified(source: &Path, target: &Path, expected: &str) -> Result<(), Str
     result
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn make_executable(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    assert_no_reparse(path)?;
+    let mut mode = fs::metadata(path).map_err(|e| e.to_string())?.permissions();
+    mode.set_mode(0o755);
+    fs::set_permissions(path, mode).map_err(|e| format!("chmod {}: {e}", path.display()))
+}
+
 fn remove_preinstalled(root: &Path, manifest: &SignedManifest) {
     for name in manifest.files.keys() {
         let _ = fs::remove_file(sibling(&root.join(name), TMP_SUFFIX));
@@ -532,7 +635,10 @@ fn preinstall(stage: &Path, root: &Path, manifest: &SignedManifest) -> Result<()
         let staged = stage.join("files").join(stage_filename(name));
         if !staged.is_file() { continue; }
         ensure_install_parent(root, name)?;
-        copy_verified(&staged, &sibling(&root.join(name), TMP_SUFFIX), &info.sha256)?;
+        let tmp = sibling(&root.join(name), TMP_SUFFIX);
+        copy_verified(&staged, &tmp, &info.sha256)?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if name.as_str() == GAME_BINARY { make_executable(&tmp)?; }
     }
     Ok(())
 }
@@ -548,10 +654,12 @@ where F: FnMut(u64, u64), G: FnMut(String) {
         return Err("refusing to install the same or an older release".into());
     }
     let current = std::env::current_exe().map_err(|e| e.to_string())?;
-    if current.file_name().and_then(|n| n.to_str()) != Some("DinurdoJK.exe") {
+    if current.file_name().and_then(|n| n.to_str()) != Some(GAME_BINARY) {
         return Err("unexpected game executable path".into());
     }
     let install_root = current.parent().ok_or("game directory is unavailable")?;
+    #[cfg(target_os = "macos")]
+    reject_app_bundle(&current)?;
     assert_no_reparse(install_root)?;
     let mut needed = Vec::new();
     let mut total = 0u64;
@@ -601,6 +709,8 @@ where F: FnMut(u64, u64), G: FnMut(String) {
                 return Err(format!("downloaded {asset} does not match publisher-signed SHA-256"));
             }
             fs::rename(&partial, &path).map_err(|e| e.to_string())?;
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if name.as_str() == GAME_BINARY { make_executable(&path)?; }
             completed += count;
             report_file(format!("[UPDATE] Verified {asset}: size and signed SHA-256 matched"));
         }
@@ -639,9 +749,11 @@ where F: FnMut(u64, u64), G: FnMut(String) {
 /// A copy of the running executable acts as the helper: no separate unsigned
 /// binary is downloaded. The helper re-verifies staged publisher authorization.
 fn launch_helper(exe: &Path, stage: &Path, pid: u32) -> Result<(), String> {
-    if exe.file_name().and_then(|n| n.to_str()) != Some("DinurdoJK.exe") {
-        return Err("updater will only replace DinurdoJK.exe".into());
+    if exe.file_name().and_then(|n| n.to_str()) != Some(GAME_BINARY) {
+        return Err(format!("updater will only replace {GAME_BINARY}"));
     }
+    #[cfg(target_os = "macos")]
+    reject_app_bundle(exe)?;
     assert_no_reparse(exe)?;
     let dir = exe.parent().ok_or("game directory not found")?;
     validate_stage(stage, dir)?;
@@ -649,7 +761,10 @@ fn launch_helper(exe: &Path, stage: &Path, pid: u32) -> Result<(), String> {
     // downloaded stage: Windows searches the EXE directory for dependent DLLs
     // before our Rust signature validation runs.
     assert_no_reparse(dir)?;
+    #[cfg(windows)]
     let helper = dir.join(format!("DinurdoJK-Updater-{pid}.exe"));
+    #[cfg(not(windows))]
+    let helper = dir.join(format!("DinurdoJK-Updater-{pid}"));
     assert_no_reparse(&helper)?;
     if fs::symlink_metadata(&helper).is_ok() {
         fs::remove_file(&helper).map_err(|e| format!("remove stale updater helper: {e}"))?;
@@ -684,7 +799,8 @@ fn remove_stale_helpers() {
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-        if path != current && name.starts_with("dinurdojk-updater-") && name.ends_with(".exe")
+        if path != current && name.starts_with("dinurdojk-updater-")
+            && (if cfg!(windows) { name.ends_with(".exe") } else { !name.ends_with(".exe") })
             && entry.file_type().is_ok_and(|kind| kind.is_file()) {
             let _ = fs::remove_file(&path);
         }
@@ -776,7 +892,7 @@ fn launch_pending(updater_root: &Path) -> Result<bool, String> {
         // and this EXE matches the publisher-signed bytes exactly.
         if remote != local || !stage.join("installing").is_file() ||
             file_sha256(&std::env::current_exe().map_err(|e| e.to_string())?)? !=
-                manifest.files.get("DinurdoJK.exe").ok_or("signed EXE missing")?.sha256 {
+                manifest.files.get(GAME_BINARY).ok_or("signed game executable missing")?.sha256 {
             let _ = fs::remove_file(updater_root.join("pending.txt"));
             return Ok(false);
         }
@@ -823,13 +939,13 @@ fn move_replace(from: &Path, to: &Path) -> Result<(), String> {
 /// (target, displaced original) for each file swapped in by this run.
 type Swapped = Vec<(PathBuf, Option<PathBuf>)>;
 
-/// Put every changed file in place: dependencies first, DinurdoJK.exe last, so
-/// the EXE (which decides whether a retry is still needed) is the commit point.
+/// Put every changed file in place: dependencies first, the native game
+/// executable last, so its version is the commit point.
 /// Each file is hashed once more here, right before it becomes live, closing the
 /// window since it was written. Unchanged installed files are never read.
 fn install_files(stage: &Path, root: &Path, manifest: &SignedManifest, swapped: &mut Swapped) -> Result<(), String> {
     let mut order: Vec<_> = manifest.files.iter().collect();
-    order.sort_by_key(|(name, _)| name.as_str() == "DinurdoJK.exe");
+    order.sort_by_key(|(name, _)| name.as_str() == GAME_BINARY);
     for (name, info) in order {
         let staged = stage.join("files").join(stage_filename(name));
         if !staged.is_file() { continue; }
@@ -847,7 +963,13 @@ fn install_files(stage: &Path, root: &Path, manifest: &SignedManifest, swapped: 
             }
             ensure_install_parent(root, name)?;
             copy_verified(&staged, &tmp, &info.sha256)?;
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if name.as_str() == GAME_BINARY { make_executable(&tmp)?; }
         }
+        // An interrupted run can leave an otherwise verified temporary file
+        // without execute bits. Always restore the mode before the swap.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if name.as_str() == GAME_BINARY { make_executable(&tmp)?; }
         let old = if target.exists() {
             let old = sibling(&target, OLD_SUFFIX);
             if old.exists() { fs::remove_file(&old).map_err(|e| io_error("remove", &old, e))?; }
@@ -883,9 +1005,11 @@ fn undo_swaps(swapped: &Swapped) -> Result<(), String> {
 }
 
 fn apply_update(exe: &Path, stage: &Path, pid: u32) -> Result<(), String> {
-    if exe.file_name().and_then(|n| n.to_str()) != Some("DinurdoJK.exe") {
+    if exe.file_name().and_then(|n| n.to_str()) != Some(GAME_BINARY) {
         return Err("unexpected installation target".into());
     }
+    #[cfg(target_os = "macos")]
+    reject_app_bundle(exe)?;
     let root = exe.parent().ok_or("missing install directory")?;
     // The helper is a link/copy of the game image placed beside it. It acts
     // only on the installation it lives in, whatever the command line says.
@@ -977,10 +1101,10 @@ pub fn helper_entry() -> Option<i32> {
         if let Ok(root) = staging_root() {
             record_failure(&root, parsed.as_ref().ok().map(|(_, _, stage)| stage.as_path()), error);
         }
-        // Never leave the user without a game. Only the sibling DinurdoJK.exe
-        // of this helper copy is started, and it must skip the updater once.
+        // Never leave the user without a game. Only the sibling native game
+        // binary of this helper copy is started, and it skips the updater once.
         if let (Ok((pid, exe, _)), Ok(helper)) = (&parsed, std::env::current_exe()) {
-            if process_exited(*pid) && exe.file_name().and_then(|n| n.to_str()) == Some("DinurdoJK.exe")
+            if process_exited(*pid) && exe.file_name().and_then(|n| n.to_str()) == Some(GAME_BINARY)
                 && exe.parent() == helper.parent() && exe.is_file() {
                 let _ = relaunch_game(exe, true);
             }
@@ -1014,11 +1138,56 @@ fn process_exited(pid: u32) -> bool {
     unsafe { CloseHandle(handle) };
     status == WAIT_OBJECT_0
 }
-#[cfg(not(windows))]
-fn process_exited(_pid: u32) -> bool { true }
+#[cfg(target_os = "macos")]
+unsafe extern "C" { fn kill(pid: i32, signal: i32) -> i32; }
 
-#[cfg(not(windows))]
-fn wait_for_process(_pid: u32) -> Result<(), String> { Err("Updater currently supports Windows only".into()) }
+#[cfg(target_os = "macos")]
+fn process_exited(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 { return false; }
+    if unsafe { kill(pid as i32, 0) } == 0 { return false; }
+    // ESRCH is 3 on Darwin. EPERM is NOT evidence of termination.
+    std::io::Error::last_os_error().raw_os_error() == Some(3)
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_process(pid: u32) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !process_exited(pid) {
+        if std::time::Instant::now() >= deadline {
+            return Err("game did not exit within 60 seconds".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" { fn kill(pid: i32, signal: i32) -> i32; }
+
+#[cfg(target_os = "linux")]
+fn process_exited(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 { return false; }
+    if unsafe { kill(pid as i32, 0) } == 0 { return false; }
+    // ESRCH=3 on Linux; EPERM means still running, not exited.
+    std::io::Error::last_os_error().raw_os_error() == Some(3)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_process(pid: u32) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !process_exited(pid) {
+        if std::time::Instant::now() >= deadline {
+            return Err("game did not exit within 60 seconds".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
+fn process_exited(_pid: u32) -> bool { false }
+#[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
+fn wait_for_process(_pid: u32) -> Result<(), String> { Err("Updater is unsupported on this platform".into()) }
 
 
 /// Bounded, HTTPS-only streaming GET. WinHTTP follows GitHub's secure CDN
@@ -1083,14 +1252,65 @@ where F: FnMut(&[u8], u64) -> Result<(), String> {
     }
     Ok(status as u16)
 }
-#[cfg(not(windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn http_get<F>(url: &str, max: u64, mut receive: F) -> Result<u16, String>
+where F: FnMut(&[u8], u64) -> Result<(), String> {
+    use std::{io::Read, process::{Command, Stdio}};
+    // System curl verifies OS trust roots and follows only
+    // HTTPS redirects to GitHub's asset CDN. Never invoke a shell.
+    if !url.starts_with("https://") || url.bytes().any(|b| b.is_ascii_control()) {
+        return Err("updater requires an HTTPS URL".into());
+    }
+    const TRAILER: &str = "\nDJKHTTP:";
+    let mut child = Command::new("/usr/bin/curl")
+        .args(["--silent", "--show-error", "--location", "--proto", "=https",
+            "--proto-redir", "=https", "--max-time", "300", "--connect-timeout", "15",
+            "--header", "Accept-Encoding: identity", "--user-agent", "DinurdoJK-Updater/1.0",
+            "--write-out", "\nDJKHTTP:%{http_code}", "--url", url])
+        .stdout(Stdio::piped()).stderr(Stdio::null())
+        .spawn().map_err(|e| format!("start system curl: {e}"))?;
+    let result = (|| -> Result<u16, String> {
+        let mut pipe = child.stdout.take().ok_or("curl stdout unavailable")?;
+        let mut tail = Vec::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let mut total = 0u64;
+        // Keep the fixed-size status trailer buffered rather than passing it
+        // to the data stream or hashing it as part of the signed file.
+        const KEEP: usize = 12; // len("\nDJKHTTP:200")
+        loop {
+            let count = pipe.read(&mut buffer).map_err(|e| e.to_string())?;
+            if count == 0 { break; }
+            tail.extend_from_slice(&buffer[..count]);
+            if tail.len() > KEEP {
+                let emit = tail.len() - KEEP;
+                total = total.checked_add(emit as u64).ok_or("download overflow")?;
+                if total > max { return Err("update download exceeds size limit".into()); }
+                receive(&tail[..emit], total)?;
+                tail.drain(..emit);
+            }
+        }
+        if tail.len() != KEEP || !tail.starts_with(TRAILER.as_bytes()) {
+            return Err("GitHub download returned no HTTP status".into());
+        }
+        let status = std::str::from_utf8(&tail[TRAILER.len()..])
+            .map_err(|_| "invalid GitHub status")?.parse::<u16>()
+            .map_err(|_| "invalid GitHub status")?;
+        Ok(status)
+    })();
+    if result.is_err() { let _ = child.kill(); }
+    let wait = child.wait().map_err(|e| format!("wait for curl: {e}"))?;
+    if !wait.success() { return Err(format!("GitHub curl request failed: {wait}")); }
+    result
+}
+
+#[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
 fn http_get<F>(_url: &str, _max: u64, _receive: F) -> Result<u16, String>
 where F: FnMut(&[u8], u64) -> Result<(), String> {
-    Err("GitHub update checking currently supports Windows only".into())
+    Err("GitHub update checking unsupported on this platform".into())
 }
 
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod security_tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
@@ -1459,6 +1679,78 @@ mod install_tests {
     #[test]
     fn state_is_separate_per_installation_directory() {
         assert_ne!(install_key(Path::new(r"C:\Games\JK")), install_key(Path::new(r"D:\Games\JK")));
+        #[cfg(windows)]
         assert_eq!(install_key(Path::new(r"C:\Games\JK")), install_key(Path::new(r"c:\games\jk")));
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_update_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn only_the_macos_binary_and_shared_assets_are_authorized() {
+        let key = SigningKey::from_bytes(&[42; 32]);
+        let signed = |files: serde_json::Value| {
+            let raw = serde_json::to_vec(&serde_json::json!({
+                "format": 2, "tag": "v1.2.3", "files": files,
+            })).unwrap();
+            let signature = key.sign(&raw).to_bytes();
+            parse_signed_manifest_with_key(&raw, &signature, &key.verifying_key())
+        };
+        let valid = serde_json::json!({"DinurdoJK":{"size":3,"sha256":"a".repeat(64)},
+            "DinurdoJK/shared/dinurdo-assets.pk4":{"size":3,"sha256":"a".repeat(64)}});
+        assert!(signed(valid.clone()).is_ok());
+        let mut bad = valid.clone();
+        bad["files.exe"] = serde_json::json!({"size":3,"sha256":"a".repeat(64)});
+        assert!(signed(bad).is_err());
+        let mut bad = valid;
+        bad["DinurdoJK/dependencies/dxil.dll"] = serde_json::json!({"size":3,"sha256":"a".repeat(64)});
+        assert!(signed(bad).is_err());
+        assert_eq!(release_asset_name(GAME_BINARY), MACOS_BINARY_ASSET);
+        assert_eq!(stage_filename(GAME_BINARY), GAME_BINARY);
+    }
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+mod linux_update_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn linux_manifest_rejects_other_platform_dependencies_and_traversal() {
+        let key = SigningKey::from_bytes(&[42; 32]);
+        let verified = |files: serde_json::Value| {
+            let raw = serde_json::to_vec(&serde_json::json!({
+                "format": 2, "tag": "v1.2.3", "files": files,
+            })).unwrap();
+            parse_signed_manifest_with_key(&raw, &key.sign(&raw).to_bytes(), &key.verifying_key())
+        };
+        let valid = serde_json::json!({
+            "DinurdoJK":{"size":3,"sha256":"a".repeat(64)},
+            "DinurdoJK/dependencies/libphonon.so":{"size":3,"sha256":"a".repeat(64)},
+            "DinurdoJK/shared/dinurdo-assets.pk4":{"size":3,"sha256":"a".repeat(64)},
+        });
+        assert!(verified(valid.clone()).is_ok());
+        for evil in ["DinurdoJK.exe", "DinurdoJK/dependencies/phonon.dll", "../../libphonon.so",
+                     "DinurdoJK/dependencies/../libphonon.so"] {
+            let mut invalid = valid.clone();
+            invalid[evil] = serde_json::json!({"size":3,"sha256":"a".repeat(64)});
+            assert!(verified(invalid).is_err(), "accepted {evil}");
+        }
+        let mut missing = valid;
+        missing.as_object_mut().unwrap().remove("DinurdoJK/dependencies/libphonon.so");
+        assert!(verified(missing).is_err());
+    }
+
+    #[test]
+    fn linux_release_asset_mapping_and_stage_names() {
+        assert_eq!(GAME_BINARY, "DinurdoJK");
+        assert_eq!(release_asset_name(GAME_BINARY), LINUX_BINARY_ASSET);
+        assert_eq!(release_asset_name("DinurdoJK/dependencies/libphonon.so"), LINUX_PHONON_ASSET);
+        assert_eq!(stage_filename("DinurdoJK/dependencies/libphonon.so"), "deps__libphonon.so");
+        assert_eq!(signed_name_from_stage("deps__libphonon.so"), "DinurdoJK/dependencies/libphonon.so");
+        assert_eq!(MANIFEST_NAME, "release-manifest-linux-x86_64.json");
     }
 }

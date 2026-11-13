@@ -287,17 +287,28 @@ impl App {
             "DISPLAY & FRAME PACING",
             "Window mode, timing, output and presentation.",
         );
+        #[cfg(target_os = "macos")]
+        const BACKENDS: [(RendererBackend, &str); 1] = [(RendererBackend::Metal, "Metal")];
+        #[cfg(target_os = "windows")]
         const BACKENDS: [(RendererBackend, &str); 2] = [
             (RendererBackend::Vulkan, "Vulkan"),
             (RendererBackend::Dx12, "DX12"),
         ];
+        #[cfg(all(not(windows), not(target_os = "macos")))]
+        const BACKENDS: [(RendererBackend, &str); 1] = [(RendererBackend::Vulkan, "Vulkan")];
         if let Some(target) = segmented_row(
             ui,
             "Render backend",
-            "Graphics API the renderer runs on. Driver quality differs per \
-             vendor, so try the other one if something looks wrong. DX12 caps \
-             presentation at three frames per refresh; Vulkan does not. Needs \
-             Apply.",
+            if cfg!(target_os = "macos") {
+                "Native Metal graphics backend for macOS."
+            } else if cfg!(target_os = "linux") {
+                "Native Vulkan graphics backend for Linux."
+            } else {
+                "Graphics API the renderer runs on. Driver quality differs per \
+                 vendor, so try the other one if something looks wrong. DX12 caps \
+                 presentation at three frames per refresh; Vulkan does not. Needs \
+                 Apply."
+            },
             theme::Reset::Video(ui::VIDEO_ROW_RENDER_BACKEND),
             self.video.renderer_backend,
             &BACKENDS,
