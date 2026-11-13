@@ -22,13 +22,15 @@ const DEPENDENCY_RELEASE_FILES: &[&str] = &[
     "vcruntime140.dll", "vcruntime140_1.dll",
 ];
 const LINUX_DEPENDENCY_FILES: &[&str] = &["libphonon.so"];
+const MACOS_DEPENDENCY_FILES: &[&str] = &["libphonon.dylib"];
 
-// Windows' signed dependency names are unchanged. Linux grants precisely one
-// different path; neither platform accepts the other's native runtime files.
+// Windows' signed dependency names are unchanged. Linux and macOS each grant
+// precisely one different path; no platform accepts another's native runtime.
 fn allowed_dependency(name: &str) -> bool {
     let Some(file) = name.strip_prefix("DinurdoJK/dependencies/") else { return false; };
     (cfg!(windows) && DEPENDENCY_RELEASE_FILES.contains(&file))
         || (cfg!(target_os = "linux") && LINUX_DEPENDENCY_FILES.contains(&file))
+        || (cfg!(target_os = "macos") && MACOS_DEPENDENCY_FILES.contains(&file))
 }
 
 #[cfg(windows)]
@@ -52,15 +54,26 @@ const MANIFEST_NAME: &str = "release-manifest-unsupported.json";
 #[cfg(all(not(windows), not(target_os = "macos"), not(all(target_os = "linux", target_arch = "x86_64"))))]
 const SIGNATURE_NAME: &str = "release-manifest-unsupported.sig";
 
+// The client data folder `DinurdoJK/` sits beside the executable, so on
+// Unix the executable itself cannot be named `DinurdoJK` (macOS volumes are
+// usually case-insensitive too). Release packages rename the Cargo output.
 #[cfg(windows)]
 const GAME_BINARY: &str = "DinurdoJK.exe";
-#[cfg(not(windows))]
-const GAME_BINARY: &str = "DinurdoJK";
+#[cfg(target_os = "linux")]
+const GAME_BINARY: &str = "DinurdoJK.x86_64";
+#[cfg(target_os = "macos")]
+const GAME_BINARY: &str = "DinurdoJK-macos";
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+const GAME_BINARY: &str = "DinurdoJK-unsupported";
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MACOS_BINARY_ASSET: &str = "DinurdoJK-macos-arm64";
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 const MACOS_BINARY_ASSET: &str = "DinurdoJK-macos-x86_64";
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MACOS_PHONON_ASSET: &str = "libphonon-macos-arm64.dylib";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const MACOS_PHONON_ASSET: &str = "libphonon-macos-x86_64.dylib";
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const LINUX_BINARY_ASSET: &str = "DinurdoJK-linux-x86_64";
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -206,7 +219,7 @@ fn parse_signed_manifest_with_key(raw: &[u8], signature: &[u8], key: &VerifyingK
         return Err("unsupported signed per-file release manifest format or tag".into());
     }
     let max_files = if cfg!(windows) { DEPENDENCY_RELEASE_FILES.len() + 2 }
-        else if cfg!(target_os = "linux") { 3 } else { 2 };
+        else if cfg!(any(target_os = "linux", target_os = "macos")) { 3 } else { 2 };
     if !manifest.files.contains_key(GAME_BINARY) || manifest.files.len() > max_files {
         return Err(format!("signed file allowlist must contain {GAME_BINARY}"));
     }
@@ -214,6 +227,11 @@ fn parse_signed_manifest_with_key(raw: &[u8], signature: &[u8], key: &VerifyingK
     if !manifest.files.contains_key("DinurdoJK/dependencies/libphonon.so")
         || !manifest.files.contains_key("DinurdoJK/shared/dinurdo-assets.pk4") {
         return Err("Linux manifest must contain the native Steam Audio library and shared assets".into());
+    }
+    #[cfg(target_os = "macos")]
+    if !manifest.files.contains_key("DinurdoJK/dependencies/libphonon.dylib")
+        || !manifest.files.contains_key("DinurdoJK/shared/dinurdo-assets.pk4") {
+        return Err("macOS manifest must contain the native Steam Audio library and shared assets".into());
     }
     let mut total = 0u64;
     for (name, info) in &manifest.files {
@@ -244,7 +262,10 @@ fn check_digest(hash: &str) -> Result<(), String> {
 // The asset PK4 and runtime dependencies have fixed, validated destinations.
 fn release_asset_name(installed_name: &str) -> &str {
     #[cfg(target_os = "macos")]
-    if installed_name == GAME_BINARY { return MACOS_BINARY_ASSET; }
+    {
+        if installed_name == GAME_BINARY { return MACOS_BINARY_ASSET; }
+        if installed_name == "DinurdoJK/dependencies/libphonon.dylib" { return MACOS_PHONON_ASSET; }
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         if installed_name == GAME_BINARY { return LINUX_BINARY_ASSET; }
@@ -288,10 +309,10 @@ fn parse_release_json(bytes: &[u8], installed: &str) -> Result<Option<Release>, 
     let local = stable_version(installed).ok_or("installed version must be MAJOR.MINOR.PATCH")?;
     if remote <= local { return Ok(None); }
 
-    // Other OS releases may appear before this architecture has been published.
-    // Do not interpret a Windows or Mac release as a Linux update. A partially
-    // published signature/manifest pair is still an error, never a fallback.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    // Other OS releases may appear before this platform has been published
+    // (each platform builds and publishes independently). A release without
+    // this platform's manifest is "no update"; a partially published
+    // signature/manifest pair is still an error, never a fallback.
     {
         let assets = value["assets"].as_array().ok_or("GitHub release has no assets")?;
         let has_manifest = assets.iter().any(|a| a["name"].as_str() == Some(MANIFEST_NAME));
@@ -1511,8 +1532,12 @@ mod security_tests {
         assert_eq!(stable_version("v0.2.0-rc1"), None);
         assert!(interpret_check_response(404, b"", "0.1.0").unwrap().is_none());
         assert!(interpret_check_response(403, b"", "0.1.0").is_err());
+        // A release published for other platforms only is "no update" here.
         let release = br#"{"tag_name":"v0.2.0","assets":[]}"#;
-        assert!(parse_release_json(release, "0.1.0").is_err());
+        assert!(parse_release_json(release, "0.1.0").unwrap().is_none());
+        // A manifest without its signature is never accepted.
+        let unsigned = format!(r#"{{"tag_name":"v0.2.0","assets":[{{"name":"{MANIFEST_NAME}"}}]}}"#);
+        assert!(parse_release_json(unsigned.as_bytes(), "0.1.0").is_err());
     }
 }
 
@@ -1699,9 +1724,13 @@ mod macos_update_tests {
             let signature = key.sign(&raw).to_bytes();
             parse_signed_manifest_with_key(&raw, &signature, &key.verifying_key())
         };
-        let valid = serde_json::json!({"DinurdoJK":{"size":3,"sha256":"a".repeat(64)},
+        let valid = serde_json::json!({"DinurdoJK-macos":{"size":3,"sha256":"a".repeat(64)},
+            "DinurdoJK/dependencies/libphonon.dylib":{"size":3,"sha256":"a".repeat(64)},
             "DinurdoJK/shared/dinurdo-assets.pk4":{"size":3,"sha256":"a".repeat(64)}});
         assert!(signed(valid.clone()).is_ok());
+        let mut missing = valid.clone();
+        missing.as_object_mut().unwrap().remove("DinurdoJK/dependencies/libphonon.dylib");
+        assert!(signed(missing).is_err());
         let mut bad = valid.clone();
         bad["files.exe"] = serde_json::json!({"size":3,"sha256":"a".repeat(64)});
         assert!(signed(bad).is_err());
@@ -1709,6 +1738,7 @@ mod macos_update_tests {
         bad["DinurdoJK/dependencies/dxil.dll"] = serde_json::json!({"size":3,"sha256":"a".repeat(64)});
         assert!(signed(bad).is_err());
         assert_eq!(release_asset_name(GAME_BINARY), MACOS_BINARY_ASSET);
+        assert_eq!(release_asset_name("DinurdoJK/dependencies/libphonon.dylib"), MACOS_PHONON_ASSET);
         assert_eq!(stage_filename(GAME_BINARY), GAME_BINARY);
     }
 }
@@ -1728,12 +1758,12 @@ mod linux_update_tests {
             parse_signed_manifest_with_key(&raw, &key.sign(&raw).to_bytes(), &key.verifying_key())
         };
         let valid = serde_json::json!({
-            "DinurdoJK":{"size":3,"sha256":"a".repeat(64)},
+            "DinurdoJK.x86_64":{"size":3,"sha256":"a".repeat(64)},
             "DinurdoJK/dependencies/libphonon.so":{"size":3,"sha256":"a".repeat(64)},
             "DinurdoJK/shared/dinurdo-assets.pk4":{"size":3,"sha256":"a".repeat(64)},
         });
         assert!(verified(valid.clone()).is_ok());
-        for evil in ["DinurdoJK.exe", "DinurdoJK/dependencies/phonon.dll", "../../libphonon.so",
+        for evil in ["DinurdoJK", "DinurdoJK.exe", "DinurdoJK/dependencies/phonon.dll", "../../libphonon.so",
                      "DinurdoJK/dependencies/../libphonon.so"] {
             let mut invalid = valid.clone();
             invalid[evil] = serde_json::json!({"size":3,"sha256":"a".repeat(64)});
@@ -1746,7 +1776,7 @@ mod linux_update_tests {
 
     #[test]
     fn linux_release_asset_mapping_and_stage_names() {
-        assert_eq!(GAME_BINARY, "DinurdoJK");
+        assert_eq!(GAME_BINARY, "DinurdoJK.x86_64");
         assert_eq!(release_asset_name(GAME_BINARY), LINUX_BINARY_ASSET);
         assert_eq!(release_asset_name("DinurdoJK/dependencies/libphonon.so"), LINUX_PHONON_ASSET);
         assert_eq!(stage_filename("DinurdoJK/dependencies/libphonon.so"), "deps__libphonon.so");

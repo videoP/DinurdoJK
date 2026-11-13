@@ -7,6 +7,9 @@
 # Ignore scripts except the GitHub release signer.
 /scripts/*
 !/scripts/make_signed_release.py
+!/scripts/make_signed_linux_release.py
+!/scripts/make_signed_macos_release.py
+!/scripts/publish_multiplatform_release.py
 !/scripts/stamp_ci_version.py
 !/scripts/build-cache-report.ps1
 !/scripts/ensure-smaa-vendor.ps1

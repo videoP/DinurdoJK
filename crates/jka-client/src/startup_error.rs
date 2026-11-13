@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 const REQUIRED_DEPENDENCIES: &[&str] = &["phonon.dll"];
 #[cfg(target_os = "linux")]
 const REQUIRED_DEPENDENCIES: &[&str] = &["libphonon.so"];
-#[cfg(all(not(windows), not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+const REQUIRED_DEPENDENCIES: &[&str] = &["libphonon.dylib"];
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
 const REQUIRED_DEPENDENCIES: &[&str] = &[];
 
 /// Show `message` in a native dialog (and on stderr for console launches).
@@ -39,7 +41,9 @@ pub(crate) fn fatal(message: impl std::fmt::Display) -> std::process::ExitCode {
 pub(crate) fn verify_client_folder(install: &Path) -> Option<String> {
     let folder = install.join(jka_assets::pk3::DINURDOJK_DIRECTORY);
     let dependencies = folder.join("dependencies");
-    let executable_name = if cfg!(windows) { "DinurdoJK.exe" } else { "DinurdoJK" };
+    let executable_name = std::env::current_exe().ok()
+        .and_then(|exe| exe.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| if cfg!(windows) { "DinurdoJK.exe" } else { "the DinurdoJK executable" }.to_owned());
     let expect = |detail: String| Some(format!(
         "{detail}\n\nThe '{name}' folder must be in the same folder as {executable_name} ({install}). \
          Keep the executable together with its '{name}' folder, or reinstall/update.",

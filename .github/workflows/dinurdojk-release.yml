@@ -1,27 +1,34 @@
-name: DinurdoJK Signed Windows Release (DLAA)
-# Compilation runs immediately on push. Only the publication job uses
-# release-signing and the protected Ed25519 private key.
+name: DinurdoJK Signed Multi-Platform Release
+
+# All platform jobs are eligible for the SAME protected environment review at
+# the same time, allowing a single Review deployments approval for this run.
+# Build/signing runs remain independent; publish consumes only successful output.
 on:
   push:
     branches: [main]
   workflow_dispatch:
+
 concurrency:
-  group: dinurdojk-signed-windows-release
-  cancel-in-progress: true
+  group: dinurdojk-signed-multiplatform-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
+
 jobs:
-  windows-build:
+  windows:
+    name: Windows x86-64 (build + sign)
     if: github.repository == 'videoP/DinurdoJK' && github.ref == 'refs/heads/main'
     runs-on: windows-2022
     timeout-minutes: 180
+    environment: release-signing
+    outputs:
+      # Public, not secret: lets the publisher re-verify every signature.
+      public_key: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
     permissions:
       contents: read
-    outputs:
-      publish: ${{ steps.version.outputs.publish }}
-      tag: ${{ steps.version.outputs.tag }}
     env:
-      # Repository public variable and private NWH build secret (NOT the updater signer).
+      # The public key must be present at RUST COMPILATION time.
       DINURDOJK_UPDATE_PUBLIC_KEY_HEX: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -50,7 +57,7 @@ jobs:
         shell: pwsh
         run: |
           if ($env:DINURDOJK_UPDATE_PUBLIC_KEY_HEX -notmatch '^[0-9a-fA-F]{64}$') {
-            throw 'Set REPOSITORY variable DINURDOJK_UPDATE_PUBLIC_KEY_HEX (public signing key).'
+            throw 'Missing release-signing Environment variable DINURDOJK_UPDATE_PUBLIC_KEY_HEX.'
           }
           $tag = (& python scripts/make_signed_release.py --print-tag).Trim()
           if ($LASTEXITCODE -ne 0 -or $tag -notmatch '^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
@@ -60,9 +67,19 @@ jobs:
           $json = gh release list --limit 100 --json tagName,isDraft,isPrerelease
           if ($LASTEXITCODE -ne 0) { throw 'Could not inspect GitHub Releases.' }
           $releases = @($json | ConvertFrom-Json)
-          if (@($releases | Where-Object { $_.tagName -eq $tag }).Count -gt 0) {
-            Write-Host "$tag already exists; skipping so signed release assets are never overwritten."
-            'publish=false' >> $env:GITHUB_OUTPUT
+          $existingRelease = @($releases | Where-Object { $_.tagName -eq $tag })
+          if ($existingRelease.Count -gt 0) {
+            $info = gh release view $tag --json targetCommitish,assets | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $info.targetCommitish -ne $env:GITHUB_SHA) {
+              throw "Existing release $tag points to another commit; refusing to modify."
+            }
+            if (@($info.assets | Where-Object { $_.name -eq 'release-manifest.sig' }).Count -gt 0) {
+              Write-Host "$tag already includes signed Windows assets; skipping Windows compilation."
+              'publish=false' >> $env:GITHUB_OUTPUT
+              exit 0
+            }
+            'publish=true' >> $env:GITHUB_OUTPUT
+            Write-Host "Completing missing Windows platform assets for $tag."
             exit 0
           }
           $version = [Version]::Parse($tag.Substring(1))
@@ -79,18 +96,8 @@ jobs:
           'publish=true' >> $env:GITHUB_OUTPUT
           Write-Host "Building $tag from $env:GITHUB_SHA."
 
-      # The full NWH module is deliberately absent from Git. Restore it
-      # from the repository build secret before Cargo runs build.rs / rustc.
-      - name: Require non-deployment NWH source for parallel compilation
-        if: steps.version.outputs.publish == 'true'
-        shell: pwsh
-        env:
-          DINURDOJK_NWH_SOURCE_B64: ${{ secrets.DINURDOJK_NWH_SOURCE_B64 }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:DINURDOJK_NWH_SOURCE_B64)) {
-            throw 'Set REPOSITORY Actions secret DINURDOJK_NWH_SOURCE_B64 for automatic builds.'
-          }
-
+      # The full NWH module is deliberately absent from Git. Restore it only
+      # for an approved release, before Cargo runs build.rs / rustc.
       - name: Restore local-only NWH source
         if: steps.version.outputs.publish == 'true'
         shell: pwsh
@@ -98,7 +105,7 @@ jobs:
           DINURDOJK_NWH_SOURCE_B64: ${{ secrets.DINURDOJK_NWH_SOURCE_B64 }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:DINURDOJK_NWH_SOURCE_B64)) {
-            throw 'Missing repository Actions secret DINURDOJK_NWH_SOURCE_B64.'
+            throw 'Missing release-signing Environment secret DINURDOJK_NWH_SOURCE_B64.'
           }
           $relativePath = 'crates/jka-client/src/net/nwh_private.rs'
           if (Test-Path -LiteralPath $relativePath) {
@@ -385,6 +392,15 @@ jobs:
 
       # Fail fast on signer dependencies before the expensive compilation.
       # The PRIVATE signing key is supplied only to the later signing step.
+      - name: Install Ed25519 signer
+        if: steps.version.outputs.publish == 'true'
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check 'cryptography>=43,<48'
+          if ($LASTEXITCODE -ne 0) { throw 'Ed25519 cryptography installation failed.' }
+          python -c 'from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; print("Ed25519 signer ready")'
+          if ($LASTEXITCODE -ne 0) { throw 'Ed25519 signer import failed.' }
+
       - name: Build optimized Release with DLAA
         if: steps.version.outputs.publish == 'true'
         shell: pwsh
@@ -403,91 +419,8 @@ jobs:
             }
           }
 
-      - name: Preserve NVIDIA SDK license in Windows compilation payload
-        if: steps.version.outputs.publish == 'true'
-        shell: pwsh
-        run: |
-          $license = 'target/release/licenses/NVIDIA-DLSS-SDK-LICENSE.txt'
-          New-Item -ItemType Directory -Force (Split-Path $license -Parent) | Out-Null
-          Copy-Item (Join-Path $env:DLSS_SDK 'LICENSE.txt') $license -ErrorAction Stop
-          if ((Get-Item $license).Length -eq 0) { throw 'Missing NVIDIA DLSS license.' }
-
-      - name: Upload unsigned Windows runtime for protected release job
-        if: steps.version.outputs.publish == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: DinurdoJK-windows-runtime-${{ github.run_id }}
-          path: |
-            target/release/DinurdoJK.exe
-            target/release/DinurdoJK/dependencies/*
-            target/release/licenses/NVIDIA-DLSS-SDK-LICENSE.txt
-          if-no-files-found: error
-          retention-days: 14
-
-  windows-publish:
-    needs: windows-build
-    if: >-
-      github.repository == 'videoP/DinurdoJK' &&
-      github.ref == 'refs/heads/main' &&
-      needs.windows-build.outputs.publish == 'true'
-    runs-on: windows-2022
-    timeout-minutes: 180
-    environment: release-signing
-    permissions:
-      contents: write
-    env:
-      DINURDOJK_UPDATE_PUBLIC_KEY_HEX: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Checkout exact commit for packaging
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Stamp and verify publication tag
-        shell: pwsh
-        run: |
-          python scripts/stamp_ci_version.py
-          if ($LASTEXITCODE -ne 0) { throw 'Could not stamp build version.' }
-          $tag = (& python scripts/make_signed_release.py --print-tag).Trim()
-          if ($LASTEXITCODE -ne 0 -or $tag -cne '${{ needs.windows-build.outputs.tag }}') {
-            throw 'Windows build tag disagrees with publishing tag.'
-          }
-          if ($env:DINURDOJK_UPDATE_PUBLIC_KEY_HEX -notmatch '^[0-9a-fA-F]{64}$') {
-            throw 'Missing release signing environment public key.'
-          }
-      - name: Download immutable Windows compiled runtime
-        uses: actions/download-artifact@v4
-        with:
-          name: DinurdoJK-windows-runtime-${{ github.run_id }}
-          path: target/release
-      - name: Verify Windows compiled runtime payload
-        shell: pwsh
-        run: |
-          foreach ($name in @('DinurdoJK.exe', 'DinurdoJK/dependencies/nvngx_dlss.dll',
-                               'DinurdoJK/dependencies/OpenALSoft.x86_64.dll',
-                               'DinurdoJK/dependencies/dxcompiler.dll',
-                               'DinurdoJK/dependencies/dxil.dll',
-                               'DinurdoJK/dependencies/ffmpeg.exe',
-                               'licenses/NVIDIA-DLSS-SDK-LICENSE.txt')) {
-            $path = Join-Path 'target/release' $name
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
-                (Get-Item -LiteralPath $path).Length -le 0) {
-              throw "Windows CI artifact missing $path"
-            }
-          }
-      - name: Install Ed25519 signer
-        shell: pwsh
-        run: |
-          python -m pip install --disable-pip-version-check 'cryptography>=43,<48'
-          if ($LASTEXITCODE -ne 0) { throw 'Ed25519 cryptography installation failed.' }
-          python -c 'from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; print("Ed25519 signer ready")'
-          if ($LASTEXITCODE -ne 0) { throw 'Ed25519 signer import failed.' }
-
       - name: Package and sign updater release
+        if: steps.version.outputs.publish == 'true'
         shell: pwsh
         env:
           # Private key is exposed to this one signing step, NEVER to the build.
@@ -500,9 +433,7 @@ jobs:
                               'FFmpeg-SOURCE-NOTICE.txt')) {
             Copy-Item -LiteralPath (Join-Path 'release-licenses' $name) -Destination (Join-Path $licenseDir $name) -ErrorAction Stop
           }
-          if (-not (Test-Path -LiteralPath (Join-Path $licenseDir 'NVIDIA-DLSS-SDK-LICENSE.txt') -PathType Leaf)) {
-            throw 'NVIDIA SDK license was not preserved in Windows CI build artifact.'
-          }
+          Copy-Item (Join-Path $env:DLSS_SDK 'LICENSE.txt') (Join-Path $licenseDir 'NVIDIA-DLSS-SDK-LICENSE.txt') -ErrorAction Stop
           foreach ($name in @('dxcompiler.dll', 'dxil.dll')) {
             if (-not (Test-Path -LiteralPath (Join-Path 'target/release/DinurdoJK/dependencies' $name) -PathType Leaf)) {
               throw "Missing Microsoft DXC runtime before signing: $name"
@@ -511,45 +442,458 @@ jobs:
           if (-not (Test-Path -LiteralPath 'target/release/DinurdoJK/dependencies/ffmpeg.exe' -PathType Leaf)) {
             throw 'Missing pinned FFmpeg runtime before signing: DinurdoJK/dependencies/ffmpeg.exe'
           }
-          python scripts/make_signed_release.py --runtime target/release --out dist/release --tag '${{ needs.windows-build.outputs.tag }}'
+          python scripts/make_signed_release.py --runtime target/release --out dist/release --tag '${{ steps.version.outputs.tag }}'
           if ($LASTEXITCODE -ne 0) { throw 'Release signing failed.' }
           if ((Get-Item 'dist/release/release-manifest.sig').Length -ne 64) {
             throw 'Signature must be 64 raw Ed25519 bytes.'
           }
           # The full ZIP is for new/manual installations. Individual assets
           # are for the updater; the signed manifest binds their exact hashes.
-          $archive = "dist/release/DinurdoJK-${{ needs.windows-build.outputs.tag }}-full.zip"
+          $archive = "dist/release/DinurdoJK-${{ steps.version.outputs.tag }}-full.zip"
           python -c 'import sys, json, zipfile, pathlib, hashlib; p=pathlib.Path(sys.argv[1]); d=p.parent; z=zipfile.ZipFile(p); m=json.loads((d/"release-manifest.json").read_bytes()); files=set(m["files"]); names=set(z.namelist()); notices={n for n in names if n.startswith("licenses/")}; required={"licenses/FFmpeg-GPL-3.0.txt","licenses/FFmpeg-SOURCE-NOTICE.txt","licenses/OpenAL-Soft-LGPL-2.0.txt","licenses/DXC-LICENSE.txt","licenses/DXC-ThirdPartyNotices.txt","licenses/NVIDIA-DLSS-SDK-LICENSE.txt"}; assert m["format"]==2; assert names==files|notices; assert required<=notices; assert all(not n.lower().endswith(".txt") for n in files); assert {"DinurdoJK.exe","DinurdoJK/shared/dinurdo-assets.pk4","DinurdoJK/dependencies/dxcompiler.dll","DinurdoJK/dependencies/dxil.dll","DinurdoJK/dependencies/ffmpeg.exe"}<=files; assert all(hashlib.sha256(z.read(n)).hexdigest()==f["sha256"] for n,f in m["files"].items()); print("Verified runtime-only signed manifest and full ZIP license notices")' $archive
           if ($LASTEXITCODE -ne 0) { throw 'Release layout, notices or hashes failed verification.' }
 
       - name: Upload signed updater artifact
+        if: steps.version.outputs.publish == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: DinurdoJK-${{ needs.windows-build.outputs.tag }}-signed-update
+          name: signed-release-windows
           path: dist/release/*
           if-no-files-found: error
           retention-days: 14
 
-      - name: Create official GitHub Release
-        shell: pwsh
+  macos:
+    name: macOS ${{ matrix.arch }} (build + sign)
+    if: >-
+      github.repository == 'videoP/DinurdoJK' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            rust_target: aarch64-apple-darwin
+            arch: arm64
+          - runner: macos-15-intel
+            rust_target: x86_64-apple-darwin
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    environment: release-signing
+    outputs:
+      # Public, not secret: lets the publisher re-verify signatures without
+      # joining the protected environment (which would need a second approval).
+      public_key: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DINURDOJK_UPDATE_PUBLIC_KEY_HEX: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
+      CARGO_INCREMENTAL: '0'
+      AUDIONIMBUS_AUTO_INSTALL_PROGRESS: '0'
+      # libphonon.dylib ships in DinurdoJK/dependencies beside the executable.
+      RUSTFLAGS: '-C link-arg=-Wl,-rpath,@executable_path/DinurdoJK/dependencies'
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Stamp version and check release eligibility
+        id: release
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
-          $tag = '${{ needs.windows-build.outputs.tag }}'
-          $assets = @(Get-ChildItem 'dist/release' -File | Sort-Object Name | ForEach-Object { $_.FullName })
-          $manifest = Get-Content 'dist/release/release-manifest.json' -Raw | ConvertFrom-Json
-          $expectedCount = @($manifest.files.PSObject.Properties).Count + 3
-          if ($assets.Count -ne $expectedCount) {
-            throw "Expected $expectedCount assets (individual files + full ZIP + manifest + signature); found $($assets.Count)"
+          set -euo pipefail
+          python3 scripts/stamp_ci_version.py
+          tag="$(python3 scripts/make_signed_release.py --print-tag)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          [[ "${DINURDOJK_UPDATE_PUBLIC_KEY_HEX:-}" =~ ^[0-9a-fA-F]{64}$ ]] || {
+            echo 'Missing release-signing Environment variable DINURDOJK_UPDATE_PUBLIC_KEY_HEX' >&2; exit 1; }
+          if info="$(gh release view "$tag" --json targetCommitish,assets 2>/dev/null)"; then
+            target="$(jq -r .targetCommitish <<<"$info")"
+            [ "$target" = "$GITHUB_SHA" ] || { echo "Release $tag targets $target, not $GITHUB_SHA" >&2; exit 1; }
+            if jq -e --arg n "release-manifest-macos-${ARCH}.sig" '.assets[] | select(.name == $n)' <<<"$info" >/dev/null; then
+              echo "$tag already has signed macOS ${ARCH} assets; skipping compilation."
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install native Rust and tools
+        if: steps.release.outputs.build == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Install libclang and CMake
+        if: steps.release.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          brew install llvm cmake pkg-config
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+          echo "PATH=$(brew --prefix llvm)/bin:$PATH" >> "$GITHUB_ENV"
+          test "$(rustc -vV | sed -n 's/^host: //p')" = '${{ matrix.rust_target }}'
+          test "$(uname -m)" = '${{ matrix.arch }}'
+
+      # Installed BEFORE the private key exists in any step's environment.
+      - name: Install Ed25519 signer
+        if: steps.release.outputs.build == 'true'
+        run: |
+          python3 -m pip install --disable-pip-version-check 'cryptography>=44,<48'
+          python3 -c 'from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey'
+
+      - name: Cache Rust
+        if: steps.release.outputs.build == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-release-${{ matrix.rust_target }}
+
+      - name: Restore private NWH module
+        if: steps.release.outputs.build == 'true'
+        shell: bash
+        env:
+          DINURDOJK_NWH_SOURCE_B64: ${{ secrets.DINURDOJK_NWH_SOURCE_B64 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          source = os.environ.get('DINURDOJK_NWH_SOURCE_B64', '').strip()
+          if not source:
+              raise SystemExit('Missing release-signing Environment secret DINURDOJK_NWH_SOURCE_B64')
+          path = Path('crates/jka-client/src/net/nwh_private.rs')
+          if path.exists():
+              raise SystemExit('Private module unexpectedly exists')
+          path.write_bytes(base64.b64decode(source, validate=True))
+          PY
+
+      - name: Compile native macOS binary
+        if: steps.release.outputs.build == 'true'
+        run: cargo build --locked --release -p DinurdoJK
+
+      # Steam Audio is linked dynamically (audionimbus auto-install copies
+      # libphonon.dylib into its build OUT_DIR). Bundle it beside the binary
+      # and make sure the binary resolves it through the @executable_path rpath.
+      - name: Stage Steam Audio and verify macOS runtime linkage
+        if: steps.release.outputs.build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary=target/release/DinurdoJK
+          test -x "$binary"
+          lipo -archs "$binary" | tr ' ' '\n' | grep -Fx '${{ matrix.arch }}'
+          phonon="$(ls -t target/release/build/audionimbus-sys-*/out/lib/libphonon.dylib 2>/dev/null | head -n 1 || true)"
+          test -n "$phonon" || { echo 'Steam Audio libphonon.dylib not found in the build output' >&2; exit 1; }
+          lipo -archs "$phonon" | tr ' ' '\n' | grep -Fx '${{ matrix.arch }}'
+          mkdir -p dist/stage
+          cp "$phonon" dist/stage/libphonon.dylib
+          chmod 755 dist/stage/libphonon.dylib
+          otool -L "$binary" | tee "dist/macos-${{ matrix.arch }}-dependencies.txt"
+          # Whatever install name Valve's dylib carries, load it via the rpath.
+          linked="$(otool -L "$binary" | awk 'NR>1 && /libphonon\.dylib/ {print $1; exit}')"
+          test -n "$linked" || { echo 'Binary does not reference libphonon.dylib' >&2; exit 1; }
+          if [ "$linked" != '@rpath/libphonon.dylib' ]; then
+            install_name_tool -change "$linked" '@rpath/libphonon.dylib' "$binary"
+          fi
+          install_name_tool -id '@rpath/libphonon.dylib' dist/stage/libphonon.dylib
+          otool -l "$binary" | grep -A2 LC_RPATH | grep -F '@executable_path/DinurdoJK/dependencies'
+          if otool -L "$binary" | awk 'NR>1 {print $1}' | grep -Ev '^(/usr/lib/|/System/Library/|@rpath/libphonon\.dylib$)'; then
+            echo 'Unexpected non-system dynamic dependency (would be missing on user machines)' >&2
+            exit 1
+          fi
+          echo "PHONON_PATH=$PWD/dist/stage/libphonon.dylib" >> "$GITHUB_ENV"
+
+      # Developer ID credentials are NOT required for standalone macOS releases.
+      # Ad-hoc signing satisfies Apple Silicon's code-signature requirement; it
+      # is not Developer ID signing or notarization, so Gatekeeper may still
+      # quarantine downloads. Signed after install_name_tool edits.
+      - name: Ad-hoc code sign
+        if: steps.release.outputs.build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          codesign --force --sign - "$PHONON_PATH"
+          codesign --verify --verbose=2 "$PHONON_PATH"
+          codesign --force --sign - target/release/DinurdoJK
+          codesign --verify --verbose=2 target/release/DinurdoJK
+
+      - name: Package and sign updater manifest
+        if: steps.release.outputs.build == 'true'
+        shell: bash
+        env:
+          # Private key is exposed to this one signing step only.
+          DINURDOJK_UPDATE_PRIVATE_KEY_B64: ${{ secrets.DINURDOJK_UPDATE_PRIVATE_KEY_B64 }}
+          TAG: ${{ steps.release.outputs.tag }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          test -n "${DINURDOJK_UPDATE_PRIVATE_KEY_B64:-}" || {
+            echo 'Missing release-signing Environment secret DINURDOJK_UPDATE_PRIVATE_KEY_B64' >&2
+            exit 1
           }
-          gh release create $tag @assets --target $env:GITHUB_SHA --title "DinurdoJK $tag" --latest --notes "Windows x64 with Vulkan DLAA and FFmpeg for Render Studio exports. Download the full ZIP for a new install; it includes third-party license notices under licenses/. Existing DinurdoJK clients with signed per-file update support download only changed runtime files. FFmpeg is GPLv3; review source distribution obligations. Retail Jedi Academy assets are NOT included."
-          if ($LASTEXITCODE -ne 0) { throw 'Failed to create official GitHub Release.' }
-          $release = gh release view $tag --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0 -or $release.isDraft -or $release.isPrerelease) {
-            throw 'GitHub Release verification failed.'
+          python3 scripts/make_signed_macos_release.py \
+            --binary target/release/DinurdoJK \
+            --phonon "$PHONON_PATH" \
+            --assets assets/dinurdo-assets.pk4 \
+            --out "dist/macos-${ARCH}" --tag "$TAG" --arch "$ARCH"
+          test "$(wc -c < "dist/macos-${ARCH}/release-manifest-macos-${ARCH}.sig")" -eq 64
+
+      - name: Upload macOS release for common publisher
+        if: steps.release.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-release-macos-${{ matrix.arch }}
+          path: dist/macos-${{ matrix.arch }}/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Preserve macOS diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DinurdoJK-macos-${{ matrix.arch }}-diagnostics-${{ github.run_id }}
+          path: dist/macos-${{ matrix.arch }}-dependencies.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+  linux:
+    name: Linux x86-64 (build + sign)
+    if: >-
+      github.repository == 'videoP/DinurdoJK' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+    environment: release-signing
+    outputs:
+      public_key: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DINURDOJK_UPDATE_PUBLIC_KEY_HEX: ${{ vars.DINURDOJK_UPDATE_PUBLIC_KEY_HEX }}
+      CARGO_INCREMENTAL: '0'
+      AUDIONIMBUS_AUTO_INSTALL_PROGRESS: '0'
+      # Literal $ORIGIN (no shell expansion here): libphonon.so ships in
+      # DinurdoJK/dependencies beside the executable.
+      RUSTFLAGS: '-C link-arg=-Wl,-rpath,$ORIGIN/DinurdoJK/dependencies'
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Stamp version and check release eligibility
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/stamp_ci_version.py
+          tag="$(python3 scripts/make_signed_linux_release.py --print-tag)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          [[ "${DINURDOJK_UPDATE_PUBLIC_KEY_HEX:-}" =~ ^[0-9a-fA-F]{64}$ ]] || {
+            echo 'Missing release-signing Environment variable DINURDOJK_UPDATE_PUBLIC_KEY_HEX' >&2; exit 1; }
+          if info="$(gh release view "$tag" --json targetCommitish,assets 2>/dev/null)"; then
+            target="$(jq -r .targetCommitish <<<"$info")"
+            [ "$target" = "$GITHUB_SHA" ] || { echo "Release $tag targets $target, not $GITHUB_SHA" >&2; exit 1; }
+            if jq -e '.assets[] | select(.name == "release-manifest-linux-x86_64.sig")' <<<"$info" >/dev/null; then
+              echo "$tag already has signed Linux assets; skipping compilation."
+              echo "build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "build=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        if: steps.release.outputs.build == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install dependencies
+        if: steps.release.outputs.build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake pkg-config libclang-dev \
+            libasound2-dev libudev-dev libvulkan-dev \
+            libwayland-dev libxkbcommon-dev libx11-dev libxcb1-dev \
+            libxcursor-dev libxi-dev libxrandr-dev curl
+          clang_library="$(find /usr/lib/llvm-* -maxdepth 2 -name libclang.so -print -quit)"
+          test -n "$clang_library"
+          echo "LIBCLANG_PATH=$(dirname "$clang_library")" >> "$GITHUB_ENV"
+          test "$(rustc -vV | sed -n 's/^host: //p')" = 'x86_64-unknown-linux-gnu'
+          test "$(uname -m)" = 'x86_64'
+
+      # Installed BEFORE the private key exists in any step's environment.
+      - name: Install Ed25519 signer
+        if: steps.release.outputs.build == 'true'
+        run: |
+          python3 -m pip install --disable-pip-version-check 'cryptography>=44,<48'
+          python3 -c 'from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey'
+
+      - name: Cache Rust
+        if: steps.release.outputs.build == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x86_64-unknown-linux-gnu
+
+      - name: Restore private NWH source
+        if: steps.release.outputs.build == 'true'
+        shell: bash
+        env:
+          DINURDOJK_NWH_SOURCE_B64: ${{ secrets.DINURDOJK_NWH_SOURCE_B64 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          source = os.environ.get('DINURDOJK_NWH_SOURCE_B64', '').strip()
+          if not source:
+              raise SystemExit('Missing release-signing Environment secret DINURDOJK_NWH_SOURCE_B64')
+          path = Path('crates/jka-client/src/net/nwh_private.rs')
+          if path.exists():
+              raise SystemExit('Private NWH file unexpectedly exists')
+          path.write_bytes(base64.b64decode(source, validate=True))
+          PY
+
+      - name: Compile Linux executable
+        if: steps.release.outputs.build == 'true'
+        run: cargo build --locked --release -p DinurdoJK
+
+      # The packaged executable is DinurdoJK.x86_64: the DinurdoJK/ data folder
+      # sits beside it, so a file named DinurdoJK cannot exist there.
+      - name: Stage Steam Audio and verify Linux runtime linkage
+        if: steps.release.outputs.build == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary=target/release/DinurdoJK
+          test -x "$binary"
+          readelf -h "$binary" | grep -q 'Class:.*ELF64'
+          readelf -h "$binary" | grep -q 'Machine:.*Advanced Micro Devices X86-64'
+          readelf -d "$binary" | grep -Fq '$ORIGIN/DinurdoJK/dependencies'
+          # Valve's library from this build's audionimbus OUT_DIR; never a system phonon.
+          phonon="$(ls -t target/release/build/audionimbus-sys-*/out/lib/libphonon.so 2>/dev/null | head -n 1 || true)"
+          test -n "$phonon" || { echo 'Steam Audio libphonon.so not found in the build output' >&2; exit 1; }
+          readelf -h "$phonon" | grep -q 'Machine:.*Advanced Micro Devices X86-64'
+          mkdir -p dist/linux-check/DinurdoJK/dependencies
+          cp "$binary" dist/linux-check/DinurdoJK.x86_64
+          cp "$phonon" dist/linux-check/DinurdoJK/dependencies/libphonon.so
+          chmod 755 dist/linux-check/DinurdoJK.x86_64
+          ldd dist/linux-check/DinurdoJK.x86_64 | tee dist/linux-dependencies.txt
+          grep -F 'libphonon.so =>' dist/linux-dependencies.txt | grep -Fq 'linux-check/DinurdoJK/dependencies/libphonon.so'
+          if grep -q 'not found' dist/linux-dependencies.txt; then
+            echo 'Missing dynamic dependency in standalone Linux package' >&2
+            exit 1
+          fi
+          echo "PHONON_PATH=$PWD/dist/linux-check/DinurdoJK/dependencies/libphonon.so" >> "$GITHUB_ENV"
+
+      - name: Package and sign updater manifest
+        if: steps.release.outputs.build == 'true'
+        shell: bash
+        env:
+          # Private key is exposed to this one signing step only.
+          DINURDOJK_UPDATE_PRIVATE_KEY_B64: ${{ secrets.DINURDOJK_UPDATE_PRIVATE_KEY_B64 }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test -n "${DINURDOJK_UPDATE_PRIVATE_KEY_B64:-}" || {
+            echo 'Missing release-signing Environment secret DINURDOJK_UPDATE_PRIVATE_KEY_B64' >&2
+            exit 1
           }
-          foreach ($asset in $assets) {
-            $name = Split-Path -Leaf $asset
-            if (@($release.assets | Where-Object { $_.name -eq $name }).Count -ne 1) {
-              throw "Missing GitHub Release asset $name"
-            }
-          }
-          Write-Host "Published $tag and verified all $expectedCount release assets."
+          python3 scripts/make_signed_linux_release.py \
+            --binary target/release/DinurdoJK \
+            --phonon "$PHONON_PATH" \
+            --assets assets/dinurdo-assets.pk4 \
+            --license /usr/share/common-licenses/Apache-2.0 \
+            --out dist/signed-linux --tag "$TAG"
+          test "$(wc -c < dist/signed-linux/release-manifest-linux-x86_64.sig)" -eq 64
+
+      - name: Upload signed Linux release files for common publisher
+        if: steps.release.outputs.build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-release-linux
+          path: dist/signed-linux/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Preserve Linux diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DinurdoJK-linux-diagnostics-${{ github.run_id }}
+          path: dist/linux-dependencies.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    name: Publish available signed platforms
+    needs: [windows, linux, macos]
+    # Runs when any platform failed: it publishes whatever verified, signed
+    # platform artifacts exist. Not gated by release-signing (no private key
+    # here), so it never needs a second approval.
+    if: >-
+      !cancelled() && github.repository == 'videoP/DinurdoJK' &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Stamp the same version on publication checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/stamp_ci_version.py
+          python3 -m pip install --disable-pip-version-check 'cryptography>=44,<48'
+
+      - name: Download successful platforms' signed artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: signed-release-*
+          merge-multiple: true
+          path: dist/signed-platforms
+
+      - name: Verify signatures and publish (draft first, never replacing complete platforms)
+        shell: bash
+        env:
+          PUBLIC_KEY_HEX: ${{ needs.windows.outputs.public_key || needs.linux.outputs.public_key || needs.macos.outputs.public_key }}
+        run: |
+          set -euo pipefail
+          tag="$(python3 scripts/make_signed_release.py --print-tag)"
+          python3 scripts/publish_multiplatform_release.py \
+            --tag "$tag" --commit "$GITHUB_SHA" \
+            --input dist/signed-platforms \
+            --shared-asset assets/dinurdo-assets.pk4 \
+            --public-key-hex "$PUBLIC_KEY_HEX"
