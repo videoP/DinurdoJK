@@ -174,6 +174,14 @@ pub(in crate::app) fn tayst_reward_spec(
         RewardKind::Assist => ("medal_assist", None, REWARD_ASSIST_SOUND),
         RewardKind::Denied | RewardKind::GauntletEvent => return None,
     };
+    // Base JK2MV does not enable JK2AWARDS. Keep the optional visual medal
+    // controlled by cg_drawRewards, but do not request the absent capture
+    // award sound (the normal CTF team-scored announcer is handled separately).
+    let sound = if kind == RewardKind::Capture && jka_assets::pk3::active_jk2().is_some() {
+        &[][..]
+    } else {
+        sound
+    };
     Some(RewardSpec {
         shader,
         fallback_shader,
@@ -851,6 +859,11 @@ impl App {
                     }
                 }
                 crate::cgame::CgameNotice::ScoreClientChanged { client, name, team } => {
+                    // A reused slot/changed roster must not inherit an old
+                    // broadcast-card sort score during +scores refresh.
+                    self.spectator_broadcast.invalidate_changed_card_score(
+                        client, name.as_deref(), team,
+                    );
                     // `scores` supplies the numerical columns, but TaystJK
                     // reads current CS_PLAYERS for the name and team each
                     // time it draws a row. Update the retained scoreboard on
@@ -943,6 +956,9 @@ impl App {
                     let show_deaths = score_deaths_mode != 0
                         && !matches!(gametype, 3 | 4 | 8)
                         && mapped_entries.iter().any(|entry| entry.deaths.is_some());
+                    // The scoreboard is intentionally cleared by +scores;
+                    // retain a separate score fallback for spectator cards.
+                    self.spectator_broadcast.remember_card_scores(&mapped_entries);
                     self.scoreboard = Some(UiScoreboard {
                         team_scores,
                         // The live ready mask comes from the current snapshot at draw time,

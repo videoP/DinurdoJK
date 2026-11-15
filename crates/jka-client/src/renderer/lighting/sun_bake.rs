@@ -428,6 +428,12 @@ impl Renderer {
         let Some(world) = self.world.as_mut().filter(|world| !world.source_map) else { return; };
         let state = &mut world.sun_bake;
         if state.direction_pending.is_some() { return; }
+        if state.fitted_direction.is_some() {
+            // Already computed (automatically in sky gain mode C, or by an earlier
+            // press): reuse it instead of searching again.
+            self.select_baked_sun_direction(true);
+            return;
+        }
         let Some(source) = state.source.clone() else {
             state.direction_status = crate::renderer::BakedSunDirectionStatus::Unavailable;
             return;
@@ -590,6 +596,19 @@ impl Renderer {
                     eprintln!("[BAKED SUN] Sun-direction search rejected: {error}; original lightmaps preserved");
                 }
             }
+        }
+        // Sky gain mode C needs the map's authored time of day. With no
+        // q3map_sun, run the same one-shot shadow search as FIND ORIGINAL SUN
+        // once per map (a failed or rejected search is not retried).
+        let auto_find = self.sun_override && self.sky_world_gain_mode == 2
+            && self.world.as_ref().is_some_and(|world| {
+                let state = &world.sun_bake;
+                !world.source_map && state.source.is_some() && state.selected_sun.is_none()
+                    && state.fitted_direction.is_none() && state.direction_pending.is_none()
+                    && matches!(state.direction_status, crate::renderer::BakedSunDirectionStatus::Idle)
+            });
+        if auto_find {
+            self.find_baked_sun_direction();
         }
         let desired = self.baked_sun_removal_auto || self.baked_sun_removal_contour
             || requested(self.effective_baked_sun_removal(), self.baked_sun_debug_mode);

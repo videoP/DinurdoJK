@@ -1069,7 +1069,7 @@ app_cvars! {
     }
 
     APP_R_MAPOVERBRIGHTBITS {
-        runtime: CvarDef::new("r_mapOverBrightBits", "auto", "auto|0|1", "OpenJK map lightmap/vertex/lightgrid authoring range: auto selects 1 on JK2 servers, 0 elsewhere. Requires next map load or vid_restart.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::MapLoadOrVidRestart,
+        runtime: CvarDef::new("r_mapOverBrightBits", "auto", "auto|0|1", "Map lightmap/vertex/lightgrid range: auto preserves JK2MV bytes at either JK2 output-overbright setting; uses 0 on JKA. Explicit 0/1 retains OpenJK conversion. Requires next map load or vid_restart.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::MapLoadOrVidRestart,
             |app| CvarValue::String(App::cvar_get_r_mapoverbrightbits(app)),
             |app, value| App::cvar_set_r_mapoverbrightbits(app, APP_R_MAPOVERBRIGHTBITS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_mapoverbrightbits, Some(|name, value| {
                 crate::app::overbright_value(value)

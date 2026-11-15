@@ -98,6 +98,9 @@ fn main() {
         _ => {}
     }
     if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("windows") { jk2.define("WIN32", None); }
+    // MVSDK/jk2mv select their macOS platform block from MACOS_X, which their
+    // build systems (jk2mv CMakeLists GlobalDefines) define on Apple targets.
+    if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("macos") { jk2.define("MACOS_X", None); }
     if jk2.get_compiler().is_like_msvc() { jk2.flag("/FIjk2_namespace.h"); }
     else { jk2.flag("-include").flag("native/jk2_namespace.h"); }
     for file in ["bg_pmove", "bg_slidemove", "bg_panimate", "bg_saber", "bg_weapons", "bg_misc", "bg_multiversion", "animMappingTable", "q_math", "q_shared"] {
@@ -159,6 +162,9 @@ fn main() {
         .flag_if_supported("-ffp-contract=off");
     if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("windows") {
         jk2_collision.define("WIN32", None);
+    }
+    if env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("macos") {
+        jk2_collision.define("MACOS_X", None);
     }
     match env::var("CARGO_CFG_TARGET_ARCH").ok().as_deref() {
         Some("x86_64") => {

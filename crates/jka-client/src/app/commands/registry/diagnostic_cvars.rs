@@ -6,6 +6,15 @@ use crate::{
     },
 };
 pub(super) const CVARS: &[CvarDef<App>] = &[
+CvarDef::new("r_lampShadowDebug", "0", "0|1|2", "Session-only: 0 off, 1 single diagnostic snapshot after next local-shadow selection, 2 repeat on player move/PVS reselection. Reports flare candidates, grouping, slots, plus post-encode moving-caster face masks and shader gate states in console/latest.log. No GPU readback or render changes.", CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::renderer::lamp_shadow_debug_mode() as i32), |app, value| {
+    let CvarValue::Int(mode) = value else { unreachable!() };
+    crate::renderer::set_lamp_shadow_debug_mode(mode as u8);
+    app.render_command(crate::renderer::RenderCommand::SetLampShadowDebug(mode as u8));
+    app.push_console_line(format!("^3[LAMP DEBUG]^7 mode {mode}: {}. See console or DinurdoJK/logs/latest.log.", match mode {
+        0 => "OFF", 1 => "one snapshot at current player location", _ => "detailed snapshots on each 32-unit/PVS reselection",
+    }));
+    Ok(())
+}),
 CvarDef::new("cg_remoteSmoothing", "0", "0..4", "Live remote players AND spectator-follow POV: 0 original; 1 buffered linear/hold; 2 buffered linear + bounded extrapolation; 3 Hermite + extrapolation; 4 jaMME-inspired commandTime-aware Hermite (fallback linear). Visual-only, session-only.", CvarType::Int { min: 0, max: 4 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::mode() as i32), |app, value| {
     let CvarValue::Int(mode) = value else { unreachable!() };
     crate::cgame::remote_smoothing::set_mode(mode as u8);
@@ -31,6 +40,19 @@ CvarDef::new("cg_remoteExtrapMaxMs", "35", "0..100", "Maximum visual-only extrap
 CvarDef::new("cg_remoteSmoothDebug", "0", "0..2", "0 off; 1 one-second smoothing/underrun/correction summary; 2 also logs per remote player. No render overhead/readbacks. Session only.", CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::debug() as i32), |_app, value| {
     let CvarValue::Int(level) = value else { unreachable!() };
     crate::cgame::remote_smoothing::set_debug(level as u8);
+    Ok(())
+}),
+CvarDef::new("cg_specCamDebug", "0", "0..20000", "Live spectator-camera jitter log: N logs the next N rendered follow frames to latest.log (SPECCAM lines: frame/presentation/damping clocks, snapshot times and commandTimes, raw vs presented origin/angles, ideal vs damped target/location, final camera). 0 stops. One-shot, session only, no render cost when 0.", CvarType::Int { min: 0, max: 20000 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(0), |app, value| {
+    let CvarValue::Int(frames) = value else { unreachable!() };
+    app.arm_spectator_camera_debug(frames as u32);
+    app.push_console_line(format!("^3cg_specCamDebug:^7 {}", if frames > 0 {
+        format!("logging the next {frames} spectator-follow frames to latest.log (grep SPECCAM)")
+    } else { "OFF".to_owned() }));
+    Ok(())
+}),
+CvarDef::new("cg_footstepDebug", "0", "0..3", "JK2 footstep pipeline diagnostics, session only: 0 off; 1 a two-second counter summary (legs-frame advances, due footfalls, ground/cg_footsteps gates, probe misses and SURF_NOSTEPS, queued, submitted to audio, voice pool, replacements); 2 also one rate-limited line per candidate (entity, animation, frames, groundEntityNum, bolt, trace fraction/entity/flags); 3 as 2 with the JK2 ground probe restricted to the world BSP (A/B against the entity-aware CG_Trace). Output goes to the log.", CvarType::Int { min: 0, max: 3 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::footsteps::debug_level() as i32), |_app, value| {
+    let CvarValue::Int(level) = value else { unreachable!() };
+    crate::cgame::footsteps::set_debug_level(level as u8);
     Ok(())
 }),
 CvarDef::new("cg_remoteSmoothStats", "0", "0|1", "Write 1 to print an immediate remote visual history/jitter/underrun report to the in-game console. Read-back remains 0 (one-shot command cvar).", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(false), |app, value| {

@@ -60,7 +60,7 @@ impl App {
         theme::row(
             ui,
             "Model LOD scale",
-            "OpenJK/TaystJK r_lodscale for Ghoul2, MD3 and compiled BSP-model LODs (default 5). Larger keeps higher-detail meshes at greater distances; r_lodbias is added afterward. Medium, High and Ultra presets use the supported maximum of 100.",
+            "r_lodscale controls Ghoul2, MD3 and compiled BSP-model LODs (default 5). Larger values keep higher-detail meshes at greater distances; r_lodbias is applied afterward. Medium, High and Ultra presets use the supported maximum of 100.",
             theme::Reset::Video(ui::VIDEO_ROW_MODEL_LOD_SCALE),
             |ui| {
                 let mut scale = self.video.lod_scale;
@@ -80,7 +80,7 @@ impl App {
         if let Some(index) = quality_table_row(
             ui,
             "Model detail",
-            "r_lodbias. Higher values bias Ghoul2, MD3 and baked BSP models toward cheaper LODs after projected-size selection, exactly like TaystJK. Highest (0) is the default.",
+            "r_lodbias. Higher values bias Ghoul2, MD3 and baked BSP models toward cheaper LODs after projected-size selection. Highest (0) is the default.",
             theme::Reset::Video(ui::VIDEO_ROW_GHOUL2_LOD_BIAS),
             self.video.ghoul2_lod_bias,
             &MODEL_DETAIL,

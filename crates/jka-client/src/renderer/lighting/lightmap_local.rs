@@ -4,26 +4,31 @@ use crate::renderer::{scene, Vec3};
 
 pub(crate) const AUTHORED: u32 = crate::materials::ADDED_MAP_LIGHT_AUTHORED;
 pub(crate) const FX: u32 = 1 << 4;
-pub(crate) const ALL: u32 = crate::materials::SHADER_LIGHT_ALL | AUTHORED | FX;
+pub(crate) const FLARES: u32 = scene::WORLD_FLARE_SHADOW_SOURCE;
+pub(crate) const ALL: u32 = crate::materials::SHADER_LIGHT_ALL | AUTHORED | FX | FLARES;
 pub(crate) const DEFAULT_SOURCES: u32 =
     crate::materials::SHADER_LIGHT_GLOW | crate::materials::SHADER_LIGHT_EMISSIVE_COMPANION;
 // Reserve three array layers for the RGB sum used by moving sun shadows.
 pub(super) const MAX_SOURCES: usize = 253;
 
+/// Original lightmap/illumination selection. World flares never generate
+/// irradiance, even when their independent lamp-shadow toggle is enabled.
 pub(in crate::renderer) fn source_enabled(light: &scene::DynamicLight, mask: u32) -> bool {
-    let reason = if light.shader_promotion_mask == 0 {
-        if light.emitter_normal.iter().any(|v| v.abs() > 1e-6) {
-            AUTHORED
-        } else {
-            0
-        }
-    } else {
-        light.shader_promotion_mask
-    };
-    reason & mask & ALL != 0
+    let reason = light.shader_promotion_mask & !FLARES;
+    let authored = light.shader_promotion_mask == 0
+        && light.emitter_normal.iter().any(|v| v.abs() > 1e-6);
+    let sources = reason | if authored { AUTHORED } else { 0 };
+    (sources & mask & (ALL & !FLARES)) != 0
         && !(mask & AUTHORED != 0
-            && light.shader_promotion_mask & crate::materials::SHADER_LIGHT_AUTHORED_OVERLAP != 0)
+            && reason & crate::materials::SHADER_LIGHT_AUTHORED_OVERLAP != 0)
         && light.surface_lighting
+}
+
+/// Lamp-shadow selection can also use shadow-only world flares. The other
+/// source classes retain their existing independent illumination permissions.
+pub(in crate::renderer) fn shadow_source_enabled(light: &scene::DynamicLight, mask: u32) -> bool {
+    (mask & FLARES != 0 && light.shader_promotion_mask & FLARES != 0 && light.surface_lighting)
+        || source_enabled(light, mask)
 }
 
 /// Per-light R32F irradiance stays within 64 MiB, independently of the sun.
@@ -81,6 +86,29 @@ pub(super) fn irradiance(light: &scene::DynamicLight, position: Vec3, normal: Ve
 mod tests {
     use super::*;
     #[test]
+    fn world_flare_provenance_does_not_enable_other_source_classes() {
+        let mut light = scene::DynamicLight {
+            position: [0.0; 3], color: [1.0; 3], radius: 256.0,
+            intensity: 1.0, shadow_power: 1000.0,
+            falloff: scene::DynamicLightFalloff::Smooth, surface_lighting: true,
+            emitter_normal: [0.0; 3], emitter_two_sided: false,
+            angle_attenuation: true, angle_scale: 0.0, extra_distance: 0.0,
+            shader_promotion_mask: FLARES,
+        };
+        assert!(shadow_source_enabled(&light, FLARES));
+        assert!(!source_enabled(&light, ALL));
+        assert!(!shadow_source_enabled(&light, AUTHORED | FX | crate::materials::SHADER_LIGHT_ALL));
+        light.emitter_normal = [0.0, 1.0, 0.0];
+        assert!(!source_enabled(&light, AUTHORED));
+        light.shader_promotion_mask = 0;
+        assert!(source_enabled(&light, AUTHORED));
+        light.shader_promotion_mask = crate::materials::SHADER_LIGHT_GLOW
+            | crate::materials::SHADER_LIGHT_AUTHORED_OVERLAP | FLARES;
+        assert!(!source_enabled(&light, AUTHORED | crate::materials::SHADER_LIGHT_GLOW));
+        assert!(shadow_source_enabled(&light, AUTHORED | FLARES));
+    }
+
+    #[test]
     fn local_light_budget_scales_all_pages_together() {
         let sizes = output_sizes(&[[2048, 2048], [1024, 1024]], 64, 8192);
         assert_eq!(sizes, [[256, 256], [128, 128]]);
@@ -110,6 +138,7 @@ mod lamp_shadow_gate_tests {
             assert_eq!(inferred_lamp_shadows_allowed(AUTHORED, mode), mode.is_csm());
         }
         assert!(inferred_lamp_shadows_allowed(FX | AUTHORED, DynamicShadowsMode::CascadedShadowMaps));
+        assert!(inferred_lamp_shadows_allowed(FLARES, DynamicShadowsMode::CascadedShadowMaps));
     }
 }
 
@@ -165,7 +194,7 @@ impl crate::renderer::Renderer {
             && world
                 .static_bake_sources
                 .iter()
-                .any(|(i, light)| *i == index && source_enabled(light, self.baked_local_sources))
+                .any(|(i, light)| *i == index && shadow_source_enabled(light, self.baked_local_sources))
     }
 
     pub(in crate::renderer) fn static_runtime_light_enabled(

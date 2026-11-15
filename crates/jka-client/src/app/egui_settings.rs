@@ -19,6 +19,7 @@ mod image;
 mod interface;
 mod lighting;
 mod relighting;
+mod relighting_profiles;
 mod materials;
 mod mod_options;
 mod models;

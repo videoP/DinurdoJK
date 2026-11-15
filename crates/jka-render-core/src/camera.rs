@@ -22,14 +22,13 @@ const DISTANCE_CULL_DIAGONAL: f32 = 1.732_050_8;
 // JKA; MASK_CAMERACLIP adds CONTENTS_PLAYERCLIP.
 const CAMERA_DAMP_INTERVAL: f32 = 1000.0 / 125.0;
 
-/// 125 FPS per-frame damping strength normalization.
-/// At 125 FPS one camera frame is 8 ms: 0.3 covers 30% of remaining error.
-/// The elapsed time exponent keeps the same response at other render FPS.
-/// This matches TaystJK's legacy per-frame coefficient at 125 FPS, not the
-/// 50-ms exponent published in grayj/Jedi-Academy's old cg_view.c source.
+/// TaystJK CG_DampPosition uses cg_cameraFPS=125 by default. At the
+/// reference FPS, strength 0.3 retains 70% of the existing damping offset.
+/// This is only the decay factor; the *moving-ideal* correction is also needed
+/// for FPS independence (see damp_position below).
 #[inline]
-fn calibrated_125_damping_retention(remaining_per_50ms: f32, elapsed_ms: f32) -> f32 {
-    remaining_per_50ms.powf(elapsed_ms / CAMERA_DAMP_INTERVAL)
+fn calibrated_125_damping_retention(remaining_per_reference_frame: f32, elapsed_ms: f32) -> f32 {
+    remaining_per_reference_frame.powf(elapsed_ms / CAMERA_DAMP_INTERVAL)
 }
 const CAMERA_SIZE: f32 = 4.0;
 const CONTENTS_SOLID: i32 = 0x0000_0001;
@@ -165,6 +164,12 @@ impl Default for ThirdPersonSettings {
 pub struct ThirdPersonCameraState {
     current_target: [f32; 3],
     current_location: [f32; 3],
+    // TaystJK dampPos_t.ideal / prevIdeal are distinct: prevIdeal advances
+    // only on positive camera time, while ideal changes every rendered frame.
+    target_ideal: [f32; 3],
+    location_ideal: [f32; 3],
+    previous_target_ideal: [f32; 3],
+    previous_location_ideal: [f32; 3],
     last_frame: f64,
     last_yaw: f32,
     stiff_factor: f32,
@@ -177,6 +182,10 @@ impl Default for ThirdPersonCameraState {
         Self {
             current_target: [0.0; 3],
             current_location: [0.0; 3],
+            target_ideal: [0.0; 3],
+            location_ideal: [0.0; 3],
+            previous_target_ideal: [0.0; 3],
+            previous_location_ideal: [0.0; 3],
             last_frame: 0.0,
             last_yaw: 0.0,
             stiff_factor: 0.0,
@@ -189,6 +198,13 @@ impl Default for ThirdPersonCameraState {
 impl ThirdPersonCameraState {
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Read-only damping state for diagnostics:
+    /// `(ideal target, damped target, ideal location, damped location, last clock)`.
+    pub fn debug_snapshot(&self) -> ([f32; 3], [f32; 3], [f32; 3], [f32; 3], f64) {
+        (self.target_ideal, self.current_target, self.location_ideal,
+            self.current_location, self.last_frame)
     }
 }
 
@@ -375,6 +391,10 @@ fn reset_third_person_damp<W: TraceWorld>(
     let (focus, target) = ideal_target(settings, input);
     let location = ideal_location(target, forward, settings.range);
 
+    state.target_ideal = target;
+    state.location_ideal = location;
+    state.previous_target_ideal = target;
+    state.previous_location_ideal = location;
     state.current_target = camera_trace(world, focus, target, input.client_num);
     let (location, camera_fraction) =
         camera_trace_with_fraction(world, state.current_target, location, input.client_num);
@@ -386,6 +406,41 @@ fn reset_third_person_damp<W: TraceWorld>(
     state.initialized = true;
 }
 
+/// Exact moving-ideal recurrence from TaystJK cg_view.c::CG_DampPosition
+/// (cg_cameraFPS=125). The previous position is ideal + damp, including any
+/// correction from the last collision trace. Merely exponentiating the
+/// positional difference (old position - new ideal) is *not* equivalent at
+/// render rates other than the reference FPS and causes excess follow lag.
+#[inline]
+fn damp_position(
+    current: &mut [f32; 3],
+    current_ideal: &mut [f32; 3],
+    previous_ideal: &mut [f32; 3],
+    ideal: [f32; 3],
+    remaining_per_frame: f32,
+    elapsed_ms: f32,
+) {
+    // cam.damp is independent of cam.ideal and is preserved on zero-time
+    // frames. Keep the two ideals distinct to avoid double-applying movement
+    // when the next positive interval arrives.
+    let damp = sub(*current, *current_ideal);
+    *current_ideal = ideal;
+    if elapsed_ms <= 0.0 {
+        *current = add(ideal, damp);
+        return;
+    }
+    let ideal_delta = sub(ideal, *previous_ideal);
+    *previous_ideal = ideal;
+
+    let relative_time = elapsed_ms / CAMERA_DAMP_INTERVAL;
+    let time_factor = calibrated_125_damping_retention(remaining_per_frame, elapsed_ms);
+    // TaystJK: shift = (idealDelta / dtime) * dampfactor/(1-dampfactor)
+    //           damp  = time_factor * (damp + shift) - shift
+    let shift_scale = remaining_per_frame / (1.0 - remaining_per_frame) / relative_time;
+    let shift = scale(ideal_delta, shift_scale);
+    *current = add(ideal, sub(scale(add(damp, shift), time_factor), shift));
+}
+
 fn update_target_damp<W: TraceWorld>(
     world: &mut W,
     settings: ThirdPersonSettings,
@@ -395,13 +450,22 @@ fn update_target_damp<W: TraceWorld>(
     // CG_UpdateThirdPersonTargetDamp, ordinary on-foot path.
     let (focus, ideal) = ideal_target(settings, input);
     if settings.target_damp >= 1.0 || input.teleported {
+        state.target_ideal = ideal;
         state.current_target = ideal;
-    } else if settings.target_damp >= 0.0 {
-        let diff = sub(ideal, state.current_target);
-        let damp = 1.0 - settings.target_damp;
-        let elapsed_ms = (input.time - state.last_frame) as f32;
-        let ratio = calibrated_125_damping_retention(damp, elapsed_ms);
-        state.current_target = add(ideal, scale(diff, -ratio));
+    } else if settings.target_damp > 0.0 {
+        damp_position(
+            &mut state.current_target,
+            &mut state.target_ideal,
+            &mut state.previous_target_ideal,
+            ideal,
+            1.0 - settings.target_damp,
+            (input.time - state.last_frame) as f32,
+        );
+    } else {
+        // TaystJK's zero-damping branch holds prevIdeal, not the previous
+        // potentially collision-clipped output.
+        state.target_ideal = ideal;
+        state.current_target = state.previous_target_ideal;
     }
     state.current_target = camera_trace(world, focus, state.current_target, input.client_num);
 }
@@ -429,13 +493,20 @@ fn update_camera_damp<W: TraceWorld>(
     }
 
     if damp_factor >= 1.0 || input.teleported {
+        state.location_ideal = ideal;
         state.current_location = ideal;
-    } else if damp_factor >= 0.0 {
-        let diff = sub(ideal, state.current_location);
-        let left = 1.0 - damp_factor;
-        let elapsed_ms = (input.time - state.last_frame) as f32;
-        let ratio = calibrated_125_damping_retention(left, elapsed_ms);
-        state.current_location = add(ideal, scale(diff, -ratio));
+    } else if damp_factor > 0.0 {
+        damp_position(
+            &mut state.current_location,
+            &mut state.location_ideal,
+            &mut state.previous_location_ideal,
+            ideal,
+            1.0 - damp_factor,
+            (input.time - state.last_frame) as f32,
+        );
+    } else {
+        state.location_ideal = ideal;
+        state.current_location = state.previous_location_ideal;
     }
     let (location, camera_fraction) = camera_trace_with_fraction(
         world,
@@ -509,11 +580,13 @@ pub fn offset_third_person_view<W: TraceWorld>(
     }
     let angles = vector_to_angles(aim);
 
-    // OpenJK applies cg_thirdPersonHorzOffset after calculating the final aim
-    // angles, using viewaxis[1] from AnglesToAxis.
+    // TaystJK applies horzOffset only to the rendered vieworg. It must NOT
+    // feed back into cam.loc.damp, otherwise the next frame dampens an offset
+    // which was never part of the ideal camera location.
+    let mut rendered_location = state.current_location;
     if settings.horz_offset != 0.0 {
-        state.current_location = add(
-            state.current_location,
+        rendered_location = add(
+            rendered_location,
             scale(angles_axis1(angles), settings.horz_offset),
         );
     }
@@ -532,7 +605,7 @@ pub fn offset_third_person_view<W: TraceWorld>(
             ideal_target,
         });
     ThirdPersonViewOutput {
-        origin: state.current_location,
+        origin: rendered_location,
         angles,
         late_latch,
     }
@@ -1125,6 +1198,97 @@ mod tests {
         }
         assert_eq!(calibrated_125_damping_retention(1.0, 8.0), 1.0);
         assert_eq!(calibrated_125_damping_retention(0.0, 8.0), 0.0);
+    }
+
+    #[test]
+    fn taystjk_damping_includes_moving_ideal_at_nonreference_fps() {
+        // These are CG_DampPosition's exact 125-FPS equations, with one
+        // moving-ideal step. At 1000 FPS, naive interpolation produces
+        // ~0.044 units, while TaystJK's moving-ideal recurrence gives ~0.186.
+        let mut current = [0.0, 0.0, 0.0];
+        let mut current_ideal = [0.0, 0.0, 0.0];
+        let mut previous_ideal = [0.0, 0.0, 0.0];
+        damp_position(&mut current, &mut current_ideal, &mut previous_ideal, [1.0, 0.0, 0.0], 0.7, 1.0);
+        let time_factor = 0.7_f32.powf(0.125);
+        let shift = 1.0 / 0.125 * 0.7 / 0.3;
+        let expected = 1.0 + time_factor * shift - shift;
+        assert!((current[0] - expected).abs() < 1e-6);
+        assert_eq!(previous_ideal, [1.0, 0.0, 0.0]);
+        assert!((current[0] - (1.0 - time_factor)).abs() > 0.1);
+
+        // At exactly 125 FPS this reduces to the original JKA MP equation.
+        let mut current = [0.0; 3];
+        let mut current_ideal = [0.0; 3];
+        let mut previous_ideal = [0.0; 3];
+        damp_position(&mut current, &mut current_ideal, &mut previous_ideal, [8.0, 0.0, 0.0], 0.7, 8.0);
+        assert!((current[0] - 2.4).abs() < 1e-5);
+    }
+
+    #[test]
+    fn taystjk_moving_follow_target_matches_across_render_rates() {
+        // Compare a sustained linear player path at 125/500/2000 FPS.
+        // Movement-feedforward is necessary for these to converge.
+        let mut final_positions = Vec::new();
+        for fps in [125, 500, 2000] {
+            let mut current = [0.0; 3];
+            let mut current_ideal = [0.0; 3];
+            let mut previous_ideal = [0.0; 3];
+            let dt = 1000.0 / fps as f32;
+            for step in 1..=fps {
+                let ideal_x = step as f32 * 300.0 / fps as f32;
+                damp_position(&mut current, &mut current_ideal, &mut previous_ideal, [ideal_x, 0.0, 0.0], 0.7, dt);
+            }
+            final_positions.push(current[0]);
+        }
+        for position in &final_positions[1..] {
+            assert!((position - final_positions[0]).abs() < 0.02,
+                "125/500/2000 FPS spectator camera diverged: {final_positions:?}");
+        }
+    }
+
+    #[test]
+    fn taystjk_zero_time_frame_does_not_advance_previous_ideal() {
+        let mut current = [0.0; 3];
+        let mut current_ideal = [0.0; 3];
+        let mut previous_ideal = [0.0; 3];
+        damp_position(&mut current, &mut current_ideal, &mut previous_ideal,
+            [1.0, 0.0, 0.0], 0.7, 0.0);
+        assert_eq!(current, [1.0, 0.0, 0.0]);
+        assert_eq!(previous_ideal, [0.0; 3]);
+        damp_position(&mut current, &mut current_ideal, &mut previous_ideal,
+            [2.0, 0.0, 0.0], 0.7, 8.0);
+        // prevIdeal was 0 before the 8-ms update, so delta is 2; damp was 0.
+        assert!((current[0] - 0.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn third_person_horizontal_offset_does_not_accumulate_in_damping_state() {
+        struct ClearWorld;
+        impl TraceWorld for ClearWorld {
+            fn trace(&mut self, query: TraceQuery) -> jka_movement::TraceResult {
+                jka_movement::TraceResult::clear(query.end)
+            }
+            fn point_contents(&mut self, _point: [f32; 3], _pass_entity: i32) -> i32 { 0 }
+        }
+        let settings = ThirdPersonSettings {
+            camera_damp: 0.3, target_damp: 0.5, horz_offset: 12.0,
+            ..ThirdPersonSettings::default()
+        };
+        let mut state = ThirdPersonCameraState::default();
+        let initial = offset_third_person_view(
+            &mut ClearWorld, settings, &mut state,
+            third_person_input([0.0; 3], [0.0; 3], 1000.0),
+        );
+        assert!((initial.origin[1].abs() - 12.0).abs() < 1e-4);
+        assert!(state.current_location[1].abs() < 1e-4);
+        for frame in 1..=100 {
+            let output = offset_third_person_view(
+                &mut ClearWorld, settings, &mut state,
+                third_person_input([0.0; 3], [0.0; 3], 1000.0 + 8.0 * frame as f64),
+            );
+            assert!((output.origin[1] - initial.origin[1]).abs() < 1e-3);
+            assert!(state.current_location[1].abs() < 1e-3);
+        }
     }
 
     #[test]

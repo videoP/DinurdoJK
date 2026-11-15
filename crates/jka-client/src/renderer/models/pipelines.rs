@@ -1876,7 +1876,9 @@ pub(in crate::renderer) fn create_world_wireframe_pipeline(
     msaa_samples: u32,
     shader_variant: WorldShaderVariantKey,
 ) -> wgpu::RenderPipeline {
-    let shader_constants = shader_variant.compilation_constants();
+    let shader_constants = shader_variant.compilation_constants().into_iter()
+        .filter(|(name, _)| *name != "JK2_LEGACY_COLOR")
+        .collect::<Vec<_>>();
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA deformed-world wireframe pipeline"),
         layout: Some(layout),
@@ -2130,7 +2132,7 @@ pub(in crate::renderer) fn create_world_pipeline_specialized(
             .iter()
             .copied()
             .filter(|(name, _)| {
-                !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS" | "LEGACY_WORLD_ENCODED_BLEND")
+                !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS" | "LEGACY_WORLD_ENCODED_BLEND" | "JK2_LEGACY_COLOR")
             })
             .collect::<Vec<_>>()
     });

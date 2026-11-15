@@ -542,7 +542,7 @@ impl App {
                 .and_then(|session| session.client_game.client_info(usize::try_from(entry.client).ok()?, &session.siege_classes));
             (entry.model, entry.model_fallback) = info.map(|info| {
                 let fallback = info.missing_model_fallback();
-                (format!("{}/{}", info.model_name, info.skin_name), format!("{}/{}", fallback.model_name, fallback.skin_name))
+                (info.model_icon_key(), fallback.model_icon_key())
             }).unwrap_or_default();
         }
         let (gametype, map) = self.game_session.as_ref().map_or((0, String::new()), |session| {

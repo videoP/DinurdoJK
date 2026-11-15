@@ -786,7 +786,7 @@ fn shader_library_internal(
     }
     if !override_shader_files.is_empty() {
         warnings.push(format!(
-            "TaystJK compatibility: loaded {} .oshader override file(s)",
+            "Loaded {} .oshader override file(s)",
             override_shader_files.len()
         ));
     }
@@ -1608,7 +1608,7 @@ pub fn promote_lightmap_to_float(image: &mut TextureData) {
     image.mip_level_count = 1;
 }
 
-fn f32_to_f16_bits(value: f32) -> u16 {
+pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exponent = ((bits >> 23) & 0xff) as i32;

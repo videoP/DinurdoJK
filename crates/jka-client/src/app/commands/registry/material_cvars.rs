@@ -199,7 +199,7 @@ app_cvars! {
     APP_R_DETAILTEXTURES {
         runtime: CvarDef::new(
             "r_detailTextures", "1", "0|1",
-            "Enable shader stages explicitly marked `detail` (TaystJK legacy behavior). Applies on the next map load or vid_restart; r_autoDetailTextures controls synthetic BSP micro-detail separately.",
+            "Enable shader stages explicitly marked `detail`. Applies on the next map load or vid_restart; r_autoDetailTextures controls synthetic BSP micro-detail separately.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::MapLoadOrVidRestart,
             |_app: &App| CvarValue::String(bool_value(crate::materials::legacy_detail_textures_enabled())),
             |app, value| App::cvar_set_r_detailtextures(app, APP_R_DETAILTEXTURES.entry.name, &value.to_string()),

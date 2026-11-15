@@ -944,6 +944,7 @@ pub struct PostEffects {
     /// Sky world illumination for lightmapped world: 0 live pass, 1 baked, 2 + sky visibility.
     pub sky_world_bake_ab: u8,
     pub sky_world_light_isolation: bool,
+    pub sky_world_gain_mode: u8,
     pub sky_world_lighting_strength: f32,
     pub bake_threads: u8,
     pub baked_sun_shadow_map: bool,
@@ -1250,7 +1251,7 @@ pub enum RenderCommand {
     SetRelightBakeDeferred(bool),
     SetPvsMode(PvsMode),
     SetFacePlaneCull(bool),
-    SetWorldFlares(bool),
+    SetWorldFlares { mode: u8, enhanced_intensity: f32, enhanced_core: f32, enhanced_wash: f32, enhanced_locality: f32 },
     SetDrawInlineModels(bool),
     SetInlineTransformMode(ui::InlineTransformMode),
     /// r_fragmentShaderMode: 0 general world fragment program, 1 per-material specialized.
@@ -1266,7 +1267,7 @@ pub enum RenderCommand {
     SetCompetitiveAb(u32),
     SetFpsCap(u32),
     SetGamma(f32),
-    SetOverbrightBits(u8),
+    SetOverbrightBits { bits: u8, jk2_mode: bool },
     SetGammaMethod(crate::gamma::GammaMethod),
     SetHardwareGammaActive(bool),
     PrepareGammaMethod(u64),
@@ -1365,6 +1366,7 @@ pub enum RenderCommand {
     SetAddedMapLightSources(u32),
     SetLampShadowSources(u32),
     SetLampShadowAB(u8),
+    SetLampShadowDebug(u8),
     SetEntityFixtureLightingAB(bool),
     SetCsmCoverageAB(bool),
     SetEntityAmbientLighting(EntityAmbientLightingMode),

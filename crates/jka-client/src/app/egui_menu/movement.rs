@@ -42,7 +42,7 @@ impl App {
                 theme::row(
                     ui,
                     "Command window",
-                    "cl_commandsize. TaystJK-compatible command history for prediction, packet selection and CONNECTION INTERRUPTED. AUTO considers movement rate and ping (at least 64). Manual values: 64, 128, 256 or 512. Does not change packet cadence.",
+                    "cl_commandsize. Command history for prediction, packet selection and CONNECTION INTERRUPTED. AUTO considers movement rate and ping (at least 64). Manual values: 64, 128, 256 or 512. Does not change packet cadence.",
                     theme::Reset::MovementCommandSize,
                     |ui| {
                         let configured = self.japro_cg.lagometer.command_size;

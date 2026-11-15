@@ -138,6 +138,7 @@ impl App {
             self.egui_toggle_row(ui, "Source: emissive maps", "Use emissive companion textures as shadow sources.", ui::VIDEO_ROW_BAKED_LOCAL_EMISSIVE, self.video.baked_local_sources & 4 != 0);
             self.egui_toggle_row(ui, "Source: authored surfacelight", "Use authored q3map_surfacelight lamps as shadow sources; this switch alone adds no light.", ui::VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT, self.video.baked_local_sources & 8 != 0);
             self.egui_toggle_row(ui, "Source: fixed continuous EFX", "Use fixed continuously active EFX lamps. Moving, triggered and intermittent effects are excluded.", ui::VIDEO_ROW_BAKED_LOCAL_FX, self.video.baked_local_sources & 16 != 0);
+            self.egui_toggle_row(ui, "Source: world flares", "Use compiled BSP flare locations as shadow-only lamp sources. Nearby compatible authored, shader and EFX lamps share one shadow cubemap (32-unit radius). This does not add direct map lighting or affect flare sprites.", ui::VIDEO_ROW_BAKED_LOCAL_FLARES, self.video.baked_local_sources & 32 != 0);
         });
         if !lamp_shadow_mode {
             ui.small("Select Cascaded Shadow Maps to use these lamp shadows.");

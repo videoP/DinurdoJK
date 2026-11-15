@@ -557,6 +557,50 @@ impl WorldPatchLod {
         }
     }
 
+    /// Capture existing mutable index ranges when ShitteR is activated after
+    /// map load. This allocates nothing while ShitteR remains disabled.
+    pub(in crate::renderer) fn shitter_active_ranges(
+        &self,
+        states: &[Auto4GeometryState],
+        auto_members: &[Vec<usize>],
+        full: &[WorldBatch],
+        source_indices: &[u32],
+    ) -> Vec<(u32, Vec<u32>)> {
+        let mut ranges = Vec::new();
+        for (geometry, item) in self.geometries.iter().enumerate() {
+            if item.active.start == item.reserved.start
+                && item.active.end > item.active.start
+            {
+                let mut indices = Vec::new();
+                self.padded_geometry_indices(geometry, &mut indices);
+                ranges.push((item.active.start, indices));
+            }
+        }
+        for (geometry, state) in states.iter().enumerate() {
+            if let Auto4GeometryState::Ready { range, .. } = state {
+                let Some(members) = auto_members.get(geometry) else { continue; };
+                let mut indices = Vec::new();
+                if self.source.is_some() {
+                    self.recipe_indices(members, full, &mut indices);
+                } else {
+                    // AUTO4 runs even on maps without any curved BSP patches.
+                    // WorldPatchLod has no source in that case; use the exact
+                    // retained indexed geometry that the collapse worker uses.
+                    for &member in members {
+                        let Some(batch) = full.get(member) else { continue; };
+                        if let Some(slice) = source_indices.get(
+                            batch.full_indexed_range.start as usize..batch.full_indexed_range.end as usize,
+                        ) {
+                            indices.extend_from_slice(slice);
+                        }
+                    }
+                }
+                ranges.push((range.start, indices));
+            }
+        }
+        ranges
+    }
+
     /// Applied to a freshly completed worker result before it reaches the GPU.
     pub fn collapse(
         &mut self,
@@ -860,6 +904,21 @@ pub(in crate::renderer) fn update(
                 continue;
             };
             stats.index_upload_bytes += bytes;
+            if crate::renderer::collision_world_only() && crate::renderer::shitter_texture_enabled()
+                && range.start == lod.geometries[geometry].reserved.start
+            {
+                let mut indices = Vec::new();
+                lod.padded_geometry_indices(geometry, &mut indices);
+                let (cache, vertices, models) = (&mut world.shitter_slope_cache,
+                    &world.static_ao_gpu_vertices, &world.inline_models);
+                if let Some(cache) = cache.as_mut() {
+                    cache.cache_collapsed(range.start, &indices, |index| {
+                        if let Some(v) = vertices.get(index as usize) { return Some(v.position); }
+                        models.iter().find_map(|model| index.checked_sub(model.gpu_vertex_start)
+                            .and_then(|offset| model.base.get(offset as usize).map(|v| v.position)))
+                    });
+                }
+            }
             let g = &lod.geometries[geometry];
             for &(set, index) in &g.targets {
                 let batches = match set {
@@ -914,6 +973,19 @@ pub(in crate::renderer) fn update(
                 &world.full_batches, range.start, &written,
             );
             lod.recipe_versions[recipe] = signature;
+            if crate::renderer::collision_world_only() && crate::renderer::shitter_texture_enabled() {
+                let mut indexes = Vec::new();
+                lod.recipe_indices(&world.auto4_geometry_members[recipe], &world.full_batches, &mut indexes);
+                let (cache, vertices, models) = (&mut world.shitter_slope_cache,
+                    &world.static_ao_gpu_vertices, &world.inline_models);
+                if let Some(cache) = cache.as_mut() {
+                    cache.cache_collapsed(range.start, &indexes, |index| {
+                        if let Some(v) = vertices.get(index as usize) { return Some(v.position); }
+                        models.iter().find_map(|model| index.checked_sub(model.gpu_vertex_start)
+                            .and_then(|offset| model.base.get(offset as usize).map(|v| v.position)))
+                    });
+                }
+            }
             continue;
         }
         let mut indices = std::mem::take(&mut lod.scratch);
@@ -934,6 +1006,17 @@ pub(in crate::renderer) fn update(
                 bytemuck::cast_slice(&indices),
             );
             stats.index_upload_bytes += indices.len() as u64 * 4;
+        }
+        if crate::renderer::collision_world_only() && crate::renderer::shitter_texture_enabled() {
+            let (cache, vertices, models) = (&mut world.shitter_slope_cache,
+                &world.static_ao_gpu_vertices, &world.inline_models);
+            if let Some(cache) = cache.as_mut() {
+                cache.cache_collapsed(range.start, &indices, |index| {
+                    if let Some(v) = vertices.get(index as usize) { return Some(v.position); }
+                    models.iter().find_map(|model| index.checked_sub(model.gpu_vertex_start)
+                        .and_then(|offset| model.base.get(offset as usize).map(|v| v.position)))
+                });
+            }
         }
         let active = range.start..range.start + indices.len() as u32;
         crate::renderer::visibility::compaction::auto4_set_geometry_range(

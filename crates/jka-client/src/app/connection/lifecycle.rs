@@ -24,6 +24,7 @@ impl App {
     }
 
     pub(in crate::app) fn disconnect_to_main_menu(&mut self) {
+        self.relighting_profiles_disconnected();
         self.reset_remote_emotes();
         if self.demo_video_export.is_some() {
             self.cancel_demo_video_export();
@@ -89,9 +90,10 @@ impl App {
         }
         self.predictor.reset();
         self.live_input = crate::net::LiveInput::default();
-        self.render_command(RenderCommand::SetOverbrightBits(
-            self.video.effective_overbright_bits(false),
-        ));
+        self.render_command(RenderCommand::SetOverbrightBits {
+            bits: self.video.effective_overbright_bits(false),
+            jk2_mode: false,
+        });
         self.scoreboard = None;
         for guess in &mut self.spectator_ping_guesses {
             guess.reset();
@@ -151,6 +153,7 @@ impl App {
     /// The previous GPU world is harmless behind the opaque loading-information
     /// screen and is replaced atomically by RenderCommand::LoadMap.
     pub(in crate::app) fn disconnect_for_demo_transition(&mut self) {
+        self.relighting_profiles_disconnected();
         self.reset_remote_emotes();
         if self.chat_log_enabled {
             self.chat_log.end("Switched to demo playback");
@@ -197,9 +200,10 @@ impl App {
         }
         self.predictor.reset();
         self.live_input = crate::net::LiveInput::default();
-        self.render_command(RenderCommand::SetOverbrightBits(
-            self.video.effective_overbright_bits(false),
-        ));
+        self.render_command(RenderCommand::SetOverbrightBits {
+            bits: self.video.effective_overbright_bits(false),
+            jk2_mode: false,
+        });
         self.scoreboard = None;
         for guess in &mut self.spectator_ping_guesses {
             guess.reset();

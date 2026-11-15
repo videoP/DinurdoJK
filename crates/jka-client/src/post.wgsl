@@ -33,6 +33,7 @@ struct AutoExposureState {
 // misc_skyportal camera depth (reversed-Z). Only read while
 // settings.cloud_foreground.w > 0; see portal_radial_depth.
 @group(0) @binding(26) var portal_depth_texture: texture_depth_2d;
+@group(0) @binding(27) var jk2_gamma_lut: texture_2d<f32>;
 // Sparse march output, read only by fs_cloud_resolve. It lives in its own bind
 // group because the march pipeline renders into this texture and so must not
 // have it bound; per-entry-point reachability keeps group 1 out of that
@@ -85,6 +86,29 @@ fn output_dither_srgb8(color: vec3<f32>, pixel_position: vec2<f32>) -> vec3<f32>
     let bright_lsb = 2.275 / 255.0;
     let linear_lsb = mix(dark_lsb, bright_lsb, sqrt(luma));
     return clamp(color + vec3<f32>(ordered * linear_lsb), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// Both post paths consume the same JK2MV-style encoded gamma/overbright LUT.
+// Unaffected JKA/HDR frames retain exactly their original color transfer.
+fn output_gamma_color(linear: vec3<f32>, gamma: f32) -> vec3<f32> {
+    if (settings.snow_haze.z > 1.5) {
+        // The single grading cube already contains JK2 output gamma.
+        return linear;
+    }
+    if (settings.snow_haze.z > 0.5 && (abs(gamma - 1.0) > 0.001 || settings.snow_haze.w > 0.5)) {
+        let uv = (sqrt(clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0))) * 1023.0 + vec3<f32>(0.5)) / 1024.0;
+        return vec3<f32>(
+            textureSampleLevel(jk2_gamma_lut, color_lut_sampler, vec2<f32>(uv.r, 0.5), 0.0).r,
+            textureSampleLevel(jk2_gamma_lut, color_lut_sampler, vec2<f32>(uv.g, 0.5), 0.0).r,
+            textureSampleLevel(jk2_gamma_lut, color_lut_sampler, vec2<f32>(uv.b, 0.5), 0.0).r
+        );
+    }
+    return pow(max(linear, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
+}
+fn post_overbright_gain(color: vec3<f32>) -> vec3<f32> {
+    // JK2 SDR output gain was baked into the LUT before color grading.
+    return select(color, color * 2.0,
+                  settings.snow_haze.w > 0.5 && settings.snow_haze.z < 0.5);
 }
 
 fn luminance(c: vec3<f32>) -> f32 {
@@ -231,7 +255,11 @@ fn apply_color_lut(color: vec3<f32>) -> vec3<f32> {
     let input = clamp(color / scale, vec3<f32>(0.0), vec3<f32>(1.0));
     // Sample texel centres so 0 and 1 map exactly to the endpoints of the
     // baked 33^3 cube while hardware trilinear filtering handles interpolation.
-    let coord = (input * (COLOR_LUT_SIZE - 1.0) + vec3<f32>(0.5)) / COLOR_LUT_SIZE;
+    var coord_input = input;
+    if (settings.snow_haze.z > 1.5) {
+        coord_input = sqrt(input);
+    }
+    let coord = (coord_input * (COLOR_LUT_SIZE - 1.0) + vec3<f32>(0.5)) / COLOR_LUT_SIZE;
     let graded = textureSample(color_lut_texture, color_lut_sampler, coord).rgb;
     return mix(color, graded * scale, strength);
 }
@@ -3230,7 +3258,7 @@ fn full_post_common(input: VertexOut) -> vec4<f32> {
     if (post_feature(POST_FEATURE_LEGACY1_FOG)) {
         color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
     }
-    color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
+    color = output_gamma_color(color, gamma);
     color = purple_fringe_color(input.uv, color);
     color = apply_rain_grade(color, settings.weather_look.y);
     color = apply_color_lut(color);
@@ -3240,7 +3268,7 @@ fn full_post_common(input: VertexOut) -> vec4<f32> {
     }
     color = film_grain(color, input.uv);
     // Final framebuffer overbright after all color transforms, as in #1349.
-    if (settings.snow_haze.w > 0.5) { color *= 2.0; }
+    color = post_overbright_gain(color);
     if (settings.taa_params.x < 0.5) {
         color = output_dither_srgb8(color, input.position.xy);
     }
@@ -3303,14 +3331,14 @@ fn fs_rain_only(input: VertexOut) -> @location(0) vec4<f32> {
     color = native_night_scene(color, input.uv);
     color *= exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
     color = display_mapping(color);
-    color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
+    color = output_gamma_color(color, gamma);
     color = apply_rain_grade(color, settings.weather_look.y);
     color = apply_color_lut(color);
     if (settings.film.z > 0.5) {
         let edge = smoothstep(0.28, 0.78, distance(input.uv, vec2<f32>(0.5)));
         color *= 1.0 - edge * 0.28;
     }
-    if (settings.snow_haze.w > 0.5) { color *= 2.0; }
+    color = post_overbright_gain(color);
     if (settings.taa_params.x < 0.5) {
         color = output_dither_srgb8(color, input.position.xy);
     }
@@ -3407,7 +3435,7 @@ fn taa_post_common(input: VertexOut) -> TaaFragmentOut {
     color = display_mapping(color);
 
     color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
-    color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.0 / gamma));
+    color = output_gamma_color(color, gamma);
     color = purple_fringe_color(input.uv, color);
     color = apply_rain_grade(color, settings.weather_look.y);
     color = apply_color_lut(color);
@@ -3416,7 +3444,7 @@ fn taa_post_common(input: VertexOut) -> TaaFragmentOut {
         color *= 1.0 - edge * 0.28;
     }
     color = film_grain(color, input.uv);
-    if (settings.snow_haze.w > 0.5) { color *= 2.0; }
+    color = post_overbright_gain(color);
     var out: TaaFragmentOut;
     // Dither LDR presentation only. HDR already preserved the fog gradient,
     // while temporal history must always stay free of the ordered pattern.

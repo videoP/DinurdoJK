@@ -87,7 +87,7 @@ impl App {
             "Texture filtering",
             "How textures are sampled at a distance and at grazing angles. \
              Anisotropic filtering keeps floors and walls sharp far away and is \
-             nearly free on modern hardware.",
+             nearly free on modern hardware. Applies immediately without vid_restart.",
             theme::Reset::Video(ui::VIDEO_ROW_TEXTURE_FILTER),
             self.video.texture_filter,
             &FILTERS,

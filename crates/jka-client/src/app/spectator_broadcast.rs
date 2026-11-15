@@ -5,14 +5,16 @@
 //! `Cmd_FollowCycle_f(ent, 1)`). Button edges are not reliable client
 //! commands, so `sv_floodProtect` never drops them and they never use up the
 //! chat/`score` flood budget. Each confirmed follow target contributes one real
-//! followed-playerState sample; the sweep ends when the server's cycle wraps
-//! back to the original player. Cycle order does not matter: every player in
-//! the server's cycle is visited once per sweep.
+//! followed-playerState sample. A continuous forward pass runs while each
+//! probe still sees the original player; otherwise the client returns to the
+//! original and tries the opposite direction. Full-cycle wrap completes the
+//! sweep without the old per-player return trips.
 //!
 //! While the server temporarily follows someone else, the presented snapshot
 //! is synthesized: the original player's playerState and every entity seen
-//! during the sweep are extrapolated from their latest authoritative state, and
-//! fresh entities from the probe snapshot near the presented view replace them.
+//! during the sweep are extrapolated from their latest authoritative state.
+//! Whenever a probe contains the original ET_PLAYER, its body refreshes the
+//! presented view; other fresh entities near that view replace cached ones.
 //! Only the presentation copy handed to the game session is replaced; the
 //! protocol decoder keeps its own delta baselines untouched. Event sequences
 //! are carried over unchanged, so nothing re-fires.
@@ -67,14 +69,14 @@ const TR_LINEAR_STOP: i32 = 3;
 /// g_gravity default; entityState carries no gravity of its own.
 const DEFAULT_GRAVITY: f32 = 800.0;
 
-/// Gap between the end of one sweep schedule and the start of the next.
+/// Gap between completing one sweep and starting the next.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
-/// Real POV time between two excursions, so the followed view is mostly
-/// authoritative and only briefly extrapolated.
+/// Real original-player POV time between forward and reverse passes after
+/// a probe loses the original body. Normal, visible probes need no home dwell.
 const HOME_DWELL: Duration = Duration::from_millis(250);
 /// A pressed edge must produce a new follow target within this time.
 const STEP_TIMEOUT: Duration = Duration::from_millis(1000);
-/// Hard cap on one excursion (high ping / stuck mod), then restore explicitly.
+/// Limit for a stalled follow transition (high ping / stuck mod).
 const EXCURSION_TIMEOUT: Duration = Duration::from_secs(3);
 /// OpenJK EVENT_VALID_MSEC: the server frees temp entities after this.
 const EVENT_VALID_MS: i32 = 300;
@@ -206,18 +208,20 @@ impl EventEntities {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Leg {
-    /// Pressing away from the original (`+attack` forward, `+altattack` back).
-    Out,
-    /// Pressing the opposite button until the original is followed again.
-    Back,
-    /// On the original's real POV until `until`, then the next excursion.
+    /// Advance through the server's follow cycle with +attack, while each
+    /// probe still contains the original player entity.
+    Forward,
+    /// After an early visibility failure, scan the other direction from home.
+    Reverse,
+    /// Real original-player POV before starting the reverse pass.
     Home { until: Instant },
 }
 
-/// Follow-cycle excursions: out `d` steps with one button and back with the
-/// other, alternating sides with growing depth (+1, -1, +2, -2, ...). Each
-/// excursion samples every player it passes; the original's real POV returns
-/// between excursions instead of only after a full loop.
+/// Mode-4 live telemetry scanner. Continue straight through the follow cycle
+/// as long as *every* probe provides a fresh ET_PLAYER for our original POV.
+/// The first probe without it stops all automatic presses and requests an
+/// explicit return to the original follow target. After returning, a reverse
+/// pass may sample players not reached in the forward direction.
 struct Sweep {
     original: i32,
     /// Latest authoritative view of the original player and its server time.
@@ -231,16 +235,14 @@ struct Sweep {
     entities: BTreeMap<u16, (EntityState, i32)>,
     /// Follow target the server last confirmed in a snapshot.
     current: i32,
-    /// Signed excursion depths for this sweep.
-    schedule: Vec<i32>,
-    index: usize,
+    /// Number of distinct confirmed follow transitions on this pass.
+    steps: usize,
+    /// Roster-based safety bound if the server's follow cycle changes.
+    max_steps: usize,
     leg: Leg,
-    /// Steps away from the original along the current excursion.
-    position: i32,
     leg_started: Instant,
-    /// Button for the next press (`+attack` or `+altattack`).
+    /// Button for the next press (+attack or +altattack).
     press_button: i32,
-    /// Press `press_button` on the next authored usercmd.
     press_due: bool,
     events: EventEntities,
     /// Usercmds sent with attack released since the last press (edge guard).
@@ -249,32 +251,12 @@ struct Sweep {
     /// Explicit `follow <original>` fallback: pending until the command
     /// channel is quiet, then the time it was sent.
     restore: Option<Option<Instant>>,
-}
-
-fn out_button(depth: i32) -> i32 {
-    if depth > 0 { BUTTON_ATTACK } else { BUTTON_ALT_ATTACK }
-}
-
-fn back_button(depth: i32) -> i32 {
-    if depth > 0 { BUTTON_ALT_ATTACK } else { BUTTON_ATTACK }
-}
-
-/// +1, -1, +2, -2, ... covering `others` players split over both directions.
-fn excursion_schedule(others: usize) -> Vec<i32> {
-    let forward = (others + 1) / 2;
-    let backward = others - forward;
-    let mut schedule = Vec::new();
-    for depth in 1..=forward.max(backward) {
-        if depth <= forward { schedule.push(depth as i32); }
-        if depth <= backward { schedule.push(-(depth as i32)); }
-    }
-    schedule
+    /// Retry from home in reverse only after a forward visibility failure.
+    resume_reverse: bool,
 }
 
 impl Sweep {
     fn start(original: i32, anchor: &ProtocolSnapshot, now: Instant, others: usize) -> Self {
-        let schedule = excursion_schedule(others.max(1));
-        let first = schedule[0];
         let mut events = EventEntities::default();
         events.observe(anchor);
         Self {
@@ -290,17 +272,17 @@ impl Sweep {
                 .map(|entity| (entity.number, (entity.clone(), anchor.server_time)))
                 .collect(),
             current: original,
-            schedule,
-            index: 0,
-            leg: Leg::Out,
-            position: 0,
+            steps: 0,
+            max_steps: others.max(1) + 1,
+            leg: Leg::Forward,
             leg_started: now,
-            press_button: out_button(first),
+            press_button: BUTTON_ATTACK,
             press_due: true,
             events,
             released_cmds: 0,
             last_press: None,
             restore: None,
+            resume_reverse: false,
         }
     }
 
@@ -309,8 +291,31 @@ impl Sweep {
         !matches!(self.leg, Leg::Home { .. }) || self.restore.is_some()
     }
 
-    fn depth(&self) -> i32 {
-        self.schedule.get(self.index).copied().unwrap_or(1)
+    /// Stop immediately when a probe cannot refresh the original view. A
+    /// server round trip may still take multiple rendered frames; there is no
+    /// way to obtain a missing original entity from a remote POV locally.
+    fn return_for_missing_view(&mut self) {
+        if self.restore.is_none() {
+            // With only one other followable player, reverse would sample the
+            // same player again and cannot reveal any new telemetry.
+            self.resume_reverse = self.leg == Leg::Forward && self.max_steps > 2;
+            self.restore = Some(None);
+            self.press_due = false;
+        }
+    }
+
+    /// The real original view has been reacquired. Wait briefly for its
+    /// authoritative snapshot before starting a reverse probe pass.
+    fn begin_reverse_if_due(&mut self, now: Instant) {
+        if let Leg::Home { until } = self.leg {
+            if now >= until {
+                self.leg = Leg::Reverse;
+                self.steps = 0;
+                self.leg_started = now;
+                self.press_button = BUTTON_ALT_ATTACK;
+                self.press_due = true;
+            }
+        }
     }
 
     /// The original player is still networked (sweep not yet left, or the
@@ -330,14 +335,15 @@ impl Sweep {
 
     /// Build the presentation snapshot for a probe snapshot (server following
     /// someone other than `original`).
-    fn synthesize(&mut self, probe: &ProtocolSnapshot) -> ProtocolSnapshot {
+    fn synthesize(&mut self, probe: &ProtocolSnapshot) -> (ProtocolSnapshot, bool) {
         let now_time = probe.server_time;
         // A probe snapshot that still sees the original player gives us its
         // real body state; adopt it as the newest authoritative view.
-        if let Some(body) = probe.entities.iter().find(|entity| {
+        let original_body = probe.entities.iter().find(|entity| {
             i32::from(entity.number) == self.original
                 && entity.field_i32("eType") == Some(ET_PLAYER)
-        }) {
+        });
+        if let Some(body) = original_body {
             apply_entity_to_view(&mut self.view, body, now_time);
             self.view_time = now_time;
         }
@@ -369,7 +375,7 @@ impl Sweep {
         entities.sort_by_key(|entity| entity.number);
         entities.dedup_by_key(|entity| entity.number);
 
-        ProtocolSnapshot {
+        (ProtocolSnapshot {
             server_time: probe.server_time,
             message_num: probe.message_num,
             delta_num: probe.delta_num,
@@ -380,7 +386,7 @@ impl Sweep {
             player_state: view,
             vehicle_player_state: self.vehicle_player_state.clone(),
             entities,
-        }
+        }, original_body.is_some())
     }
 }
 
@@ -567,6 +573,33 @@ impl FreeCam {
     }
 }
 
+/// A `scores` row retained for broadcast card ordering even while the normal
+/// scoreboard deliberately clears its rows before requesting a fresh `score`.
+/// The roster identity prevents a newly connected client from inheriting a
+/// previous occupant's score when the server reuses a client slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CardScore {
+    name: String,
+    team: i32,
+    score: i32,
+    deaths: Option<i32>,
+}
+
+/// Preserve the existing mode-4 playerState preference, but keep score-based
+/// ordering stable during a transient scoreboard cache miss.
+fn card_score(
+    mode: i32,
+    sampled: Option<(i32, i32)>,
+    board: Option<(i32, Option<i32>)>,
+) -> (Option<i32>, Option<i32>) {
+    match (mode, sampled, board) {
+        (4, Some((score, deaths)), _) => (Some(score), Some(deaths)),
+        (_, _, Some((score, deaths))) => (Some(score), deaths),
+        (_, Some((score, deaths)), None) => (Some(score), Some(deaths)),
+        _ => (None, None),
+    }
+}
+
 #[derive(Default)]
 pub(in crate::app) struct SpectatorBroadcast {
     last_team_scores: Option<[i32; 2]>,
@@ -587,6 +620,8 @@ pub(in crate::app) struct SpectatorBroadcast {
     /// Latest real snapshot of the normally followed player (mode 4 only).
     last_real: Option<ProtocolSnapshot>,
     samples: [Option<PlayerTelemetry>; 32],
+    /// Last complete live `scores` reply, independent of scoreboard visibility.
+    card_scores: [Option<CardScore>; 32],
     team_info: [Option<TeamInfoSample>; 32],
     last_team_info_sequence: Option<u32>,
     last_reliable_sequence: Option<i32>,
@@ -594,6 +629,49 @@ pub(in crate::app) struct SpectatorBroadcast {
 }
 
 impl SpectatorBroadcast {
+    /// `+scores` clears the actual scoreboard during refresh. Do not clear
+    /// these values: the broadcast cards need a stable sort key until new
+    /// authoritative scores arrive (or a client's roster identity changes).
+    pub(super) fn remember_card_scores(&mut self, entries: &[ui::UiScoreEntry]) {
+        self.card_scores = std::array::from_fn(|_| None);
+        for entry in entries {
+            if let Some(slot) = usize::try_from(entry.client).ok()
+                .and_then(|client| self.card_scores.get_mut(client))
+            {
+                *slot = Some(CardScore {
+                    name: entry.name.clone(),
+                    team: entry.team,
+                    score: entry.score,
+                    deaths: entry.deaths,
+                });
+            }
+        }
+    }
+
+    pub(super) fn invalidate_changed_card_score(
+        &mut self,
+        client: i32,
+        name: Option<&str>,
+        team: Option<i32>,
+    ) {
+        if let Some(slot) = usize::try_from(client).ok()
+            .and_then(|client| self.card_scores.get_mut(client))
+        {
+            if slot.as_ref().is_some_and(|cached| {
+                team != Some(cached.team)
+                    || name.is_some_and(|name| name != cached.name)
+            }) {
+                *slot = None;
+            }
+        }
+    }
+
+    fn card_score_for(&self, client: usize, name: &str, team: i32) -> Option<(i32, Option<i32>)> {
+        self.card_scores.get(client)?.as_ref()
+            .filter(|cached| cached.name == name && cached.team == team)
+            .map(|cached| (cached.score, cached.deaths))
+    }
+
     pub(in crate::app) fn free_active(&self) -> bool {
         self.free.is_some()
     }
@@ -717,54 +795,55 @@ impl SpectatorBroadcast {
         if client == sweep.original {
             if sweep.current != sweep.original {
                 sweep.current = sweep.original;
-                sweep.position = 0;
-                if sweep.restore.is_some() {
-                    // The explicit restore landed: end this schedule.
+                sweep.steps = 0;
+                if sweep.restore.is_some() && sweep.resume_reverse {
+                    // The first probe without our original entity ended the
+                    // forward pass. Refresh the real POV, then attempt the
+                    // reverse side; no repeated forward crossing of the gap.
+                    sweep.restore = None;
+                    sweep.resume_reverse = false;
+                    sweep.leg = Leg::Home { until: now + HOME_DWELL };
+                    sweep.press_due = false;
+                } else {
+                    // Normal full-cycle wrap, or explicit final restore.
                     self.sweep = None;
                     self.next_sweep_at = Some(now + SWEEP_INTERVAL);
                     self.last_real = Some(snapshot.clone());
                     return snapshot;
                 }
-                // Back home (or the cycle wrapped early): dwell on the real POV.
-                sweep.leg = Leg::Home { until: now + HOME_DWELL };
-                sweep.press_due = false;
             }
             sweep.refresh_anchor(&snapshot);
             self.last_real = Some(snapshot.clone());
             return sweep.events.complete(snapshot);
         }
         let telemetry = PlayerTelemetry::from_player_state(&snapshot.player_state, now);
+        let (presented, original_visible) = sweep.synthesize(&snapshot);
         if client != sweep.current {
             sweep.current = client;
-            match sweep.leg {
-                Leg::Out => {
-                    sweep.position += 1;
-                    if sweep.position >= sweep.depth().abs() {
-                        sweep.leg = Leg::Back;
-                        sweep.leg_started = now;
-                        sweep.press_button = back_button(sweep.depth());
-                    }
-                    sweep.press_due = sweep.restore.is_none();
-                }
-                Leg::Back => {
-                    sweep.position -= 1;
-                    // Two steps past home without meeting the original: the
-                    // cycle changed (join/leave). Restore explicitly.
-                    if sweep.position <= -2 && sweep.restore.is_none() {
-                        sweep.restore = Some(None);
-                    }
-                    sweep.press_due = sweep.restore.is_none();
-                }
-                Leg::Home { .. } => {
-                    // Someone else moved our follow target: put it back.
-                    if sweep.restore.is_none() {
-                        sweep.restore = Some(None);
-                    }
+            if sweep.restore.is_none() {
+                sweep.steps += 1;
+                sweep.leg_started = now;
+                if sweep.steps > sweep.max_steps {
+                    // Unexpected roster/cycle change: don't press forever.
+                    sweep.restore = Some(None);
+                    sweep.press_due = false;
+                } else if !matches!(sweep.leg, Leg::Home { .. }) && original_visible {
+                    // Continue straight to the next player. This snapshot
+                    // contains an authoritative body for our original POV;
+                    // there is no need to follow home between probes.
+                    sweep.press_due = true;
+                } else if matches!(sweep.leg, Leg::Home { .. }) {
+                    // External target change during the home dwell.
+                    sweep.restore = Some(None);
                     sweep.press_due = false;
                 }
             }
         }
-        let presented = sweep.synthesize(&snapshot);
+        // Check EVERY probe, not only the first after a follow transition:
+        // the original can leave the current target's PVS while we're there.
+        if !original_visible {
+            sweep.return_for_missing_view();
+        }
         if let Some(entry) = usize::try_from(client).ok().and_then(|slot| self.samples.get_mut(slot)) {
             *entry = Some(telemetry);
         }
@@ -1142,6 +1221,7 @@ impl App {
                 last_ui_refresh: state.last_ui_refresh,
                 // Observed values stay valid for the map (demo seeks, toggles).
                 samples: state.samples,
+                card_scores: state.card_scores,
                 team_info: state.team_info,
                 last_team_info_sequence: state.last_team_info_sequence,
                 ..Default::default()
@@ -1299,28 +1379,14 @@ impl App {
                     }
                 }
                 None => match sweep.leg {
-                    Leg::Home { until } => {
-                        if now >= until {
-                            sweep.index += 1;
-                            if sweep.index >= sweep.schedule.len() {
-                                self.spectator_broadcast.sweep = None;
-                                self.spectator_broadcast.next_sweep_at = Some(now + SWEEP_INTERVAL);
-                            } else {
-                                sweep.leg = Leg::Out;
-                                sweep.position = 0;
-                                sweep.leg_started = now;
-                                sweep.press_button = out_button(sweep.depth());
-                                sweep.press_due = true;
-                            }
-                        }
-                    }
-                    Leg::Out | Leg::Back => {
+                    Leg::Home { .. } => sweep.begin_reverse_if_due(now),
+                    Leg::Forward | Leg::Reverse => {
                         let step_stalled = !sweep.press_due
                             && sweep.last_press.is_some_and(|at| now.saturating_duration_since(at) >= STEP_TIMEOUT);
                         let too_long = now.saturating_duration_since(sweep.leg_started) >= EXCURSION_TIMEOUT;
                         if step_stalled || too_long {
                             if sweep.current == sweep.original {
-                                // Never left the original: nothing to restore.
+                                // Never left the original: no follow to restore.
                                 self.spectator_broadcast.sweep = None;
                                 self.spectator_broadcast.next_sweep_at = Some(now + Duration::from_secs(10));
                             } else {
@@ -1434,12 +1500,11 @@ impl App {
             // Mode 4 reads score/deaths from sampled playerStates; modes 2/3
             // prefer the `score` board and fall back to samples.
             let sampled_score = observed.map(|sample| (sample.score, sample.deaths));
-            let (score, deaths) = match (mode, sampled_score, board) {
-                (4, Some((score, deaths)), _) => (Some(score), Some(deaths)),
-                (_, _, Some(entry)) => (Some(entry.score), entry.deaths),
-                (_, Some((score, deaths)), None) => (Some(score), Some(deaths)),
-                _ => (None, None),
-            };
+            let board_score = board.map(|entry| (entry.score, entry.deaths))
+                .or_else(|| session.live.then(|| {
+                    self.spectator_broadcast.card_score_for(client, &info.name, info.team)
+                }).flatten());
+            let (score, deaths) = card_score(i32::from(mode), sampled_score, board_score);
             let weapon = entity.and_then(|e| e.state.field_i32("weapon"))
                 .or_else(|| team_info.map(|info| info.weapon).filter(|weapon| *weapon > 0))
                 .or_else(|| observed.and_then(|sample| sample.weapon));
@@ -1487,6 +1552,7 @@ impl App {
                 let mut bars = self.broadcast_bars.borrow_mut();
                 (bars.sample(client, BAR_HEALTH, health, now), bars.sample(client, BAR_FORCE, force, now))
             };
+            let model_icon_key = info.model_icon_key();
             players.push(ui::BroadcastPlayerUi {
                 client: client as i32, team: info.team, name: info.name,
                 score, deaths,
@@ -1496,8 +1562,8 @@ impl App {
                 speed_stale,
                 alive: alive_now,
                 vitals,
-                model: format!("{}/{}", info.model_name, info.skin_name),
-                model_fallback: format!("{}/{}", fallback.model_name, fallback.skin_name),
+                model: model_icon_key,
+                model_fallback: fallback.model_icon_key(),
                 position: position.filter(|p| p.iter().all(|v| v.is_finite()))
                     .map(|p| p.map(|v| v.round() as i32)),
                 yaw: yaw.rem_euclid(360.0).round() as i16,
@@ -1600,6 +1666,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cards_keep_last_score_during_scoreboard_refresh() {
+        let mut state = SpectatorBroadcast::default();
+        state.card_scores[1] = Some(CardScore {
+            name: "Alpha".into(), team: TEAM_RED, score: 25, deaths: Some(2),
+        });
+        state.card_scores[2] = Some(CardScore {
+            name: "Bravo".into(), team: TEAM_RED, score: 10, deaths: Some(4),
+        });
+        // The normal scoreboard can be None between +scores and its response.
+        // Card sorting must not lose the score keys in that interval.
+        let score_a = card_score(4, None, state.card_score_for(1, "Alpha", TEAM_RED));
+        let score_b = card_score(4, None, state.card_score_for(2, "Bravo", TEAM_RED));
+        assert_eq!(score_a, (Some(25), Some(2)));
+        assert_eq!(score_b, (Some(10), Some(4)));
+        assert!(score_a.0 > score_b.0);
+        // A real follow sample still takes precedence in mode 4.
+        assert_eq!(card_score(4, Some((28, 3)), state.card_score_for(1, "Alpha", TEAM_RED)),
+            (Some(28), Some(3)));
+        assert_eq!(card_score(2, Some((28, 3)), state.card_score_for(1, "Alpha", TEAM_RED)),
+            (Some(25), Some(2)));
+    }
+
+    #[test]
+    fn card_score_cache_rejects_reused_player_slots() {
+        let mut state = SpectatorBroadcast::default();
+        state.card_scores[7] = Some(CardScore {
+            name: "Previous".into(), team: TEAM_BLUE, score: 99, deaths: None,
+        });
+        assert_eq!(state.card_score_for(7, "Previous", TEAM_BLUE), Some((99, None)));
+        assert_eq!(state.card_score_for(7, "Replacement", TEAM_BLUE), None);
+        assert_eq!(state.card_score_for(7, "Previous", TEAM_RED), None);
+        state.invalidate_changed_card_score(7, Some("Replacement"), Some(TEAM_BLUE));
+        assert_eq!(state.card_score_for(7, "Previous", TEAM_BLUE), None);
+        // A disconnect invalidates the slot too.
+        state.card_scores[7] = Some(CardScore {
+            name: "Previous".into(), team: TEAM_BLUE, score: 99, deaths: None,
+        });
+        state.invalidate_changed_card_score(7, None, None);
+        assert_eq!(state.card_score_for(7, "Previous", TEAM_BLUE), None);
+    }
+
+    #[test]
     fn player_speed_matches_xy_spectator_units_per_second() {
         assert_eq!(horizontal_speed(Some(300.0), Some(400.0)), Some(500));
         assert_eq!(horizontal_speed(Some(0.0), Some(0.0)), Some(0));
@@ -1666,43 +1774,86 @@ mod tests {
     }
 
     #[test]
-    fn sweep_presents_original_view_and_completes_on_wrap() {
+    fn missing_original_after_one_probe_stops_pressing_and_queues_return() {
         let now = Instant::now();
         let mut state = SpectatorBroadcast::default();
         let mut anchor = snapshot(1000, 1, vec![player_entity(5, [0.0; 3], [100.0, 0.0, 0.0])]);
         set_vec3_ps(&mut anchor.player_state, "velocity", [200.0, 0.0, 0.0]);
         anchor.player_state.persistant[PERS_SCORE] = 7;
         state.last_real = Some(anchor.clone());
-        state.sweep = Some(Sweep::start(1, &anchor, now, 1));
+        state.sweep = Some(Sweep::start(1, &anchor, now, 3));
 
-        // Server now follows client 3; it cannot see entity 5.
+        // First probe has no ET_PLAYER for our original view: display at
+        // most this one extrapolated frame before requesting a real return.
         let mut probe = snapshot(1100, 3, Vec::new());
         probe.player_state.stats[STAT_HEALTH] = 42;
         probe.player_state.persistant[PERS_SCORE] = 9;
         let shown = state.filter_snapshot(probe, now, None);
         assert_eq!(shown.player_state.field_i32("clientNum"), Some(1));
-        let origin = vec3_ps(&shown.player_state, "origin");
-        assert!((origin[0] - 20.0).abs() < 1e-3, "{origin:?}");
+        assert!((vec3_ps(&shown.player_state, "origin")[0] - 20.0).abs() < 1e-3);
         let body = shown.entities.iter().find(|e| e.number == 5).expect("held entity");
         assert!((vec3_entity(body, "pos.trBase")[0] - 10.0).abs() < 1e-3);
         let sample = state.samples[3].expect("probe sample");
         assert_eq!((sample.health, sample.score), (42, 9));
-        // Depth reached: press +altattack back toward the original.
-        assert!(state.sweep.as_ref().is_some_and(|s| s.press_due && s.current == 3
-            && s.leg == Leg::Back && s.press_button == BUTTON_ALT_ATTACK));
+        assert!(state.sweep.as_ref().is_some_and(|s| s.restore == Some(None)
+            && s.resume_reverse && !s.press_due));
 
-        // Back on the original: real snapshot, dwell at home.
+        // No more synthetic follow presses while the return is pending.
+        let mut buttons = 0;
+        state.shape_buttons(&mut buttons, now);
+        assert_eq!(buttons & (BUTTON_ATTACK | BUTTON_ALT_ATTACK), 0);
+
+        // When the server confirms the real follow, the reverse side can be
+        // scanned after one home dwell. The view is authoritative again.
         let back = state.filter_snapshot(snapshot(1200, 1, Vec::new()), now, None);
         assert_eq!(back.server_time, 1200);
-        assert!(state.sweep.as_ref().is_some_and(|s| matches!(s.leg, Leg::Home { .. })));
+        assert!(state.sweep.as_ref().is_some_and(|s| matches!(s.leg, Leg::Home { .. })
+            && s.restore.is_none() && !s.resume_reverse));
         assert!(!state.synthesized());
+        let sweep = state.sweep.as_mut().expect("reverse is scheduled");
+        sweep.begin_reverse_if_due(now + HOME_DWELL);
+        assert_eq!(sweep.leg, Leg::Reverse);
+        assert_eq!(sweep.press_button, BUTTON_ALT_ATTACK);
+        assert!(sweep.press_due);
     }
 
     #[test]
-    fn schedule_alternates_sides_with_growing_depth() {
-        assert_eq!(excursion_schedule(1), vec![1]);
-        assert_eq!(excursion_schedule(2), vec![1, -1]);
-        assert_eq!(excursion_schedule(5), vec![1, -1, 2, -2, 3]);
+    fn visible_original_allows_consecutive_forward_probes_and_wrap() {
+        let now = Instant::now();
+        let mut state = SpectatorBroadcast::default();
+        let anchor = snapshot(1000, 1, Vec::new());
+        state.sweep = Some(Sweep::start(1, &anchor, now, 3));
+        for (time, followed, x) in [(1100, 3, 10.0), (1200, 5, 20.0), (1300, 7, 30.0)] {
+            let probe = snapshot(time, followed, vec![player_entity(1, [x, 0.0, 0.0], [0.0; 3])]);
+            let shown = state.filter_snapshot(probe, now, None);
+            assert_eq!(shown.player_state.field_i32("clientNum"), Some(1));
+            assert!((vec3_ps(&shown.player_state, "origin")[0] - x).abs() < 1e-3);
+            let sweep = state.sweep.as_ref().expect("continues forward");
+            assert_eq!(sweep.leg, Leg::Forward);
+            assert_eq!(sweep.current, followed);
+            assert!(sweep.press_due && sweep.restore.is_none());
+            assert_eq!(sweep.view_time, time);
+            assert!(state.samples[followed as usize].is_some());
+        }
+        // No +altattack / reverse leg was needed. The fourth +attack wraps
+        // to the original and ends the complete sweep.
+        let home = state.filter_snapshot(snapshot(1400, 1, Vec::new()), now, None);
+        assert_eq!(home.player_state.field_i32("clientNum"), Some(1));
+        assert!(state.sweep.is_none());
+    }
+
+    #[test]
+    fn original_disappearing_during_same_follow_forces_return() {
+        let now = Instant::now();
+        let mut state = SpectatorBroadcast::default();
+        let anchor = snapshot(1000, 1, Vec::new());
+        state.sweep = Some(Sweep::start(1, &anchor, now, 3));
+        state.filter_snapshot(snapshot(1100, 3, vec![player_entity(1, [0.0; 3], [0.0; 3])]), now, None);
+        assert!(state.sweep.as_ref().is_some_and(|s| s.press_due));
+        // Even without a changed follow target, visibility loss must stop
+        // the pending next press.
+        state.filter_snapshot(snapshot(1150, 3, Vec::new()), now, None);
+        assert!(state.sweep.as_ref().is_some_and(|s| s.restore == Some(None) && !s.press_due));
     }
 
     #[test]
@@ -1732,17 +1883,37 @@ mod tests {
     }
 
     #[test]
-    fn overshooting_home_requests_restore() {
+    fn unexpected_follow_cycle_length_requests_restore() {
         let now = Instant::now();
         let mut state = SpectatorBroadcast::default();
         state.sweep = Some(Sweep::start(1, &snapshot(0, 1, Vec::new()), now, 1));
-        state.filter_snapshot(snapshot(50, 3, Vec::new()), now, None); // out -> back
-        state.filter_snapshot(snapshot(100, 4, Vec::new()), now, None); // position 0
-        state.filter_snapshot(snapshot(150, 5, Vec::new()), now, None); // -1
-        state.filter_snapshot(snapshot(200, 6, Vec::new()), now, None); // -2
+        for (time, client) in [(50, 3), (100, 4), (150, 5)] {
+            state.filter_snapshot(
+                snapshot(time, client, vec![player_entity(1, [0.0; 3], [0.0; 3])]),
+                now,
+                None,
+            );
+        }
         let sweep = state.sweep.as_ref().expect("restoring");
-        assert!(matches!(sweep.restore, Some(None)));
+        assert_eq!(sweep.steps, 3);
+        assert_eq!(sweep.restore, Some(None));
         assert!(!sweep.press_due);
+    }
+
+    #[test]
+    fn missing_original_in_reverse_does_not_retry_forward() {
+        let now = Instant::now();
+        let mut state = SpectatorBroadcast::default();
+        let anchor = snapshot(1000, 1, Vec::new());
+        let mut sweep = Sweep::start(1, &anchor, now, 3);
+        sweep.leg = Leg::Reverse;
+        sweep.press_button = BUTTON_ALT_ATTACK;
+        state.sweep = Some(sweep);
+        state.filter_snapshot(snapshot(1100, 3, Vec::new()), now, None);
+        assert!(state.sweep.as_ref().is_some_and(|s| s.restore == Some(None)
+            && !s.resume_reverse && !s.press_due));
+        state.filter_snapshot(snapshot(1200, 1, Vec::new()), now, None);
+        assert!(state.sweep.is_none());
     }
 
     #[test]

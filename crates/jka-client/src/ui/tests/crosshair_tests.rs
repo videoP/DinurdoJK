@@ -204,6 +204,50 @@ fn line_crosshair_is_a_short_vertical_line() {
 }
 
 #[test]
+fn line_shape_forces_static_without_changing_the_archived_dynamic_preference() {
+    for saved_mode in [0, 1, 2] {
+        let mut crosshair = CrosshairSettings {
+            style: CROSSHAIR_STYLE_LINE,
+            image: 0,
+            dynamic: saved_mode,
+            ..CrosshairSettings::default()
+        };
+        assert!(crosshair.is_line_shape());
+        assert_eq!(crosshair.effective_dynamic_mode(), 0);
+        assert_eq!(crosshair.dynamic, saved_mode);
+
+        // An explicitly selected stock image is not the line shape.
+        crosshair.image = 1;
+        assert!(!crosshair.is_line_shape());
+        assert_eq!(crosshair.effective_dynamic_mode(), saved_mode);
+
+        // Switching back to an ordinary shape restores the saved mode.
+        crosshair.image = 0;
+        crosshair.style = 1;
+        assert!(!crosshair.is_line_shape());
+        assert_eq!(crosshair.effective_dynamic_mode(), saved_mode);
+    }
+}
+
+#[test]
+fn line_crosshair_does_not_render_in_projected_dynamic_tail() {
+    let (width, height) = (1280_u32, 960_u32);
+    let mut ui = UiSnapshot::default();
+    ui.mode = OverlayMode::None;
+    ui.video.draw_2d = true;
+    ui.video.skip_ui = false;
+    ui.crosshair.style = CROSSHAIR_STYLE_LINE;
+    ui.crosshair.dynamic = 1;
+    ui.crosshair_target.dynamic = true; // stale dynamic frame during style switch
+    let mut fixed = Vec::new();
+    build_crosshair_vertices(&mut fixed, &ui, None, width, height);
+    assert_eq!(fixed.len(), 6);
+    let mut projected = Vec::new();
+    build_crosshair_vertices(&mut projected, &ui, Some([120.0, 100.0]), width, height);
+    assert!(projected.is_empty());
+}
+
+#[test]
 fn helper_line_is_fixed_and_not_part_of_projected_dynamic_crosshair() {
     let (width, height) = (1280_u32, 960_u32);
     let mut ui = UiSnapshot::default();

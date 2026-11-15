@@ -1369,7 +1369,7 @@ app_cvars! {
 
     APP_CG_HUDSCORE {
         runtime: CvarDef::new("cg_hudScore", "tl 0 0 1", "anchor x y scale",
-            "HUD editor transform for Score; independent of TaystJK visibility cvars.",
+            "HUD editor transform for Score; independent of score visibility cvars.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.hud_layout.element(HudElementId::Score).to_config()),
             |app, value| {
@@ -1415,7 +1415,7 @@ app_cvars! {
 
     APP_CG_HUDENEMYINFO {
         runtime: CvarDef::new("cg_hudEnemyInfo", "tl 0 0 1", "anchor x y scale",
-            "HUD editor transform for EnemyInfo; independent of TaystJK visibility cvars.",
+            "HUD editor transform for EnemyInfo; independent of enemy-info visibility cvars.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.hud_layout.element(HudElementId::EnemyInfo).to_config()),
             |app, value| {

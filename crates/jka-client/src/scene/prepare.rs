@@ -5,6 +5,7 @@ use crate::scene::{
     assign_reflection_probes, authored_sun, bsp_brush_entities, bsp_dynamic_lights, bsp_fx_runners,
     bsp_global_fog_num, bsp_global_fog_params, bsp_physics_collision_mesh,
     bsp_portal_surface_anchors, bsp_sky_portal, bsp_surface_lights, bsp_weather_occlusion_source,
+    append_world_flare_shadow_sources,
     bsp_world_effect_registrations, bsp_worldspawn_distance_cull, build_prepared_portal_draw_plan,
     build_voxel_probe_gi,
     cache_reflection_decisions, class_for, collect_grass_emitters,
@@ -591,7 +592,7 @@ pub(in crate::scene) fn prepare_internal(
                 .map(|page| format!("{page:04}"))
                 .collect::<Vec<_>>().join(", ");
             warnings.push(format!(
-                "{name}: {} missing external lightmap page(s) ({preview}{}); using BSP vertex colors for affected surfaces (TaystJK fallback)",
+                "{name}: {} missing external lightmap page(s) ({preview}{}); using BSP vertex colors for affected surfaces",
                 missing_external_lightmaps.len(),
                 if missing_external_lightmaps.len() > 8 { ", ..." } else { "" },
             ));
@@ -781,7 +782,7 @@ pub(in crate::scene) fn prepare_internal(
     let tints_ms = tints_started.elapsed().as_secs_f64() * 1000.0;
 
     let lights_started = Instant::now();
-    let (surface_lights, gi_surface_lights, surface_light_stats, static_bake_lights) =
+    let (surface_lights, gi_surface_lights, surface_light_stats, mut static_bake_lights) =
         bsp_surface_lights(&mesh, &surface_materials);
     let surface_lights_ms = lights_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -2078,6 +2079,15 @@ pub(in crate::scene) fn prepare_internal(
         })
     }).collect::<Vec<_>>();
     devprintln!(1, "{name}: RBSP world flares: {} authored candidate(s)", world_flares.len());
+    // Keep flare shadow candidates separate from lightmap/GI illumination.
+    // Final fixture combining runs at world upload, after fixed EFX promotion.
+    let (inferred, relocated) = append_world_flare_shadow_sources(
+        &mut static_bake_lights, &world_flares,
+        |origin| crate::scene::lighting::flare_lamp_origin(&bsp, origin));
+    devprintln!(1, "{name}: flare shadow candidates: {inferred} ({relocated} moved out of solid geometry)");
+    if relocated != 0 {
+        println!("{name}: {relocated} of {inferred} flare shadow lamp(s) were inside solid brushes and moved to open space");
+    }
 
     let coastal_bathymetry = if options.ocean {
         crate::ocean::bathymetry::start(Arc::clone(&bsp), &vertices, &batches, &pvs_batches,

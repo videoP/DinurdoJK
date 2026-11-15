@@ -405,13 +405,15 @@ fn card_flag(player: &BroadcastPlayerUi, ui: &UiSnapshot) -> Option<(i32, Option
 }
 
 fn missing_carrier_flags<'a>(
-    ui: &'a UiSnapshot, team: i32, players: &[&BroadcastPlayerUi],
+    ui: &'a UiSnapshot, team: i32, players: &[BroadcastPlayerUi],
 ) -> Vec<&'a super::Jk2FlagUi> {
     ui.jk2_flags.iter().filter(|flag| {
         // Bucky MVSDK can have an opt-in neutral/yellow third flag, which
         // has no dedicated spectator team stack. Attach it to RED's header.
         (flag.team == team || (team == TEAM_RED && flag.team == 0))
             && (flag.status == 4 || (flag.status == 1
+                // Search BOTH rosters: a stolen flag is carried by the
+                // opposing team, not by the team that owns the flag.
                 && !players.iter().any(|p| Some(p.client) == flag.carrier_client)))
     }).collect()
 }
@@ -527,7 +529,7 @@ fn player_stacks(out: &mut Vec<UiVertex>, p: &Paint, b: &SpectatorBroadcastUi, t
         // This strip is attached directly to the corresponding player stack,
         // not a second cg_enhancedFlagStatus overlay in the screen corner.
         // A dropped flag (or unknown carrier) has no player card to decorate.
-        let missing = missing_carrier_flags(p.ui, side.team, &players);
+        let missing = missing_carrier_flags(p.ui, side.team, &b.players);
         if !missing.is_empty() {
             let y = bottom - stack_h - status_h + 2.0 * s;
             let tile_w = card_w / missing.len() as f32;
@@ -540,11 +542,23 @@ fn player_stacks(out: &mut Vec<UiVertex>, p: &Paint, b: &SpectatorBroadcastUi, t
                 if let Some(image) = flag_status_icon(flag.team, flag.status) {
                     p.hud_image(out, image, [icon_x, y, size, size]);
                 }
-                let label = if flag.status == 4 { "DROPPED" } else { "CARRIER UNKNOWN" };
-                let text_w = p.txt.width(label, small_px);
+                // Known off-roster carriers aren't "unknown"; show a
+                // server-reported name (or client number) when no card exists.
+                let label = if flag.status == 4 {
+                    "DROPPED".to_owned()
+                } else if let Some(client) = flag.carrier_client {
+                    flag.carrier.as_deref().filter(|name| !name.is_empty())
+                        .map(|name| format!("CARRIER {}", strip_colors(name)))
+                        .unwrap_or_else(|| format!("CARRIER #{client}"))
+                } else {
+                    "CARRIER UNKNOWN".to_owned()
+                };
+                let available = (tile_w - size - 16.0 * s).max(0.0);
+                let label = p.fit(&label, small_px, available);
+                let text_w = p.txt.width(&label, small_px);
                 let tx = if side.mirrored { icon_x - text_w - 6.0 * s }
                     else { icon_x + size + 6.0 * s };
-                p.txt.draw(out, label, tx, y + 16.0 * s, small_px, MUTED);
+                p.txt.draw(out, &label, tx, y + 16.0 * s, small_px, MUTED);
             }
         }
 
@@ -714,25 +728,32 @@ mod tests {
         });
         // The entity's old flag powerup cannot light a card after a drop.
         assert_eq!(card_flag(&player, &ui), None);
-        assert_eq!(missing_carrier_flags(&ui, TEAM_RED, &[&player]).len(), 1);
+        assert_eq!(missing_carrier_flags(&ui, TEAM_RED, std::slice::from_ref(&player)).len(), 1);
 
         // Confirmed pickup attaches both image and time to the correct card.
         ui.jk2_flags[0].status = 1;
         ui.jk2_flags[0].carrier_client = Some(7);
         ui.jk2_flags[0].held_ms = 91_000;
         assert_eq!(card_flag(&player, &ui), Some((TEAM_RED, Some(91_000))));
-        assert!(missing_carrier_flags(&ui, TEAM_RED, &[&player]).is_empty());
+        assert!(missing_carrier_flags(&ui, TEAM_RED, std::slice::from_ref(&player)).is_empty());
+        // BLUE player carrying RED's flag still occupies BLUE's card, not
+        // RED's. The RED flag must not produce an extra unknown-carrier tile.
+        assert_eq!(player.team, TEAM_BLUE);
+        assert_eq!(ui.jk2_flags[0].team, TEAM_RED);
+        // A carrier number known from the powerup but absent from the roster
+        // still gets a status tile; it must NOT be named "UNKNOWN".
+        assert_eq!(missing_carrier_flags(&ui, TEAM_RED, &[]).len(), 1);
 
         // If the carrier is unknown, never label a guessed player.
         ui.jk2_flags[0].carrier_client = None;
         assert_eq!(card_flag(&player, &ui), None);
-        assert_eq!(missing_carrier_flags(&ui, TEAM_RED, &[&player]).len(), 1);
+        assert_eq!(missing_carrier_flags(&ui, TEAM_RED, std::slice::from_ref(&player)).len(), 1);
 
         // The optional third-team flag has no card stack of its own.
         ui.jk2_flags[0].team = 0;
         ui.jk2_flags[0].status = 4;
-        assert_eq!(missing_carrier_flags(&ui, TEAM_RED, &[&player]).len(), 1);
-        assert!(missing_carrier_flags(&ui, TEAM_BLUE, &[&player]).is_empty());
+        assert_eq!(missing_carrier_flags(&ui, TEAM_RED, std::slice::from_ref(&player)).len(), 1);
+        assert!(missing_carrier_flags(&ui, TEAM_BLUE, std::slice::from_ref(&player)).is_empty());
 
         // JKA still uses the native observed flag powerups and the same art.
         ui.jk2_mode = false;

@@ -12,6 +12,7 @@ struct SkyVertex {
 struct Settings {
     moon: vec4<f32>,
     flags: vec4<u32>, // x active, y moon, z strength bits; w bits 0 vanilla, 1 isolation, 2+ receiver offset
+    gain: vec4<f32>, // r_skyWorldGainMode calibration (sky_gain_calibrated)
 }
 @group(0) @binding(0) var<storage, read> receivers: array<SkyVertex>;
 @group(0) @binding(1) var<storage, read_write> world_vertex_words: array<u32>;
@@ -44,7 +45,8 @@ fn vertex_sky_gain(packed: u32) -> vec3<f32> {
     let color = select(sky_environment.light_color, vec3<f32>(0.70, 0.82, 1.0), moon_active);
     let intensity = select(sky_environment.light_intensity, settings.moon.w, moon_active);
     let direct = color * intensity * max(dot(n, direction), 0.0) * direct_visibility;
-    let full_gain = clamp(ambient * 0.5 + direct * 0.2, vec3(0.03), vec3(4.0));
+    let full_gain = sky_gain_calibrated(clamp(ambient * 0.5 + direct * 0.2, vec3(0.03), vec3(4.0)),
+        vec3(1.0), select(direction.y, -1.0, moon_active), settings.gain);
     let incidence = max(dot(n, direction), 0.0);
     let exposure = clamp(max(ambient_visibility, direct_visibility * incidence), 0.0, 1.0);
     let isolation = (settings.flags.w & 2u) != 0u;

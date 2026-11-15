@@ -1,7 +1,7 @@
 //! Competitive world A/B. Shitter reuses the normal world BSP GPU geometry,
 //! PVS, index ranges and indirect draw calls, with a flat no-texture shader.
 //! Steam Audio and gameplay collision are independent of this path.
-use super::{camera_depth_compare, depth_format, PvsMode, Renderer};
+use super::{depth_format, PvsMode, Renderer};
 use crate::scene;
 use std::sync::{mpsc, Arc};
 use std::path::PathBuf;
@@ -271,12 +271,177 @@ pub(in crate::renderer) fn upload(
     })
 }
 
+/// Contiguous runs of triangles with the same authored face slope. All run
+/// boundaries are in the already-resident native BSP index buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::renderer) struct ShitterSlopeRun {
+    pub first_index: u32,
+    pub index_count: u32,
+    pub gray: bool,
+}
+
+/// Created only on entering textured ShitteR for a map. The normal renderer
+/// stores NONE of this cache. AUTO4 collapsed ranges are cached when installed
+/// (not reclassified every frame); all original ranges use the immutable table.
+pub(in crate::renderer) struct ShitterSlopeCache {
+    static_runs: Vec<ShitterSlopeRun>,
+    dynamic_runs: BTreeMap<u32, Vec<ShitterSlopeRun>>,
+    static_end: u32,
+}
+
+fn shitter_face_gray(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> bool {
+    let ab = [b[0]-a[0], b[1]-a[1], b[2]-a[2]];
+    let ac = [c[0]-a[0], c[1]-a[1], c[2]-a[2]];
+    let cross = [
+        ab[1]*ac[2] - ab[2]*ac[1],
+        ab[2]*ac[0] - ab[0]*ac[2],
+        ab[0]*ac[1] - ab[1]*ac[0],
+    ];
+    let area2 = cross[0].hypot(cross[1]).hypot(cross[2]);
+    // OpenJK PM_ClipVelocity's walkability threshold MIN_WALK_NORMAL = 0.7,
+    // evaluated in renderer Y-up. Use the *triangle plane* (not smooth shared
+    // vertex normals), which prevents adjacent faces changing each other's grid.
+    area2 > 1.0e-7 && cross[1] / area2 >= 0.7
+}
+
+fn shitter_runs_from_indices(
+    indices: &[u32], first_index: u32,
+    mut position: impl FnMut(u32) -> Option<[f32; 3]>,
+) -> Vec<ShitterSlopeRun> {
+    let mut runs: Vec<ShitterSlopeRun> = Vec::new();
+    for (triangle, corners) in indices.chunks_exact(3).enumerate() {
+        let gray = match (position(corners[0]), position(corners[1]), position(corners[2])) {
+            (Some(a), Some(b), Some(c)) => shitter_face_gray(a, b, c),
+            _ => false,
+        };
+        let start = first_index + (triangle as u32)*3;
+        if let Some(last) = runs.last_mut() {
+            if last.gray == gray && last.first_index + last.index_count == start {
+                last.index_count += 3;
+                continue;
+            }
+        }
+        runs.push(ShitterSlopeRun { first_index: start, index_count: 3, gray });
+    }
+    runs
+}
+
+fn world_position(world: &super::WorldGpu, index: u32) -> Option<[f32; 3]> {
+    if let Some(vertex) = world.static_ao_gpu_vertices.get(index as usize) {
+        return Some(vertex.position);
+    }
+    for model in &world.inline_models {
+        let Some(offset) = index.checked_sub(model.gpu_vertex_start) else { continue; };
+        if let Some(vertex) = model.base.get(offset as usize) {
+            return Some(vertex.position);
+        }
+    }
+    None
+}
+
+impl ShitterSlopeCache {
+    pub(in crate::renderer) fn for_world(world: &super::WorldGpu) -> Self {
+        let indices = world.remap_index_source.as_slice();
+        let static_runs = shitter_runs_from_indices(indices, 0, |index| world_position(world, index));
+        let gray = static_runs.iter().filter(|run| run.gray).map(|run| run.index_count/3).sum::<u32>();
+        println!("[SHITTER] cached triangle slope classifications: {} triangles ({} walkable), {} runs, ShitteR-only", indices.len()/3, gray, static_runs.len());
+        Self { static_runs, dynamic_runs: BTreeMap::new(), static_end: indices.len() as u32 }
+    }
+
+    pub(in crate::renderer) fn cache_collapsed(
+        &mut self, start: u32, indices: &[u32], mut position: impl FnMut(u32) -> Option<[f32; 3]>,
+    ) {
+        self.dynamic_runs.insert(start, shitter_runs_from_indices(indices, start, |index| position(index)));
+    }
+
+    pub(in crate::renderer) fn forget_collapsed(&mut self, start: u32) {
+        self.dynamic_runs.remove(&start);
+    }
+
+    /// Project cached triangle runs into this draw's slice without any face
+    /// slope calculation. The material selection changes only at triangle
+    /// boundaries, and each triangle is submitted exactly once.
+    pub(in crate::renderer) fn append_draws(
+        &self, first: u32, count: u32,
+        orange: &mut Vec<super::DrawIndexedIndirectArgs>,
+        gray: &mut Vec<super::DrawIndexedIndirectArgs>,
+    ) {
+        let end = first.saturating_add(count);
+        let override_runs = self.dynamic_runs.range(..=first).next_back()
+            .map(|(_, runs)| runs.as_slice())
+            .filter(|runs| runs.last().is_some_and(|run|
+                run.first_index + run.index_count > first));
+        let runs = override_runs.unwrap_or_else(|| if first < self.static_end {
+            &self.static_runs
+        } else {
+            &[]
+        });
+        let mut at = runs.partition_point(|run| run.first_index + run.index_count <= first);
+        let mut covered = first;
+        while let Some(run) = runs.get(at) {
+            if run.first_index >= end { break; }
+            let start = run.first_index.max(first);
+            let stop = (run.first_index + run.index_count).min(end);
+            if start > covered { // unknown AUTO4 region: do not drop triangles
+                push_shitter_draw(orange, covered, start - covered);
+            }
+            if stop > start {
+                push_shitter_draw(if run.gray { &mut *gray } else { &mut *orange }, start, stop-start);
+                covered = stop;
+            }
+            at += 1;
+        }
+        if covered < end {
+            push_shitter_draw(orange, covered, end - covered);
+        }
+    }
+}
+
+fn push_shitter_draw(draws: &mut Vec<super::DrawIndexedIndirectArgs>, first: u32, count: u32) {
+    if count == 0 { return; }
+    if let Some(last) = draws.last_mut() {
+        if last.first_index + last.index_count == first {
+            last.index_count += count;
+            return;
+        }
+    }
+    draws.push(super::DrawIndexedIndirectArgs {
+        first_index: first, index_count: count,
+        instance_count: 1, base_vertex: 0, first_instance: 0,
+    });
+}
+
+/// Register any already-resident patches/AUTO4 recipes when the user activates
+/// textured ShitteR after previously playing the map in the normal renderer.
+/// These are not rebuilt or even inspected while ShitteR is disabled.
+pub(in crate::renderer) fn cache_active_shitter_lod(world: &mut super::WorldGpu) {
+    let ranges = world.patch_lod.shitter_active_ranges(
+        &world.auto4_collapse_cache.states, &world.auto4_geometry_members, &world.full_batches,
+        &world.remap_index_source,
+    );
+    for (start, indices) in ranges {
+        let (cache, vertices, models) = (&mut world.shitter_slope_cache,
+            &world.static_ao_gpu_vertices, &world.inline_models);
+        if let Some(cache) = cache.as_mut() {
+            cache.cache_collapsed(start, &indices, |index| {
+                if let Some(vertex) = vertices.get(index as usize) { return Some(vertex.position); }
+                models.iter().find_map(|model| index.checked_sub(model.gpu_vertex_start)
+                    .and_then(|offset| model.base.get(offset as usize).map(|v| v.position)))
+            });
+        }
+    }
+}
+
 // The original flat pipeline remains completely separate from the optional
 // textured variant, so /r_shitterTexture 0 executes no texture sampling.
 pub(in crate::renderer) struct CollisionWorldTexturedPipeline {
     pub pipeline: wgpu::RenderPipeline,
+    pub gray_pipeline: wgpu::RenderPipeline,
     pub bind_group: wgpu::BindGroup,
-    _image: super::GpuImage,
+    // Retain the layout and images so changing r_textureMode can rebind the
+    // live sampler without reloading textures or recompiling the pipeline.
+    image_layout: wgpu::BindGroupLayout,
+    _images: [super::GpuImage; 2],
 }
 
 pub(in crate::renderer) struct CollisionWorldPipeline {
@@ -286,30 +451,27 @@ pub(in crate::renderer) struct CollisionWorldPipeline {
     samples: u32,
     game: Option<PathBuf>,
     texture_requested: bool,
-    texture_job: Option<mpsc::Receiver<Result<(crate::materials::TextureData, String), String>>>,
+    texture_job: Option<mpsc::Receiver<Result<[(crate::materials::TextureData, String); 2], String>>>,
 }
 
-const SHITTER_IMAGE: &str = "textures/factory/base";
+const SHITTER_ORANGE_IMAGE: &str = "textures/japro/orange_grid";
+const SHITTER_GRAY_IMAGE: &str = "textures/japro/gray_grid";
 
-// CPU-only work; runs once on a background thread, never in frame encoding.
-// Prefer the image at the shader qpath. If the qpath is script-only, resolve
-// one ordinary diffuse image from that script; do NOT execute its stages.
+// Both images are resolved once by the background worker. An authored shader
+// name can be a script-only alias; only its static diffuse image is used.
+// Missing assets remain conspicuously magenta, never silently substituted.
 fn load_shitter_image(
-    base: &std::path::Path,
-    game: Option<&std::path::Path>,
+    assets: &mut jka_assets::pk3::AssetSearchPath,
+    qpath: &'static str,
 ) -> Result<(crate::materials::TextureData, String), String> {
-    let mut assets = jka_assets::pk3::AssetSearchPath::open_game(base, game)
-        .map_err(|error| format!("Shitter image asset search: {error}"))?;
     if let Some(data) = super::try_load_texture_asset_from_search_path(
-        &mut assets, SHITTER_IMAGE, false, true, true, "Shitter raw world image",
+        assets, qpath, false, true, true, "Shitter raw world image",
     ) {
-        return Ok((data, SHITTER_IMAGE.to_owned()));
+        return Ok((data, qpath.to_owned()));
     }
-    // Resolve script-only aliases only on a background worker. The canonical
-    // shader library parser already handles .shader/.oshader precedence.
-    let (shaders, _) = crate::materials::shader_library(&mut assets, &mut Vec::new(), false)?;
-    let shader = jka_assets::shader::find_shader(&shaders, SHITTER_IMAGE)
-        .ok_or_else(|| format!("{SHITTER_IMAGE} has no raw image and no shader definition"))?;
+    let (shaders, _) = crate::materials::shader_library(assets, &mut Vec::new(), false)?;
+    let shader = jka_assets::shader::find_shader(&shaders, qpath)
+        .ok_or_else(|| format!("{qpath} has no raw image and no shader definition"))?;
     for stage in &shader.stages {
         if stage.video || stage.image.is_empty() || stage.image.starts_with('$')
             || !matches!(stage.tc_gen, jka_assets::shader::TcGen::Base)
@@ -317,12 +479,52 @@ fn load_shitter_image(
             continue;
         }
         if let Some(data) = super::try_load_texture_asset_from_search_path(
-            &mut assets, &stage.image, false, true, true, "Shitter shader diffuse image",
+            assets, &stage.image, false, true, true, "Shitter shader diffuse image",
         ) {
             return Ok((data, stage.image.clone()));
         }
     }
-    Err(format!("{SHITTER_IMAGE} shader defines no usable diffuse image"))
+    Err(format!("{qpath} shader defines no usable diffuse image"))
+}
+
+fn load_shitter_images(
+    base: &std::path::Path,
+    game: Option<&std::path::Path>,
+) -> Result<[(crate::materials::TextureData, String); 2], String> {
+    let mut assets = jka_assets::pk3::AssetSearchPath::open_game(base, game)
+        .map_err(|error| format!("Shitter image asset search: {error}"))?;
+    Ok([SHITTER_ORANGE_IMAGE, SHITTER_GRAY_IMAGE].map(|name| {
+        load_shitter_image(&mut assets, name).unwrap_or_else(|error| {
+            eprintln!("[SHITTER TEXTURE] {error}; showing missing-texture checker");
+            (crate::materials::missing_texture_data(), format!("MISSING {name}"))
+        })
+    }))
+}
+
+// Called when the live r_textureMode / anisotropy sampler changes. The two
+// resident grid textures and pipeline are retained; rebinding is O(1) and
+// never occurs in a normal frame.
+fn shitter_grid_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    images: &[super::GpuImage; 2],
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Shitter orange/gray grid image bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0, resource: wgpu::BindingResource::TextureView(&images[0].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1, resource: wgpu::BindingResource::TextureView(&images[1].view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2, resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
 }
 
 fn create_shitter_world_pipeline(
@@ -333,6 +535,7 @@ fn create_shitter_world_pipeline(
     samples: u32,
     shader_source: &str,
     label: &'static str,
+    gray: bool,
 ) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
@@ -347,6 +550,14 @@ fn create_shitter_world_pipeline(
         bind_group_layouts: &layouts,
         immediate_size: 0,
     });
+    // Hold specialization constants until create_render_pipeline has consumed the descriptor.
+    // An array literal inside the conditional constants field would be dropped too early.
+    let grid_constants = [("GRID_GRAY", if gray { 1.0 } else { 0.0 })];
+    let fragment_constants: &[(&str, f64)] = if image_layout.is_some() {
+        &grid_constants
+    } else {
+        &[]
+    };
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(&layout),
@@ -380,7 +591,9 @@ fn create_shitter_world_pipeline(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: depth_format(),
             depth_write_enabled: Some(true),
-            depth_compare: Some(camera_depth_compare()),
+            // Strict reversed-Z: coincident authored triangles cannot keep
+            // repainting each other in arbitrary order. Gray is drawn first.
+            depth_compare: Some(wgpu::CompareFunction::Greater),
             stencil: Default::default(),
             bias: Default::default(),
         }),
@@ -388,7 +601,10 @@ fn create_shitter_world_pipeline(
         fragment: Some(wgpu::FragmentState {
             module: &shader,
             entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: fragment_constants,
+                ..Default::default()
+            },
             targets: &[Some(wgpu::ColorTargetState {
                 format,
                 blend: None,
@@ -410,7 +626,7 @@ impl Renderer {
         if !reusable {
             let pipeline = create_shitter_world_pipeline(
                 &self.device, &self.camera_layout, None, format, samples,
-                include_str!("../collision_world.wgsl"), "Native BSP flat Shitter pipeline",
+                include_str!("../collision_world.wgsl"), "Native BSP flat Shitter pipeline", false,
             );
             self.collision_world_pipeline = Some(CollisionWorldPipeline {
                 pipeline, textured: None, format, samples,
@@ -450,7 +666,7 @@ impl Renderer {
         let game = self.detail_texture_game.clone();
         let (tx, rx) = mpsc::channel();
         match std::thread::Builder::new().name("shitter-world-image".into()).spawn(move || {
-            let _ = tx.send(load_shitter_image(&root, game.as_deref()));
+            let _ = tx.send(load_shitter_images(&root, game.as_deref()));
         }) {
             Ok(_) => cached.texture_job = Some(rx),
             Err(error) => self.finish_shitter_textured_pipeline(Err(format!(
@@ -461,55 +677,67 @@ impl Renderer {
 
     fn finish_shitter_textured_pipeline(
         &mut self,
-        result: Result<(crate::materials::TextureData, String), String>,
+        result: Result<[(crate::materials::TextureData, String); 2], String>,
     ) {
-        let (data, path) = match result {
-            Ok((data, path)) => (data, path),
+        let images = match result {
+            Ok(images) => images,
             Err(error) => {
-                eprintln!("[SHITTER TEXTURE] {error}; showing missing-texture checker");
-                (crate::materials::missing_texture_data(), "MISSING".to_owned())
+                eprintln!("[SHITTER TEXTURE] {error}; showing missing-texture checkers");
+                [SHITTER_ORANGE_IMAGE, SHITTER_GRAY_IMAGE].map(|name| {
+                    (crate::materials::missing_texture_data(), format!("MISSING {name}"))
+                })
             }
         };
-        let width = data.width;
-        let height = data.height;
-        let image = super::upload_texture_picmip(&self.device, &self.queue, &data, self.picmip);
+        let [(orange_data, orange_path), (gray_data, gray_path)] = images;
+        let (orange_width, orange_height) = (orange_data.width, orange_data.height);
+        let (gray_width, gray_height) = (gray_data.width, gray_data.height);
+        let orange_image = super::upload_texture_picmip(&self.device, &self.queue, &orange_data, self.picmip);
+        let gray_image = super::upload_texture_picmip(&self.device, &self.queue, &gray_data, self.picmip);
         let image_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Shitter single raw image layout"),
+            label: Some("Shitter orange/gray grid image layout"),
             entries: &[
                 super::bindings::texture_entry(0),
+                super::bindings::texture_entry(1),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 1,
+                    binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
         });
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Shitter single raw image bind group"),
-            layout: &image_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0, resource: wgpu::BindingResource::TextureView(&image.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1, resource: wgpu::BindingResource::Sampler(&self.repeat_sampler),
-                },
-            ],
-        });
+        let images = [orange_image, gray_image];
+        let bind_group = shitter_grid_bind_group(
+            &self.device, &image_layout, &images, &self.repeat_sampler,
+        );
         let format = self.scene_format();
         let pipeline = create_shitter_world_pipeline(
             &self.device, &self.camera_layout, Some(&image_layout), format, self.msaa_samples,
             include_str!("../collision_world_textured.wgsl"),
-            "Native BSP one-image Shitter pipeline",
+            "Native BSP orange-grid Shitter pipeline", false,
+        );
+        let gray_pipeline = create_shitter_world_pipeline(
+            &self.device, &self.camera_layout, Some(&image_layout), format, self.msaa_samples,
+            include_str!("../collision_world_textured.wgsl"),
+            "Native BSP gray-grid Shitter pipeline", true,
         );
         if let Some(cached) = self.collision_world_pipeline.as_mut() {
             cached.textured = Some(CollisionWorldTexturedPipeline {
-                pipeline, bind_group, _image: image,
+                pipeline, gray_pipeline, bind_group, image_layout, _images: images,
             });
         }
-        println!("[SHITTER TEXTURE] sampled {} ({}x{}, picmip {}, one bind group, one texture fetch per world fragment)",
-            path, width, height, self.picmip);
+        println!("[SHITTER TEXTURE] orange={} ({}x{}), walkable-gray={} ({}x{}), picmip {}, one bind group, one sample per world fragment",
+            orange_path, orange_width, orange_height, gray_path, gray_width, gray_height, self.picmip);
+    }
+
+    pub(in crate::renderer) fn rebind_shitter_texture_sampler(&mut self) {
+        if let Some(textured) = self.collision_world_pipeline.as_mut()
+            .and_then(|cached| cached.textured.as_mut())
+        {
+            textured.bind_group = shitter_grid_bind_group(
+                &self.device, &textured.image_layout, &textured._images, &self.repeat_sampler,
+            );
+        }
     }
 }
 
@@ -601,5 +829,37 @@ mod collision_pvs_tests {
         );
         assert_eq!(min, [10.0, 200.0, -80.0]);
         assert_eq!(max, [30.0, 400.0, 100.0]);
+    }
+}
+
+#[cfg(test)]
+mod shitter_grid_tests {
+    use super::{ShitterSlopeCache, shitter_face_gray, shitter_runs_from_indices};
+
+    #[test]
+    fn true_triangle_planes_define_walkable_grids() {
+        assert!(shitter_face_gray([0.,0.,0.], [0.,0.,1.], [1.,0.,0.]));
+        assert!(!shitter_face_gray([0.,0.,0.], [1.,0.,0.], [0.,0.,1.]));
+        assert!(!shitter_face_gray([0.,0.,0.], [0.,1.,0.], [0.,0.,1.]));
+    }
+
+    #[test]
+    fn cached_triangle_runs_are_exclusive_and_can_be_sliced() {
+        // Two triangles share edge vertices yet have different plane normals.
+        let points = [[0.,0.,0.], [0.,0.,1.], [1.,0.,0.], [0.,1.,0.]];
+        let indexes = [0,1,2,0,3,1];
+        let runs = shitter_runs_from_indices(&indexes, 0, |i| points.get(i as usize).copied());
+        assert_eq!(runs.len(), 2);
+        assert!(runs[0].gray);
+        assert!(!runs[1].gray);
+        let cache = ShitterSlopeCache { static_runs: runs, dynamic_runs: Default::default(), static_end: 6 };
+        let (mut orange, mut gray) = (Vec::new(), Vec::new());
+        cache.append_draws(0,6,&mut orange,&mut gray);
+        assert_eq!((gray[0].first_index,gray[0].index_count), (0,3));
+        assert_eq!((orange[0].first_index,orange[0].index_count), (3,3));
+        orange.clear();gray.clear();
+        cache.append_draws(3,3,&mut orange,&mut gray);
+        assert_eq!(orange.len(),1);
+        assert!(gray.is_empty());
     }
 }

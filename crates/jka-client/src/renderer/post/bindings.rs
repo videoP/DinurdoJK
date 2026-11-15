@@ -120,6 +120,7 @@ pub(in crate::renderer) fn create_gamma_post_bind_group(
     buffer: &wgpu::Buffer,
     color_lut_view: &wgpu::TextureView,
     color_lut_sampler: &wgpu::Sampler,
+    jk2_gamma_lut_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("JKA gamma-only post bind group"),
@@ -144,6 +145,10 @@ pub(in crate::renderer) fn create_gamma_post_bind_group(
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(color_lut_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(jk2_gamma_lut_view),
             },
         ],
     })
@@ -192,6 +197,7 @@ pub(in crate::renderer) fn create_post_bind_group(
     dof: Option<&DofTarget>,
     color_lut_view: &wgpu::TextureView,
     color_lut_sampler: &wgpu::Sampler,
+    jk2_gamma_lut_view: &wgpu::TextureView,
     cloud_detail_view: &wgpu::TextureView,
     cloud_noise_sampler: &wgpu::Sampler,
     cloud_transfer_view: &wgpu::TextureView,
@@ -256,6 +262,10 @@ pub(in crate::renderer) fn create_post_bind_group(
             wgpu::BindGroupEntry {
                 binding: 10,
                 resource: wgpu::BindingResource::Sampler(color_lut_sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 27,
+                resource: wgpu::BindingResource::TextureView(jk2_gamma_lut_view),
             },
             wgpu::BindGroupEntry {
                 binding: 11,

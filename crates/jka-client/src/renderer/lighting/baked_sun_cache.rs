@@ -21,6 +21,8 @@ struct Composition {
     /// Sky illumination (Blue Water environment or vanilla sunlight curve):
     /// strength and quantized input key, so unchanged frames do not recompose.
     sky: Option<(f32, [i32; 6])>,
+    /// r_skyWorldGainMode calibration (mode, authored toward-sun Y, valid).
+    gain: [f32; 4],
 }
 
 /// Shared BSP sky-bake inputs. Vanilla doesn't initialize Blue Water just to
@@ -67,6 +69,7 @@ struct Parameters {
     smoothing: [f32; 4],
     sky: [f32; 4],
     moon: [f32; 4],
+    gain: [f32; 4],
 }
 
 /// GPU-only, change-triggered sky gain for static LIGHTMAP_BY_VERTEX BSP
@@ -86,6 +89,7 @@ struct VertexSkyInput {
 struct VertexSkySettings {
     moon: [f32; 4],
     flags: [u32; 4],
+    gain: [f32; 4],
 }
 struct VertexSkyGpu {
     pipeline: wgpu::ComputePipeline,
@@ -99,6 +103,7 @@ struct VertexSkyGpu {
     vanilla_toward_sun: Option<[f32; 3]>,
     strength: f32,
     isolate_sky: bool,
+    gain: [f32; 4],
 }
 impl VertexSkyGpu {
     fn new(device: &wgpu::Device, generation: u64, samples: &[VertexSkyInput], static_vertex_count: usize) -> Self {
@@ -124,7 +129,7 @@ impl VertexSkyGpu {
             usage: wgpu::BufferUsages::STORAGE,
         });
         let inline_start = samples.partition_point(|s| (s.gpu_index as usize) < static_vertex_count) as u32;
-        Self { pipeline, source, generation, count: samples.len() as u32, inline_start, active: false, moon: None, vanilla_toward_sun: None, strength: 0.0, isolate_sky: false }
+        Self { pipeline, source, generation, count: samples.len() as u32, inline_start, active: false, moon: None, vanilla_toward_sun: None, strength: 0.0, isolate_sky: false, gain: [0.0; 4] }
     }
 
     fn replace_samples(&mut self, device: &wgpu::Device, generation: u64, samples: &[VertexSkyInput], static_vertex_count: usize) {
@@ -144,7 +149,7 @@ impl VertexSkyGpu {
         environment: Option<&::blue_water_sky::environment::EnvironmentMap>,
         fallback: (&GpuImage, &wgpu::Sampler, &wgpu::Buffer),
         moon: Option<([f32; 3], f32)>, vanilla_toward_sun: Option<[f32; 3]>,
-        active: bool, strength: f32, isolate_sky: bool, receiver_offset: u32,
+        active: bool, strength: f32, isolate_sky: bool, receiver_offset: u32, gain: [f32; 4],
     ) {
         if receiver_offset >= self.count { return; }
         let settings = VertexSkySettings {
@@ -154,6 +159,7 @@ impl VertexSkyGpu {
             ),
             flags: [u32::from(active), u32::from(moon.is_some()), strength.to_bits(),
                 u32::from(vanilla_toward_sun.is_some()) | (u32::from(isolate_sky) << 1) | (receiver_offset << 2)],
+            gain,
         };
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("static vertex sky bake parameters"),
@@ -499,11 +505,11 @@ impl LightmapCache {
         &mut self, device: &wgpu::Device, queue: &wgpu::Queue,
         vertex_buffer: &wgpu::Buffer, original: &[crate::renderer::GpuVertex],
         samples: &[super::lightmap_sun::VertexSkySample], generation: u64,
-        sky: Option<(Option<&::blue_water_sky::environment::EnvironmentMap>, Option<([f32; 3], f32)>, Option<[f32; 3]>, f32, bool)>,
+        sky: Option<(Option<&::blue_water_sky::environment::EnvironmentMap>, Option<([f32; 3], f32)>, Option<[f32; 3]>, f32, bool, [f32; 4])>,
         environment: Option<&::blue_water_sky::environment::EnvironmentMap>,
         _debug_alpha_one: bool,
     ) {
-        if let Some((environment, moon, vanilla_toward_sun, strength, isolate_sky)) = sky {
+        if let Some((environment, moon, vanilla_toward_sun, strength, isolate_sky, gain)) = sky {
             if !samples.is_empty() && self.vertex_sky.as_ref().is_none_or(|g| g.generation != generation) {
                 // Indexed upload interns coincident vertices across BSP
                 // batches. Writing one RGB slot from multiple workgroups would
@@ -534,8 +540,9 @@ impl LightmapCache {
             if let Some(state) = self.vertex_sky.as_mut() {
                 state.dispatch(device, queue, vertex_buffer, environment,
                     (&self.dummy_environment.0, &self.dummy_environment.1, &self.dummy_environment.2),
-                    moon, vanilla_toward_sun, true, strength, isolate_sky, 0);
+                    moon, vanilla_toward_sun, true, strength, isolate_sky, 0, gain);
                 state.active = true;
+                state.gain = gain;
                 state.moon = moon;
                 state.vanilla_toward_sun = vanilla_toward_sun;
                 state.strength = strength;
@@ -546,7 +553,7 @@ impl LightmapCache {
             // Water atlas. The dummy bindings make the zero-gain kernel safe.
             state.dispatch(device, queue, vertex_buffer, environment,
                 (&self.dummy_environment.0, &self.dummy_environment.1, &self.dummy_environment.2),
-                None, None, false, 0.0, false, 0);
+                None, None, false, 0.0, false, 0, [0.0; 4]);
             state.active = false;
         }
     }
@@ -559,7 +566,7 @@ impl LightmapCache {
         if let Some(state) = &self.vertex_sky {
             state.dispatch(device, queue, vertices, environment,
                 (&self.dummy_environment.0, &self.dummy_environment.1, &self.dummy_environment.2),
-                state.moon, state.vanilla_toward_sun, state.active, state.strength, state.isolate_sky, 0);
+                state.moon, state.vanilla_toward_sun, state.active, state.strength, state.isolate_sky, 0, state.gain);
         }
     }
 
@@ -574,7 +581,7 @@ impl LightmapCache {
             state.dispatch(device, queue, vertices, environment,
                 (&self.dummy_environment.0, &self.dummy_environment.1, &self.dummy_environment.2),
                 state.moon, state.vanilla_toward_sun, true, state.strength,
-                state.isolate_sky, state.inline_start);
+                state.isolate_sky, state.inline_start, state.gain);
         }
     }
 
@@ -716,6 +723,7 @@ impl LightmapCache {
                         |d| [d[0], d[1], d[2], 0.0],
                     )
                 }),
+                gain: composition.map_or([0.0; 4], |c| c.gain),
             };
             let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
@@ -947,6 +955,7 @@ impl Renderer {
                     0.0,
                 ],
                 isolate_sky: self.sky_world_light_isolation,
+                gain: self.sky_gain_calibration(),
                 static_csm: sun_ready && explicit_sun
                     && self.cascaded_shadow_mode == crate::renderer::DynamicShadowsMode::CascadedShadowMaps,
                 sky: sky_light,
@@ -1036,6 +1045,7 @@ impl Renderer {
                     if self.sky_backend == 1 { moon_light } else { None },
                     vanilla_toward_sun,
                     self.sky_world_lighting_strength, self.sky_world_light_isolation,
+                    self.sky_gain_calibration(),
                 )),
                 environment, self.debug_world_vertex_alpha_one,
             );
@@ -1246,6 +1256,7 @@ mod tests {
                     static_csm: false,
                     isolate_sky: false,
                     sky: None,
+                    gain: [0.0; 4],
                 };
                 cache.compose(
                     &device,

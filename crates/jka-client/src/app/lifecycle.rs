@@ -1254,6 +1254,12 @@ impl ApplicationHandler<UserEvent> for App {
                     .distance_cull
                     .unwrap_or(crate::camera::DEFAULT_DISTANCE_CULL);
                 self.map_authored_sun = map.sun;
+                // Do not apply gameplay map profiles to Studio workspaces or
+                // speculative frontend scenery. Restore/apply after the new
+                // authored sun is known, before the clock and first upload.
+                if !frontend_background && self.render_studio.graphics_gameplay.is_none() && !headless() {
+                    self.relighting_profile_map_loaded(&name, request_id);
+                }
                 // Sample the real clock AFTER assigning this map's authored sun
                 // but BEFORE its first sky/lightmap configuration and upload.
                 // Baked never follows the clock again during this map session.
@@ -3492,7 +3498,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.last_simulated_mouse_input = Some(sample);
                 // Keep the crosshair endpoint coherent with this exact raw-input
                 // view sample before publishing the pair to the render seqlock.
-                if self.crosshair.dynamic != 0
+                if self.crosshair.effective_dynamic_mode() != 0
                     || (self.video.depth_of_field_strength > 0.001 && self.video.dof_mode == ui::DofMode::On && self.video.dof_autofocus)
                 {
                     self.update_crosshair_target(event_at);
@@ -3532,7 +3538,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // Trace first, then publish rotation + endpoint together. This
                     // prevents the renderer from late-latching a new angle while
                     // still drawing the previous mouse sample's dynamic crosshair.
-                    if self.crosshair.dynamic != 0
+                    if self.crosshair.effective_dynamic_mode() != 0
                         || (self.video.depth_of_field_strength > 0.001 && self.video.dof_mode == ui::DofMode::On && self.video.dof_autofocus)
                     {
                         self.update_crosshair_target(event_at);
@@ -3551,7 +3557,7 @@ impl ApplicationHandler<UserEvent> for App {
                         // old local fallback and rerun the authoritative CGame
                         // camera rather than approximating through geometry.
                         self.update_solo_player_view_and_presentation();
-                        if self.crosshair.dynamic != 0
+                        if self.crosshair.effective_dynamic_mode() != 0
                             || (self.video.depth_of_field_strength > 0.001
                                 && self.video.dof_mode == ui::DofMode::On
                                 && self.video.dof_autofocus)

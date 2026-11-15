@@ -107,7 +107,7 @@ pub(in crate::renderer) fn dry_variant(v: WorldShaderVariantKey) -> Option<World
 /// using vertex colour. Everything else compiles ENABLE_BAKED_SUN_RELIGHT out.
 fn baked_relight_live(m: MaterialFragmentKey) -> bool {
     m.flags & (2 | 8388608) != 0 || (m.flags & 131072 != 0 && m.flags & 1 != 0)
-        || (m.flags_w & super::variants::MATERIAL_FLAGS_W_SKY_OVERLAY) != 0
+        || (m.flags_w & (super::variants::MATERIAL_FLAGS_W_SKY_OVERLAY | super::variants::MATERIAL_FLAGS_W_VERTEX_OVERLAY)) != 0
 }
 
 /// Exact material-side eliminations in the main base pass. Reflection/fog/dlight

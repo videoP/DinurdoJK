@@ -77,7 +77,7 @@ impl App {
 commands! {
     // TaystJK codemp/client/cl_input.cpp IN_CenterView. This is an engine
     // input command, not a cgame/server command: never forward it over the wire.
-    cmd_centerview ["centerview"] ("centerview", "Center the view pitch (TaystJK IN_CenterView).", CommandScope::Always) |self, _command| {
+    cmd_centerview ["centerview"] ("centerview", "Center the view pitch.", CommandScope::Always) |self, _command| {
         self.live_input.center_view();
         // Local /map and /devmap use a second OpenJK Pmove input accumulator.
         if self.game_session.as_ref().is_some_and(|session| session.local) {
@@ -89,7 +89,7 @@ commands! {
     }
 
     // TaystJK cg_consolecmds.c: showPlayerId and clientlist share CG_ClientList_f.
-    cmd_show_player_id ["showPlayerId", "clientlist"] ("showPlayerId", "List active client slots with team, name and bot marker (TaystJK).", CommandScope::Always) |self, _command| {
+    cmd_show_player_id ["showPlayerId", "clientlist"] ("showPlayerId", "List active client slots with team, name and bot marker.", CommandScope::Always) |self, _command| {
         let clients = self.game_session.as_ref()
             .map(|session| session.client_game.player_id_list())
             .unwrap_or_default();
@@ -146,14 +146,14 @@ commands! {
     cmd_weaponclean ["weaponclean", ] ("weaponclean <raw_weapon_id>", "Choose a weapon by raw WP_* ID (without /weapon slot remapping).", CommandScope::Always, game = GameCommand::WeaponClean) |self, command| {
         if self.execute_game_command(command) { CommandResult::Handled } else { CommandResult::Unhandled }
     }
-    cmd_selectfiremode ["selectfiremode", ] ("selectfiremode", "TaystJK: toggle singlefire primary/alternate firing mode.", CommandScope::Always, game = GameCommand::ToggleFireMode) |self, command| {
+    cmd_selectfiremode ["selectfiremode", ] ("selectfiremode", "Toggle single-fire primary/alternate firing mode.", CommandScope::Always, game = GameCommand::ToggleFireMode) |self, command| {
         if self.execute_game_command(command) { CommandResult::Handled } else { CommandResult::Unhandled }
     }
-    cmd_tell_target ["tell_target", ] ("tell_target <message>", "Send private text to the crosshair target (TaystJK CG_TellTarget_f).", CommandScope::Always) |self, command| {
+    cmd_tell_target ["tell_target", ] ("tell_target <message>", "Send private text to the crosshair target.", CommandScope::Always) |self, command| {
         self.tell_selected_player(command, false);
         CommandResult::Handled
     }
-    cmd_tell_attacker ["tell_attacker", ] ("tell_attacker <message>", "Send private text to the last player who damaged you (TaystJK CG_TellAttacker_f).", CommandScope::Always) |self, command| {
+    cmd_tell_attacker ["tell_attacker", ] ("tell_attacker <message>", "Send private text to the last player who damaged you.", CommandScope::Always) |self, command| {
         self.tell_selected_player(command, true);
         CommandResult::Handled
     }
@@ -165,19 +165,19 @@ commands! {
     cmd_singlefire_up ["-singlefire", ] ("-singlefire", "Release singlefire.", CommandScope::Always) |self, command| {
         self.tayst_special_button(command); CommandResult::Handled
     }
-    cmd_duck_down ["+duck", ] ("+duck", "TaystJK no-roll duck sequence.", CommandScope::Always) |self, command| {
+    cmd_duck_down ["+duck", ] ("+duck", "Start the no-roll duck sequence.", CommandScope::Always) |self, command| {
         self.tayst_special_button(command); CommandResult::Handled
     }
-    cmd_duck_up ["-duck", ] ("-duck", "Release TaystJK no-roll duck.", CommandScope::Always) |self, command| {
+    cmd_duck_up ["-duck", ] ("-duck", "Release the no-roll duck button.", CommandScope::Always) |self, command| {
         self.tayst_special_button(command); CommandResult::Handled
     }
-    cmd_grapple_down ["+grapple", ] ("+grapple", "TaystJK grapple button12.", CommandScope::Always) |self, command| {
+    cmd_grapple_down ["+grapple", ] ("+grapple", "Press the grapple button (button 12).", CommandScope::Always) |self, command| {
         self.tayst_special_button(command); CommandResult::Handled
     }
-    cmd_grapple_up ["-grapple", ] ("-grapple", "Release TaystJK grapple; JA+ performs use pulse.", CommandScope::Always) |self, command| {
+    cmd_grapple_up ["-grapple", ] ("-grapple", "Release the grapple button; JA+ performs a use pulse.", CommandScope::Always) |self, command| {
         self.tayst_special_button(command); CommandResult::Handled
     }
-    cmd_lowjump ["lowjump", ] ("lowjump", "TaystJK brief jump tap.", CommandScope::Always) |self, _command| {
+    cmd_lowjump ["lowjump", ] ("lowjump", "Perform a brief jump tap.", CommandScope::Always) |self, _command| {
         self.tayst_lowjump(); CommandResult::Handled
     }
 
@@ -477,11 +477,11 @@ commands! {
         if self.execute_game_command(command) { CommandResult::Handled } else { CommandResult::Unhandled }
     }
 
-    cmd_game_invfree ["invfree", ] ("invfree", "TaystJK: use the first owned holdable other than jetpack.", CommandScope::Always, game = GameCommand::InventoryFree) |self, command| {
+    cmd_game_invfree ["invfree", ] ("invfree", "Use the first owned holdable other than the jetpack.", CommandScope::Always, game = GameCommand::InventoryFree) |self, command| {
         if self.execute_game_command(command) { CommandResult::Handled } else { CommandResult::Unhandled }
     }
 
-    cmd_game_flipkick ["flipkick", ] ("flipkick", "TaystJK jaPRO flipkick bind sequence.", CommandScope::Always, game = GameCommand::Flipkick) |self, command| {
+    cmd_game_flipkick ["flipkick", ] ("flipkick", "Run the jaPRO flipkick bind sequence.", CommandScope::Always, game = GameCommand::Flipkick) |self, command| {
         if self.execute_game_command(command) {
             CommandResult::Handled
         } else {

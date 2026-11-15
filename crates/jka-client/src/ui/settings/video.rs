@@ -414,12 +414,15 @@ pub struct VideoSettings {
     /// Session-only r_bakedSunTerminator: curved-surface sun ray origins.
     pub sun_terminator: bool,
     /// Sky world lighting delivery: 0 live fullscreen, 1 baked, 2 baked with traced occlusion.
-    /// A/B for the luxel normal: 0 existing smoothed normal, 1 face normal (screen-pass parity).
+    /// Cached sky illumination: 0 off, 1 on, using selected sun receiver normals.
     pub sky_world_bake_ab: u8,
     /// A/B: 0 original sky tint (including enclosed authored light), 1 use
     /// traced sky exposure to protect enclosed/locally lit surfaces. In
     /// Realtime the static BSP contribution uses the cached exposure bake.
     pub sky_world_light_isolation: bool,
+    /// Blue Water world-gain calibration: 0 A original absolute gain, 1 B daylight
+    /// fades to the authored lightmap, 2 C ratio to the map's authored time of day.
+    pub sky_world_gain_mode: u8,
     /// Shared sky-world adjustment: 0 off, 1 full, delivered by the active mode.
     pub sky_world_lighting_strength: f32,
     /// 0 = original automatic worker counts, 1..32 = fixed workers for relighting bakes.
@@ -588,15 +591,29 @@ pub struct VideoSettings {
     /// Legacy saber core selection (0 original, 1 thin sbak, 2 both, 3 glow only).
     /// Has no effect on the modern saber presentation.
     pub saber_core_mode: u32,
-    /// Standard OpenJK/TaystJK `r_flares`: authored RBSP MST_FLARE world flares.
-    pub flares: bool,
+    /// World flare presentation: 0 Off, 1 OpenJK/TaystJK Legacy, 2 lens Enhanced.
+    /// Old r_flares 0/1 configs retain their meaning.
+    pub flares: u8,
+    /// Enhanced-only additive lens contribution multiplier, 0..1 (default 0.12).
+    /// Legacy BSP sprites and saber flares remain unaffected.
+    pub flare_enhanced_intensity: f32,
+    /// Multiplies the narrow f0 peak only, independently of its screen wash.
+    /// 1.0 is the unmodified source peak; default 3.0 preserves a visible core
+    /// even when the broad screen wash is disabled.
+    pub flare_enhanced_core: f32,
+    /// Enhanced-only broad screen-wash multiplier, 0..1 (default 0.10).
+    /// 0 keeps only the localized lens features; 1 preserves the source wash.
+    pub flare_enhanced_wash: f32,
+    /// Enhanced-only screen-distance localization, 0..1 (default 0.70).
+    /// Higher values confine the lens effect closer to the authored source.
+    pub flare_enhanced_locality: f32,
     /// Experiment: permit conservative reverse-lightmap pair fusion when the
     /// CPU world-material recipe is rebuilt from its retained baseline.
     pub stage_collapse_extra: bool,
     /// Reversible CPU-prepared composite of compatible consecutive additive world stages.
     /// Disable for exact authored multi-draw A/B comparisons (cold GPU world reupload).
     pub additive_stage_fusion: bool,
-    /// Optional world-flare override; either world cvar enables the same renderer.
+    /// Older r_worldFlares toggle. Effective flare mode falls back to Legacy when enabled.
     pub world_flares: bool,
     /// Screen-space saber clash flare overlay, separate from authored hit EFX.
     pub saber_flares: bool,
@@ -697,10 +714,22 @@ impl VideoSettings {
 }
 
 impl VideoSettings {
-    /// Both names enable the same RBSP renderer: `r_worldFlares` is an
-    /// independent override, not a second rendering pass. No duplicate draws.
+    /// Legacy r_worldFlares remains a fallback when r_flares is 0. The menu
+    /// clears that override when explicitly choosing a mode so Off stays Off.
+    pub fn world_flare_mode(&self) -> u8 {
+        if self.flares == 0 && self.world_flares { 1 } else { self.flares.min(2) }
+    }
+
     pub fn world_flares_active(&self) -> bool {
-        self.flares || self.world_flares
+        self.world_flare_mode() != 0
+    }
+
+    pub fn world_flare_mode_label(&self) -> &'static str {
+        match self.world_flare_mode() {
+            0 => "OFF",
+            2 => "ENHANCED",
+            _ => "LEGACY",
+        }
     }
 }
 
@@ -714,7 +743,7 @@ mod flare_cvar_tests {
         assert!(settings.world_flares_active());
         assert!(settings.saber_flares);
 
-        settings.flares = false;
+        settings.flares = 0;
         settings.world_flares = false;
         assert!(!settings.world_flares_active());
 
@@ -724,8 +753,12 @@ mod flare_cvar_tests {
         assert!(settings.world_flares_active());
 
         settings.world_flares = false;
-        settings.flares = true;
+        settings.flares = 1;
         assert!(settings.world_flares_active());
+        settings.flares = 2;
+        assert_eq!(settings.world_flare_mode(), 2);
+        settings.flares = 0;
+        assert!(!settings.world_flares_active());
         assert!(!settings.saber_flares);
     }
 }
@@ -737,7 +770,19 @@ impl VideoSettings {
     }
 
     pub fn effective_map_overbright_bits(&self, jk2_server: bool) -> u8 {
-        if self.map_overbright_bits <= 1 { self.map_overbright_bits } else { u8::from(jk2_server) }
+        if self.map_overbright_bits <= 1 {
+            // An explicit map-range override keeps the OpenJK behavior.
+            return self.map_overbright_bits;
+        }
+        if jk2_server {
+            // JK2MV's R_ColorShiftLightingBytes uses shift = 1 - overbrightBits
+            // only when overbrightBits != 0. Since JK2MV clamps output bits to
+            // 0..1, the original lightmap, vertex, and lightgrid bytes are
+            // unchanged in both cases. Match that without modifying the
+            // general OpenJK converter or losing the explicit map override.
+            return self.effective_overbright_bits(true);
+        }
+        0
     }
 }
 
@@ -988,6 +1033,7 @@ impl Default for VideoSettings {
             sun_terminator: false,
             sky_world_bake_ab: 1,
             sky_world_light_isolation: false,
+            sky_world_gain_mode: 2,
             sky_world_lighting_strength: 1.0,
             bake_threads: 0,
             baked_sun_shadow_map: true,
@@ -1114,7 +1160,11 @@ impl Default for VideoSettings {
             lightmap_only: false,
             modern_sabers: false,
             saber_core_mode: 0,
-            flares: true,
+            flares: 1,
+            flare_enhanced_intensity: 0.12,
+            flare_enhanced_core: 3.0,
+            flare_enhanced_wash: 0.10,
+            flare_enhanced_locality: 0.70,
             stage_collapse_extra: false,
             additive_stage_fusion: true,
             world_flares: false,
@@ -1262,11 +1312,17 @@ impl VideoSettings {
                     effective.sky_world_bake_ab = 1;
                 } else {
                     effective.blue_water_environment.world_lighting = effective.sky_world_lighting_strength;
-                    effective.baked_sun_cache = false;
+                    // Baked-sun removal (slider/Auto/Contour) must work in
+                    // Realtime exactly as in Baked, so the saved sun-cache
+                    // setting is kept. Only the baked *sky* gain is disabled:
+                    // the fullscreen pass already supplies it.
                     effective.sky_world_bake_ab = 0;
                 }
-                effective.sun_lighting = false;
-                effective.entity_sun_lighting = false;
+                // Daytime sky gain is 1 (authored exposure), so the sun comes
+                // from the explicit-sun path exactly as in vanilla Realtime;
+                // the atmosphere gain only takes over toward dusk/night.
+                effective.sun_lighting = true;
+                effective.entity_sun_lighting = true;
             } else {
                 // Vanilla Realtime keeps the change-triggered BSP compositor
                 // while live CSM handles world shadows; no Blue Water atlas.
@@ -1349,18 +1405,21 @@ mod relighting_tests {
         v.sky_backend = 1;
         v.dynamic_shadows = DynamicShadowsMode::CascadedShadowMapsEntities;
         let legacy = v.effective_relighting();
-        assert!(!legacy.baked_sun_cache);
+        assert!(legacy.baked_sun_cache, "Realtime keeps the saved sun cache so baked-sun removal works");
+        assert_eq!(legacy.sky_world_bake_ab, 0, "fullscreen pass supplies the sky gain");
         assert!(legacy.blue_water_environment.world_lighting > 0.0);
         v.sky_world_light_isolation = true;
         let protected = v.effective_relighting();
         assert!(protected.baked_sun_cache);
         assert_eq!(protected.sky_world_bake_ab, 1);
         assert_eq!(protected.blue_water_environment.world_lighting, 0.0);
-        assert!(!protected.sun_lighting);
+        assert!(protected.sun_lighting, "daytime sky gain is 1, so Realtime adds the sun explicitly");
         assert_eq!(v.effective_shadow_mode(), DynamicShadowsMode::CascadedShadowMaps);
         v.dynamic_shadows = DynamicShadowsMode::Off;
-        assert!(!v.effective_relighting().baked_sun_cache,
+        let fallback = v.effective_relighting();
+        assert_eq!(fallback.sky_world_bake_ab, 0,
             "without CSM the existing realtime fallback is retained");
+        assert!(fallback.blue_water_environment.world_lighting > 0.0);
     }
 
     #[test]
@@ -1402,5 +1461,31 @@ mod relighting_tests {
         assert_eq!((on.baked_indirect_scale, on.baked_indirect_saturation, on.baked_indirect_power), (0.4, 0.3, 2.5));
         assert_eq!(on.baked_indirect_highlight_preserve, 0.7);
         assert_eq!(on.blue_water_environment.world_lighting, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod jk2mv_overbright_tests {
+    use super::VideoSettings;
+
+    #[test]
+    fn auto_jk2_preserves_bsp_lighting_bytes_at_both_output_bit_values() {
+        let mut settings = VideoSettings::default();
+        settings.map_overbright_bits = 2; // auto
+        settings.overbright_bits = 0;
+        assert_eq!(settings.effective_map_overbright_bits(true), 0);
+        settings.overbright_bits = 1;
+        assert_eq!(settings.effective_map_overbright_bits(true), 1);
+        settings.overbright_bits = 2; // auto (JK2)
+        assert_eq!(settings.effective_map_overbright_bits(true), 1);
+        assert_eq!(settings.effective_map_overbright_bits(false), 0);
+    }
+
+    #[test]
+    fn user_map_override_still_uses_openjk_range() {
+        let mut settings = VideoSettings::default();
+        settings.map_overbright_bits = 1;
+        settings.overbright_bits = 0;
+        assert_eq!(settings.effective_map_overbright_bits(true), 1);
     }
 }

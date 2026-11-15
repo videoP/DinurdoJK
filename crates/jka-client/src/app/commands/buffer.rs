@@ -392,7 +392,7 @@ impl App {
                 };
                 let Some(option) = crate::japro_cg::plugin_disable_option(bit) else {
                     self.push_console_error(format!(
-                        "^1plugin:^7 bit {bit} is not a TaystJK jaPRO plugin-disable option; use /plugin to list them"
+                        "^1plugin:^7 bit {bit} is not a jaPRO plugin-disable option; use /plugin to list them"
                     ));
                     return;
                 };
@@ -419,6 +419,17 @@ impl App {
 #[cfg(test)]
 mod config_comment_tests {
     use super::split_console_script;
+
+    #[test]
+    fn quoted_semicolons_remain_in_set_values_until_vstr_expansion() {
+        let input = "seta ac_attack \"+attack; wait 1; -attack\"; echo finished";
+        assert_eq!(split_console_script(input), [
+            "seta ac_attack \"+attack; wait 1; -attack\"", "echo finished"
+        ]);
+        assert_eq!(split_console_script("+attack; wait 1; -attack"), [
+            "+attack", "wait 1", "-attack"
+        ]);
+    }
 
     #[test]
     fn console_exec_ignores_verbose_comments_but_not_quoted_urls() {

@@ -207,6 +207,17 @@ impl ClientInfo {
             format!("{}/{}", self.model_name, self.skin_name)
         }
     }
+    /// Team-aware portrait request shared by scoreboard and spectator cards.
+    /// The avatar worker resolves this with BG_ValidateSkinForTeam against the
+    /// active VFS, just like CG_LoadClientInfo. The raw configstring skin is
+    /// *not* necessarily the skin displayed by the player renderer.
+    pub fn model_icon_key(&self) -> String {
+        format!(
+            "@team-model-icon\t{}\t{}\t{}\t{}\t{}",
+            self.model_name, self.skin_name, self.team, self.gametype,
+            u8::from(self.jedi_v_merc),
+        )
+    }
     /// The exact skin-name construction used by OpenJK `CG_RegisterClientModelname`.
     pub fn skin_qpath(&self) -> String {
         if self.skin_name.contains('|')
@@ -5176,6 +5187,18 @@ mod client_info_tests {
         assert_eq!(info.missing_model_fallback().model_cvar(), "kyle/blue");
         info.gametype = 3; // Duel is not a team mode, even with a team hint.
         assert_eq!(info.missing_model_fallback().model_cvar(), "kyle");
+    }
+
+    #[test]
+    fn ui_portrait_request_preserves_the_team_for_skin_validation() {
+        let mut info = ClientInfo::solo_model("night elf/blue");
+        info.gametype = 8; // JK2 CTF
+        info.team = TEAM_RED;
+        assert_eq!(info.model_icon_key(),
+            "@team-model-icon\tnight elf\tblue\t1\t8\t0");
+        let fallback = info.missing_model_fallback();
+        assert_eq!(fallback.model_icon_key(),
+            "@team-model-icon\tkyle\tblue\t1\t8\t0");
     }
 
     #[test]

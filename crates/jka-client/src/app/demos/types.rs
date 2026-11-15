@@ -16,6 +16,11 @@ pub(in crate::app) struct DemoCameraSample {
     /// High-resolution visual sample time. Protocol/event ownership still uses
     /// `server_time`; camera damping can use this without 1 ms quantization.
     pub(in crate::app) presentation_time_ms: f64,
+    /// Clock for third-person target/location damping. Equals
+    /// `presentation_time_ms` except while following another player, where
+    /// TaystJK uses the followed playerState's fractional commandTime
+    /// (`commandTime + predictedTimeFrac`), not the render/server clock.
+    pub(in crate::app) damp_time_ms: f64,
     /// Native JKA origin for BSP cluster/area visibility tests.
     pub(in crate::app) native_origin: [f32; 3],
     /// Actor origin in native JKA coordinates. OpenJK third-person starts here.

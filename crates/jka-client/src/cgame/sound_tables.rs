@@ -4,6 +4,21 @@
 //! Pure data and lookups only, so event workers can build sound requests
 //! without touching the VFS; the owner thread stages and decodes the assets.
 
+use std::borrow::Cow;
+
+/// Use the announcer asset directory registered by the active game's cgame.
+/// JK2MV/MVSDK registers the `40MOM` lines under `mothma`; JKA/OpenJK
+/// registers the same lines under `protocol`. Only remap these known cgame
+/// announcer references: arbitrary sound configstrings must remain authored.
+pub fn announcer_asset_path(qpath: &str, jk2: bool) -> Cow<'_, str> {
+    if jk2 {
+        if let Some(line) = qpath.strip_prefix("sound/chars/protocol/misc/") {
+            return Cow::Owned(format!("sound/chars/mothma/misc/{line}"));
+        }
+    }
+    Cow::Borrowed(qpath)
+}
+
 pub const WP_STUN_BATON: i32 = 1;
 pub const WP_MELEE: i32 = 2;
 pub const WP_SABER: i32 = 3;
@@ -248,6 +263,14 @@ mod tests {
         assert_eq!(weapon_sounds(WP_SABER).select, None);
         assert_eq!(weapon_sounds(17).flash, Some("sound/weapons/rocket/rocklf1a.wav"));
         assert_eq!(weapon_sounds(18).flash, None);
+    }
+
+    #[test]
+    fn jk2_announcer_uses_mothma_without_changing_jka_or_other_sounds() {
+        let source = "sound/chars/protocol/misc/40MOM032";
+        assert_eq!(announcer_asset_path(source, true), "sound/chars/mothma/misc/40MOM032");
+        assert_eq!(announcer_asset_path(source, false), source);
+        assert_eq!(announcer_asset_path("sound/chars/kyle/misc/jump1", true), "sound/chars/kyle/misc/jump1");
     }
 
     #[test]

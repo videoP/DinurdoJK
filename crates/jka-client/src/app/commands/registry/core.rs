@@ -106,7 +106,7 @@ commands! {
     // TaystJK codemp/client/snd_dma.cpp S_Play_f: accept multiple sound
     // names, append .wav when the name has no extension, register each and
     // start it on the local sound channel (without a volume argument).
-    cmd_play ["play", ] ("play <sound> [sound ...]", "Play one or more local sound effects by asset path (TaystJK S_Play_f).", CommandScope::Always) |self, command| {
+    cmd_play ["play", ] ("play <sound> [sound ...]", "Play one or more local sound effects by asset path.", CommandScope::Always) |self, command| {
         let mut names = command.split_whitespace().skip(1).peekable();
         if names.peek().is_none() {
             self.push_console_line("^3usage:^7 play <sound> [sound ...]".to_owned());
@@ -143,7 +143,7 @@ commands! {
 
     // This changes local renderer state, not a server command. Register it in
     // the always-available console set (also used by completion in devmap).
-    cmd_remap_shader ["remapShader", ] ("remapShader <old> <new>", "Locally remap one renderer shader to another, matching TaystJK R_RemapShader behavior.", CommandScope::Always) |self, command| {
+    cmd_remap_shader ["remapShader", ] ("remapShader <old> <new>", "Locally remap one renderer shader to another.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
             [_verb, old, new] => {
@@ -361,7 +361,7 @@ commands! {
         CommandResult::Handled
     }
 
-    cmd_which ["which", ] ("which <qpath> [all]", "Locate the winning file in an active PK3 or loose directory (TaystJK /which). Optional all lists shadowed files too.", CommandScope::Always) |self, command| {
+    cmd_which ["which", ] ("which <qpath> [all]", "Locate the winning file in an active PK3 or loose directory. Optional all lists shadowed files too.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         let args = match words.as_slice() {
             [_, path] => Some((*path, false)),
@@ -605,7 +605,7 @@ commands! {
         return CommandResult::Handled;
     }
 
-    cmd_set ["set", "seta", "sets", "setu"] ("set[u|a|s] <variable> <value>", "Create or set a cvar; setu marks userinfo, seta archives, sets marks serverinfo (TaystJK behavior).", CommandScope::Always) |self, command| {
+    cmd_set ["set", "seta", "sets", "setu"] ("set[u|a|s] <variable> <value>", "Create or set a cvar; setu marks userinfo, seta archives, and sets marks serverinfo.", CommandScope::Always) |self, command| {
         let (verb, rest) = command.split_once(char::is_whitespace)
             .map(|(verb, rest)| (verb, rest.trim())).unwrap_or((command, ""));
         let Some((name, value)) = rest.split_once(char::is_whitespace) else {

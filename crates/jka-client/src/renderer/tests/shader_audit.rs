@@ -605,6 +605,7 @@ fn print_report(label: &str, report: &Report) {
 fn minimal_key() -> WorldShaderVariantKey {
     WorldShaderVariantKey {
         shader_input_mode: 0,
+        jk2_legacy_color: false,
         pbr: false,
         pom: false,
         pbr_shared_material_eval: false,

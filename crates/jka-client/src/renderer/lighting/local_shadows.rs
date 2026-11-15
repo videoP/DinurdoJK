@@ -12,7 +12,219 @@ use crate::renderer::lighting::glass_transmission::{
 };
 use wgpu::util::DeviceExt;
 
+/// Maximum distance for two authored/shader/EFX/flare sources to represent a
+/// single physical fixture. This is a shadow-cubemap grouping rule only;
+/// nothing is deleted or merged in the illumination / lightmap bake catalog.
+pub(in crate::renderer) const LAMP_COMBINE_DISTANCE: f32 = 32.0;
+
+fn compatible_lamp_origins(a: scene::DynamicLight, b: scene::DynamicLight) -> bool {
+    let pa = Vec3::from_array(a.position);
+    let pb = Vec3::from_array(b.position);
+    if !pa.is_finite() || !pb.is_finite()
+        || pa.distance_squared(pb) > LAMP_COMBINE_DISTANCE * LAMP_COMBINE_DISTANCE
+    { return false; }
+    let na = Vec3::from_array(a.emitter_normal).normalize_or_zero();
+    let nb = Vec3::from_array(b.emitter_normal).normalize_or_zero();
+    // Never join opposing wall fixtures, even if their centroids are close.
+    if na.length_squared() > 0.0 && nb.length_squared() > 0.0 {
+        return na.dot(nb) > 0.25;
+    }
+    // A point light behind a one-sided area emitter should not steal its
+    // cubemap. Allow the regular 8-unit surface bias and small inaccuracies.
+    if na.length_squared() > 0.0 && na.dot(pb-pa) < -12.0 { return false; }
+    if nb.length_squared() > 0.0 && nb.dot(pa-pb) < -12.0 { return false; }
+    true
+}
+
+/// Group immutable static source indices once at map upload. Each source
+/// remains individually selectable and independently A/B-toggleable; only the
+/// *shadow cubemap* has a unique physical-fixture identity. Comparing each
+/// member to the entire group prevents transitive chaining across fixtures.
+pub(in crate::renderer) fn static_lamp_shadow_groups(
+    lights: &[scene::DynamicLight],
+) -> Vec<usize> {
+    use std::collections::HashMap;
+    type Cell = (i32,i32,i32);
+    fn cell(p: [f32;3]) -> Cell {
+        let inv=1.0/LAMP_COMBINE_DISTANCE;
+        ((p[0]*inv).floor() as i32, (p[1]*inv).floor() as i32,
+         (p[2]*inv).floor() as i32)
+    }
+    let mut groups = Vec::<Vec<usize>>::new();
+    let mut lookup = HashMap::<Cell,Vec<usize>>::new();
+    let mut ids = Vec::with_capacity(lights.len());
+    for (i, light) in lights.iter().copied().enumerate() {
+        let point = cell(light.position);
+        let mut compatible = None;
+        if light.surface_lighting && light.position.iter().all(|v|v.is_finite()) {
+            'neighbors: for dz in -1..=1 {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        if let Some(candidates) = lookup.get(&(point.0+dx,point.1+dy,point.2+dz)) {
+                            for &id in candidates {
+                                if groups[id].iter().all(|&j|compatible_lamp_origins(light,lights[j])) {
+                                    compatible=Some(id);
+                                    break 'neighbors;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let group = if let Some(id) = compatible {
+            groups[id].push(i); id
+        } else {
+            let id=groups.len(); groups.push(vec![i]); id
+        };
+        ids.push(group);
+        // A new group's anchor is sufficient for grid lookup; a candidate
+        // must agree with *all* members before it can join that group.
+        if compatible.is_none() && light.surface_lighting && light.position.iter().all(|v|v.is_finite()) {
+            lookup.entry(point).or_default().push(group);
+        }
+    }
+    ids
+}
+
+fn lamp_shadow_debug_kind(light: scene::DynamicLight) -> &'static str {
+    let mask=light.shader_promotion_mask;
+    if mask & super::lightmap_local::FLARES != 0 { "flare" }
+    else if mask & super::lightmap_local::FX != 0 { "fx" }
+    else if mask & crate::materials::SHADER_LIGHT_GLOW != 0 { "glow" }
+    else if mask & crate::materials::SHADER_LIGHT_EMISSIVE_COMPANION != 0 { "emissive" }
+    else if mask & crate::materials::SHADER_LIGHT_ADDITIVE != 0 { "additive" }
+    else if light.emitter_normal.iter().any(|v|v.abs()>1e-6) { "authored" }
+    else { "point" }
+}
+
 impl Renderer {
+    /// Request a CPU-only probe at the player's current location. The debug
+    /// cvar itself is not archived; even mode 2 only logs on the existing
+    /// 32-unit/PVS reselect boundary, never every frame.
+    pub(in crate::renderer) fn request_lamp_shadow_debug(&mut self, mode: u8) {
+        self.lamp_shadow_debug_pending = mode != 0;
+        self.lamp_shadow_debug_post_encode_pending = false;
+        if mode != 0 {
+            if let Some(world) = self.world.as_mut() {
+                world.local_shadows.selection_position = None;
+            }
+        }
+    }
+
+    fn dump_lamp_shadow_debug(&mut self, focus: Vec3, gate: &str) {
+        let Some(world)=self.world.as_ref() else {
+            println!("[LAMP DEBUG] No world loaded. Reload the map and retry near the flare.");
+            return;
+        };
+        let mode=crate::renderer::lamp_shadow_debug_mode();
+        if mode==0 {return;}
+        let mut counts=[0usize;7];
+        let mut enabled_bake=vec![false;world.dynamic_lights.len()];
+        let mut has_bake_source=vec![false;world.dynamic_lights.len()];
+        let enabled_mask=if self.baked_local_shadows {self.baked_local_sources} else {0};
+        for (index, light) in &world.static_bake_sources {
+            if light.shader_promotion_mask & super::lightmap_local::FLARES != 0 {counts[0]+=1;}
+            else if light.shader_promotion_mask & super::lightmap_local::FX != 0 {counts[1]+=1;}
+            else if light.shader_promotion_mask & crate::materials::SHADER_LIGHT_GLOW != 0 {counts[2]+=1;}
+            else if light.shader_promotion_mask & crate::materials::SHADER_LIGHT_ADDITIVE != 0 {counts[3]+=1;}
+            else if light.shader_promotion_mask & crate::materials::SHADER_LIGHT_EMISSIVE_COMPANION != 0 {counts[4]+=1;}
+            else if light.emitter_normal.iter().any(|v|v.abs()>1e-6) {counts[5]+=1;}
+            else {counts[6]+=1;}
+            if let Some(is_baked)=has_bake_source.get_mut(*index) { *is_baked=true; }
+            if let Some(enabled)=enabled_bake.get_mut(*index) {
+                *enabled |= super::lightmap_local::shadow_source_enabled(light,enabled_mask);
+            }
+        }
+        let active=&world.local_shadows.active_light_indices;
+        let gpu_count=self.active_static_light_count();
+        let shader_ids=self.baked_local_shader_inputs().0;
+        println!("[LAMP DEBUG] gate={gate} CSM={:?} baked_shadow={} source_mask=0x{:02x} compiled_flare_surfaces={} flare_candidates={} fx={} glow={} additive={} emissive={} authored={} other={} runtime_prefix={} all_lights={} selected={} gpu_static={} gpu_shader_ids={:?} moving_casters={} lightmap_active={}",
+            self.cascaded_shadow_mode, self.baked_local_shadows, self.baked_local_sources,
+            world.compiled_world_flare_count, counts[0],counts[1],counts[2],counts[3],counts[4],counts[5],counts[6],
+            world.runtime_light_count, world.dynamic_lights.len(),active.len(),gpu_count,shader_ids,
+            self.baked_local_moving_casters(),self.baked_local_lightmap_active());
+        println!("[LAMP DEBUG] player render=({:.1},{:.1},{:.1}) JKA={:?}; group_radius={:.0}; cache={} slots active={:?}",
+            focus.x,focus.y,focus.z,scene::jka_position(focus.to_array()),LAMP_COMBINE_DISTANCE,
+            LOCAL_SHADOW_CACHE_SLOTS,active);
+        let mut nearest:Vec<_>=world.dynamic_lights.iter().enumerate()
+            .filter(|(i,_)| *i>=world.runtime_light_count || has_bake_source[*i])
+            .map(|(i,l)|(i,Vec3::from_array(l.position).distance(focus)))
+            .filter(|(_,distance)|distance.is_finite())
+            .collect();
+        nearest.sort_by(|a,b|a.1.total_cmp(&b.1));
+        let max_rows=if mode==2 {24} else {10};
+        let relevant=nearest.iter().filter(|(_,d)|*d<=768.0).count();
+        println!("[LAMP DEBUG] candidates within 768 units={relevant}; nearest {} below (including disabled sources):",max_rows.min(nearest.len()));
+        for (index,distance) in nearest.into_iter().take(max_rows) {
+            let light=world.dynamic_lights[index];
+            let baked=enabled_bake[index];
+            let is_area=light.emitter_normal.iter().any(|v|v.abs()>1e-6);
+            let promote=self.added_map_light_sources();
+            let area_enabled=if light.shader_promotion_mask!=0 {
+                promote & crate::materials::SHADER_LIGHT_ALL != 0
+                    && light.shader_promotion_mask & promote & crate::materials::SHADER_LIGHT_ALL != 0
+                    && !(promote & super::lightmap_local::AUTHORED!=0 &&
+                         light.shader_promotion_mask & crate::materials::SHADER_LIGHT_AUTHORED_OVERLAP!=0)
+            } else {promote & super::lightmap_local::AUTHORED!=0};
+            let point_enabled=self.static_point_lighting_enabled();
+            let pvs=inferred_lamp_in_player_pvs(world.visibility.as_ref(),light,focus);
+            let geo_pvs=local_light_is_pvs_relevant(world,light);
+            let score=local_shadow_importance(light,focus,active.contains(&index));
+            let reason=if !light.surface_lighting {"surface_lighting_off"}
+                else if baked && !pvs {"player_PVS_reject"}
+                else if index>=world.runtime_light_count && !baked {"source_disabled_or_rejected"}
+                else if is_area && !area_enabled && !baked {"area_promotion_off"}
+                else if !is_area && !point_enabled && !baked {"point_lights_off"}
+                else if !geo_pvs {"geometry_PVS_reject"}
+                else if score<=0.0 {"score_zero_often_backface_or_out_of_range"}
+                else if active.contains(&index) {"SELECTED"}
+                else if active.iter().any(|&chosen|world.lamp_shadow_group_by_light[chosen]==world.lamp_shadow_group_by_light[index]) {"COMBINED_into_other_source"}
+                else {"OUTSIDE_top_four"};
+            let slot=world.local_shadows.cache_entries.iter().position(|entry|entry.light_index==Some(index))
+                .map_or(0,|slot|slot+1);
+            // Receiver strength exactly as uploaded to GPU `shape.y`.
+            let power=if light.shadow_power>0.0 {light.shadow_power} else {light.intensity*light.radius.powi(2)*0.35};
+            println!("[LAMP DEBUG] #{index} type={} group={} dist={distance:.0} xyz=({:.0},{:.0},{:.0}) r={:.0} power={power:.0} normal={:?} mask=0x{:x} baked={} pvs={}/{} score={score:.4} slot={} {}",
+                lamp_shadow_debug_kind(light),world.lamp_shadow_group_by_light[index],light.position[0],light.position[1],light.position[2],
+                light.radius,light.emitter_normal,light.shader_promotion_mask,baked,pvs,geo_pvs,slot,reason);
+        }
+        if counts[0]==0 {
+            println!("[LAMP DEBUG] No compiled flare SHADOW CANDIDATES. If a visible red flare exists, check compiled_flare_surfaces: zero means it is probably EFX/sprite/shader, not BSP MST_FLARE; nonzero means source promotion rejected the BSP flare data.");
+        }
+        // The selection dump happens before the moving-caster cubemap pass;
+        // sample its actual CPU encoding results exactly once after that pass.
+        self.lamp_shadow_debug_post_encode_pending = true;
+    }
+
+    /// CPU-only diagnostics. No GPU readback, pipeline change, or extra draws.
+    /// "moving_casters=true" merely means the map has *some* depth casters;
+    /// the per-slot face mask below proves whether any intersect this flare.
+    fn dump_lamp_shadow_caster_debug(&mut self, pass_gate: &str) {
+        if !self.lamp_shadow_debug_post_encode_pending { return; }
+        self.lamp_shadow_debug_post_encode_pending = false;
+        let Some(world) = self.world.as_ref() else { return; };
+        let shadows = &world.local_shadows;
+        println!("[LAMP DEBUG] moving_pass={pass_gate} pipeline_local_shadows={} pipeline_baked_relight={} variant_pending={} cache_parked={} active={} rendered_faces={} entity_face_pairs={} moving_bsp_face_pairs={} static_rebuilds={} cpu_encode_ms={:.3} (CPU only; no GPU depth readback)",
+            world.active_pipeline_variant.local_shadows,
+            world.active_pipeline_variant.baked_sun_relight,
+            self.world_variant_pending.is_some(), shadows.parked(),
+            shadows.active_light_indices.len(), shadows.ab_last_dynamic_faces,
+            shadows.ab_last_entity_face_pairs, shadows.ab_last_bsp_face_pairs,
+            shadows.ab_last_static_rebuilds, shadows.ab_last_cpu_ms);
+        for &index in &shadows.active_light_indices {
+            let Some(slot)=shadows.cache_entries.iter().position(|entry|entry.light_index==Some(index)) else {
+                println!("[LAMP DEBUG] moving_lamp #{index} MISSING_CACHE_SLOT");
+                continue;
+            };
+            let mask=shadows.moving_face_masks[slot];
+            let octants=shadows.moving_octant_masks[slot];
+            println!("[LAMP DEBUG] moving_lamp #{index} type={} slot={} moving_faces=0x{:02x} face_count={} octants=0x{:02x} status={}",
+                lamp_shadow_debug_kind(world.dynamic_lights[index]),slot+1,mask,mask.count_ones(),octants,
+                if mask==0 { "NO_MOVING_CASTER_IN_LIGHT_FRUSTUM" } else { "MOVING_CASTER_FACE_PRESENT_CHECK_RECEIVER" });
+        }
+    }
+
     pub(in crate::renderer) fn set_lamp_shadow_ab(&mut self, mode: u8) {
         let mode = mode.min(4);
         if self.lamp_shadow_ab == mode { return; }
@@ -48,13 +260,17 @@ impl Renderer {
     pub(in crate::renderer) fn update_local_shadow_selection(&mut self, camera: &Camera, player_position: Option<Vec3>) {
         // Static map lights keep their raster cache even when transient lights
         // use RT; transient lights never consume cubemap slots.
+        let focus=player_position.unwrap_or(camera.position);
         let direct_local_lighting_enabled =
             self.static_point_lighting_enabled() || self.any_area_lights_enabled() || self.baked_local_shadows || self.entity_fixture_active();
         if !direct_local_lighting_enabled || !(self.local_light_shadows_enabled || self.baked_local_shadows || self.entity_fixture_active()) {
+            if self.lamp_shadow_debug_pending {
+                self.lamp_shadow_debug_pending=false;
+                self.dump_lamp_shadow_debug(focus,"no_shadow_mode_active");
+            }
             return;
         }
 
-        let focus=player_position.unwrap_or(camera.position);
         let reselect_distance=if self.baked_local_shadows {32.0} else {LOCAL_SHADOW_RESELECT_DISTANCE};
         let should_reselect = self.world.as_ref().is_some_and(|world| {
             if world.light_count == 0 {
@@ -69,6 +285,10 @@ impl Renderer {
             cluster_changed || moved
         });
         if !should_reselect {
+            if self.lamp_shadow_debug_pending {
+                self.lamp_shadow_debug_pending=false;
+                self.dump_lamp_shadow_debug(focus,"selection_unchanged");
+            }
             return;
         }
 
@@ -165,6 +385,10 @@ impl Renderer {
         }
 
         self.upload_light_buffer();
+        if self.lamp_shadow_debug_pending || crate::renderer::lamp_shadow_debug_mode()==2 {
+            self.lamp_shadow_debug_pending=false;
+            self.dump_lamp_shadow_debug(focus,"selection_updated");
+        }
 
         if changed {
             if let Some(world) = &self.world {
@@ -500,6 +724,51 @@ pub(in crate::renderer) fn inferred_lamp_in_player_pvs(
     vis.visible(vis.cluster_at(scene::jka_position(focus.to_array())), &[lamp_cluster])
 }
 
+/// Choose a single eligible shadow-map representative for every physical
+/// fixture. The illumination catalogs are *not* rewritten: enabling/disabling
+/// a provenance source simply changes which original lamp supplies shadow
+/// position/radius/power; authored surfaces win when enabled.
+fn combine_lamp_shadow_candidates(
+    lights: &[scene::DynamicLight],
+    group_by_light: &[usize],
+    baked_indices: &[bool],
+    sources: u32,
+    candidates: &[(usize,f32)],
+) -> Vec<usize> {
+    // (representative index, representative score, priority, strongest score
+    // among every enabled contributor). The latter controls fixture ranking.
+    let mut combined: Vec<Option<(usize, f32, u8, f32)>> = vec![None; lights.len()];
+    for &(index, score) in candidates {
+        let group = group_by_light[index];
+        let light = lights[index];
+        let authored = sources & super::lightmap_local::AUTHORED != 0
+            && baked_indices[index]
+            && super::lightmap_local::source_enabled(&light, super::lightmap_local::AUTHORED);
+        let flare_only = light.shader_promotion_mask == super::lightmap_local::FLARES;
+        let preference = if authored { 3 } else if flare_only { 1 } else { 2 };
+        let previous = &mut combined[group];
+        match previous {
+            Some((old_index, old_score, old_pref, group_score)) => {
+                *group_score = (*group_score).max(score);
+                if preference > *old_pref
+                    || (preference == *old_pref &&
+                        (score > *old_score || (score == *old_score && index < *old_index)))
+                {
+                    *old_index=index; *old_score=score; *old_pref=preference;
+                }
+            }
+            None => { *previous=Some((index,score,preference,score)); }
+        }
+    }
+    let mut representatives: Vec<_> = combined.into_iter().flatten()
+        .map(|(index,_,_,group_score)|(index,group_score)).collect();
+    representatives.sort_by(|(a_index, a_score), (b_index, b_score)| {
+        b_score.total_cmp(a_score).then_with(|| a_index.cmp(b_index))
+    });
+    representatives.truncate(MAX_LOCAL_SHADOW_LIGHTS);
+    representatives.into_iter().map(|(index, _)| index).collect()
+}
+
 pub(in crate::renderer) fn select_relevant_shadow_lights(
     world: &WorldGpu,
     focus: Vec3,
@@ -509,13 +778,21 @@ pub(in crate::renderer) fn select_relevant_shadow_lights(
     shader_promotion_mask: u32,
     baked_sources: u32,
 ) -> Vec<usize> {
+    // Compute enabled provenance once rather than searching the bake catalog
+    // for each candidate. Flare sources are shadow-only and are not baked.
+    let mut baked_indices = vec![false; world.dynamic_lights.len()];
+    for (index, light) in &world.static_bake_sources {
+        if let Some(enabled) = baked_indices.get_mut(*index) {
+            *enabled |= super::lightmap_local::shadow_source_enabled(light, baked_sources);
+        }
+    }
     let mut candidates = world
         .dynamic_lights
         .iter()
         .copied()
         .enumerate()
         .filter_map(|(index, light)| {
-            let baked = world.static_bake_sources.iter().any(|(source,l)|*source==index && super::lightmap_local::source_enabled(l,baked_sources));
+            let baked = baked_indices[index];
             if baked && !inferred_lamp_in_player_pvs(world.visibility.as_ref(),light,focus) {return None;}
             if index >= world.runtime_light_count && !baked { return None; }
             if !light.surface_lighting {
@@ -552,13 +829,13 @@ pub(in crate::renderer) fn select_relevant_shadow_lights(
             (score > 0.0).then_some((index, score))
         })
         .collect::<Vec<_>>();
-    candidates.sort_by(|(a_index, a_score), (b_index, b_score)| {
-        b_score
-            .total_cmp(a_score)
-            .then_with(|| a_index.cmp(b_index))
-    });
-    candidates.truncate(MAX_LOCAL_SHADOW_LIGHTS);
-    candidates.into_iter().map(|(index, _)| index).collect()
+    combine_lamp_shadow_candidates(
+        &world.dynamic_lights,
+        &world.lamp_shadow_group_by_light,
+        &baked_indices,
+        baked_sources,
+        &candidates,
+    )
 }
 
 /// Octants intersected by an AABB as seen from a fixed world-space lamp.
@@ -984,6 +1261,7 @@ impl Renderer {
                 world.local_shadows.ab_last_bsp_face_pairs = 0;
                 world.local_shadows.ab_last_cpu_ms = 0.0;
             }
+            self.dump_lamp_shadow_caster_debug("no_global_moving_casters");
             return;
         }
         let cpu_started = std::time::Instant::now();
@@ -1123,6 +1401,7 @@ impl Renderer {
         if let Some(world) = &mut self.world {
             world.local_shadows.ab_last_cpu_ms = elapsed_ms;
         }
+        self.dump_lamp_shadow_caster_debug("encoded");
     }
 }
 

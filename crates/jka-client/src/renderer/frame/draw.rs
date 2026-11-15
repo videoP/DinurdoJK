@@ -171,6 +171,9 @@ impl Renderer {
         // Legacy console name retained for A/B configs; the path now draws
         // the original BSP world mesh, never the collision/acoustic mesh.
         let collision_world_only = crate::renderer::collision_world_only() && self.world.is_some();
+        // Stable frame-level admission; never borrow the whole renderer again
+        // while atmosphere or render targets are held mutably below.
+        let native_sky_visible = self.native_sky_surface_visible();
         let competitive_no_world = self.competitive_ab == 10
             || competitive_mask & (probe::WORLD_DRAW | probe::WORLD_PREP_AND_DRAW) != 0;
         // A/B bit 0 disables optional split encoder finishing while preserving
@@ -528,7 +531,14 @@ impl Renderer {
         if render_ocean {
             self.ocean_visibility.begin_frame(&self.device);
         }
+        self.ensure_realtime_sky_normals();
+        let sky_normals_active = self.realtime_sky_normals_active();
         let mut plan = self.frame_plan;
+        if sky_normals_active {
+            plan.needs_linear_depth = true;
+            plan.rain_only_linear_depth = false;
+            plan.hiz_early = false;
+        }
         if self.thermal_vision != 0 { self.ensure_thermal_post_pipeline(); }
         let rt_taa_active = self.thermal_vision == 0 && self.rt_taa_active();
         if self.video_depth_capture_requested() {
@@ -639,7 +649,7 @@ impl Renderer {
         let blue_water_color_reader = self.blue_water_sky.as_ref().is_some_and(|_| {
             self.blue_water_environment.world_lighting > 0.0
                 || (self.cloud_backend == 1 && self.clouds_enabled && self.cloud_shadows_enabled)
-                || (self.sky_backend == 1 && self.fast_sky == 0
+                || (native_sky_visible
                     && self.blue_water_environment.aerial_perspective)
                 || self.blue_water_environment.weather_backend == 1
         });
@@ -1000,7 +1010,7 @@ impl Renderer {
         self.update_sun_ray_preview(camera, player_position);
         self.prepare_rt_local_rate(view_proj, camera.position);
         self.prepare_rt_receiver_flags();
-        if self.blue_water_environment.weather_backend == 1 || self.sky_backend == 1
+        if self.blue_water_environment.weather_backend == 1 || native_sky_visible
             || (self.ocean_enabled && self.ocean_settings.backend != 0) {
             self.ensure_weather_occlusion();
         }
@@ -1199,6 +1209,17 @@ impl Renderer {
             } else {
                 world.snow_shell.release();
             }
+            // Map-local slope classification is built only for textured ShitteR.
+            // Do this before patch and AUTO4 cache updates so any newly written
+            // mutable index ranges are classified when installed, not per frame.
+            if collision_world_only && crate::renderer::shitter_texture_enabled()
+                && world.shitter_slope_cache.is_none()
+            {
+                world.shitter_slope_cache = Some(
+                    crate::renderer::collision_world::ShitterSlopeCache::for_world(world),
+                );
+                crate::renderer::collision_world::cache_active_shitter_lod(world);
+            }
             if competitive_mask & probe::PVS == 0 { update_visibility(world, camera); }
             let auto4_area_mask = effective_area_mask(world, self.pvs_mode, area_mask).copied();
             if competitive_mask & probe::AUTO4 == 0 { refresh_auto4_lazy_collapse(
@@ -1259,6 +1280,10 @@ impl Renderer {
                 );
             }
             if collision_world_only && !competitive_no_world {
+                // Lazy and strictly ShitteR-only. Switching back to ordinary
+                // rendering never computes another triangle classification.
+                let textured_ready = crate::renderer::shitter_texture_enabled()
+                    && self.collision_world_pipeline.as_ref().is_some_and(|p| p.textured.is_some());
                 // This list is drawn as ONE native indexed multi-draw. Its
                 // ranges are the original world.index_buffer offsets, and it
                 // inherits exactly the normal cluster/AUTO PVS and areaportals.
@@ -1268,6 +1293,8 @@ impl Renderer {
                 // No heap allocation is needed on steady-state frames.
                 let mut draws = std::mem::take(&mut self.cpu_compact_indirect_scratch);
                 draws.clear();
+                let mut gray_draws = std::mem::take(&mut self.shitter_gray_draw_scratch);
+                gray_draws.clear();
                 {
                     let active = active_batch_selection(world, self.pvs_mode);
                     let mask = effective_area_mask;
@@ -1287,19 +1314,32 @@ impl Renderer {
                         {
                             continue;
                         }
-                        draws.push(DrawIndexedIndirectArgs {
-                            index_count: batch.indexed_range.end - batch.indexed_range.start,
-                            instance_count: 1,
-                            first_index: batch.indexed_range.start,
-                            base_vertex: 0,
-                            first_instance: 0,
-                        });
+                        if textured_ready {
+                            world.shitter_slope_cache.as_ref().expect("ShitteR classification built")
+                                .append_draws(batch.indexed_range.start,
+                                    batch.indexed_range.end - batch.indexed_range.start,
+                                    &mut draws, &mut gray_draws);
+                        } else {
+                            draws.push(DrawIndexedIndirectArgs {
+                                index_count: batch.indexed_range.end - batch.indexed_range.start,
+                                instance_count: 1,
+                                first_index: batch.indexed_range.start,
+                                base_vertex: 0,
+                                first_instance: 0,
+                            });
+                        }
                     }
                 }
                 crate::renderer::collision_world::update_native_flat_draw(
                     &self.device, &self.queue, &mut world.native_flat_draw, &draws,
                 );
+                if textured_ready {
+                    crate::renderer::collision_world::update_native_flat_draw(
+                        &self.device, &self.queue, &mut world.native_flat_draw_gray, &gray_draws,
+                    );
+                }
                 self.cpu_compact_indirect_scratch = draws;
+                self.shitter_gray_draw_scratch = gray_draws;
             }
             if self.grass_enabled && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
                 && competitive_mask & probe::GRASS == 0 {
@@ -2495,11 +2535,19 @@ impl Renderer {
                         store: wgpu::StoreOp::Store,
                     },
                 }),
+                self.realtime_sky_normals.as_ref().filter(|_| sky_normals_active).map(|sky|
+                    wgpu::RenderPassColorAttachment {
+                        view: &sky.view, depth_slice: None, resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 2.0, g: 2.0, b: 0.0, a: 0.0 }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
             ];
             let color_attachments = if lean_rain_depth {
                 &lean_attachments[..]
             } else {
-                &full_attachments[..]
+                &full_attachments[..if sky_normals_active { 4 } else { 3 }]
             };
             if capture_api_calls { info.perf_encode_calls.render_passes = info.perf_encode_calls.render_passes.saturating_add(1); }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2524,6 +2572,8 @@ impl Renderer {
             if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
             pass.set_pipeline(if lean_rain_depth {
                 &self.rain_depth_prepass_pipeline
+            } else if sky_normals_active {
+                &self.realtime_sky_normals.as_ref().unwrap().opaque
             } else if self.thermal_vision == 6 && self.nir_depth_pipeline.is_some() {
                 self.nir_depth_pipeline.as_ref().unwrap()
             } else if (1..=5).contains(&self.thermal_vision) && self.thermal_depth_pipeline.is_some() {
@@ -2544,7 +2594,9 @@ impl Renderer {
                 if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
                 pass.set_vertex_buffer(0, world.vertex_buffer.slice(..));
                 if capture_api_calls { info.perf_encode_calls.set_vertex_buffer = info.perf_encode_calls.set_vertex_buffer.saturating_add(1); }
-                pass.set_vertex_buffer(1, world.legacy_dlight_surface_id_buffer.slice(..));
+                pass.set_vertex_buffer(1, if sky_normals_active {
+                    world.sky_normal_buffer.as_ref().unwrap().slice(..)
+                } else { world.legacy_dlight_surface_id_buffer.slice(..) });
                 if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
                 pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 let mut mask_pipeline_active = false;
@@ -2593,6 +2645,8 @@ impl Renderer {
                                 if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                                 pass.set_pipeline(if lean_rain_depth {
                                     &self.rain_depth_prepass_pipeline
+                                } else if sky_normals_active {
+                                    &self.realtime_sky_normals.as_ref().unwrap().opaque
                                 } else if self.thermal_vision == 6 && self.nir_depth_pipeline.is_some() {
                                     self.nir_depth_pipeline.as_ref().unwrap()
                                 } else if (1..=5).contains(&self.thermal_vision) && self.thermal_depth_pipeline.is_some() {
@@ -2615,6 +2669,8 @@ impl Renderer {
                                 if capture_api_calls { info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1); }
                                 pass.set_pipeline(if lean_rain_depth {
                                     &self.rain_depth_prepass_mask_pipeline
+                                } else if sky_normals_active {
+                                    &self.realtime_sky_normals.as_ref().unwrap().masked
                                 } else if self.thermal_vision == 6 && self.nir_depth_mask_pipeline.is_some() {
                                     self.nir_depth_mask_pipeline.as_ref().unwrap()
                                 } else if (1..=5).contains(&self.thermal_vision) && self.thermal_depth_mask_pipeline.is_some() {
@@ -2636,16 +2692,44 @@ impl Renderer {
             // Players, vehicles and other depth-writing entities. Without them
             // every post consumer saw the BSP behind an entity, which washed
             // third-person players in background fog.
-            if lean_rain_depth {
-                if self.weather.rain.lean_models && !self.weather.rain.static_depth {
+            if sky_normals_active {
+                // Keep the existing entity pipeline attachment contract. No
+                // geometry is redrawn: the usual model phase follows the world
+                // phase with three loaded targets instead of four. Model policy
+                // and a depth match keep the underlying world normals hidden.
+                drop(pass);
+                let model_attachments = [
+                    &self.targets.linear_depth_render_view,
+                    &self.targets.motion_vector_view,
+                    &self.targets.reflection_mask_view,
+                ].map(|view| Some(wgpu::RenderPassColorAttachment {
+                    view, depth_slice: None, resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                }));
+                if capture_api_calls { info.perf_encode_calls.render_passes += 1; }
+                let mut models = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("JKA model depth prepass after sky normals"),
+                    color_attachments: &model_attachments,
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.targets.ao_depth_view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                self.dynamic_model_renderer.draw_prepass(&mut models, &self.camera_bind_group);
+            } else {
+                if lean_rain_depth {
+                    if self.weather.rain.lean_models && !self.weather.rain.static_depth {
+                        self.dynamic_model_renderer
+                            .draw_rain_prepass(&mut pass, &self.camera_bind_group);
+                    }
+                } else if !(plan.rain_only_linear_depth && self.weather.rain.static_depth) {
                     self.dynamic_model_renderer
-                        .draw_rain_prepass(&mut pass, &self.camera_bind_group);
+                        .draw_prepass(&mut pass, &self.camera_bind_group);
                 }
-            } else if !(plan.rain_only_linear_depth && self.weather.rain.static_depth) {
-                self.dynamic_model_renderer
-                    .draw_prepass(&mut pass, &self.camera_bind_group);
+                drop(pass);
             }
-            drop(pass);
             self.gpu_profiler
                 .write_encoder_timestamp(&mut encoder, GpuPass::Depth, true);
         }
@@ -3481,7 +3565,7 @@ impl Renderer {
                 drop(pass);
                 // Per-view world flares use this reflection's just-rendered depth
                 // before the next slot clears the shared depth attachment.
-                if self.world_flares_enabled && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
+                if self.world_flares_mode != 0 && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
                     && competitive_mask & probe::WORLD_FLARES == 0 {
                     let flare_format = crate::renderer::reflections::planar::PLANAR_COLOR_FORMAT;
                     self.world_flares_planar[slot].draw_planar(
@@ -3558,6 +3642,8 @@ impl Renderer {
         // fullscreen sky pass skips those pixels to avoid a second application.
         let sky_world_baked = false;
         let model_sky_world = self.sun_override && self.sky_backend == 1 && self.sky_world_lighting_strength > 0.0;
+        // r_skyWorldGainMode calibration; also needs &self, so read before any field borrow below.
+        let sky_gain = self.sky_gain_calibration();
         let blue_water_moon_csm_active = shadow_matrices.is_some()
             && (self.blue_water_environment.world_lighting > 0.0
                 || self.blue_water_moon_shadow_direction().is_some());
@@ -3752,7 +3838,7 @@ impl Renderer {
             // Suppress dome shading and the opaque aerial compute/composite;
             // tables, environment, entity lighting, and weather stay current.
             // Other readers (portals, planar mirrors, water) fail open.
-            let blue_water_indoor_skip = self.sky_backend == 1 && self.fast_sky == 0
+            let blue_water_indoor_skip = native_sky_visible
                 && self.pvs_mode != PvsMode::Off && world.visibility.is_some()
                 && world.last_cluster.flatten().and_then(|cluster|
                     world.sky_reachable_by_cluster.get(cluster).copied()) == Some(false)
@@ -3779,7 +3865,7 @@ impl Renderer {
                         || !self.blue_water_environment.aerial_perspective,
                     key, camera, jitter,
                     camera_pos_time[3], ocean_sun.direction.map(|value| -value), sea_plane,
-                    self.sky_backend == 1 && self.fast_sky == 0 && !blue_water_indoor_skip,
+                    native_sky_visible && !blue_water_indoor_skip,
                     self.cloud_backend == 1 && self.clouds_enabled, self.cloud_coverage,
                     [self.weather_wind.speed, self.weather_wind.direction], self.blue_water_environment, self.cloud_render_resolution.scale(), ocean_sun.intensity, frame_delta, self.weather.rain.native_sheltered(camera.position.to_array()));
                 info.native_thunder.extend(atmosphere.take_thunder());
@@ -3859,7 +3945,7 @@ impl Renderer {
                 let probe = self.ocean.as_ref().filter(|ocean|ocean.backend()!=0).and_then(|ocean| ocean.original_underwater_probe());
                 let first_atmosphere_render_started = menu_scene_trace.then(Instant::now);
                 atmosphere.render_image(&self.device, &self.queue, &mut encoder, probe,
-                    self.relighting_mode == 1 && self.sky_backend == 1 && self.fast_sky == 0
+                    self.relighting_mode == 1 && native_sky_visible
                         && self.blue_sky_cube_ab == 1);
                 if let Some(started) = first_atmosphere_render_started {
                     rverbose!(2, "[MAP FIRST SCENE SKY] atmosphere render_image {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
@@ -4207,7 +4293,7 @@ impl Renderer {
                     }
                 }
                 drop(sky_pass);
-                if self.world_flares_enabled && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
+                if self.world_flares_mode != 0 && !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
                     && competitive_mask & probe::WORLD_FLARES == 0 {
                     let flare_format = flare_scene_format;
                     self.world_flares_sky.draw_sky(
@@ -4292,7 +4378,10 @@ impl Renderer {
             // Keep the cloned QuerySet alive for the full render-pass lifetime.
             // Blend the authored source against encoded destination values.
             // SDR aliases share storage, including individual MSAA samples.
-            let encoded_world = (flare_scene_format.is_srgb() || self.world_encoded_blend.is_some())
+            // Shitter/no-world draw no authored world batch, so they must not
+            // create the per-frame display-space alias view or drop the stats query.
+            let encoded_world = !collision_world_only && !competitive_no_world
+                && (flare_scene_format.is_srgb() || self.world_encoded_blend.is_some())
                 && !active_pipeline_variant.encoded_world_pipelines.is_empty();
             // A hardware query cannot span attachment/pass transitions. Avoid
             // reporting a partial world sample or changing the image to profile it.
@@ -4302,7 +4391,8 @@ impl Renderer {
                 format: Some(flare_scene_format.remove_srgb_suffix()),
                 ..Default::default()
             });
-            let encoded_color_view = (encoded_world && flare_scene_format.is_srgb()).then(|| encoded_alias(color_view));
+            // Created on the first switch into encoded blending, not every frame.
+            let mut encoded_color_view: Option<wgpu::TextureView> = None;
             let mut encoded_world_active = false;
             info.perf_world_skip_clear = skip_world_color_clear(
                 self.color_clear_mode, self.fast_sky, sky_portal_drawn, world.sky_covers_background,
@@ -4387,36 +4477,42 @@ impl Renderer {
             if capture_api_calls { info.perf_encode_calls.set_index_buffer = info.perf_encode_calls.set_index_buffer.saturating_add(1); }
             pass.set_index_buffer(world.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             if collision_world_only && !competitive_no_world {
-                if let (Some(draw), Some(pipeline)) =
-                    (world.native_flat_draw.as_ref(), self.collision_world_pipeline.as_ref())
-                {
-                    if draw.count != 0 {
-                        if crate::renderer::shitter_texture_enabled() {
-                            if let Some(textured) = pipeline.textured.as_ref() {
-                                pass.set_pipeline(&textured.pipeline);
-                                pass.set_bind_group(1, &textured.bind_group, &[]);
-                                if capture_api_calls {
-                                    info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1);
-                                }
-                            } else {
-                                // The raw image is decoding on an asset worker.
-                                pass.set_pipeline(&pipeline.pipeline);
-                            }
-                        } else {
-                            // A genuinely texture-free shader/pipeline, not a
-                            // uniform branch that still samples in the fragment.
-                            pass.set_pipeline(&pipeline.pipeline);
+                if let Some(pipeline) = self.collision_world_pipeline.as_ref() {
+                    let orange = world.native_flat_draw.as_ref().filter(|d| d.count != 0);
+                    let textured = crate::renderer::shitter_texture_enabled()
+                        .then_some(pipeline.textured.as_ref()).flatten();
+                    if let Some(textured) = textured {
+                        pass.set_bind_group(1, &textured.bind_group, &[]);
+                        if capture_api_calls {
+                            info.perf_encode_calls.set_bind_group = info.perf_encode_calls.set_bind_group.saturating_add(1);
                         }
-                        // Vertex 0 and indices are ALREADY regular BSP buffers;
-                        // textured mode adds only the one persistent bind group.
+                        // Draw gray walkable surfaces first. Strict depth test
+                        // makes any exact coplanar decorative duplicates unable
+                        // to overwrite the walkable face with orange.
+                        for (draw, shader) in [
+                            (world.native_flat_draw_gray.as_ref(), &textured.gray_pipeline),
+                            (orange, &textured.pipeline),
+                        ] {
+                            let Some(draw) = draw.filter(|draw| draw.count != 0) else { continue; };
+                            pass.set_pipeline(shader);
+                            pass.multi_draw_indexed_indirect(&draw.buffer, 0, draw.count);
+                            info.world_encoded_batches += draw.count;
+                            info.world_multidraw_groups += 1;
+                            info.world_multidraw_batches += draw.count;
+                            if capture_api_calls {
+                                info.perf_encode_calls.set_pipeline += 1;
+                                info.perf_encode_calls.multi_draw_indexed_indirect_count += 1;
+                            }
+                        }
+                    } else if let Some(draw) = orange {
+                        pass.set_pipeline(&pipeline.pipeline);
                         pass.multi_draw_indexed_indirect(&draw.buffer, 0, draw.count);
                         info.world_encoded_batches = draw.count;
-                        info.world_multidraw_groups = info.world_multidraw_groups.saturating_add(1);
-                        info.world_multidraw_batches = info.world_multidraw_batches.saturating_add(draw.count);
+                        info.world_multidraw_groups += 1;
+                        info.world_multidraw_batches += draw.count;
                         if capture_api_calls {
-                            info.perf_encode_calls.set_pipeline = info.perf_encode_calls.set_pipeline.saturating_add(1);
-                            info.perf_encode_calls.multi_draw_indexed_indirect_count =
-                                info.perf_encode_calls.multi_draw_indexed_indirect_count.saturating_add(1);
+                            info.perf_encode_calls.set_pipeline += 1;
+                            info.perf_encode_calls.multi_draw_indexed_indirect_count += 1;
                         }
                     }
                 }
@@ -4427,6 +4523,9 @@ impl Renderer {
                     let requested = $encoded && encoded_world;
                     if requested != encoded_world_active {
                         drop(pass);
+                        if requested && encoded_color_view.is_none() && flare_scene_format.is_srgb() {
+                            encoded_color_view = Some(encoded_alias(color_view));
+                        }
                         if let Some(blend) = &self.world_encoded_blend {
                             if requested { blend.encode_world(&self.device, &mut encoder,
                                 if self.msaa_samples > 1 { color_view } else { scene_output }, &self.targets.depth_view); }
@@ -4533,7 +4632,7 @@ impl Renderer {
             // after the opaque world (see the skybox code in bsp_lean.wgsl).
             // Anything else keeps the per-pixel BSP sky for this frame.
             let mut sky_box_batch: Option<&WorldBatch> = None;
-            let blue_sky_path = self.sky_backend == 1 && self.fast_sky == 0
+            let blue_sky_path = native_sky_visible
                 && self.blue_water_sky.is_some() && !sky_portal_drawn;
             let mut sky_cloud_batches: [Option<&WorldBatch>; 4] = [None; 4];
             let mut sky_box_path = false;
@@ -5756,7 +5855,7 @@ impl Renderer {
             // The sky dome is NOT affected by this haze toggle. Preserve the
             // existing PVS-indoor gate and diagnostic A/B override.
             let blue_sky_air_active = self.blue_sky_diag & 6 == 0
-                && self.sky_backend == 1 && self.fast_sky == 0
+                && native_sky_visible
                 && self.blue_water_environment.aerial_perspective
                 && !blue_water_indoor_skip;
 
@@ -5778,10 +5877,12 @@ impl Renderer {
                         let model_sky_lit = atmosphere.apply_scene(&self.device, &self.queue, &mut encoder,
                             color_view, resolve_target, &self.targets.depth_view, self.cloud_shadows_enabled,
                             bw_portal_depth, blue_water_moon_light, moon_csm,
-                            (&self.targets.reflection_mask_view, &self.targets.linear_depth_view, sky_world_baked),
+                            (&self.targets.reflection_mask_view, &self.targets.linear_depth_view, sky_world_baked,
+                                self.realtime_sky_normals.as_ref().filter(|_| sky_normals_active).map(|s| &s.view)),
                             model_sky_world.then_some((&self.dynamic_model_renderer.entity_lighting_buffer,
                                 crate::renderer::models::types::ENTITY_SKY_WORLD_OFFSET,
-                                self.sky_world_lighting_strength, self.sky_world_light_isolation)));
+                                self.sky_world_lighting_strength, self.sky_world_light_isolation)),
+                            sky_gain);
                         self.dynamic_model_renderer.sky_world_refreshed = model_sky_lit;
                         self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterClouds, true);
                     }
@@ -6451,10 +6552,12 @@ impl Renderer {
                         let model_sky_lit = atmosphere.apply_scene(&self.device, &self.queue,
                             &mut encoder, color_view, resolve_target, &self.targets.depth_view,
                             self.cloud_shadows_enabled, bw_portal_depth, blue_water_moon_light, moon_csm,
-                            (&self.targets.reflection_mask_view, &self.targets.linear_depth_view, sky_world_baked),
+                            (&self.targets.reflection_mask_view, &self.targets.linear_depth_view, sky_world_baked,
+                                self.realtime_sky_normals.as_ref().filter(|_| sky_normals_active).map(|s| &s.view)),
                             model_sky_world.then_some((&self.dynamic_model_renderer.entity_lighting_buffer,
                                 crate::renderer::models::types::ENTITY_SKY_WORLD_OFFSET,
-                                self.sky_world_lighting_strength, self.sky_world_light_isolation)));
+                                self.sky_world_lighting_strength, self.sky_world_light_isolation)),
+                            sky_gain);
                         self.dynamic_model_renderer.sky_world_refreshed = model_sky_lit;
                         self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::BlueWaterClouds, true);
                     }
@@ -7959,7 +8062,7 @@ impl Renderer {
         // completed opaque depth before screen-space post processing.
         if !(7..=9).contains(&self.competitive_ab) && self.competitive_ab != 14
             && competitive_mask & probe::WORLD_FLARES == 0
-            && self.world_flares_enabled && self.world.is_some() {
+            && self.world_flares_mode != 0 && self.world.is_some() {
             let (flare_color_view, flare_resolve) = if let Some(view) = &self.targets.msaa_view {
                 (view, Some(scene_output))
             } else {

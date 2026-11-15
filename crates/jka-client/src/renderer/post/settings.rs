@@ -59,7 +59,7 @@ impl Renderer {
         let split_changed = (self.split_toning.active() || split_toning.active())
             && self.split_toning != split_toning;
         let grading_active = new_lut_grade.lut_active() || split_toning.active();
-        let lut_changed = self.color_lut_preset != effects.color_lut
+        let mut lut_changed = self.color_lut_preset != effects.color_lut
             || grade_changed
             || split_changed
             || (grading_active && self.color_lut_strength != lut_strength);
@@ -177,6 +177,7 @@ impl Renderer {
         self.sun_terminator = effects.sun_terminator;
         self.sky_world_bake_ab = effects.sky_world_bake_ab.min(1);
         self.sky_world_light_isolation = effects.sky_world_light_isolation;
+        self.sky_world_gain_mode = effects.sky_world_gain_mode.min(2);
         self.sky_world_lighting_strength = effects.sky_world_lighting_strength.clamp(0.0, 1.0);
         // Worker-count changes affect the next bake; do not cancel an active bake.
         self.bake_threads = effects.bake_threads.min(32);
@@ -393,6 +394,7 @@ impl Renderer {
         if old_dof_enabled != (self.depth_of_field_strength > 0.001) {
             self.dof_focus_valid = false;
         }
+        let old_lut_strength = self.color_lut_strength;
         self.color_lut_strength = lut_strength;
         self.color_grade = color_grade;
         self.split_toning = split_toning;
@@ -406,6 +408,12 @@ impl Renderer {
             0.0
         };
         self.color_lut_preset = effects.color_lut;
+        // Fusing changes the 3D LUT's input domain/format, and partially
+        // applied film presets must be blended during baking rather than
+        // per pixel. Rebuild when either property changes.
+        let wants_fusion = self.should_fuse_jk2_output_lut();
+        lut_changed |= wants_fusion != self.jk2_gamma_baked
+            || (wants_fusion && old_lut_strength != lut_strength);
         let lut_binding_changed = lut_changed && self.rebuild_color_grading_lut();
         if lut_changed {
             rverbose!(1, "Color LUT: {}", self.color_lut_preset.label());
@@ -416,11 +424,11 @@ impl Renderer {
             bytemuck::bytes_of(&GammaPostUniform {
                 values: [
                     self.output_gamma(),
-                    self.color_lut_effective_strength,
+                    if self.jk2_gamma_baked { 1.0 } else { self.color_lut_effective_strength },
                     if self.vignette_enabled { 1.0 } else { 0.0 },
                     self.color_grade.exposure_ev,
                 ],
-                flags: [if self.hdr_enabled { 1.0 } else { 0.0 }, if self.hdr_output.is_some() { 1.0 } else { 0.0 }, 0.0, 0.0],
+                flags: [if self.hdr_enabled { 1.0 } else { 0.0 }, if self.hdr_output.is_some() { 1.0 } else { 0.0 }, f32::from(self.overbright_bits), if self.jk2_gamma_baked { 2.0 } else { f32::from(u8::from(self.jk2_legacy_color)) }],
             }),
         );
         self.rebuild_frame_plan();

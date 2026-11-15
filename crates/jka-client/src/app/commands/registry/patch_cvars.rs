@@ -91,7 +91,7 @@ app_cvars! {
         implementations: []
     }
     APP_R_SPEEDS {
-        runtime: CvarDef::new("r_speeds", "", "0..8", "TaystJK-style renderer stats: 1 world geometry, 2 culling, 3 viewcluster, 4 dynamic lights, 5 zFar, 6 flares, 7 memory; 8 extended patch LOD diagnostics.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app: &App| CvarValue::String(app.video.speeds.to_string()), |app, value| App::cvar_set_r_speeds(app, APP_R_SPEEDS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_speeds, None),
+        runtime: CvarDef::new("r_speeds", "", "0..8", "Renderer statistics: 1 world geometry, 2 culling, 3 viewcluster, 4 dynamic lights, 5 zFar, 6 flares, 7 memory; 8 extended patch LOD diagnostics.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app: &App| CvarValue::String(app.video.speeds.to_string()), |app, value| App::cvar_set_r_speeds(app, APP_R_SPEEDS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_speeds, None),
         config: CvarBinding {
             default: Some(|state| state.video.speeds.to_string()),
             ..CvarBinding::NONE

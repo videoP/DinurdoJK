@@ -39,7 +39,8 @@ fn sky_world_gain(at:vec2<i32>)->vec3<f32> {
     let intensity=select(sky_environment.light_intensity,parameters.moon.w,moon_active);
     let incidence=max(dot(n,direction),0.0);
     let direct=color*intensity*incidence*direct_visibility;
-    let full_gain=clamp(ambient*0.5+direct*0.2,vec3(0.03),vec3(4.0));
+    let now_y=select(direction.y,-1.0,moon_active);
+    let full_gain=sky_gain_calibrated(clamp(ambient*0.5+direct*0.2,vec3(0.03),vec3(4.0)),vec3(1.0),now_y,parameters.gain);
     // Existing lightmaps combine sky/direct GI with compiled point lights.
     // Never darken a sealed room merely because its surface faces upward.
     // This geometric weight is a conservative approximation of the DAYLIGHT
@@ -62,7 +63,7 @@ pub(crate) fn cache_shader() -> String {
 struct Settings {{ baked_sun_direction_strength:vec4<f32>, baked_sun_radiance:vec4<f32>, baked_sun_debug_mode:vec4<u32>, baked_indirect_adjust:vec4<f32>, baked_indirect_curve:vec4<f32> }}
 var<private> lighting_settings:Settings;
 struct VertexOut {{baked_sun_fit:vec4<f32>,world_normal:vec3<f32>}}
-struct Parameters {{fit:vec4<f32>,radiance_strength:vec4<f32>,adjust:vec4<f32>,curve:vec4<f32>,sun:vec4<f32>,direction_strength:vec4<f32>, smoothing:vec4<f32>, sky:vec4<f32>, moon:vec4<f32>}}
+struct Parameters {{fit:vec4<f32>,radiance_strength:vec4<f32>,adjust:vec4<f32>,curve:vec4<f32>,sun:vec4<f32>,direction_strength:vec4<f32>, smoothing:vec4<f32>, sky:vec4<f32>, moon:vec4<f32>, gain:vec4<f32>}}
 @group(0) @binding(0) var source:texture_2d<f32>;
 @group(0) @binding(1) var corrected:texture_storage_2d<rgba16float,write>;
 @group(0) @binding(2) var<uniform> parameters:Parameters;

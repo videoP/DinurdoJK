@@ -44,7 +44,7 @@ app_cvars! {
     }
 
     APP_R_MARKCOUNT {
-        runtime: CvarDef::new("r_markcount", "", "0..4096", "TaystJK wall mark count (default 100). Zero disables authored EFX decals.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(app.video.mark_count.to_string()), |app, value| App::cvar_set_r_markcount(app, APP_R_MARKCOUNT.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_markcount, None),
+        runtime: CvarDef::new("r_markcount", "", "0..4096", "Wall mark count (default 100). Zero disables authored EFX decals.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(app.video.mark_count.to_string()), |app, value| App::cvar_set_r_markcount(app, APP_R_MARKCOUNT.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_markcount, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Ok(n) = value.trim().parse::<u32>() { settings.mark_count = n.min(4096); }
@@ -335,7 +335,7 @@ app_cvars! {
     }
 
     APP_FX_PHYSICS {
-        runtime: CvarDef::new("fx_physics", "", "0..3", "FX particle physics (TaystJK): 0 off, 1 same as 0 (stock has no non-expensive collision), 2 trace primitives flagged expensivePhysics, 3 force the world trace on every physics primitive.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_fx_physics(app)), |app, value| App::cvar_set_fx_physics(app, APP_FX_PHYSICS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_fx_physics, None),
+        runtime: CvarDef::new("fx_physics", "", "0..3", "FX particle physics: 0 off, 1 same as 0 (stock has no non-expensive collision), 2 trace primitives flagged expensivePhysics, 3 force the world trace on every physics primitive.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_fx_physics(app)), |app, value| App::cvar_set_fx_physics(app, APP_FX_PHYSICS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_fx_physics, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     settings.fx_physics = normalize_fx_physics(value, settings.fx_physics);

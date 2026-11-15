@@ -7,7 +7,7 @@ app_cvars! {
                 "cg_crosshairColor",
                 "",
                 "R G B A (0..255)",
-                "TaystJK-style crosshair RGBA color.",
+                "Crosshair RGBA color.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -110,7 +110,7 @@ app_cvars! {
     APP_CG_CROSSHAIRSCOPE {
         runtime: CvarDef::new(
             "cg_crossHairScope", "0", "0|1|2",
-            "TaystJK Disruptor scope: 0 classic 4:3 scope and rotating insert (no crosshair), 1 normal crosshair without the scope mask, 2 full-screen scope mask (no crosshair). Ammo ticks and charge meter remain in all modes.",
+            "Disruptor scope: 0 classic 4:3 scope and rotating insert (no crosshair), 1 normal crosshair without the scope mask, 2 full-screen scope mask (no crosshair). Ammo ticks and charge meter remain in all modes.",
             CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::Int(App::cvar_get_cg_crosshairscope(app)),
             |app, value| App::cvar_set_cg_crosshairscope(app, APP_CG_CROSSHAIRSCOPE.entry.name, &value.to_string()),
@@ -457,7 +457,7 @@ app_cvars! {
     }
 
     APP_CG_DRAWPLAYERNAMES {
-        runtime: CvarDef::new("cg_drawPlayerNames", "", "0..2", "TaystJK: draw unobstructed player names above players. 0 off, 1 names, 2 names plus health bars.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_drawplayernames(app)), |app, value| App::cvar_set_cg_drawplayernames(app, APP_CG_DRAWPLAYERNAMES.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_drawplayernames, None),
+        runtime: CvarDef::new("cg_drawPlayerNames", "", "0..2", "Draw unobstructed player names above players. 0 off, 1 names, 2 names plus health bars.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_drawplayernames(app)), |app, value| App::cvar_set_cg_drawplayernames(app, APP_CG_DRAWPLAYERNAMES.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_drawplayernames, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     settings.player_names.mode = value
@@ -506,7 +506,7 @@ app_cvars! {
                 "cg_drawPlayerNamesScale",
                 "",
                 "0.05..4",
-                "TaystJK: scale of world-space player-name labels.",
+                "Scale of world-space player-name labels.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,

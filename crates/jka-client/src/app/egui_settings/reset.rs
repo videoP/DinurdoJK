@@ -289,6 +289,7 @@ impl App {
             ui::VIDEO_ROW_BAKED_LOCAL_EMISSIVE => { self.video.baked_local_sources = (self.video.baked_local_sources & !4) | (defaults.baked_local_sources & 4); self.sync_lamp_shadow_sources(); }
             ui::VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT => { self.video.baked_local_sources = (self.video.baked_local_sources & !8) | (defaults.baked_local_sources & 8); self.sync_lamp_shadow_sources(); }
             ui::VIDEO_ROW_BAKED_LOCAL_FX => { self.video.baked_local_sources = (self.video.baked_local_sources & !16) | (defaults.baked_local_sources & 16); self.sync_lamp_shadow_sources(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_FLARES => { self.video.baked_local_sources = (self.video.baked_local_sources & !32) | (defaults.baked_local_sources & 32); self.sync_lamp_shadow_sources(); }
             ui::VIDEO_ROW_PROMOTE_SHADER_GLOW => {
                 self.video.promote_shader_glow = defaults.promote_shader_glow;
                 self.sync_added_map_lights();
@@ -358,6 +359,11 @@ impl App {
             }
             ui::VIDEO_ROW_FLARES => {
                 self.video.flares = defaults.flares;
+                self.video.flare_enhanced_intensity = defaults.flare_enhanced_intensity;
+                self.video.flare_enhanced_core = defaults.flare_enhanced_core;
+                self.video.flare_enhanced_wash = defaults.flare_enhanced_wash;
+                self.video.flare_enhanced_locality = defaults.flare_enhanced_locality;
+                self.video.world_flares = false;
                 self.sync_world_flares();
                 self.mark_config_dirty();
             }

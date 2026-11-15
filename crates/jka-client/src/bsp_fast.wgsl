@@ -408,6 +408,8 @@ fn moved_shader_input(original: VertexIn) -> VertexIn {
 const MATERIAL_LEGACY_ADDITIVE_SRGB: u32 = 536870912u;
 // Enabled only by the display-space BSP PSOs (SDR alias or float transfer).
 override LEGACY_WORLD_ENCODED_BLEND: bool = false;
+// JK2MV legacy LDR lightmap modulation, specialized at map/protocol transition.
+override JK2_LEGACY_COLOR: bool = false;
 // Approximate TaystJK's additive SOURCE modulation: its 8-bit rgbGen wave
 // multiplies the encoded texture sample before the blend. The scene target
 // remains linear, so this does not emulate encoded-framebuffer destination
@@ -458,6 +460,37 @@ fn legacy_rgb_decode(value: vec3<f32>) -> vec3<f32> {
     return select(pow((v + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)),
                   v / 12.92, v <= vec3<f32>(0.04045));
 }
+// JK2MV's fixed-function GL_DST_COLOR/GL_ZERO lightmap modulation works
+// on encoded 8-bit color. WGPU's sRGB samplers return linear values, so only
+// the JK2 variant re-encodes for this legacy multiply, then decodes once.
+// In JKA this function specializes to the original single multiplication.
+// JK2-only fast approximation of sRGB's transfer curve. The reference GL
+// multiplication happened on encoded bytes; avoid six per-fragment pow()s.
+// Max error (isolated curves) is below one encoded 8-bit step. JKA's shader
+// specialization never enters this branch.
+fn jk2_fast_encode(linear: vec3<f32>) -> vec3<f32> {
+    let x = clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0));
+    let root = sqrt(x);
+    let fourth = sqrt(root);
+    let eighth = sqrt(fourth);
+    let high = 0.662002687 * root + 0.684122060 * fourth
+        - 0.323583601 * eighth - 0.022541147 * x;
+    return select(high, 12.92 * x, x <= vec3<f32>(0.0031308));
+}
+fn jk2_fast_decode(encoded: vec3<f32>) -> vec3<f32> {
+    let x = clamp(encoded, vec3<f32>(0.0), vec3<f32>(1.0));
+    let high = 0.000945259493 + x * (0.032443209706 + x * (
+        0.516486173775 + x * (0.700847650651 + x * (
+        -0.409055501740 + x * (0.207285015737 - x * 0.048960661348)))));
+    return select(high, x / 12.92, x <= vec3<f32>(0.04045));
+}
+fn implicit_lightmap_rgb(diffuse: vec3<f32>, lightmap: vec3<f32>) -> vec3<f32> {
+    if (JK2_LEGACY_COLOR) {
+        return jk2_fast_decode(jk2_fast_encode(diffuse) * jk2_fast_encode(lightmap));
+    }
+    return diffuse * lightmap;
+}
+
 fn classic_three_stage_rgb(input: VertexOut) -> vec4<f32> {
     // 0: base diffuse; 2: baked lightmap; 5: stage-three overlay (non-sky).
     let diffuse = textureSample(base_texture, base_sampler, input.uv).rgb;
@@ -765,7 +798,7 @@ fn competitive_one_stage_lit(input: VertexOut, classic: u32) -> vec4<f32> {
         if (classic_lightmap_only) {
             base = vec4<f32>(lightmap_color, base.a);
         } else {
-            base = vec4<f32>(base.rgb * lightmap_color, base.a);
+            base = vec4<f32>(implicit_lightmap_rgb(base.rgb, lightmap_color), base.a);
         }
     }
 

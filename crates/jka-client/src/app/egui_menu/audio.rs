@@ -94,7 +94,7 @@ impl App {
         theme::section(
             ui,
             "GAMEPLAY SOUNDS",
-            "jaPRO / TaystJK voice and feedback options. They apply on every server and are archived to DinurdoJK.cfg.",
+            "Voice and feedback options. They apply on every server and are archived to DinurdoJK.cfg.",
         );
         self.audio_choice_row(
             ui, "Underwater audio",
@@ -264,7 +264,7 @@ impl App {
         self.audio_choice_row(
             ui,
             "Kill message",
-            "cg_killMessage. TaystJK center-screen kill confirmation. Normal includes your FFA place/score; Kill only suppresses that footer; High moves the message upward.",
+            "cg_killMessage. Center-screen kill confirmation. Normal includes your FFA place/score; Kill only suppresses that footer; High moves the message upward.",
             "cg_killMessage",
             self.audio.game.kill_message,
             &[(0, "Off"), (1, "Normal + score"), (2, "Kill only"), (3, "High")],
@@ -272,7 +272,7 @@ impl App {
         self.audio_choice_row(
             ui,
             "Awards",
-            "cg_drawRewards. TaystJK/JKA reward medals and announcer. Quake 3 swaps the supported Excellent, Impressive, Humiliation and Denied presentation to the Q3 variants.",
+            "cg_drawRewards. JKA reward medals and announcer. Quake 3 swaps supported Excellent, Impressive, Humiliation and Denied presentation to Q3 variants.",
             "cg_drawRewards",
             self.audio.game.draw_rewards,
             &[(0, "Off"), (1, "JKA"), (2, "Quake 3")],

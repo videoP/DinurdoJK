@@ -108,7 +108,8 @@ impl crate::renderer::Renderer {
         self.ssr_enabled
             || self.reflection_debug_enabled
             || self.weather.fog.mode == crate::ui::FogMode::LegacyDrawFog1
-            || (self.sky_backend == 1 && self.blue_water_environment.filmic)
+            || (self.sky_backend == 1 && !crate::renderer::collision_world_only()
+                && self.blue_water_environment.filmic)
     }
 }
 

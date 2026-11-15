@@ -125,7 +125,7 @@ impl App {
                     });
                 }
                 if (1..=4).contains(&style) {
-                    theme::row(ui, "Directions", "Direction bits inside cg_strafeHelper. Defaults match TaystJK: WA, WD, A, D and Center.", theme::Reset::None, |ui| {
+                    theme::row(ui, "Directions", "Direction bits inside cg_strafeHelper. Defaults: WA, WD, A, D and Center.", theme::Reset::None, |ui| {
                         let mut flags = self.strafe_helper.flags;
                         for (bit, label) in [
                             (crate::ui::SHELPER_W, "W"),
@@ -143,7 +143,7 @@ impl App {
                             let _ = self.set_console_cvar("cg_strafeHelper", &flags.to_string());
                         }
                     });
-                    theme::row(ui, "Offset", "cg_strafeHelperOffset. TaystJK stores hundredths of a degree; default 75 = 0.75 degrees.", theme::Reset::None, |ui| {
+                    theme::row(ui, "Offset", "cg_strafeHelperOffset. Measured in hundredths of a degree; default 75 = 0.75 degrees.", theme::Reset::None, |ui| {
                         let mut value = self.strafe_helper.offset;
                         let readout = format!("{:.2}°", value * 0.01);
                         if theme::slider(ui, &mut value, -500.0..=500.0, &readout) {
@@ -157,7 +157,7 @@ impl App {
                             let _ = self.set_console_cvar("cg_strafeHelperLineWidth", &value.to_string());
                         }
                     });
-                    theme::row(ui, "Precision", "cg_strafeHelperPrecision. TaystJK uses this as the world-space distance before projecting a guide. Cinematic keeps that distance directly as its 3D line length.", theme::Reset::None, |ui| {
+                    theme::row(ui, "Precision", "cg_strafeHelperPrecision. World-space distance used to project guides; Cinematic uses it directly as the 3D line length.", theme::Reset::None, |ui| {
                         let mut value = self.strafe_helper.precision as f32;
                         let readout = format!("{value:.0}");
                         if theme::slider(ui, &mut value, 100.0..=10000.0, &readout) {
@@ -193,7 +193,7 @@ impl App {
                     });
                 }
                 if style != 0 {
-                    theme::row(ui, "Physics FPS", "cg_strafeHelper_FPS. Auto uses movement command cadence/server fixed Pmove for the strafe bars. TaystJK styles retain com_maxfps, or 125 when uncapped.", theme::Reset::None, |ui| {
+                    theme::row(ui, "Physics FPS", "cg_strafeHelper_FPS. Auto uses movement command cadence/server fixed Pmove for Xonotic, Q3DF and Warsow bars. jaPRO styles use com_maxfps, or 125 when uncapped.", theme::Reset::None, |ui| {
                         let mut value = self.strafe_helper.fps;
                         let readout = if value < 1.0 { "Auto".to_owned() } else { format!("{value:.0}") };
                         if theme::slider(ui, &mut value, 0.0..=1000.0, &readout) {
@@ -225,7 +225,7 @@ impl App {
                 theme::section(
                     ui,
                     "MOVEMENT KEYS",
-                    "TaystJK-compatible cg_movementKeys overlay controls. Position is handled by HUD Edit Mode.",
+                    "cg_movementKeys overlay controls. Position is handled by HUD Edit Mode.",
                 );
                 const MOVEMENT_KEY_MODES: [(u8, &str); 5] = [
                     (0, "Off"), (1, "Original"), (2, "+ Attack"), (3, "Compact"), (4, "Movable"),
@@ -308,7 +308,7 @@ impl App {
                 theme::row(
                     ui,
                     "Color",
-                    "cg_crosshairColor. RGB picker; the archived cvar keeps TaystJK's R G B A 0..255 format.",
+                    "cg_crosshairColor. RGB picker; the archived cvar stores R G B A values from 0 to 255.",
                     theme::Reset::None,
                     |ui| {
                         let mut rgb = [
@@ -341,18 +341,28 @@ impl App {
                     },
                 );
                 const DYNAMIC_CROSSHAIR: [(u8, &str); 3] = [(0, "Off"), (1, "Always"), (2, "Smart")];
-                if let Some(mode) = segmented_row(
-                    ui,
-                    "Dynamic crosshair",
-                    "TaystJK cg_dynamicCrosshair. Off keeps the crosshair at screen center. Always traces from the weapon/player muzzle. Smart uses TaystJK's static overrides for saber/melee, race mode and the applicable strafehelper modes.",
-                    theme::Reset::None,
-                    self.crosshair.dynamic,
-                    &DYNAMIC_CROSSHAIR,
-                ) {
-                    let _ = self.set_console_cvar("cg_dynamicCrosshair", &mode.to_string());
+                let line_crosshair = self.crosshair.is_line_shape();
+                ui.add_enabled_ui(!line_crosshair, |ui| {
+                    if let Some(mode) = segmented_row(
+                        ui,
+                        "Dynamic crosshair",
+                        "cg_dynamicCrosshair. Off keeps the crosshair centered. Always traces from the weapon/player muzzle. Smart uses static positioning for saber/melee, race mode and applicable strafehelper modes. The jaPRO Line crosshair always stays centered.",
+                        theme::Reset::None,
+                        self.crosshair.effective_dynamic_mode(),
+                        &DYNAMIC_CROSSHAIR,
+                    ) {
+                        let _ = self.set_console_cvar("cg_dynamicCrosshair", &mode.to_string());
+                    }
+                });
+                if line_crosshair {
+                    theme::label(ui, theme::plain(
+                        "The jaPRO line crosshair is always centered. Your saved dynamic mode will return when you select another crosshair.",
+                        12.5,
+                        theme::TEXT_FAINT(),
+                    ));
                 }
 
-                theme::section(ui, "PROJECTILE LEAD", "TaystJK / jaPRO projectile prediction. The server's RESTRICT_LEAD (restricts bit 4) always takes precedence.");
+                theme::section(ui, "PROJECTILE LEAD", "jaPRO projectile lead indicator. The server's RESTRICT_LEAD (restricts bit 4) always takes precedence.");
                 let lead_restricted = self.server_restrictions().contains(crate::app::restrictions::LEAD_INDICATOR);
                 let lead_value = self.japro_cg.lead_indicator;
                 theme::row(ui, "Lead indicator", "cg_leadIndicator: Off, 1 uses snapshot ping, >=2 uses the given millisecond offset. Visibility and server restrictions apply in all modes.", theme::Reset::None, |ui| {
@@ -370,7 +380,7 @@ impl App {
                     theme::label(ui, theme::plain("Disabled by this server (restricts & 4). Your saved preference is unchanged.", 12.5, theme::WARNING()));
                 }
                 if lead_value >= 2.0 {
-                    theme::row(ui, "Manual lead offset", "cg_leadIndicator (milliseconds). Ping mode is automatic; manual uses this value directly as in TaystJK.", theme::Reset::None, |ui| {
+                    theme::row(ui, "Manual lead offset", "cg_leadIndicator (milliseconds). Ping mode is automatic; Manual uses this value directly.", theme::Reset::None, |ui| {
                         let mut ms = lead_value;
                         let text = format!("{ms:.0} ms");
                         if theme::slider(ui, &mut ms, 2.0..=500.0, &text) {

@@ -160,7 +160,7 @@ impl Renderer {
             && self.weather.rain.fast_post;
         let other_full_post_effects = self.thermal_vision != 0
             || self.ocean_enabled
-            || (self.sky_backend == 1 && self.blue_water_environment.filmic)
+            || (self.native_sky_surface_visible() && self.blue_water_environment.filmic)
             || self.tone_mapping_enabled
             || self.glow_mode.enabled()
             || self.halation_enabled
@@ -208,6 +208,7 @@ impl Renderer {
         // consumer is active. Retain the consumers independently of the
         // removed legacy world-renderer selection.
         let other_linear_depth = self.thermal_vision != 0
+            || self.realtime_sky_normals_active()
             || self.ssao_enabled
             || self.rt_local_cache_wanted()
             || self.motion_vectors_wanted()
@@ -239,6 +240,7 @@ impl Renderer {
             self.motion_blur_strength > 0.001,
             self.dof_draws_this_plan(),
             rain_spatial_post,
+            self.realtime_sky_normals_active(),
         ].iter().enumerate().fold(0u32, |bits, (bit, &on)| bits | (u32::from(on) << bit));
         let rain_only_linear_depth = rain_spatial_post && !other_linear_depth;
         self.frame_plan = FramePlan {
@@ -292,7 +294,7 @@ pub(in crate::renderer) struct FramePlan {
     /// Bitmask of the consumers behind `needs_linear_depth`: 0 SSAO, 1 RT reduced
     /// shadows, 2 temporal resolve, 3 contact shadows, 4 fog, 5 legacy global
     /// post, 6 clouds, 7 snow, 8 atmosphere, 9 SSR, 10 reflection debug,
-    /// 11 motion blur, 12 depth of field, 13 rain spatial post.
+    /// 11 motion blur, 12 depth of field, 13 rain spatial post, 14 live sky normals.
     pub(in crate::renderer) linear_depth_reasons: u32,
     /// Rain is the sole consumer of the full-resolution linear-depth prepass.
     pub(in crate::renderer) rain_only_linear_depth: bool,

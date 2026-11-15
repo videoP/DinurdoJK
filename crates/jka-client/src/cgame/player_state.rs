@@ -22,6 +22,31 @@ pub(crate) fn interpolate_player_state_at(
     )
 }
 
+/// TaystJK's third-person camera clock while following another player:
+/// `predictedPlayerState.commandTime + predictedTimeFrac`, where
+/// CG_InterpolatePlayerState sets the fraction to `f * (next.commandTime -
+/// snap.commandTime)`. It is sub-millisecond, ignores server-clock drift, and
+/// stands still while the followed client sends no commands. With no usable
+/// nextSnap the fraction is 0 (cg_snapshot.c). A backwards commandTime never
+/// rewinds the clock.
+pub(crate) fn follow_command_clock_ms(
+    current: &Snapshot,
+    next: Option<&Snapshot>,
+    presentation_time_ms: f64,
+) -> f64 {
+    let base = f64::from(current.player_state.field_i32("commandTime").unwrap_or(0));
+    let Some(next) = next.filter(|next| {
+        next.server_time > current.server_time && !super::snapshot_discontinuity(current, next)
+    }) else {
+        return base;
+    };
+    let fraction = (presentation_time_ms - f64::from(current.server_time))
+        / f64::from(next.server_time - current.server_time);
+    let gap = next.player_state.field_i32("commandTime").unwrap_or(0)
+        .wrapping_sub(current.player_state.field_i32("commandTime").unwrap_or(0));
+    base + fraction * f64::from(gap.max(0))
+}
+
 /// Clone the entire current state and interpolate only TaystJK's four fields.
 /// Input-owned angles are applied before publishing by the session, leaving
 /// viewheight, commandTime, animations, stats, events and vehicle fields intact.
@@ -201,6 +226,24 @@ mod tests {
             interpolate_player_state_at(&next, None, 150.0),
             next.player_state
         );
+    }
+
+    #[test]
+    fn follow_clock_is_fractional_command_time_not_server_time() {
+        let mut current = snapshot(100);
+        current.player_state.set_field_bits("commandTime", 90);
+        let mut next = snapshot(150);
+        next.player_state.set_field_bits("commandTime", 98); // followed client ran 8 ms
+        // No nextSnap: predictedTimeFrac is 0, the clock holds at commandTime.
+        assert_eq!(follow_command_clock_ms(&current, None, 130.0), 90.0);
+        // Halfway through the 50 ms server gap = halfway through the 8 ms command gap.
+        assert!((follow_command_clock_ms(&current, Some(&next), 125.25) - 94.04).abs() < 1e-9);
+        // Continuous at the snapshot hand-off: f = 1 equals the next commandTime.
+        assert_eq!(follow_command_clock_ms(&current, Some(&next), 150.0), 98.0);
+        assert_eq!(follow_command_clock_ms(&next, None, 150.0), 98.0);
+        // A client restart (commandTime going backwards) never rewinds the clock.
+        next.player_state.set_field_bits("commandTime", 10);
+        assert_eq!(follow_command_clock_ms(&current, Some(&next), 125.0), 90.0);
     }
 
     #[test]

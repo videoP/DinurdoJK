@@ -8,8 +8,8 @@ pub const NATIVE_READOUTS: u32 = speed::ENABLE | speed::GROUNDSPEED | speed::JUM
     | speed::SPEEDGRAPH | speed::SPEEDGRAPHOLD | speed::JUMPS;
 
 pub const GUIDE_CHOICES: &[(u32, &str)] = &[
-    (0, "Off"), (SHELPER_ORIGINAL, "TaystJK Original"), (SHELPER_UPDATED, "TaystJK Updated"),
-    (SHELPER_CGAZ, "TaystJK CGAZ"), (SHELPER_CINEMATIC, "Cinematic (world guide)"),
+    (0, "Off"), (SHELPER_ORIGINAL, "jaPRO Original"), (SHELPER_UPDATED, "jaPRO Updated"),
+    (SHELPER_CGAZ, "jaPRO CGAZ"), (SHELPER_CINEMATIC, "Cinematic (world guide)"),
     (SHELPER_XONOTIC, "Xonotic bands"), (SHELPER_Q3DF, "Q3DF CGaz bands"),
     (SHELPER_WARSOW_HUD, "Warsow triangles"),
 ];

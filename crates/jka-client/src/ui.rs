@@ -200,7 +200,7 @@ pub use settings::rendering::{
     VIDEO_ROW_EMISSIVE_AREA_LIGHTS, VIDEO_ROW_PROMOTE_FX_LIGHTS,
     VIDEO_ROW_PROMOTE_SHADER_ADDITIVE, VIDEO_ROW_PROMOTE_SHADER_EMISSIVE,
     VIDEO_ROW_PROMOTE_SHADER_GLOW,
-    VIDEO_ROW_BAKED_LOCAL_GLOW, VIDEO_ROW_BAKED_LOCAL_ADDITIVE, VIDEO_ROW_BAKED_LOCAL_EMISSIVE, VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT, VIDEO_ROW_BAKED_LOCAL_FX,
+    VIDEO_ROW_BAKED_LOCAL_GLOW, VIDEO_ROW_BAKED_LOCAL_ADDITIVE, VIDEO_ROW_BAKED_LOCAL_EMISSIVE, VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT, VIDEO_ROW_BAKED_LOCAL_FX, VIDEO_ROW_BAKED_LOCAL_FLARES,
     VIDEO_ROW_ENTITY_AMBIENT_LIGHTING, VIDEO_ROW_ENTITY_SHADOW_LIGHT, VIDEO_ROW_FLARES,
     VIDEO_ROW_FLOAT_LIGHTMAP, VIDEO_ROW_FPS_CAP, VIDEO_ROW_FULLSCREEN, VIDEO_ROW_FX_FPS,
     VIDEO_ROW_FX_FPS_SCOPE, VIDEO_ROW_FX_GEOMETRY, VIDEO_ROW_FX_LOD, VIDEO_ROW_FX_PHYSICS,
@@ -609,7 +609,7 @@ pub struct UiMatchStats {
 pub struct AvatarAtlas {
     pub columns: u32,
     pub rows: u32,
-    /// Lower-case `model/skin` -> cell index.
+    /// Lower-case raw `model/skin` or team-validated portrait key -> cell index.
     pub cells: std::collections::HashMap<String, u32>,
 }
 
@@ -619,6 +619,12 @@ impl AvatarAtlas {
         let key = key.to_ascii_lowercase();
         if let Some(&cell) = self.cells.get(&key) {
             return Some(cell);
+        }
+        // A team-aware key has already been resolved to its validated skin
+        // (and composite head, if applicable). Never fall back to a raw
+        // opposite-team or default icon when that specific key is absent.
+        if key.starts_with("@team-model-icon\t") {
+            return None;
         }
         // Composite skins ("head|torso|legs") use the head's icon, as cgame does.
         let (model, skin) = key.split_once('/').unwrap_or((key.as_str(), "default"));
@@ -1103,6 +1109,22 @@ pub struct CrosshairSettings {
     pub names_colours: bool,
     /// jaPRO `cg_drawCrosshairNamesOpacity`, 0..=1.
     pub names_opacity: f32,
+}
+
+impl CrosshairSettings {
+    /// The jaPRO line is a fixed screen-center strafehelper reference, not a
+    /// muzzle-projected aiming crosshair. An image override still uses the
+    /// ordinary crosshair path even when the saved shape is Line.
+    pub fn is_line_shape(&self) -> bool {
+        self.style == CROSSHAIR_STYLE_LINE
+            && !(1..=CROSSHAIR_IMAGE_COUNT).contains(&self.image)
+    }
+
+    /// Effective placement only; keep the archived cg_dynamicCrosshair setting
+    /// so changing away from Line restores the user's preference.
+    pub fn effective_dynamic_mode(&self) -> u8 {
+        if self.is_line_shape() { 0 } else { self.dynamic }
+    }
 }
 
 /// Highest `cg_drawCrosshair` shape: the jaPRO strafehelper line (`SHELPER_CROSSHAIR`).

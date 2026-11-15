@@ -269,13 +269,20 @@ impl NetworkSettings {
         {
             return Err(format!("{name}: invalid cvar name"));
         }
-        // Serialized configs and Quake info strings do not escape these.
+        let key = name.to_ascii_lowercase();
+        // Quoted semicolons are valid in local set/seta script values and
+        // must survive vstr and cfg serialization. Info strings, however,
+        // forbid semicolons. Check accumulated flags too: an existing setu
+        // variable must not bypass the restriction through a plain `set`.
+        let effective_flags = self.user_cvars.get(&key)
+            .map_or(flags, |existing| existing.flags.union(flags));
+        let info_value = effective_flags.contains(UserCvarFlags::USERINFO)
+            || effective_flags.contains(UserCvarFlags::SERVERINFO);
         if value.len() > 1023 || value.bytes().any(|b|
-            b < 32 || b == 127 || matches!(b, b'\\' | b';' | b'"'))
+            b < 32 || b == 127 || matches!(b, b'\\' | b'"') || (b == b';' && info_value))
         {
             return Err(format!("{name}: invalid cvar value"));
         }
-        let key = name.to_ascii_lowercase();
         if self.user_cvars.len() >= 8192 && !self.user_cvars.contains_key(&key) {
             return Err("too many user-created cvars".into());
         }
@@ -3718,6 +3725,22 @@ mod tests {
         assert_eq!(settings.user_cvars.len(), 2);
         assert!(settings.set_user_cvar("oops\\hack", "x", UserCvarFlags::USERINFO).is_err());
         assert!(settings.set_user_cvar("safe", "evil\\payload", UserCvarFlags::USERINFO).is_err());
+    }
+
+    #[test]
+    fn local_script_cvars_allow_semicolons_but_info_cvars_do_not() {
+        let mut settings = NetworkSettings::default();
+        let script = "+attack; wait 1; -attack";
+        settings.set_user_cvar("ac_attack", script, UserCvarFlags::NONE).unwrap();
+        settings.set_user_cvar("ac_attack", script, UserCvarFlags::ARCHIVE).unwrap();
+        assert_eq!(settings.user_cvar("AC_ATTACK").unwrap().value, script);
+        assert!(settings.user_cvar("ac_attack").unwrap().flags.contains(UserCvarFlags::ARCHIVE));
+        assert!(settings.set_user_cvar("ac_attack", script, UserCvarFlags::USERINFO).is_err());
+        assert!(settings.set_user_cvar("ac_info", script, UserCvarFlags::USERINFO).is_err());
+        assert!(settings.set_user_cvar("ac_server", script, UserCvarFlags::SERVERINFO).is_err());
+        settings.set_user_cvar("info_first", "safe", UserCvarFlags::USERINFO).unwrap();
+        assert!(settings.set_user_cvar("info_first", script, UserCvarFlags::NONE).is_err());
+        assert_eq!(settings.user_cvar("info_first").unwrap().value, "safe");
     }
 
     #[test]

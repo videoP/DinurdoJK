@@ -45,6 +45,18 @@ pub(crate) fn set_collision_world_only(enabled: bool) {
     COLLISION_WORLD_ONLY.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+// Opt-in lamp shadow trace. An atomic keeps session-only Cvar readback
+// independent of saved video settings. Off is a single relaxed read at
+// selection time (no GPU readbacks, extra draws or changes to lighting).
+static LAMP_SHADOW_DEBUG_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+pub(crate) fn lamp_shadow_debug_mode() -> u8 {
+    LAMP_SHADOW_DEBUG_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub(crate) fn set_lamp_shadow_debug_mode(mode: u8) {
+    LAMP_SHADOW_DEBUG_MODE.store(mode.min(2), std::sync::atomic::Ordering::Relaxed);
+}
+
 // One optional universal BSP image for Shitter. No materials, lightmaps or
 // extra draw calls. A separate pipeline keeps the flat 0 path sample-free.
 static SHITTER_TEXTURE: std::sync::atomic::AtomicBool =
@@ -916,7 +928,7 @@ struct Renderer {
     world_flares_sky: world_flares::WorldFlareRenderer,
     // Each planar view has independent flare histories, depth bindings and camera buffers.
     world_flares_planar: [world_flares::WorldFlareRenderer; PLANAR_REFLECTION_SLOTS],
-    world_flares_enabled: bool,
+    world_flares_mode: u8,
     ocean_layout: wgpu::BindGroupLayout,
     ocean_interaction: crate::ocean::interaction::InteractionGpu,
     ocean_optics_layout: wgpu::BindGroupLayout,
@@ -1214,6 +1226,9 @@ struct Renderer {
     gamma: f32,
     /// Emulated OpenJK output shift (0 or 1); never requires hardware gamma.
     overbright_bits: u8,
+    /// Set at the protocol transition, not inferred from a map filename.
+    /// Enables JK2MV's encoded-space LDR lightmap and output color treatment.
+    jk2_legacy_color: bool,
     baked_brightness: brightness::BakedBrightness,
     gamma_method: crate::gamma::GammaMethod,
     /// True only after Windows confirms the display gamma ramp is installed.
@@ -1275,6 +1290,7 @@ struct Renderer {
     /// Independent BSP lightmap A/B: 0 = original relighting, 1 = sky approximation.
     sky_world_bake_ab: u8,
     sky_world_light_isolation: bool,
+    sky_world_gain_mode: u8,
     sky_world_lighting_strength: f32,
     bake_threads: u8,
     /// UI drag guard: live sky and CSM remain responsive; static sun ray jobs wait.
@@ -1379,6 +1395,13 @@ struct Renderer {
     _color_lut_texture: wgpu::Texture,
     color_lut_view: wgpu::TextureView,
     color_lut_sampler: wgpu::Sampler,
+    // 8 KiB 1D transfer LUT. JK2-only, updated on gamma/overbright changes.
+    _jk2_gamma_lut_texture: wgpu::Texture,
+    jk2_gamma_lut_view: wgpu::TextureView,
+    jk2_gamma_lut_key: (u32, u8),
+    // The existing color grading texture contains JK2's output transfer when
+    // SDR grading is active and there are no intervening lens/rain effects.
+    jk2_gamma_baked: bool,
     cloud_noise_resources: Option<CloudNoiseResources>,
     cloud_noise_fallback: CloudNoiseResources,
     frame_plan: FramePlan,
@@ -1393,6 +1416,7 @@ struct Renderer {
     // the ordinary PVS + frustum path pack same-state visible draws into the
     // existing indirect buffer without per-frame allocation churn.
     cpu_compact_indirect_scratch: Vec<DrawIndexedIndirectArgs>,
+    shitter_gray_draw_scratch: Vec<DrawIndexedIndirectArgs>,
     cpu_compact_count_scratch: Vec<u32>,
     /// Bytes last uploaded by CPU compaction (indirect args, then counts) and
     /// the args buffer they went to. An unchanged frame skips both uploads: each
@@ -1492,6 +1516,11 @@ struct Renderer {
     baked_local_had_casters: bool,
     /// Session-only lamp-shadow experiment: 0 baseline, 1 receiver octants, 2 caster prefilter, 3 both.
     lamp_shadow_ab: u8,
+    // Set by r_lampShadowDebug command; consumed on the next shadow-selection
+    // update even if the entire shadow path is disabled.
+    lamp_shadow_debug_pending: bool,
+    // Deferred one-shot CPU caster probe, printed after the moving cubemap pass.
+    lamp_shadow_debug_post_encode_pending: bool,
     csm_coverage_ab: bool,
     irradiance_volume_enabled: bool,
     voxel_probe_gi_enabled: bool,
@@ -1534,6 +1563,7 @@ struct Renderer {
     ssr_frame_index: u32,
     depth_prepass_pipeline: wgpu::RenderPipeline,
     depth_prepass_mask_pipeline: wgpu::RenderPipeline,
+    realtime_sky_normals: Option<world::sky_normals::RealtimeSkyNormals>,
     /// Rain-only variant: writes only R32 linear depth + hardware depth.
     rain_depth_prepass_pipeline: wgpu::RenderPipeline,
     rain_depth_prepass_mask_pipeline: wgpu::RenderPipeline,

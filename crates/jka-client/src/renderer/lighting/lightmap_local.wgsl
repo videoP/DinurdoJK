@@ -39,6 +39,32 @@ fn inferred_lamp_weight(light: PointLight, position: vec3<f32>, normal: vec3<f32
     let window=max(1.0-d2/(radius*radius),0.0);
     return max(light.shape.y,0.0)*receive*emission*window*window/(d2+256.0);
 }
+// Absolute energy a moving caster removes from ONE lamp whose illumination is
+// not decomposed in the lightmap (original lighting, or a shadow-only source
+// such as a world flare). Zero when the lamp cannot be shadowed at this pixel.
+fn inferred_lamp_block(light: PointLight, input: VertexOut) -> f32 {
+    // Reuse existing face/octant metadata before the irradiance math.
+    // This adds no texture reads and also applies with transient RT enabled.
+    if lamp_raster_receiver_culling_safe() && !baked_local_moving_maybe(light,input.world_position) {return 0.0;}
+    let weight=inferred_lamp_weight(light,input.world_position,input.world_normal);
+    if weight<=0.0 || light.shadow.x<0.5 {return 0.0;}
+    let moving=baked_local_moving_visibility(light,input.world_position,input.world_normal);
+    if moving>=0.9999 {return 0.0;}
+    // A lamp behind static geometry must not darken the original map here.
+    let stationary=sample_local_shadow_visibility(light,input.world_position,input.world_normal);
+    return weight*stationary*(1.0-moving);
+}
+// Remove absolute blocked energy from the available illumination.
+// Dividing by the selected lamps' sum cancelled distance/power falloff and
+// let unrelated (including wall-hidden) lamps change shadow contrast.
+// Keep the existing 0.65 gain and 52% maximum removal, preserving hue and
+// a residual for indirect/unidentified lighting. No extra visibility taps.
+fn remove_inferred_blocked(color: vec3<f32>, blocked: f32) -> vec3<f32> {
+    if blocked<=0.0 {return color;}
+    let baseline=max(dot(max(color,vec3(0.0)),vec3(0.2126,0.7152,0.0722)),1e-6);
+    let fraction=min(0.52,0.65*blocked/baseline);
+    return color*(1.0-fraction);
+}
 fn shade_original_lamp_shadows(lightmap: vec3<f32>, input: VertexOut) -> vec3<f32> {
     let vertex_lit = input.shell_kind == 0u && (material_flags() & 131073u) == 131073u;
     if !lightmapped_shadow_receiver(input) && !vertex_lit {return lightmap;}
@@ -66,27 +92,9 @@ fn shade_original_lamp_shadows(lightmap: vec3<f32>, input: VertexOut) -> vec3<f3
     for (var i=0u;i<4u;i+=1u) {
         let encoded=(ids[i/2u]>>((i%2u)*8u))&255u;
         if encoded==0u {continue;}
-        let light=dynamic_lights[encoded-1u];
-        // Reuse existing face/octant metadata before the irradiance math.
-        // This adds no texture reads and also applies with transient RT enabled.
-        if lamp_raster_receiver_culling_safe() && !baked_local_moving_maybe(light,input.world_position) {continue;}
-        let weight=inferred_lamp_weight(light,input.world_position,input.world_normal);
-        if weight<=0.0 || light.shadow.x<0.5 {continue;}
-        let moving=baked_local_moving_visibility(light,input.world_position,input.world_normal);
-        if moving>=0.9999 {continue;}
-        // A lamp behind static geometry must not darken the original map here.
-        let stationary=sample_local_shadow_visibility(light,input.world_position,input.world_normal);
-        blocked+=weight*stationary*(1.0-moving);
+        blocked+=inferred_lamp_block(dynamic_lights[encoded-1u],input);
     }
-    if blocked<=0.0 {return lightmap;}
-    // Remove absolute blocked energy from the available baked illumination.
-    // Dividing by the selected lamps' sum cancelled distance/power falloff and
-    // let unrelated (including wall-hidden) lamps change shadow contrast.
-    // Keep the existing 0.65 gain and 52% maximum removal, preserving hue and
-    // a residual for indirect/unidentified lighting. No extra visibility taps.
-    let baseline=max(dot(max(lightmap,vec3(0.0)),vec3(0.2126,0.7152,0.0722)),1e-6);
-    let fraction=min(0.52,0.65*blocked/baseline);
-    return lightmap*(1.0-fraction);
+    return remove_inferred_blocked(lightmap,blocked);
 }
 fn shade_baked_local(lightmap: vec3<f32>, input: VertexOut) -> vec3<f32> {
     if (lighting_settings.baked_sun_debug_mode.z & 4u) != 0u {
@@ -95,19 +103,27 @@ fn shade_baked_local(lightmap: vec3<f32>, input: VertexOut) -> vec3<f32> {
     }
     if !baked_local_receiver(input) || (lighting_settings.baked_sun_debug_mode.w & 1u) == 0u { return lightmap; }
     var blocked = vec3<f32>(0.0);
+    var inferred = 0.0;
     let ids=vec2<u32>(lighting_settings.baked_indirect_curve.zw);
     for (var i=0u;i<4u;i+=1u) {
         let encoded=(ids[i/2u] >> ((i%2u)*8u)) & 255u;
         if encoded==0u {continue;}
         let light=dynamic_lights[encoded-1u];
-        if light.shape.w < 0.5 || light.shadow.x < 0.5 { continue; }
+        if light.shadow.x < 0.5 { continue; }
+        // shape.w == -1: shadow-only lamp (e.g. a world flare). It has no
+        // baked irradiance layer, so it can only be attributed the same way
+        // as in original lighting. Previously it was skipped here, so a
+        // flare-only lamp could never darken anything while lightmap
+        // reconstruction was active.
+        if light.shape.w < -0.5 { inferred += inferred_lamp_block(light,input); continue; }
+        if light.shape.w < 0.5 { continue; }
         let delta = light.position_radius.xyz - input.world_position;
         if dot(delta,delta) >= light.position_radius.w*light.position_radius.w { continue; }
         let visibility = baked_local_moving_visibility(light,input.world_position,input.world_normal);
         if visibility >= 0.9999 { continue; }
         blocked += light.color_intensity.rgb * sample_baked_local(input.lightmap_uv,i32(light.shape.w-1.0)) * (1.0-visibility);
     }
-    return max(lightmap-blocked,vec3(0.0));
+    return remove_inferred_blocked(max(lightmap-blocked,vec3(0.0)),inferred);
 }
 
 fn baked_local_total(input: VertexOut) -> vec3<f32> {

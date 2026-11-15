@@ -701,3 +701,70 @@ fn shadow_ab_octant_bounds_are_conservative() {
     let mask = moving_caster_octants([-2.0, 20.0, 20.0], [2.0, 40.0, 40.0], lamp, 64.0);
     assert_eq!(mask & 0b1100_0000, 0b1100_0000);
 }
+
+fn test_shadow_lamp(position: [f32; 3], normal: [f32; 3], source: u32) -> scene::DynamicLight {
+    scene::DynamicLight {
+        position, color: [1.0; 3], radius: 300.0, intensity: 1.0,
+        shadow_power: 200.0, falloff: scene::DynamicLightFalloff::Smooth,
+        surface_lighting: true, emitter_normal: normal, emitter_two_sided: false,
+        angle_attenuation: true, angle_scale: 0.0, extra_distance: 0.0,
+        shader_promotion_mask: source,
+    }
+}
+
+#[test]
+fn shadow_sources_combine_across_all_six_classes_without_losing_toggle_independence() {
+    use super::super::lightmap_local as classes;
+    let types = [classes::AUTHORED, crate::materials::SHADER_LIGHT_GLOW,
+        crate::materials::SHADER_LIGHT_ADDITIVE,
+        crate::materials::SHADER_LIGHT_EMISSIVE_COMPANION,
+        classes::FX, classes::FLARES];
+    let lights: Vec<_> = types.iter().enumerate().map(|(i, class)| {
+        test_shadow_lamp([i as f32 * 2.0, 0.0, 0.0],
+            if *class == classes::AUTHORED { [0.0, 1.0, 0.0] } else { [0.0; 3] },
+            if *class == classes::AUTHORED {0} else {*class})
+    }).collect();
+    let groups=static_lamp_shadow_groups(&lights);
+    assert!(groups.iter().all(|g|*g==groups[0]));
+    for (i, kind) in types.iter().copied().enumerate() {
+        let enabled: Vec<_> = lights.iter().enumerate()
+            .filter(|(_,l)| classes::shadow_source_enabled(l,kind))
+            .map(|(j,_)|(j,10.0)).collect();
+        let baked_indices = vec![true; lights.len()];
+        assert_eq!(combine_lamp_shadow_candidates(
+            &lights,&groups,&baked_indices,kind,&enabled),vec![i],
+            "source {kind} must still work independently");
+    }
+    let baked_indices=vec![true;lights.len()];
+    assert_eq!(combine_lamp_shadow_candidates(&lights,&groups,&baked_indices,
+        classes::ALL,&(0..6).map(|i|(i,10.0+i as f32)).collect::<Vec<_>>()),vec![0],
+        "the authored fixture wins without combining intensities");
+}
+
+#[test]
+fn lamp_combining_rejects_distinct_and_opposing_wall_fixtures() {
+    use super::super::lightmap_local as classes;
+    let lights = [
+        test_shadow_lamp([0.0, 0.0, 0.0],[0.0, 1.0, 0.0],0),
+        test_shadow_lamp([0.0, 0.0, 16.0],[0.0,-1.0, 0.0],classes::FX),
+        test_shadow_lamp([0.0, 0.0, 32.0],[0.0, 1.0, 0.0],classes::FLARES),
+        test_shadow_lamp([0.0, 0.0, 64.0],[0.0, 1.0, 0.0],classes::FLARES),
+    ];
+    let groups=static_lamp_shadow_groups(&lights);
+    assert_ne!(groups[0],groups[1],"back-to-back normals never combine");
+    assert_eq!(groups[0],groups[2],"fixtures within 32 can combine");
+    assert_ne!(groups[0],groups[3],"adjacent 32-unit hops must not chain");
+}
+
+#[test]
+fn authored_lamps_do_not_merge_with_points_behind_the_face() {
+    use super::super::lightmap_local as classes;
+    let lights=[
+        test_shadow_lamp([0.0,0.0,0.0],[0.0,1.0,0.0],0),
+        test_shadow_lamp([0.0,-24.0,0.0],[0.0;3],classes::FLARES),
+        test_shadow_lamp([0.0,10.0,0.0],[0.0;3],classes::FX),
+    ];
+    let groups=static_lamp_shadow_groups(&lights);
+    assert_ne!(groups[0],groups[1]);
+    assert_eq!(groups[0],groups[2]);
+}

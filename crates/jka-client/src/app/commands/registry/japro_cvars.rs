@@ -5,7 +5,7 @@ settings_cvars! { JaproCgame;
     APP_CG_AUTOKILLWHENFALLING {
         runtime: CvarDef::new(
             "cg_autoKillWhenFalling", "0", "0|1",
-            "TaystJK: send kill and a two-usercmd attack pulse to try to skip the pit-death wait; client only, default off.",
+            "Send kill and a two-usercmd attack pulse to try to skip the pit-death wait; client only, default off.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(u8::from(app.japro_cg.auto_kill_when_falling).to_string()),
             |app, value| {
@@ -41,7 +41,7 @@ settings_cvars! { JaproCgame;
     APP_CG_LEADINDICATOR {
         runtime: CvarDef::new(
             "cg_leadIndicator", "0", "0 off | 1 ping | 2..2000 manual ms",
-            "TaystJK / jaPRO projectile lead markers. 0 off; 1 use snapshot ping; >=2 manual latency in milliseconds. Always disabled when the server advertises restricts bit 4 (RESTRICT_LEAD).",
+            "jaPRO projectile lead markers: 0 off; 1 uses snapshot ping; >=2 uses manual latency in milliseconds. Disabled when the server advertises restricts bit 4 (RESTRICT_LEAD).",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.japro_cg.lead_indicator.to_string()),
             |app, value| App::cvar_set_cg_leadindicator(app, APP_CG_LEADINDICATOR.entry.name, &value.to_string()),
@@ -87,7 +87,7 @@ settings_cvars! { JaproCgame;
                 "cg_remaps",
                 "1",
                 "0 | 1 | other nonzero",
-                "TaystJK shader-remap policy: 0 blocks incoming server remaps; 1 filters models/players/* from CS_SHADERSTATE; other non-zero values allow all. Local /remapShader is unaffected. Session-only; changes apply to subsequent server remaps immediately.",
+                "Server shader-remap policy: 0 blocks incoming remaps; 1 filters models/players/* from CS_SHADERSTATE; other non-zero values allow all. Local /remapShader is unaffected. Session-only; changes apply immediately to subsequent server remaps.",
                 CvarType::String,
                 CvarFlags::NONE,
                 LatchScope::None,
@@ -190,7 +190,7 @@ settings_cvars! { JaproCgame;
 
     APP_CG_FORCEPUSHDISTORTION {
         runtime: CvarDef::new("cg_forcePushDistortion", "1", "0 | 1",
-            "Force Push/Pull: 0 original TaystJK screen-copy half-shield, 1 depth-aware screen-space shockwave with animated concentric refraction and chromatic fringe. cg_renderToTextureFX 0 still disables refraction.",
+            "Force Push/Pull: 0 classic screen-copy half-shield, 1 depth-aware screen-space shockwave with animated concentric refraction and chromatic fringe. cg_renderToTextureFX 0 still disables refraction.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(App::cvar_get_cg_forcepushdistortion(app)),
             |app, value| App::cvar_set_cg_forcepushdistortion(app, APP_CG_FORCEPUSHDISTORTION.entry.name, &value.to_string()))
@@ -241,7 +241,7 @@ settings_cvars! { JaproCgame;
     }
 
     APP_CG_RENDERTOTEXTUREFX {
-        runtime: CvarDef::new("cg_renderToTextureFX", "", "0 | 1 | 2 | 3 | 4 | 5", "0 TaystJK blue cloak; 1 TaystJK refraction; 2 Predator UV grid; 3 Predator object-space rings; 4 Predator world-space rings; 5 Predator view-space rings. Predator modes use experimental WGPU optics.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_rendertotexturefx(app)), |app, value| App::cvar_set_cg_rendertotexturefx(app, APP_CG_RENDERTOTEXTUREFX.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_rendertotexturefx, None),
+        runtime: CvarDef::new("cg_renderToTextureFX", "", "0 | 1 | 2 | 3 | 4 | 5", "0 classic blue cloak; 1 classic refraction; 2 Predator UV grid; 3 Predator object-space rings; 4 Predator world-space rings; 5 Predator view-space rings. Predator modes use experimental WGPU optics.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_rendertotexturefx(app)), |app, value| App::cvar_set_cg_rendertotexturefx(app, APP_CG_RENDERTOTEXTUREFX.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_rendertotexturefx, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, name, value| {
                     let _ = settings.japro.set_cvar(name, value);
@@ -1826,7 +1826,7 @@ settings_cvars! { JaproCgame;
     }
 
     APP_CP_ALTDIMALPHA {
-        runtime: CvarDef::new("cp_altDimAlpha", "", "1..255", "TaystJK JA+: alpha byte for players in the other dimension (default 40).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cp_altdimalpha(app)), |app, value| App::cvar_set_cp_altdimalpha(app, APP_CP_ALTDIMALPHA.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cp_altdimalpha, None),
+        runtime: CvarDef::new("cp_altDimAlpha", "", "1..255", "JA+: alpha byte for players in the other dimension (default 40).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cp_altdimalpha(app)), |app, value| App::cvar_set_cp_altdimalpha(app, APP_CP_ALTDIMALPHA.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cp_altdimalpha, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, name, value| {
                     let _ = settings.japro.set_cvar(name, value);
@@ -1930,7 +1930,7 @@ settings_cvars! { JaproCgame;
     }
 
     APP_CL_COMMANDSIZE {
-        runtime: CvarDef::new("cl_commandsize", "auto", "auto|64|128|256|512", "TaystJK-style command history window shared by prediction, network command selection and CONNECTION INTERRUPTED. AUTO scales with cl_commandRate and ping (minimum 64). Manual numbers snap UP to a supported power of two.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cl_commandsize(app)), |app, value| App::cvar_set_cl_commandsize(app, APP_CL_COMMANDSIZE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cl_commandsize, None),
+        runtime: CvarDef::new("cl_commandsize", "auto", "auto|64|128|256|512", "Command history window shared by prediction, network command selection and CONNECTION INTERRUPTED. AUTO scales with cl_commandRate and ping (minimum 64). Manual numbers round up to a supported power of two.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cl_commandsize(app)), |app, value| App::cvar_set_cl_commandsize(app, APP_CL_COMMANDSIZE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cl_commandsize, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, name, value| {
                     let _ = settings.japro.set_cvar(name, value);

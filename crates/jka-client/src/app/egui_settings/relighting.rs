@@ -32,6 +32,7 @@ impl App {
     }
 
     pub(in crate::app::egui_settings) fn egui_relighting(&mut self, ui: &mut egui::Ui) {
+        self.egui_relighting_profiles(ui);
         let defaults = VideoSettings::default();
         const MODES: [(u8, &str); 3] = [(0, "Off"), (1, "Baked"), (2, "Realtime")];
         if let Some(mode) = segmented_row(ui, "Relighting",
@@ -48,8 +49,14 @@ impl App {
             theme::section(ui, "TIME OF DAY", "Artistic 24-hour cycle; sunrise 6 AM, noon 12 PM, sunset 6 PM. Sun and moon positions update together; lunar phase and original map lighting stay independently adjustable.");
             theme::row(ui, "Time", "3 AM to the following 3 AM. Match system time uses the PC's local clock; Realtime follows it, Baked captures it at map load. Manual slider and shadow/sky selection are otherwise unchanged.", theme::Reset::None, |ui| {
                 let matching = self.video.relight_match_system_time;
+                // The disabled slider is a clock readout, not the archived
+                // manual position. Baked mode may still be using a sample
+                // captured at map load; display the current local time without
+                // changing that sample or triggering another bake.
                 let mut time = if matching {
-                    self.relight_clock_effective.unwrap_or(self.video.relight_time)
+                    use chrono::Timelike;
+                    let now = chrono::Local::now();
+                    crate::app::settings::graphics::system_clock_relighting_hour(now.hour(), now.minute())
                 } else {
                     self.video.relight_time
                 };
@@ -79,9 +86,9 @@ impl App {
             });
             if self.video.relight_match_system_time && self.video.active_relighting_mode() == 1 {
                 let hint = if self.relight_clock_effective.is_some() {
-                    "Baked: system time was captured at map load and stays fixed until the next map load."
+                    "Baked: map lighting uses the time captured at map load. The disabled slider shows the current PC clock, which may have moved on."
                 } else {
-                    "Baked: the system clock will first be sampled at the next map load. The displayed time is your saved manual value."
+                    "Baked: the system clock will first be applied at the next map load. The disabled slider shows the current PC clock."
                 };
                 theme::hint(ui, hint, theme::TEXT_DIM());
             }
@@ -160,13 +167,20 @@ impl App {
                     );
                 }
             }
+            let detected_in_use = matches!(detected,
+                crate::renderer::BakedSunDirectionStatus::Found { using_detected: true, .. });
             theme::row(ui, "Find baked sun direction",
-                "One-time low-resolution CPU search of BSP shadow edges across azimuth/elevation, followed by coarse-to-fine refinement. Does not change the current sky sun. Reconstructs removal masks in the background; preserves the original map if the result is uncertain.",
+                "One-time low-resolution CPU search of BSP shadow edges across azimuth/elevation, followed by coarse-to-fine refinement. Does not change the current sky sun. Reconstructs removal masks in the background; preserves the original map if the result is uncertain. With Sky gain calibration set to C, maps without a q3map_sun run this automatically once; the result is then reused here instead of searching again.",
                 theme::Reset::None, |ui| {
-                    ui.add_enabled_ui(!matches!(detected,
+                    ui.add_enabled_ui(!detected_in_use && !matches!(detected,
                         crate::renderer::BakedSunDirectionStatus::Searching |
                         crate::renderer::BakedSunDirectionStatus::Unavailable), |ui| {
-                        if theme::ghost_button(ui, "FIND ORIGINAL SUN").clicked() {
+                        let label = if matches!(detected, crate::renderer::BakedSunDirectionStatus::Found { .. }) {
+                            if detected_in_use { "SUN DETECTED" } else { "USE DETECTED SUN" }
+                        } else {
+                            "FIND ORIGINAL SUN"
+                        };
+                        if theme::ghost_button(ui, label).clicked() {
                             self.render_command(crate::renderer::RenderCommand::FindBakedSunDirection);
                             self.video.baked_sun_removal_auto = true;
                             self.video.baked_sun_removal_contour = false;
@@ -396,6 +410,10 @@ impl App {
                     theme::hint(ui, "Realtime world sky is cached and recomposed when the sky changes (up to once/second); realtime caster shadows are still live. No full-screen sky multiplier.", theme::TEXT_DIM());
                 }
             }
+            if let Some(mode) = segmented_row(ui, "Sky gain calibration", "How the Blue Water sky gain is scaled against the authored lightmap. A: original absolute gain (can darken shadows by day). B: daylight fades the gain to the authored exposure by sun elevation. C: ratio of the current time of day to the map's authored time, taken from q3map_sun or the detected baked sun; if neither is known the gain stays neutral. Dusk and night keep the Blue Water tint. Vanilla sky is unaffected.", theme::Reset::None,
+                self.video.sky_world_gain_mode, &[(0, "A: Original"), (1, "B: Daylight"), (2, "C: Map time")]) {
+                let _ = self.set_console_cvar("r_skyWorldGainMode", &mode.to_string());
+            }
             theme::row(ui, "Sky world lighting", "World brightness adjustment: 0% off, 100% full. Vanilla uses sun elevation and traced sky openness; Blue Water uses atmospheric irradiance. Baked updates cached lighting, Realtime uses live Blue Water lighting or vanilla cached gain with live CSM.", theme::Reset::None, |ui| {
                 let mut strength = self.video.sky_world_lighting_strength;
                 let readout = format!("{:.0}%", strength * 100.0);
@@ -492,6 +510,7 @@ impl App {
         self.render_command(crate::renderer::RenderCommand::SetEntityFixtureLightingAB(false));
         self.video.sky_world_bake_ab = d.sky_world_bake_ab;
         self.video.sky_world_light_isolation = d.sky_world_light_isolation;
+        self.video.sky_world_gain_mode = d.sky_world_gain_mode;
         self.video.sky_world_lighting_strength = d.sky_world_lighting_strength;
         self.baked_sun_debug_view = 0;
         self.sun_ray_until = None;

@@ -1134,6 +1134,24 @@ mod tests {
     }
 
     #[test]
+    fn archived_script_cvar_round_trips_quoted_semicolons() {
+        let path = std::env::temp_dir().join(format!(
+            "djk-script-{}-{:?}.cfg", std::process::id(), std::thread::current().id()
+        ));
+        let mut presentation = ClientPresentationSettings::default();
+        let script = "+attack; wait 1; -attack; wait 1; +attack";
+        presentation.network.set_user_cvar("ac_attack", script,
+            crate::net::UserCvarFlags::ARCHIVE).unwrap();
+        let config = format_archived_config(VideoSettings::default(),
+            &crate::keybinds::Bindings::default(), &presentation, &AudioSettings::default());
+        assert!(config.contains(&format!("seta ac_attack \"{script}\"")));
+        fs::write(&path, config).unwrap();
+        let reloaded = load_client_presentation_settings(&path);
+        assert_eq!(reloaded.network.user_cvar("ac_attack").unwrap().value, script);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn userinfo_only_custom_cvars_are_not_archived_by_default() {
         let mut presentation = ClientPresentationSettings::default();
         presentation.network.set_user_cvar("nwh", "1", crate::net::UserCvarFlags::USERINFO).unwrap();

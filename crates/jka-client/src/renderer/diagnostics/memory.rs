@@ -23,6 +23,11 @@ pub(in crate::renderer) fn texture_bytes(texture: &wgpu::Texture) -> u64 {
 impl Renderer {
     pub(in crate::renderer) fn print_memory_report(&self) {
         let mib = 1024.0 * 1024.0;
+        if let Some(sky) = &self.realtime_sky_normals {
+            let stream = self.world.as_ref().and_then(|w| w.sky_normal_buffer.as_ref()).map_or(0, |b| b.size());
+            println!("MEMORY GPU realtime sky normals: target {:.2} MiB, static vertex stream {:.2} MiB",
+                texture_bytes(&sky.texture) as f64 / mib, stream as f64 / mib);
+        }
         if let Some(vram) = super::vram::query(&self.adapter.get_info()) {
             println!(
                 "MEMORY GPU dedicated VRAM (DXGI, whole process incl. driver): {:.2} MiB used of {:.2} MiB OS budget ({:.0}%); GPU-visible system memory {:.2} MiB",

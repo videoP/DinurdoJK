@@ -4622,7 +4622,7 @@ impl App {
                     sui::prop_toggle(ui,"Avoid walls",&mut follow.orbit_collision).on_hover_text("Avoid BSP walls during orbit");
                 } else {
                     if follow.perspective==StudioFollowPerspective::ThirdPerson {
-                        sui::prop_toggle(ui,"Chase motion",&mut follow.motion_direction).on_hover_text("Chase movement direction (TaystJK angle -1)");
+                        sui::prop_toggle(ui,"Chase motion",&mut follow.motion_direction).on_hover_text("Orient the chase camera toward movement direction");
                     }
                     let yaw_free=follow.perspective!=StudioFollowPerspective::ThirdPerson || !follow.motion_direction;
                     ui.add_enabled_ui(yaw_free,|ui| {

@@ -892,10 +892,12 @@ impl SoundPresenter {
 
     /// `S_StartSound(NULL, clientNum, CHAN_BODY, sfx)`: one footstep of player
     /// `entity`, from `position` until the mixer knows where that player is.
-    pub fn play_footstep(&mut self, qpath: &str, entity: u16, position: [f32; 3]) {
+    /// Whether the sound was handed to the backend (`false`: no backend, or the
+    /// sample could not be registered, which is also warned about once).
+    pub fn play_footstep(&mut self, qpath: &str, entity: u16, position: [f32; 3]) -> bool {
         const CHAN_BODY: i32 = 6;
         if self.backend.is_none() {
-            return;
+            return false;
         }
         match self.assets.register(qpath) {
             Ok(sound) => {
@@ -905,8 +907,12 @@ impl SoundPresenter {
                         sound,
                     );
                 }
+                true
             }
-            Err(error) => self.warn_once(qpath, &error),
+            Err(error) => {
+                self.warn_once(qpath, &error);
+                false
+            }
         }
     }
 
@@ -986,17 +992,20 @@ impl SoundPresenter {
             return;
         }
         for qpath in candidates {
-            match self.assets.register(qpath) {
+            let resolved = tables::announcer_asset_path(
+                qpath, jka_assets::pk3::active_jk2().is_some(),
+            );
+            match self.assets.register(&resolved) {
                 Ok(sound) => {
                     if let Some(backend) = &mut self.backend {
                         backend.play(
-                            SoundRequest { qpath: (*qpath).to_owned(), entity: 1023, channel: CHAN_ANNOUNCER, origin: SoundOrigin::Local },
+                            SoundRequest { qpath: resolved.into_owned(), entity: 1023, channel: CHAN_ANNOUNCER, origin: SoundOrigin::Local },
                             sound,
                         );
                     }
                     return;
                 }
-                Err(error) => self.warn_once(qpath, &error),
+                Err(error) => self.warn_once(&resolved, &error),
             }
         }
     }
@@ -1512,7 +1521,9 @@ impl SoundPresenter {
                         Err(_) => continue, // dispatch reports the same failure
                     }
                 } else {
-                    vec![request.qpath.clone()]
+                    vec![tables::announcer_asset_path(
+                        &request.qpath, jka_assets::pk3::active_jk2().is_some(),
+                    ).into_owned()]
                 };
                 let key = candidates.join("|").replace('\\', "/").to_ascii_lowercase();
                 if !seen.insert(key) {
@@ -1547,6 +1558,14 @@ impl SoundPresenter {
             request.qpath = resolved_qpath;
             Ok(sound)
         } else {
+            // Event preparation is game-independent; resolve cgame announcer
+            // paths here on the owner thread and retain the resolved qpath for
+            // playback/diagnostics. Staging uses the same conversion above.
+            if let std::borrow::Cow::Owned(path) = tables::announcer_asset_path(
+                &request.qpath, jka_assets::pk3::active_jk2().is_some(),
+            ) {
+                request.qpath = path;
+            }
             self.assets.register(&request.qpath)
         }
     }

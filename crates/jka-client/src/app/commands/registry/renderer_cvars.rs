@@ -1139,7 +1139,7 @@ app_cvars! {
     }
 
     APP_R_FASTSKY {
-        runtime: CvarDef::new("r_fastsky", "", "0..10", "TaystJK fast sky: 0 authored skybox/cloud stages; 1 pale sky blue; 2 green; 3 yellow; 4 blue; 5 cyan; 6 magenta; 7 white; 8 orange; 9 grey; 10 red. Skips sky drawing in Unified, without adding a rendering pass.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_fastsky", "", "0..10", "Fast sky: 0 authored skybox/cloud stages; 1 pale sky blue; 2 green; 3 yellow; 4 blue; 5 cyan; 6 magenta; 7 white; 8 orange; 9 grey; 10 red. Skips sky drawing in Unified, without adding a rendering pass.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.fast_sky.to_string()),
             |app, value| App::cvar_set_fast_sky(app, APP_R_FASTSKY.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_fast_sky, None),
@@ -1210,7 +1210,7 @@ app_cvars! {
     }
 
     APP_R_COLLISION_WORLD {
-        runtime: CvarDef::new("r_collisionWorld", "", "0..1", "Live competitive-world A/B: 0 authored world/materials, 1 native BSP geometry with original PVS/area/frustum culling and one indexed multidraw. Uses flat shading by default; r_shitterTexture enables one shared factory/base image. No collision/acoustic mesh, lightmaps, or duplicate world buffers. Flat player team colors and gunmetal weapons/hilts retained. Legacy cvar name for live A/B. Archived.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_collisionWorld", "", "0..1", "Live competitive-world A/B: 0 authored world/materials, 1 native BSP geometry with original PVS/area/frustum culling and one indexed multidraw. Uses flat shading by default; r_shitterTexture enables two shared jaPRO grid images. No collision/acoustic mesh, lightmaps, or duplicate world buffers. Flat player team colors and gunmetal weapons/hilts retained. Legacy cvar name for live A/B. Archived.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |_app: &App| CvarValue::String(u8::from(crate::renderer::collision_world_only()).to_string()),
             |app, value| App::cvar_set_collision_world(app, APP_R_COLLISION_WORLD.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_collision_world, Some(|name, value| {
@@ -1235,6 +1235,9 @@ app_cvars! {
                 if self.video.collision_world != enabled {
                     self.video.collision_world = enabled;
                     self.mark_config_dirty();
+                    // Native sky/post visibility changes when flat BSP takes over.
+                    // Notify the renderer on the cvar transition, never per frame.
+                    self.sync_post_effects();
                 }
                 self.console_status = format!("NATIVE BSP WORLD: {}", if enabled { "ON" } else { "OFF" });
                 self.push_console_line(format!("[NATIVE BSP WORLD] {} (original BSP geometry/PVS/multidraw, optional raw image via r_shitterTexture)", if enabled { "ON" } else { "OFF" }));
@@ -1244,7 +1247,7 @@ app_cvars! {
     }
 
     APP_R_SHITTER_TEXTURE {
-        runtime: CvarDef::new("r_shitterTexture", "", "0..1", "Shitter native BSP world only: 0 original flat shader (zero texture samples), 1 one repeating raw textures/factory/base image with directional lighting. Ignores the authored JKA material stages; lazily loads the image and builds a separate pipeline. Archived.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_shitterTexture", "", "0..1", "Shitter native BSP world only: 0 original flat shader (zero texture samples), 1 orange_grid with gray_grid on horizontal surfaces with directional lighting. Ignores the authored JKA material stages; lazily loads the two images and builds a separate pipeline. Archived.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |_app: &App| CvarValue::String(u8::from(crate::renderer::shitter_texture_enabled()).to_string()),
             |app, value| App::cvar_set_shitter_texture(app, APP_R_SHITTER_TEXTURE.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_shitter_texture, Some(|name, value| {
@@ -1271,7 +1274,7 @@ app_cvars! {
                     self.mark_config_dirty();
                 }
                 self.console_status = format!("SHITTER WORLD TEXTURE: {}", if enabled { "ON" } else { "OFF" });
-                self.push_console_line(format!("[SHITTER WORLD TEXTURE] {}: {}", if enabled { "ON" } else { "OFF" }, if enabled { "textures/factory/base, single sampled stage" } else { "original sample-free flat shader" }));
+                self.push_console_line(format!("[SHITTER WORLD TEXTURE] {}: {}", if enabled { "ON" } else { "OFF" }, if enabled { "japro/orange_grid + horizontal gray_grid, one sampled stage" } else { "original sample-free flat shader" }));
                 Ok(())
             }
         }]
@@ -1795,6 +1798,26 @@ app_cvars! {
             fn cvar_set_r_bakedlocalfx(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let on = Self::parse_cvar_bool(name, value)?;
                 if on { self.video.baked_local_sources |= 16; } else { self.video.baked_local_sources &= !16; }
+                self.sync_lamp_shadow_sources(); self.mark_config_dirty(); self.publish_ui(); Ok(())
+            }
+        } ]
+    }
+
+    APP_R_BAKEDLOCALFLARES {
+        runtime: CvarDef::new("r_bakedLocalFlares", "", "0..1", "Use RBSP world flare locations as shadow-only lamp sources. Reuse nearby existing sources; add no direct illumination.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(App::cvar_get_r_bakedlocalflares(app)),
+            |app, value| App::cvar_set_r_bakedlocalflares(app, APP_R_BAKEDLOCALFLARES.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_bakedlocalflares, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| { if let Some(on) = parse_bool(value) { if on { settings.baked_local_sources |= 32; } else { settings.baked_local_sources &= !32; } } }),
+            archive: Some((14307, |state| format!("{}", u8::from(state.video.baked_local_sources & 32 != 0)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [ impl App {
+            fn cvar_get_r_bakedlocalflares(&self) -> String { bool_value(self.video.baked_local_sources & 32 != 0) }
+            fn cvar_set_r_bakedlocalflares(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let on = Self::parse_cvar_bool(name, value)?;
+                if on { self.video.baked_local_sources |= 32; } else { self.video.baked_local_sources &= !32; }
                 self.sync_lamp_shadow_sources(); self.mark_config_dirty(); self.publish_ui(); Ok(())
             }
         } ]
@@ -2400,6 +2423,40 @@ app_cvars! {
         } ]
     }
 
+    APP_R_SKYWORLDGAINMODE {
+        runtime: CvarDef::new("r_skyWorldGainMode", "2", "0..2", "Blue Water sky-world gain calibration against the authored lightmap. 0 A: original absolute gain (can crush shadows by day). 1 B: daylight fades the gain to 1 (authored exposure) by sun elevation, vanilla-style. 2 C (default): ratio of the live time of day to the map's authored time, taken from q3map_sun or the shadow-detected sun; unknown sun keeps the gain neutral. Affects Baked and Realtime world, vertex-lit surfaces and models; dusk/night keep the Blue Water tint.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.video.sky_world_gain_mode.to_string()),
+            |app, value| App::cvar_set_r_skyworldgainmode(app, APP_R_SKYWORLDGAINMODE.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_r_skyworldgainmode, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(mode) = value.trim().parse::<u8>().ok().filter(|mode| *mode <= 2) {
+                    settings.sky_world_gain_mode = mode;
+                }
+            }),
+            archive: Some((37127, |state| state.video.sky_world_gain_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_r_skyworldgainmode(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>()
+                    .ok().filter(|mode| *mode <= 2)
+                    .ok_or_else(|| format!("{name}: expected 0, 1 or 2"))?;
+                if self.video.sky_world_gain_mode != mode {
+                    self.video.sky_world_gain_mode = mode;
+                    self.sync_post_effects();
+                    self.mark_config_dirty();
+                }
+                self.console_status = format!("SKY WORLD GAIN: {mode} ({})", [
+                    "A original absolute gain", "B daylight fades to authored exposure",
+                    "C ratio to the map's authored time of day",
+                ][mode as usize]);
+                self.publish_ui();
+                Ok(())
+            }
+        } ]
+    }
+
     APP_R_SKYWORLDLIGHTISOLATION {
         runtime: CvarDef::new("r_skyWorldLightIsolation", "0", "0|1", "Protect authored indoor/local lighting from Sky world gain using cached sky-visibility rays (0 legacy, 1 geometry-weighted). Baked: use r_skyWorldBakeAB 1. Realtime: route static BSP sky into the cached composition while retaining live CSM shadows. Approximate: original BSP lightmaps do not separate sky GI from every compiled point light.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(bool_value(app.video.sky_world_light_isolation)),
@@ -2924,8 +2981,8 @@ app_cvars! {
         runtime: CvarDef::new(
                 "r_flares",
                 "",
-                "0..1",
-                "OpenJK/TaystJK world flares (RBSP MST_FLARE); r_worldFlares can independently enable the same GPU renderer.",
+                "0..2 (Off/Legacy/Enhanced)",
+                "Authored BSP flare presentation: 0 Off, 1 Legacy (OpenJK/TaystJK), 2 Enhanced screen-space lens flare. r_worldFlares is a legacy enable override.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -2935,28 +2992,188 @@ app_cvars! {
             .with_text_setter(App::cvar_set_r_flares, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
-                    settings.flares = parse_bool(value).unwrap_or(settings.flares)
+                    settings.flares = match value.trim().to_ascii_lowercase().as_str() {
+                        "0" | "false" | "off" => 0,
+                        "1" | "true" | "on" | "legacy" => 1,
+                        "2" | "enhanced" => 2,
+                        _ => settings.flares,
+                    }
                 }),
                 archive: Some((133, |state| {
                     let settings = state.video;
-                    format!("{}", u8::from(settings.flares))
+                    settings.flares.to_string()
                 })),
                 ..CvarBinding::NONE
             },
         implementations: [
             impl App {
                 fn cvar_get_r_flares(&self) -> String {
-                    bool_value(self.video.flares)
+                    self.video.flares.to_string()
                 }
                 fn cvar_set_r_flares(&mut self, name: &str, value: &str) -> Result<(), String> {
                     {
-                        self.video.flares = Self::parse_cvar_bool(name, value)?;
+                        self.video.flares = match value.trim().to_ascii_lowercase().as_str() {
+                            "0" | "false" | "off" => 0,
+                            "1" | "true" | "on" | "legacy" => 1,
+                            "2" | "enhanced" => 2,
+                            _ => return Err(format!("{name}: expected 0 (Off), 1 (Legacy), or 2 (Enhanced)")),
+                        };
+                        // Explicit mode selections from console or UI outrank
+                        // the optional legacy world-flare override.
+                        self.video.world_flares = false;
                         self.sync_world_flares();
                         self.mark_config_dirty();
                         self.publish_ui();
                         self.console_status =
-                            format!("WORLD FLARES: {}", if self.video.world_flares_active() { "ON" } else { "OFF" });
+                            format!("WORLD FLARES: {}", self.video.world_flare_mode_label());
                     }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FLARE_ENHANCED_INTENSITY {
+        runtime: CvarDef::new(
+            "r_flareEnhancedIntensity", "0.12", "0..1",
+            "Enhanced-only flare brightness; multiplies the final lens tint. Legacy and saber flares unchanged.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(format!("{:.3}", app.video.flare_enhanced_intensity)),
+            |app, value| App::cvar_set_r_flare_enhanced_intensity(app, APP_R_FLARE_ENHANCED_INTENSITY.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_flare_enhanced_intensity, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.trim().parse::<f32>() {
+                    if v.is_finite() && (0.0..=1.0).contains(&v) {
+                        settings.flare_enhanced_intensity = v;
+                    }
+                }
+            }),
+            archive: Some((1429, |state| format!("{:.3}", state.video.flare_enhanced_intensity))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_flare_enhanced_intensity(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let strength = value.trim().parse::<f32>()
+                        .map_err(|_| format!("{name}: expected a number from 0 to 1"))?;
+                    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+                        return Err(format!("{name}: expected a finite number from 0 to 1"));
+                    }
+                    self.video.flare_enhanced_intensity = strength;
+                    self.sync_world_flares();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+    APP_R_FLARE_ENHANCED_CORE {
+        runtime: CvarDef::new(
+            "r_flareEnhancedCore", "3.0", "0..8",
+            "Enhanced-only multiplier of the localized source peak; 0 hides the peak, 1 preserves original strength, 3 is default. Screen wash is independent.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(format!("{:.3}", app.video.flare_enhanced_core)),
+            |app, value| App::cvar_set_r_flare_enhanced_core(app, APP_R_FLARE_ENHANCED_CORE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_flare_enhanced_core, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.trim().parse::<f32>() {
+                    if v.is_finite() && (0.0..=8.0).contains(&v) {
+                        settings.flare_enhanced_core = v;
+                    }
+                }
+            }),
+            archive: Some((1432, |state| format!("{:.3}", state.video.flare_enhanced_core))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_flare_enhanced_core(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let strength = value.trim().parse::<f32>()
+                        .map_err(|_| format!("{name}: expected a number from 0 to 8"))?;
+                    if !strength.is_finite() || !(0.0..=8.0).contains(&strength) {
+                        return Err(format!("{name}: expected a finite number from 0 to 8"));
+                    }
+                    self.video.flare_enhanced_core = strength;
+                    self.sync_world_flares();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FLARE_ENHANCED_WASH {
+        runtime: CvarDef::new(
+            "r_flareEnhancedWash", "0.10", "0..1",
+            "Enhanced-only broad screen-wash strength; 0 keeps localized lens features, 1 preserves the full Shadertoy-style veil.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(format!("{:.3}", app.video.flare_enhanced_wash)),
+            |app, value| App::cvar_set_r_flare_enhanced_wash(app, APP_R_FLARE_ENHANCED_WASH.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_flare_enhanced_wash, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.trim().parse::<f32>() {
+                    if v.is_finite() && (0.0..=1.0).contains(&v) {
+                        settings.flare_enhanced_wash = v;
+                    }
+                }
+            }),
+            archive: Some((1430, |state| format!("{:.3}", state.video.flare_enhanced_wash))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_flare_enhanced_wash(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let strength = value.trim().parse::<f32>()
+                        .map_err(|_| format!("{name}: expected a number from 0 to 1"))?;
+                    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+                        return Err(format!("{name}: expected a finite number from 0 to 1"));
+                    }
+                    self.video.flare_enhanced_wash = strength;
+                    self.sync_world_flares();
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_FLARE_ENHANCED_LOCALITY {
+        runtime: CvarDef::new(
+            "r_flareEnhancedLocality", "0.70", "0..1",
+            "Enhanced-only screen-distance falloff; higher values confine the lens effect closer to the authored source.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(format!("{:.3}", app.video.flare_enhanced_locality)),
+            |app, value| App::cvar_set_r_flare_enhanced_locality(app, APP_R_FLARE_ENHANCED_LOCALITY.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_flare_enhanced_locality, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(v) = value.trim().parse::<f32>() {
+                    if v.is_finite() && (0.0..=1.0).contains(&v) {
+                        settings.flare_enhanced_locality = v;
+                    }
+                }
+            }),
+            archive: Some((1431, |state| format!("{:.3}", state.video.flare_enhanced_locality))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_flare_enhanced_locality(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let strength = value.trim().parse::<f32>()
+                        .map_err(|_| format!("{name}: expected a number from 0 to 1"))?;
+                    if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+                        return Err(format!("{name}: expected a finite number from 0 to 1"));
+                    }
+                    self.video.flare_enhanced_locality = strength;
+                    self.sync_world_flares();
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }
@@ -2994,7 +3211,7 @@ app_cvars! {
     APP_R_WORLDFLARES {
         runtime: CvarDef::new(
                 "r_worldFlares", "", "0..1",
-                "Optional world-flare override (same GPU renderer as r_flares); does not control saber overlays.",
+                "Legacy compatibility toggle: enables Legacy when r_flares is Off. Selecting a menu mode clears this override.",
                 CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
                 |app: &App| CvarValue::String(bool_value(app.video.world_flares)),
                 |app: &mut App, value: CvarValue| App::cvar_set_r_worldflares(app, APP_R_WORLDFLARES.entry.name, &value.to_string()),
@@ -3012,7 +3229,7 @@ app_cvars! {
                     self.video.world_flares = Self::parse_cvar_bool(name, value)?;
                     self.sync_world_flares();
                     self.mark_config_dirty();
-                    self.console_status = format!("WORLD FLARES: {}", if self.video.world_flares_active() { "ON" } else { "OFF" });
+                    self.console_status = format!("WORLD FLARES: {}", self.video.world_flare_mode_label());
                     self.publish_ui();
                     Ok(())
                 }
@@ -4827,7 +5044,7 @@ app_cvars! {
                 "r_lodbias",
                 "",
                 "0..8",
-                "TaystJK Ghoul2/MD3/BSP-model LOD bias; higher values select cheaper authored or generated geometry.",
+                "Ghoul2/MD3/BSP-model LOD bias; higher values select cheaper authored or generated geometry.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,

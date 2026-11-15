@@ -291,7 +291,7 @@ impl App {
         );
         mouse_number!(
             "Sensitivity",
-            "sensitivity. TaystJK mouse sensitivity multiplier; stock default is 5. Raw input does not bypass this scaling.",
+            "sensitivity. Mouse sensitivity multiplier; default is 5. Raw input still uses this scaling.",
             sensitivity,
             "sensitivity",
             0.1,
@@ -299,7 +299,7 @@ impl App {
         );
         mouse_number!(
             "Yaw scale",
-            "m_yaw. Horizontal mouse scale applied after sensitivity/acceleration; TaystJK default is 0.022.",
+            "m_yaw. Horizontal mouse scale applied after sensitivity/acceleration; default is 0.022.",
             yaw,
             "m_yaw",
             0.001,
@@ -307,7 +307,7 @@ impl App {
         );
         mouse_number!(
             "Pitch scale",
-            "m_pitch. Vertical mouse scale applied after sensitivity/acceleration; TaystJK default is 0.022. A negative value inverts vertical look.",
+            "m_pitch. Vertical mouse scale applied after sensitivity/acceleration; default is 0.022. A negative value inverts vertical look.",
             pitch,
             "m_pitch",
             0.001,
@@ -315,7 +315,7 @@ impl App {
         );
         mouse_number!(
             "Mouse acceleration",
-            "cl_mouseAccel. TaystJK legacy style-0 acceleration; 0 disables it. With subframe input, DinurdoJK uses the raw-event interval as the acceleration timebase rather than waiting for a client frame.",
+            "cl_mouseAccel. Legacy mouse acceleration; 0 disables it. With subframe input, acceleration uses the raw-event interval instead of waiting for a client frame.",
             accel,
             "cl_mouseAccel",
             0.01,

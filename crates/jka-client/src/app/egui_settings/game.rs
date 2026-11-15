@@ -204,7 +204,7 @@ impl App {
                 if let Some(mode) = segmented_row(
                     ui,
                     "Automatic head tracking",
-                    "cg_headLook. Off: no automatic look-target head turns. On: unchanged TaystJK/OpenJK behavior. Smoothed: gradually rotate toward new targets, without changing their selection or gameplay aim.",
+                    "cg_headLook. Off: no automatic look-target head turns. On: standard tracking. Smoothed: gradually rotate toward new targets, without changing their selection or gameplay aim.",
                     theme::Reset::None,
                     self.head_look,
                     &[(0, "Off"), (1, "On"), (2, "Smoothed")],

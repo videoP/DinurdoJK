@@ -318,9 +318,8 @@ impl App {
                 self.render_view_latch
             },
             input_view_rotation,
-            dynamic_crosshair_world: self
-                .crosshair_target
-                .dynamic
+            dynamic_crosshair_world: (self.crosshair.effective_dynamic_mode() != 0
+                && self.crosshair_target.dynamic)
                 .then_some(self.crosshair_hit_world)
                 .flatten(),
             player_position: demo_player_position

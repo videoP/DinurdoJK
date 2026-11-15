@@ -803,6 +803,7 @@ impl App {
             sun_terminator: self.video.sun_terminator,
             sky_world_bake_ab: effective.sky_world_bake_ab,
             sky_world_light_isolation: effective.sky_world_light_isolation,
+            sky_world_gain_mode: effective.sky_world_gain_mode,
             sky_world_lighting_strength: effective.sky_world_lighting_strength,
             bake_threads: self.video.bake_threads,
             baked_sun_shadow_map: self.video.baked_sun_shadow_map,
@@ -889,7 +890,13 @@ impl App {
     /// Synchronize the effective world-flare enable to the render thread.
     /// No saber overlay is affected by either world-flare cvar.
     pub(in crate::app) fn sync_world_flares(&self) {
-        self.render_command(RenderCommand::SetWorldFlares(self.video.world_flares_active()));
+        self.render_command(RenderCommand::SetWorldFlares {
+            mode: self.video.world_flare_mode(),
+            enhanced_intensity: self.video.flare_enhanced_intensity,
+            enhanced_core: self.video.flare_enhanced_core,
+            enhanced_wash: self.video.flare_enhanced_wash,
+            enhanced_locality: self.video.flare_enhanced_locality,
+        });
     }
 
     pub(in crate::app) fn sync_gpu_visibility(&self) {
@@ -1202,6 +1209,7 @@ impl App {
             ui::VIDEO_ROW_BAKED_LOCAL_EMISSIVE => { self.video.baked_local_sources ^= 4; self.sync_lamp_shadow_sources(); self.mark_config_dirty(); }
             ui::VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT => { self.video.baked_local_sources ^= 8; self.sync_lamp_shadow_sources(); self.mark_config_dirty(); }
             ui::VIDEO_ROW_BAKED_LOCAL_FX => { self.video.baked_local_sources ^= 16; self.sync_lamp_shadow_sources(); self.mark_config_dirty(); }
+            ui::VIDEO_ROW_BAKED_LOCAL_FLARES => { self.video.baked_local_sources ^= 32; self.sync_lamp_shadow_sources(); self.mark_config_dirty(); }
             ui::VIDEO_ROW_PROMOTE_SHADER_GLOW => {
                 self.video.promote_shader_glow = !self.video.promote_shader_glow;
                 self.sync_added_map_lights();
@@ -1252,11 +1260,11 @@ impl App {
                 let _ = self.set_console_cvar("r_saberCoreMode", &mode.to_string());
             }
             ui::VIDEO_ROW_FLARES => {
-                self.video.flares = !self.video.flares;
+                self.video.flares = (self.video.world_flare_mode() as i32 + direction).rem_euclid(3) as u8;
+                self.video.world_flares = false;
                 self.sync_world_flares();
                 self.mark_config_dirty();
-                self.console_status =
-                    format!("WORLD FLARES: {}", if self.video.world_flares_active() { "ON" } else { "OFF" });
+                self.console_status = format!("WORLD FLARES: {}", self.video.world_flare_mode_label());
             }
             ui::VIDEO_ROW_SABER_FLARES => {
                 self.video.saber_flares = !self.video.saber_flares;
@@ -2332,7 +2340,7 @@ struct RelightingCelestialArc {
     moon_elevation: f32,
 }
 
-fn system_clock_relighting_hour(local_hour: u32, local_minute: u32) -> f32 {
+pub(in crate::app) fn system_clock_relighting_hour(local_hour: u32, local_minute: u32) -> f32 {
     let hour = local_hour as f32 + local_minute as f32 / 60.0;
     if local_hour < 3 { hour + 24.0 } else { hour }
 }

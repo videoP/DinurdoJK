@@ -112,7 +112,7 @@ impl App {
         theme::row(
             ui,
             "Sky settings",
-            "These settings are saved and carry over to every map and every launch. Reset all returns this whole page to its shipped values. Double-click any slider or its label to reset just that one.",
+            "These settings are saved normally unless a relighting profile is active. Use Saved Profiles on Relighting to keep named looks or choose a map default. Reset all returns this whole page to its shipped values; double-click a slider or label to reset one setting.",
             theme::Reset::None,
             |ui| {
                 ui.add_enabled_ui(changed != 0, |ui| {

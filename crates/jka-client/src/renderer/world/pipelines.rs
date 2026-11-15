@@ -18,7 +18,7 @@ impl Renderer {
         // leave the JKA skybox visible).
         // SDR direct sky has already mapped its radiance into display range.
         self.gameplay_scene_format() == wgpu::TextureFormat::Rgba16Float
-            && self.sky_backend == 1 && self.blue_water_sky.is_some() && self.blue_water_environment.filmic
+            && self.native_sky_surface_visible() && self.blue_water_sky.is_some() && self.blue_water_environment.filmic
     }
 
     pub(in crate::renderer) fn effective_auto_exposure_strength(&self) -> f32 {
@@ -161,10 +161,11 @@ impl Renderer {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let jk2_legacy_color = self.jk2_legacy_color;
         let key = PipelineJobKey::new(
             "companion-world",
             0,
-            pipeline_hash(&(scene_format, samples, &unique_keys)),
+            pipeline_hash(&(scene_format, samples, &unique_keys, jk2_legacy_color)),
         );
         if let Some(pipelines) = self
             .pipeline_jobs
@@ -179,10 +180,23 @@ impl Renderer {
         let batches = world.coarse_batches.clone();
         self.pipeline_jobs
             .request(key, "companion-world set", move || {
+                // bsp_fast has no full WorldShaderVariantKey overrides. Build
+                // a JK2-only copy on the lazy companion worker; JKA reuses the
+                // original fast module and incurs no new shader cost.
+                let jk2_shader = jk2_legacy_color.then(|| {
+                    let source = include_str!("../../bsp_fast.wgsl").replace(
+                        "override JK2_LEGACY_COLOR: bool = false;",
+                        "override JK2_LEGACY_COLOR: bool = true;",
+                    );
+                    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("JK2 companion legacy-color world shader"),
+                        source: wgpu::ShaderSource::Wgsl(source.into()),
+                    })
+                });
                 create_world_pipelines(
                     &device,
                     &layout,
-                    &shader,
+                    jk2_shader.as_ref().unwrap_or(&shader),
                     scene_format,
                     samples,
                     &batches,
@@ -558,6 +572,14 @@ pub(in crate::renderer) fn material_uniform(
     // active. Decode it only on these prepared stages (including fused ones).
     if source.baked_sky_overlay {
         out.header[3] |= super::variants::MATERIAL_FLAGS_W_SKY_OVERLAY;
+    }
+    // Authored full-brightness overlay (rgbGen identityLighting, alpha blend) over a
+    // vertex-lit base: relighting scales it with the base. Other blends stay exact.
+    if source.vertex_lit
+        && matches!(source.rgb_gen, RgbGen::IdentityLighting)
+        && matches!(source.pipeline.blend, BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha))
+    {
+        out.header[3] |= super::variants::MATERIAL_FLAGS_W_VERTEX_OVERLAY;
     }
     // Dedicated cached-AO receiver bit for q3map LIGHTMAP_BY_VERTEX stages.
     // Restrict it to the stage that actually consumes BSP vertex RGB so
@@ -962,7 +984,7 @@ pub(in crate::renderer) fn create_ocean_native_mesh_pipeline(
     let mut constants = variant.base_pass_key().compilation_constants();
     constants.push(("ENABLE_ALPHA_TEST", 1.0));
     let vertex_constants = constants.iter().copied()
-        .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS"))
+        .filter(|(name, _)| !matches!(*name, "ENABLE_RAY_TRACED_SHADOWS" | "JK2_LEGACY_COLOR"))
         .collect::<Vec<_>>();
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some(if wireframe { "JKA submerged native ocean wireframe" } else { "JKA submerged native ocean mesh" }),
@@ -2118,18 +2140,31 @@ pub(in crate::renderer) fn create_depth_prepass_pipeline_with_entry(
     shader: &wgpu::ShaderModule,
     fragment_entry: &str,
 ) -> wgpu::RenderPipeline {
+    let sky = fragment_entry == "fs_sky";
+    let mut buffers = vec![Some(wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex, attributes: &VERTEX_ATTRIBUTES,
+    })];
+    if sky { buffers.push(Some(wgpu::VertexBufferLayout {
+        array_stride: 12, step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 6 }],
+    })); }
+    let mut targets = vec![
+        Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R32Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+        Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rg16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+        Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+    ];
+    if sky { targets.push(Some(wgpu::ColorTargetState {
+        format: wgpu::TextureFormat::Rg16Float, blend: None, write_mask: wgpu::ColorWrites::ALL,
+    })); }
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA AO depth prepass pipeline"),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_main"),
+            entry_point: Some(if sky { "vs_sky" } else { "vs_main" }),
             compilation_options: Default::default(),
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &VERTEX_ATTRIBUTES,
-            })],
+            buffers: &buffers,
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -2148,23 +2183,7 @@ pub(in crate::renderer) fn create_depth_prepass_pipeline_with_entry(
             module: shader,
             entry_point: Some(fragment_entry),
             compilation_options: Default::default(),
-            targets: &[
-                Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R32Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rg16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-            ],
+            targets: &targets,
         }),
         multiview_mask: None,
         cache: crate::pipeline_cache::get().as_ref(),
@@ -2290,18 +2309,31 @@ pub(in crate::renderer) fn create_depth_prepass_mask_pipeline_with_entry(
     shader: &wgpu::ShaderModule,
     fragment_entry: &str,
 ) -> wgpu::RenderPipeline {
+    let sky = fragment_entry == "fs_sky_mask";
+    let mut buffers = vec![Some(wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex, attributes: &VERTEX_ATTRIBUTES,
+    })];
+    if sky { buffers.push(Some(wgpu::VertexBufferLayout {
+        array_stride: 12, step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 6 }],
+    })); }
+    let mut targets = vec![
+        Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R32Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+        Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rg16Float, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+        Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+    ];
+    if sky { targets.push(Some(wgpu::ColorTargetState {
+        format: wgpu::TextureFormat::Rg16Float, blend: None, write_mask: wgpu::ColorWrites::ALL,
+    })); }
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("JKA alpha-tested depth prepass pipeline"),
         layout: Some(layout),
         vertex: wgpu::VertexState {
             module: shader,
-            entry_point: Some("vs_mask"),
+            entry_point: Some(if sky { "vs_sky_mask" } else { "vs_mask" }),
             compilation_options: Default::default(),
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &VERTEX_ATTRIBUTES,
-            })],
+            buffers: &buffers,
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
@@ -2320,23 +2352,7 @@ pub(in crate::renderer) fn create_depth_prepass_mask_pipeline_with_entry(
             module: shader,
             entry_point: Some(fragment_entry),
             compilation_options: Default::default(),
-            targets: &[
-                Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R32Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rg16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-            ],
+            targets: &targets,
         }),
         multiview_mask: None,
         cache: crate::pipeline_cache::get().as_ref(),

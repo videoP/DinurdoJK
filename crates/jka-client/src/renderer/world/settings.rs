@@ -539,6 +539,7 @@ impl Renderer {
         let shadowable_local_lights = point_lights || self.any_area_lights_enabled() || self.baked_local_shadows;
         WorldShaderVariantKey {
             shader_input_mode: self.shader_input_mode,
+            jk2_legacy_color: self.jk2_legacy_color,
             pbr: self.pbr_enabled && PBR_PROFILE_MATERIALS,
             pom: self.pbr_enabled && self.pom_enabled && PBR_PROFILE_PARALLAX_OCCLUSION,
             pbr_shared_material_eval: self.pbr_enabled && PBR_PROFILE_SHARED_MATERIAL_EVAL,
@@ -677,6 +678,7 @@ impl Renderer {
             || self.world.as_ref().is_some_and(|world| {
                 let key = &world.active_pipeline_variant;
                 key.weather_surface != needed
+                    || key.jk2_legacy_color != self.jk2_legacy_color
                     || key.classic_render_flags != classic
                     || key.static_bsp_ao != static_ao
                     || key.baked_sun_relight != baked_sun_relight

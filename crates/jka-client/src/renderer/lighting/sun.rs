@@ -15,6 +15,25 @@ pub(super) fn overcast_direct_fraction(coverage_steps: u8) -> f32 {
 }
 
 impl Renderer {
+    /// r_skyWorldGainMode inputs shared by every Blue Water world-gain consumer:
+    /// [mode, authored toward-sun Y, 1, 0]. The reference is the BSP's own baked
+    /// sun (q3map_sun, else the shadow-detected direction, which is searched for
+    /// automatically). While that is pending or rejected, assume a daytime map
+    /// (60 degrees) rather than leaving the gain flat.
+    pub(in crate::renderer) fn sky_gain_calibration(&self) -> [f32; 4] {
+        let reference = self.world.as_ref().filter(|world| !world.source_map)
+            .and_then(|world| world.sun_bake.baked_direction())
+            .map(|sun| -Vec3::from_array(sun.direction).normalize_or_zero().y)
+            .filter(|y| y.is_finite());
+        let direction_known = self.world.as_ref().filter(|world| !world.source_map)
+            .and_then(|world| world.sun_bake.baked_direction())
+            .is_some_and(|sun| Vec3::from_array(sun.direction).length_squared() > 1e-6);
+        let reference = reference.filter(|_| direction_known);
+        const ASSUMED_DAY_TOWARD_SUN_Y: f32 = 0.866;
+        [f32::from(self.sky_world_gain_mode.min(2)),
+            reference.unwrap_or(ASSUMED_DAY_TOWARD_SUN_Y), 1.0, 0.0]
+    }
+
     /// Only relit BSPs inherit volumetric cloud coverage. Ordinary JKA
     /// lightmaps/CSM retain their previous lighting without this feature.
     pub(in crate::renderer) fn relight_cloud_coverage_steps(&self) -> u8 {

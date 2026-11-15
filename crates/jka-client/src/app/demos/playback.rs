@@ -16,6 +16,19 @@ use crate::app::{
 use crate::camera::{ThirdPersonCameraState, ThirdPersonSettings, ThirdPersonViewOutput};
 use jka_movement::{TraceQuery, TraceResult, TraceWorld};
 
+/// Remaining frames of the `cg_specCamDebug` log; 0 = off (the default).
+static SPEC_CAM_DEBUG_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[derive(Clone, Copy)]
+struct SpecCamLast {
+    epoch: Instant,
+    wall: Instant,
+    frame: u32,
+    presentation_ms: f64,
+    damp_ms: f64,
+}
+static SPEC_CAM_LAST: std::sync::Mutex<Option<SpecCamLast>> = std::sync::Mutex::new(None);
+
 // A missing BSP is not an implicit camera collision. Keep worldless movement
 // prediction disabled, but still run the ordinary OpenJK third-person camera
 // with unobstructed presentation-only traces.
@@ -987,6 +1000,71 @@ impl App {
         }
     }
 
+    /// `cg_specCamDebug N`: arm a log of the next N rendered spectator-follow
+    /// frames (see `log_spectator_camera_debug`). 0 disarms.
+    pub(in crate::app) fn arm_spectator_camera_debug(&mut self, frames: u32) {
+        SPEC_CAM_DEBUG_FRAMES.store(frames, std::sync::atomic::Ordering::Relaxed);
+        SPEC_CAM_LAST.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if frames > 0 {
+            println!(
+                "SPECCAM columns: frame wall_ms wall_dt pres_ms pres_dt damp_clock damp_dt                  snapCur snapNext cmdCur cmdNext remoteMode camMode teleport client |                  rawOrigin presOrigin rawAngles presAngles | idealTarget dampedTarget                  idealLoc dampedLoc | finalOrigin finalAngles (stage order: first jump names the stage)"
+            );
+        }
+    }
+
+    /// One line per rendered spectator-follow frame while armed, to stdout
+    /// (latest.log). Stage order: raw snapshot -> presented (interpolated and
+    /// smoothed) -> ideal -> damped -> final camera.
+    fn log_spectator_camera_debug(&self, sample: &DemoCameraSample, view: &ThirdPersonViewOutput) {
+        use std::sync::atomic::Ordering;
+        if !sample.following || SPEC_CAM_DEBUG_FRAMES.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let Some(session) = self.game_session.as_ref().filter(|session| session.live) else { return };
+        let Ok(_) = SPEC_CAM_DEBUG_FRAMES.fetch_update(
+            Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)) else { return };
+        let now = Instant::now();
+        let mut last = SPEC_CAM_LAST.lock().unwrap_or_else(|p| p.into_inner());
+        let epoch = last.map_or(now, |last| last.epoch);
+        let (wall_dt, pres_dt, damp_dt, frame) = last.map_or((0.0, 0.0, 0.0, 0), |last| (
+            now.saturating_duration_since(last.wall).as_secs_f64() * 1000.0,
+            sample.presentation_time_ms - last.presentation_ms,
+            sample.damp_time_ms - last.damp_ms,
+            last.frame + 1,
+        ));
+        *last = Some(SpecCamLast {
+            epoch, wall: now, frame,
+            presentation_ms: sample.presentation_time_ms, damp_ms: sample.damp_time_ms,
+        });
+        let (ideal_target, damped_target, ideal_loc, damped_loc, _) =
+            self.third_person_camera.debug_snapshot();
+        let current = session.current_snapshot.as_ref();
+        let next = session.next_snapshot.as_ref();
+        let raw = |base: &str| current
+            .and_then(|snapshot| snapshot.player_state.field_vec3(base)).unwrap_or([f32::NAN; 3]);
+        let presented = |base: &str| session.presented_player_state()
+            .and_then(|ps| ps.field_vec3(base)).unwrap_or([f32::NAN; 3]);
+        let command = |snapshot: Option<&ProtocolSnapshot>| snapshot
+            .and_then(|snapshot| snapshot.player_state.field_i32("commandTime")).unwrap_or(-1);
+        let time = |snapshot: Option<&ProtocolSnapshot>| snapshot.map_or(-1, |snapshot| snapshot.server_time);
+        let v3 = |v: [f32; 3]| format!("{:.3} {:.3} {:.3}", v[0], v[1], v[2]);
+        println!(
+            "SPECCAM {frame} {:.3} {wall_dt:.3} {:.3} {pres_dt:.3} {:.3} {damp_dt:.3} {} {} {} {} {} {} {} {} | {} {} {} {} | {} {} {} {} | {} {}",
+            now.saturating_duration_since(epoch).as_secs_f64() * 1000.0,
+            sample.presentation_time_ms,
+            sample.damp_time_ms,
+            time(current), time(next), command(current), command(next),
+            crate::cgame::remote_smoothing::mode(),
+            self.spectator_camera.mode as i32,
+            u8::from(sample.teleported),
+            sample.client_num,
+            v3(raw("origin")), v3(presented("origin")),
+            v3(raw("viewangles")), v3(presented("viewangles")),
+            v3(ideal_target), v3(damped_target), v3(ideal_loc), v3(damped_loc),
+            v3(view.origin), v3(view.angles),
+        );
+    }
+
     pub(in crate::app) fn apply_demo_camera(&mut self, mut sample: DemoCameraSample) {
         // Vertical PM_AdjustAngleForWallRunUp repeatedly locks player yaw to BSP
         // plane normals. Suppress camera-only yaw spikes in live play and demos.
@@ -1133,10 +1211,11 @@ impl App {
                     },
                     dead_yaw: sample.dead_yaw,
                     client_num: sample.client_num,
-                    time: sample.presentation_time_ms,
+                    time: sample.damp_time_ms,
                     teleported: sample.teleported,
                 },
             );
+            self.log_spectator_camera_debug(&sample, &view);
             self.camera.position = glam::Vec3::from_array(scene::render_position(view.origin));
             self.camera.yaw = view.angles[1].to_radians();
             self.camera.pitch = -view.angles[0].to_radians();

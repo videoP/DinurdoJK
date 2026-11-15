@@ -349,6 +349,10 @@ impl Renderer {
         self.texture_filter = filter;
         self.repeat_sampler = create_texture_sampler(&self.device, false, filter);
         self.clamp_sampler = create_texture_sampler(&self.device, true, filter);
+        // The native ShitteR grids have their own bind group, outside the
+        // standard world materials. Rebind its sampler too, otherwise a live
+        // r_textureMode change only becomes visible after vid_restart.
+        self.rebind_shitter_texture_sampler();
         if let Some(world) = &mut self.world {
             rebuild_world_bind_groups(
                 &self.device,

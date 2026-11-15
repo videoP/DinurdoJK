@@ -32,6 +32,13 @@ struct FlareInstance {
     fog: [f32; 4], // local authored fog RGB + depth
 }
 
+// Immutable map data: preconverted exactly once instead of per render frame.
+#[derive(Clone, Copy)]
+struct PreparedFlare {
+    center: glam::Vec3,
+    instance: FlareInstance,
+}
+
 // One tiny immutable uniform per unique authored flare stage (not per flare).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -49,6 +56,7 @@ struct FlareStageUniform {
 
 struct FlareStageGpu {
     blend: Option<BlendFunc>,
+    is_image: bool,
     bind_group: wgpu::BindGroup,
     _uniform: wgpu::Buffer,
 }
@@ -141,11 +149,18 @@ struct FlareView {
 
 pub(super) struct WorldFlareRenderer {
     candidates: Vec<scene::WorldFlare>,
+    prepared: Vec<PreparedFlare>,
     scratch: Vec<FlareInstance>,
     // Indexed by BSP shader, then authored stage order.
     stages: BTreeMap<usize, Vec<FlareStageGpu>>,
     stage_layout: Option<wgpu::BindGroupLayout>,
     stage_pipeline: BTreeMap<Option<BlendFunc>, wgpu::RenderPipeline>,
+    enhanced_pipeline: Option<wgpu::RenderPipeline>,
+    mode: u8,
+    enhanced_intensity: f32,
+    enhanced_core: f32,
+    enhanced_wash: f32,
+    enhanced_locality: f32,
     stage_pipeline_format: Option<(wgpu::TextureFormat, u32)>,
     last_camera: Option<(glam::Vec3, glam::Vec3)>,
     uniform: Option<wgpu::Buffer>,
@@ -175,8 +190,10 @@ pub(super) struct WorldFlareRenderer {
 impl Default for WorldFlareRenderer {
     fn default() -> Self {
         Self {
-            candidates: Vec::new(), scratch: Vec::new(), stages: BTreeMap::new(),
+            candidates: Vec::new(), prepared: Vec::new(), scratch: Vec::new(), stages: BTreeMap::new(),
             stage_layout: None, stage_pipeline: BTreeMap::new(),
+            enhanced_pipeline: None, mode: 1, enhanced_intensity: 0.12,
+            enhanced_core: 3.0, enhanced_wash: 0.10, enhanced_locality: 0.70,
             stage_pipeline_format: None, last_camera: None, uniform: None,
             instances: None, states: None, draw_bind_group: None,
             compute_bind_group: None, draw_layout: None,
@@ -215,6 +232,31 @@ fn buffer_layout_entry(binding: u32, stages: wgpu::ShaderStages, read_only: bool
 }
 
 impl WorldFlareRenderer {
+    pub(super) fn set_enhanced_intensity(&mut self, value: f32) {
+        self.enhanced_intensity = if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.12 };
+    }
+
+    pub(super) fn set_enhanced_core(&mut self, value: f32) {
+        self.enhanced_core = if value.is_finite() { value.clamp(0.0, 8.0) } else { 3.0 };
+    }
+
+    pub(super) fn set_enhanced_wash(&mut self, value: f32) {
+        self.enhanced_wash = if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.10 };
+    }
+
+    pub(super) fn set_enhanced_locality(&mut self, value: f32) {
+        self.enhanced_locality = if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.70 };
+    }
+
+    pub(super) fn set_mode(&mut self, mode: u8) {
+        if self.mode != mode.min(2) {
+            // Preserve accumulated occlusion/fade when switching appearance;
+            // only restart the history on an actual enable/disable boundary.
+            if self.mode == 0 || mode == 0 { self.invalidate_history(); }
+            self.mode = mode.min(2);
+        }
+    }
+
     pub(super) fn invalidate_history(&mut self) {
         self.states = None;
         self.draw_bind_group = None;
@@ -229,6 +271,24 @@ impl WorldFlareRenderer {
 
     pub(super) fn load(&mut self, candidates: &[scene::WorldFlare]) {
         self.candidates = candidates.to_vec();
+        // A map's authored shader indices and flare positions never change.
+        // Sort ONCE so PVS filtering keeps contiguous material-stage groups
+        // without re-sorting the scratch buffer at 1500+ FPS.
+        self.candidates.sort_unstable_by_key(|flare| flare.shader_index);
+        self.prepared = self.candidates.iter().enumerate().map(|(id, flare)| {
+            let position = glam::Vec3::from_array(scene::render_position(flare.origin));
+            let normal = scene::render_position(flare.normal);
+            PreparedFlare {
+                center: position + 3.0 * glam::Vec3::from_array(normal),
+                instance: FlareInstance {
+                    origin_radius: [position.x, position.y, position.z, flare.radius],
+                    color: [flare.color[0], flare.color[1], flare.color[2],
+                        if flare.fog_is_global { 1.0 } else { 0.0 }],
+                    normal: [normal[0], normal[1], normal[2], id as f32],
+                    fog: flare.fog,
+                },
+            }
+        }).collect();
         self.stages.clear();
         self.stage_pipeline.clear();
         self.last_camera = None;
@@ -258,15 +318,15 @@ impl WorldFlareRenderer {
                 label: Some("RBSP flare authored material stage layout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
-                        binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
+                        binding: 0, visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true },
                             view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
-                        binding: 1, visibility: wgpu::ShaderStages::FRAGMENT,
+                        binding: 1, visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None,
                     },
-                    buffer_layout_entry(2, wgpu::ShaderStages::FRAGMENT, true, true),
+                    buffer_layout_entry(2, wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT, true, true),
                 ],
             }));
         }
@@ -308,14 +368,18 @@ impl WorldFlareRenderer {
                         wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() },
                     ],
                 });
-                gpu_stages.push(FlareStageGpu { blend: Some(stage.blend.unwrap_or(FLARE_OPAQUE_BLEND)), bind_group: group, _uniform: uniform });
+                gpu_stages.push(FlareStageGpu {
+                    blend: Some(stage.blend.unwrap_or(FLARE_OPAQUE_BLEND)),
+                    is_image: matches!(stage.texture, StageTexture::Image(_)),
+                    bind_group: group, _uniform: uniform,
+                });
             }
             self.stages.insert(flare.shader_index, gpu_stages);
         }
     }
 
     fn resources(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat,
-                 samples: u32, depth: &wgpu::TextureView) {
+                 samples: u32, depth: &wgpu::TextureView, thermal_legacy: bool) {
         if self.uniform.is_none() {
             self.uniform = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("RBSP world flare camera"),
@@ -420,59 +484,108 @@ impl WorldFlareRenderer {
                 cache: crate::pipeline_cache::get().as_ref(),
             })));
         }
-        if self.stage_pipeline_format == Some((format, samples))
-            && !self.stage_pipeline.is_empty() { return; }
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("RBSP world flares"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../world_flares.wgsl").into()),
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("RBSP world flare draw pipeline layout"),
-            bind_group_layouts: &[Some(self.draw_layout.as_ref().unwrap()), Some(self.stage_layout.as_ref().unwrap())],
-            immediate_size: 0,
-        });
         if self.stage_pipeline_format != Some((format, samples)) {
             self.stage_pipeline.clear();
+            self.enhanced_pipeline = None;
             self.stage_pipeline_format = Some((format, samples));
         }
-        let mut blends = vec![Some(DEFAULT_FLARE_BLEND)];
-        for stages in self.stages.values() {
-            for stage in stages { if !blends.contains(&stage.blend) { blends.push(stage.blend); } }
+        let enhanced = self.mode == 2;
+        let need_legacy = !enhanced || thermal_legacy;
+        // Never specialize the Enhanced pipeline while rendering Legacy/Minimal.
+        if need_legacy && self.stage_pipeline.is_empty() {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("RBSP legacy world flares"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("../world_flares.wgsl").into()),
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("RBSP world flare material layout"),
+                bind_group_layouts: &[Some(self.draw_layout.as_ref().unwrap()), Some(self.stage_layout.as_ref().unwrap())],
+                immediate_size: 0,
+            });
+            let mut blends = vec![Some(DEFAULT_FLARE_BLEND)];
+            for stages in self.stages.values() {
+                for stage in stages { if !blends.contains(&stage.blend) { blends.push(stage.blend); } }
+            }
+            for blend in blends {
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("RBSP legacy flare stage draw"),
+                    layout: Some(&layout), vertex: wgpu::VertexState {
+                        module: &shader, entry_point: Some("vs"), buffers: &[],
+                        compilation_options: Default::default(),
+                    }, fragment: Some(wgpu::FragmentState {
+                        module: &shader, entry_point: Some("fs"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: blend.map(|func| wgpu::BlendState {
+                                color: wgpu::BlendComponent {
+                                    src_factor: gpu_blend_factor(func.src),
+                                    dst_factor: gpu_blend_factor(func.dst),
+                                    operation: wgpu::BlendOperation::Add,
+                                },
+                                alpha: wgpu::BlendComponent::OVER,
+                            }),
+                            write_mask: wgpu::ColorWrites::COLOR,
+                        })], compilation_options: Default::default(),
+                    }), primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        cull_mode: None, ..Default::default()
+                    }, depth_stencil: Some(wgpu::DepthStencilState {
+                        format: crate::renderer::depth_format(),
+                        depth_write_enabled: Some(false),
+                        depth_compare: Some(camera_depth_compare()),
+                        stencil: Default::default(), bias: Default::default(),
+                    }), multisample: wgpu::MultisampleState {
+                        count: samples, ..Default::default()
+                    }, multiview_mask: None, cache: crate::pipeline_cache::get().as_ref(),
+                });
+                self.stage_pipeline.insert(blend, pipeline);
+            }
         }
-        for blend in blends {
-        if self.stage_pipeline.contains_key(&blend) { continue; }
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("RBSP world flare batched additive draw"),
-            layout: Some(&pipeline_layout), vertex: wgpu::VertexState {
-                module: &shader, entry_point: Some("vs"), buffers: &[],
-                compilation_options: Default::default(),
-            }, fragment: Some(wgpu::FragmentState {
-                module: &shader, entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: blend.map(|func| wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: gpu_blend_factor(func.src),
-                            dst_factor: gpu_blend_factor(func.dst),
-                            operation: wgpu::BlendOperation::Add,
-                        },
-                        alpha: wgpu::BlendComponent::OVER,
-                    }),
-                    write_mask: wgpu::ColorWrites::COLOR,
-                })], compilation_options: Default::default(),
-            }), primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None, ..Default::default()
-            }, depth_stencil: Some(wgpu::DepthStencilState {
-                format: crate::renderer::depth_format(),
-                depth_write_enabled: Some(false),
-                depth_compare: Some(camera_depth_compare()),
-                stencil: Default::default(), bias: Default::default(),
-            }), multisample: wgpu::MultisampleState {
-                count: samples, ..Default::default()
-            }, multiview_mask: None, cache: crate::pipeline_cache::get().as_ref(),
-        });
-        self.stage_pipeline.insert(blend, pipeline);
+        if enhanced && self.enhanced_pipeline.is_none() {
+            // Reuse authored material binding layout and the legacy shader's
+            // color/wave/fog helpers, but render a procedural screen-space lens.
+            let source = format!("{}\n{}", include_str!("../world_flares.wgsl"),
+                include_str!("../world_flares_enhanced.wgsl"));
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("RBSP enhanced screen-space lens flares"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("RBSP enhanced lens flare layout"),
+                bind_group_layouts: &[Some(self.draw_layout.as_ref().unwrap()), Some(self.stage_layout.as_ref().unwrap())],
+                immediate_size: 0,
+            });
+            self.enhanced_pipeline = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("RBSP enhanced flare procedural draw"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs_enhanced"),
+                    buffers: &[], compilation_options: Default::default() },
+                fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs_enhanced"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent::OVER,
+                        }),
+                        write_mask: wgpu::ColorWrites::COLOR,
+                    })], compilation_options: Default::default() }),
+                primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None, ..Default::default() },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: crate::renderer::depth_format(),
+                    depth_write_enabled: Some(false),
+                    // The flare's source is depth-probed in compute. Ghosts
+                    // are optical artifacts and may cross foreground geometry.
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: Default::default(), bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+                multiview_mask: None, cache: crate::pipeline_cache::get().as_ref(),
+            }));
         }
     }
 
@@ -573,39 +686,27 @@ impl WorldFlareRenderer {
         let vp = view.view_proj;
         let view_cluster = view.cluster.or_else(|| visibility.and_then(|v| v.cluster_at(scene::jka_position(view.eye.to_array()))));
         self.scratch.clear();
-        for (id, flare) in self.candidates.iter().enumerate() {
+        for (flare, prepared) in self.candidates.iter().zip(&self.prepared) {
             if pvs_enabled && visibility.is_some_and(|v| !v.visible(view_cluster, &flare.clusters)) {
                 self.last_pvs_rejected += 1;
                 continue;
             }
-            let position = glam::Vec3::from_array(scene::render_position(flare.origin));
-            let normal = scene::render_position(flare.normal);
-            let center = position + 3.0 * glam::Vec3::from_array(normal);
             if view.clip_plane.is_some_and(|plane| {
-                glam::Vec4::from_array(plane).dot(center.extend(1.0)) < 0.0
+                glam::Vec4::from_array(plane).dot(prepared.center.extend(1.0)) < 0.0
             }) {
                 self.last_frustum_rejected += 1;
                 continue;
             }
-            let clip = vp * center.extend(1.0);
+            let clip = vp * prepared.center.extend(1.0);
             if !clip.is_finite() || clip.w <= 0.0 ||
                 clip.x.abs() > clip.w || clip.y.abs() > clip.w ||
                 clip.z < 0.0 || clip.z > clip.w {
                 self.last_frustum_rejected += 1;
                 continue;
             }
-            self.scratch.push(FlareInstance {
-                origin_radius: [position.x, position.y, position.z, flare.radius],
-                color: [flare.color[0], flare.color[1], flare.color[2], if flare.fog_is_global { 1.0 } else { 0.0 }],
-                normal: [normal[0], normal[1], normal[2], id as f32],
-                fog: flare.fog,
-            });
+            // Already in shader order. No per-frame sort or coordinate convert.
+            self.scratch.push(prepared.instance);
         }
-        // Group by authored shader, not flare. All stages in the shader draw
-        // instanced ranges; there is never a draw call per individual flare.
-        self.scratch.sort_unstable_by_key(|instance| {
-            self.candidates[instance.normal[3] as usize].shader_index
-        });
         self.last_drawn = self.scratch.len();
         self.last_filter_ms = begin.elapsed().as_secs_f64() * 1000.0;
         // Advance even if every candidate is culled this frame: a later
@@ -615,14 +716,21 @@ impl WorldFlareRenderer {
             self.last_cpu_ms = begin.elapsed().as_secs_f64() * 1000.0;
             return;
         }
-        self.resources(device, format, samples, depth);
+        self.resources(device, format, samples, depth, thermal_glow.is_some());
         let cam = FlareCamera {
             view_proj: vp.to_cols_array_2d(),
             right: view.right.extend(0.0).to_array(),
             up: view.up.extend(0.0).to_array(),
             eye: view.eye.extend(0.0).to_array(),
             viewport_time: [width as f32, height as f32, self.clock.elapsed().as_secs_f32(), fog_mode as f32],
-            frame: [self.frame_id, self.scratch.len() as u32, 0, 0],
+            // Enhanced-only controls packed in the spare frame.z/w slots:
+            // z = UNORM16 intensity + UNORM16 core/8, w = UNORM16 wash +
+            // UNORM16 locality. No legacy buffer layout or pipeline changes.
+            frame: [self.frame_id, self.scratch.len() as u32,
+                ((self.enhanced_core.clamp(0.0, 8.0) * (65535.0 / 8.0)).round() as u32) << 16 |
+                ((self.enhanced_intensity.clamp(0.0, 1.0) * 65535.0).round() as u32),
+                ((self.enhanced_locality.clamp(0.0, 1.0) * 65535.0).round() as u32) << 16 |
+                ((self.enhanced_wash.clamp(0.0, 1.0) * 65535.0).round() as u32)],
         };
         queue.write_buffer(self.uniform.as_ref().unwrap(), 0, bytemuck::bytes_of(&cam));
         queue.write_buffer(self.instances.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.scratch));
@@ -666,12 +774,25 @@ impl WorldFlareRenderer {
                     end += 1;
                 }
                 if let Some(stages) = self.stages.get(&shader) {
-                    for stage in stages {
-                        if let Some(pipeline) = self.stage_pipeline.get(&stage.blend) {
-                            pass.set_pipeline(pipeline);
+                    if self.mode == 2 {
+                        // One procedurally rendered lens per candidate rather
+                        // than N identical lenses for N material stages. Prefer
+                        // a texture stage to derive its authored color.
+                        if let Some(stage) = stages.iter().find(|stage| stage.is_image)
+                            .or_else(|| stages.first()) {
+                            pass.set_pipeline(self.enhanced_pipeline.as_ref().unwrap());
                             pass.set_bind_group(1, &stage.bind_group, &[]);
                             pass.draw(0..6, first as u32..end as u32);
                             self.last_stage_draws += 1;
+                        }
+                    } else {
+                        for stage in stages {
+                            if let Some(pipeline) = self.stage_pipeline.get(&stage.blend) {
+                                pass.set_pipeline(pipeline);
+                                pass.set_bind_group(1, &stage.bind_group, &[]);
+                                pass.draw(0..6, first as u32..end as u32);
+                                self.last_stage_draws += 1;
+                            }
                         }
                     }
                 }
@@ -751,6 +872,49 @@ mod tests {
         assert!(source.contains("@group(0) @binding(0) var<uniform> camera: FlareCamera;"));
         let fragment = source.split_once("@fragment fn fs").unwrap().1;
         assert!(fragment.contains("camera.viewport_time"));
+    }
+
+    #[test]
+    fn enhanced_world_flare_shader_uses_the_existing_occlusion_and_authored_materials() {
+        let source = include_str!("../world_flares_enhanced.wgsl");
+        assert!(source.contains("@vertex fn vs_enhanced"));
+        assert!(source.contains("@fragment fn fs_enhanced"));
+        assert!(source.contains("states[u32(flare.normal.w)]"));
+        assert!(source.contains("flare_texture"));
+        assert!(source.contains("textureSampleLevel"));
+        assert!(source.contains("visibility.visible == 0u"));
+        assert!(source.contains("out.clip = vec4<f32>(2.0, 2.0, 1.0, 1.0)"));
+        assert!(source.contains("mu6k_lensflare"));
+        // EnhancedOut already contains @builtin(position). The fragment entry
+        // point must not declare it again or wgpu rejects the shader module.
+        let fragment_args = source.split_once("@fragment fn fs_enhanced(")
+            .expect("enhanced fragment entry point").1
+            .split_once(") ->").expect("enhanced fragment signature").0;
+        assert_eq!(fragment_args.trim(), "v: EnhancedOut");
+        assert!(source.contains("v.clip.x"));
+        assert!(source.contains("v.clip.y"));
+    }
+
+    #[test]
+    fn enhanced_world_flare_uses_shadertoy_screen_scale_and_vertex_material_sampling() {
+        let source = include_str!("../world_flares_enhanced.wgsl");
+        assert!(source.contains("v.source_ndc.x * 0.5 * aspect"));
+        assert!(source.contains("v.source_ndc.y * 0.5"));
+        assert!(source.contains("out.clip = vec4<f32>(corners[vertex], 1.0, 1.0)"));
+        let vertex = source.split_once("@vertex fn vs_enhanced").unwrap().1
+            .split_once("@fragment fn fs_enhanced").unwrap().0;
+        assert!(vertex.contains("textureSampleLevel"));
+        let fragment = source.split_once("@fragment fn fs_enhanced").unwrap().1;
+        assert!(!fragment.contains("textureSampleLevel"));
+    }
+
+    #[test]
+    fn enhanced_core_is_independent_from_wash() {
+        let source = include_str!("../world_flares_enhanced.wgsl");
+        assert!(source.contains("components.wash * core_mask * core_gain"));
+        assert!(source.contains("components.wash * (1.0 - core_mask) * wash_strength"));
+        assert!(source.contains("core_gain = gains.y"));
+        assert!(source.contains("let enhanced_gain = unpack_enhanced_gain(camera.frame.z).x"));
     }
 
     #[test]

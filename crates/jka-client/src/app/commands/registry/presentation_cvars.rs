@@ -100,7 +100,7 @@ app_cvars! {
     }
 
     APP_CG_DRAWSCORES {
-        runtime: CvarDef::new("cg_drawScores", "", "0..3", "TaystJK score HUD: 0 off; 1 classic team scores; 2 classic with red/blue score colours; 3 centred team boxes (and duel HUD in GT_DUEL).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_drawscores(app)), |app, value| App::cvar_set_cg_drawscores(app, APP_CG_DRAWSCORES.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_drawscores, None),
+        runtime: CvarDef::new("cg_drawScores", "", "0..3", "Score HUD: 0 off; 1 classic team scores; 2 classic with red/blue score colours; 3 centred team boxes (and duel HUD in GT_DUEL).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_drawscores(app)), |app, value| App::cvar_set_cg_drawscores(app, APP_CG_DRAWSCORES.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_drawscores, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     {
@@ -142,7 +142,7 @@ app_cvars! {
 
 
     APP_CG_DRAWSCORE {
-        runtime: CvarDef::new("cg_drawScore", "2", "0..2", "TaystJK: score on the player HUD; 0 off, 1 score only, 2 includes team score and team lead/deficit.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(app.draw_score.to_string()), |app, value| App::cvar_set_draw_score(app, "cg_drawScore", &value.to_string())).with_text_setter(App::cvar_set_draw_score, None),
+        runtime: CvarDef::new("cg_drawScore", "2", "0..2", "Score on the player HUD; 0 off, 1 score only, 2 includes team score and team lead/deficit.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(app.draw_score.to_string()), |app, value| App::cvar_set_draw_score(app, "cg_drawScore", &value.to_string())).with_text_setter(App::cvar_set_draw_score, None),
         config: CvarBinding {
             load_presentation: Some(|settings, _, value| {
                 if let Ok(value) = value.trim().parse::<i32>() {
@@ -163,7 +163,7 @@ app_cvars! {
     }
 
     APP_CG_DRAWSCOREX {
-        runtime: CvarDef::new("cg_drawScoreX", "0", "float", "TaystJK: horizontal offset of the player-HUD score.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(app.draw_score_x.to_string()), |app, value| App::cvar_set_draw_score_x(app, "cg_drawScoreX", &value.to_string())).with_text_setter(App::cvar_set_draw_score_x, None),
+        runtime: CvarDef::new("cg_drawScoreX", "0", "float", "Horizontal offset of the player-HUD score.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(app.draw_score_x.to_string()), |app, value| App::cvar_set_draw_score_x(app, "cg_drawScoreX", &value.to_string())).with_text_setter(App::cvar_set_draw_score_x, None),
         config: CvarBinding {
             load_presentation: Some(|settings, _, value| {
                 if let Ok(value) = value.trim().parse::<f32>() {
@@ -186,7 +186,7 @@ app_cvars! {
     }
 
     APP_CG_DRAWSCOREY {
-        runtime: CvarDef::new("cg_drawScoreY", "0", "float", "TaystJK: vertical offset of the player-HUD score.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(app.draw_score_y.to_string()), |app, value| App::cvar_set_draw_score_y(app, "cg_drawScoreY", &value.to_string())).with_text_setter(App::cvar_set_draw_score_y, None),
+        runtime: CvarDef::new("cg_drawScoreY", "0", "float", "Vertical offset of the player-HUD score.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(app.draw_score_y.to_string()), |app, value| App::cvar_set_draw_score_y(app, "cg_drawScoreY", &value.to_string())).with_text_setter(App::cvar_set_draw_score_y, None),
         config: CvarBinding {
             load_presentation: Some(|settings, _, value| {
                 if let Ok(value) = value.trim().parse::<f32>() {
@@ -209,7 +209,7 @@ app_cvars! {
     }
 
     APP_CG_DRAWENEMYINFO {
-        runtime: CvarDef::new("cg_drawEnemyInfo", "1", "0|1", "TaystJK: top-right duel opponent, leader, and Jedi Master information.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(u8::from(app.draw_enemy_info).to_string()), |app, value| App::cvar_set_draw_enemy_info(app, "cg_drawEnemyInfo", &value.to_string())).with_text_setter(App::cvar_set_draw_enemy_info, None),
+        runtime: CvarDef::new("cg_drawEnemyInfo", "1", "0|1", "Top-right duel opponent, leader, and Jedi Master information.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app: &App| CvarValue::String(u8::from(app.draw_enemy_info).to_string()), |app, value| App::cvar_set_draw_enemy_info(app, "cg_drawEnemyInfo", &value.to_string())).with_text_setter(App::cvar_set_draw_enemy_info, None),
         config: CvarBinding {
             load_presentation: Some(|settings, _, value| {
                 settings.draw_enemy_info = parse_bool(value).unwrap_or(settings.draw_enemy_info);
@@ -228,7 +228,7 @@ app_cvars! {
     }
 
     APP_CG_DRAWTEAMOVERLAY {
-        runtime: CvarDef::new("cg_drawTeamOverlay", "", "0..6", "TaystJK team overlay: 0 off; 1/2 classic, 3/4 alternate, 5/6 compact scalable; even modes omit your own row.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_drawteamoverlay(app)), |app, value| App::cvar_set_cg_drawteamoverlay(app, APP_CG_DRAWTEAMOVERLAY.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_drawteamoverlay, None),
+        runtime: CvarDef::new("cg_drawTeamOverlay", "", "0..6", "Team overlay: 0 off; 1/2 classic, 3/4 alternate, 5/6 compact scalable; even modes omit your own row.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_drawteamoverlay(app)), |app, value| App::cvar_set_cg_drawteamoverlay(app, APP_CG_DRAWTEAMOVERLAY.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_drawteamoverlay, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     {
@@ -512,7 +512,7 @@ app_cvars! {
                 "cg_drawTeamOverlayX",
                 "",
                 "integer",
-                "Horizontal anchor for the TaystJK team overlay.",
+                "Horizontal anchor for the team overlay.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -563,7 +563,7 @@ app_cvars! {
                 "cg_drawTeamOverlayY",
                 "",
                 "integer",
-                "Vertical anchor for the TaystJK team overlay.",
+                "Vertical anchor for the team overlay.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,

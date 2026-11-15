@@ -78,7 +78,7 @@ impl App {
         if let Some(target) = segmented_row(
             ui,
             "FX physics",
-            "World collision for bouncing EFX debris (fx_physics, as in TaystJK). Particles, tails and \
+            "World collision for bouncing EFX debris (fx_physics). Particles, tails and \
              emitters bounce off the map using the exact OpenJK collision world, spawn their authored \
              impact effects and stop when they settle. Off lets them fly through walls. Authored (default) \
              traces only primitives the effect author marked expensivePhysics (rock falls, dust, \
@@ -134,7 +134,7 @@ impl App {
         });
 
         theme::row(ui, "Wall mark count",
-            "r_markcount: maximum retained authored EFX wall marks, default 100. Zero disables them. BSP marks follow TaystJK's markable-surface rules.",
+            "r_markcount: maximum retained authored EFX wall marks, default 100. Zero disables them. BSP marks appear only on markable surfaces.",
             theme::Reset::None, |ui| {
                 let mut count = self.video.mark_count;
                 if ui.add(egui::DragValue::new(&mut count).range(0..=4096).speed(1.0)).changed() {
@@ -173,14 +173,88 @@ impl App {
             }
         });
 
-        self.egui_toggle_row(
+        const FLARE_MODES: [(u8, &str); 3] = [
+            (0, "Off"), (1, "Legacy"), (2, "Enhanced"),
+        ];
+        if let Some(target) = segmented_row(
             ui,
-            "World flares (r_flares)",
-            "Standard authored BSP map flares. Uses the batched world-flare GPU renderer. \
-             The optional r_worldFlares override can also enable them independently.",
-            ui::VIDEO_ROW_FLARES,
-            self.video.flares,
-        );
+            "Map flares",
+            "r_flares: Off hides authored BSP world flares; Legacy preserves the original \
+             textured shader sprites; Enhanced replaces their appearance with a \
+             mu6k/ShaderToy-style procedural lens flare. The authored flare position, \
+             BSP tint, chosen shader image/color, occlusion and fog remain in use. \
+             Saber clash flares are separate.",
+            theme::Reset::Video(ui::VIDEO_ROW_FLARES),
+            self.video.world_flare_mode(),
+            &FLARE_MODES,
+        ) {
+            self.video_selected = ui::VIDEO_ROW_FLARES;
+            let _ = self.set_console_cvar("r_flares", &target.to_string());
+        }
+
+        ui.add_enabled_ui(self.video.world_flare_mode() == 2, |ui| {
+            theme::row(
+                ui,
+                "Enhanced flare intensity",
+                "r_flareEnhancedIntensity: final brightness of Enhanced map lens flares. \
+                 0% hides lens light, 12% is the balanced default, 100% is the unscaled \
+                 contribution. Multiplies authored tint after the lens equations, preserving \
+                 shape and color. Legacy and saber flares are unaffected.",
+                theme::Reset::None,
+                |ui| {
+                    let mut percent = self.video.flare_enhanced_intensity * 100.0;
+                    let readout = format!("{:.0}%", percent);
+                    if theme::slider(ui, &mut percent, 0.0..=100.0, &readout) {
+                        let value = (percent / 100.0).clamp(0.0, 1.0);
+                        let _ = self.set_console_cvar("r_flareEnhancedIntensity", &format!("{value:.3}"));
+                    }
+                },
+            );
+            theme::row(
+                ui,
+                "Enhanced flare source strength",
+                "r_flareEnhancedCore: scales only the narrow bright peak at the authored \
+                 light source. It is independent of the broad wash, so you can make \
+                 the origin bright without filling the screen. 1.0x = original \
+                 source peak; 3.0x = default. Legacy is unaffected.",
+                theme::Reset::None,
+                |ui| {
+                    let mut core = self.video.flare_enhanced_core;
+                    let readout = format!("{core:.1}x");
+                    if theme::slider(ui, &mut core, 0.0..=8.0, &readout) {
+                        let _ = self.set_console_cvar("r_flareEnhancedCore", &format!("{core:.3}"));
+                    }
+                },
+            );
+            theme::row(
+                ui,
+                "Enhanced flare wash",
+                "r_flareEnhancedWash: strength of the broad screen-filling haze component                  of the Enhanced lens flare. 0% keeps the localized lens/ghost features                  while removing the veil; 10% is the balanced default; 100% preserves                  the fully ported wash strength.",
+                theme::Reset::None,
+                |ui| {
+                    let mut percent = self.video.flare_enhanced_wash * 100.0;
+                    let readout = format!("{:.0}%", percent);
+                    if theme::slider(ui, &mut percent, 0.0..=100.0, &readout) {
+                        let value = (percent / 100.0).clamp(0.0, 1.0);
+                        let _ = self.set_console_cvar("r_flareEnhancedWash", &format!("{value:.3}"));
+                    }
+                },
+            );
+            theme::row(
+                ui,
+                "Enhanced flare localization",
+                "r_flareEnhancedLocality: screen-distance falloff for Enhanced flares.                  0% keeps the fully broad Shadertoy footprint; 70% is the balanced default;                  100% confines both the lens and wash much closer to the authored source.",
+                theme::Reset::None,
+                |ui| {
+                    let mut percent = self.video.flare_enhanced_locality * 100.0;
+                    let readout = format!("{:.0}%", percent);
+                    if theme::slider(ui, &mut percent, 0.0..=100.0, &readout) {
+                        let value = (percent / 100.0).clamp(0.0, 1.0);
+                        let _ = self.set_console_cvar("r_flareEnhancedLocality", &format!("{value:.3}"));
+                    }
+                },
+            );
+        });
 
         self.egui_toggle_row(
             ui,

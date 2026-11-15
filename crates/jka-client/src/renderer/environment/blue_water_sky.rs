@@ -36,17 +36,39 @@ fn aerial_reuse_time_valid(last: f32, now: f32) -> bool {
         && now - last < (1.0 / 60.0)
 }
 
+// The native flat-BSP (Shitter) renderer draws no authored sky surfaces.
+// Likewise, r_fastsky replaces the sky with a clear color. Neither should
+// request an atmosphere solely because the saved r_skyBackend is Blue Water.
+// Cloud, weather, water, and sky-driven lighting remain separate consumers.
+fn native_sky_surface_visible(sky_backend: u8, fast_sky: u8, flat_bsp_world: bool) -> bool {
+    sky_backend == 1 && fast_sky == 0 && !flat_bsp_world
+}
+
 impl crate::renderer::Renderer {
+    pub(in crate::renderer) fn native_sky_surface_visible(&self) -> bool {
+        native_sky_surface_visible(
+            self.sky_backend,
+            self.fast_sky,
+            crate::renderer::collision_world_only() && self.world.is_some(),
+        )
+    }
+
     /// Poll once before recording a frame. Requested settings stay untouched;
     /// absence of a compatible result means the authored sky keeps drawing.
     pub(in crate::renderer) fn ensure_native_atmosphere(&mut self, camera: &Camera) {
         use crate::pipeline_jobs::{hash_config, PipelineJobKey};
-        let requested = self.sky_backend == 1 || self.blue_water_environment.world_lighting > 0.0
+        let sky_visible = self.native_sky_surface_visible();
+        let requested = sky_visible || self.blue_water_environment.world_lighting > 0.0
             || self.blue_water_environment.weather_backend == 1
-            || (self.cloud_backend == 1 && self.clouds_enabled);
+            || (self.cloud_backend == 1 && self.clouds_enabled)
+            // Water may still need the environment map when Shitter hides the
+            // BSP sky; that is a real consumer, unlike the saved sky preference.
+            || (self.sky_backend == 1 && self.ocean_enabled && self.ocean_settings.backend != 0);
         if !requested {
             self.pipeline_jobs.cancel_slot("native-atmosphere", 0);
-            self.blue_water_sky = None;
+            if self.blue_water_sky.take().is_some() {
+                self.rebuild_frame_plan();
+            }
             return;
         }
         let settings = self.blue_water_environment.sanitize();
@@ -56,7 +78,7 @@ impl crate::renderer::Renderer {
             cloud_quality: settings.cloud_quality,
             clouds: self.cloud_backend == 1 && self.clouds_enabled,
             weather: settings.weather_backend == 1,
-            aerial: self.sky_backend == 1 && self.fast_sky == 0,
+            aerial: sky_visible,
             picmip: self.picmip.min(16),
         };
         if self.blue_water_sky.as_ref().is_some_and(|sky| sky.config == config) {
@@ -922,10 +944,12 @@ impl AtmosphereRenderer {
         portal: Option<(&wgpu::TextureView, f32)>,
         moon_light: Option<([f32; 3], f32)>,
         moon_csm: Option<(&wgpu::TextureView, &wgpu::Sampler, &wgpu::Buffer)>,
-        world_mask: (&wgpu::TextureView, &wgpu::TextureView, bool),
+        world_mask: (&wgpu::TextureView, &wgpu::TextureView, bool, Option<&wgpu::TextureView>),
         // Shared live model lighting in Baked and Realtime. This does not
         // require a fullscreen color/depth copy in Baked.
         model_sky: Option<(&wgpu::Buffer, u64, f32, bool)>,
+        // r_skyWorldGainMode calibration shared by the fullscreen pass and models.
+        gain: [f32; 4],
     ) -> bool {
         let flash = if self.settings.weather_backend == 1 {
             self.weather.light().flash
@@ -934,7 +958,7 @@ impl AtmosphereRenderer {
         };
         let world_strength = self.settings.world_lighting;
         let models_lit = if let Some((buffer, offset, strength, isolation)) = model_sky {
-            self.scene.model_sky_light(queue, encoder, &self.sky, strength, isolation, moon_light, (buffer, offset));
+            self.scene.model_sky_light(queue, encoder, &self.sky, strength, isolation, moon_light, (buffer, offset), gain);
             true
         } else { false };
         let scene_lighting = self.frame_camera.is_some()
@@ -968,6 +992,7 @@ impl AtmosphereRenderer {
                     moon_csm,
                     world_mask,
                     models_lit,
+                    gain,
                 );
             }
         }
@@ -1728,8 +1753,9 @@ mod native_tests {
                         None,
                         None,
                         None,
-                        (&roof.0, &motion, false),
+                        (&roof.0, &motion, false, None),
                         None,
+                        [0.0; 4],
                     );
                     atmosphere.apply_opaque_air(
                         &device,
@@ -1770,7 +1796,7 @@ mod native_tests {
                         assert_eq!(atmosphere.clouds.layers().0[0].altitude, 0.0);
                         assert_eq!(Some(atmosphere.last_time), atmosphere.frozen_time);
                         atmosphere.render_image(&device, &queue, &mut encoder, None, false);
-                        atmosphere.apply_scene(&device, &queue, &mut encoder, &color, resolve, &depth, true, None, None, None, (&roof.0, &motion, false), None);
+                        atmosphere.apply_scene(&device, &queue, &mut encoder, &color, resolve, &depth, true, None, None, None, (&roof.0, &motion, false, None), None, [0.0; 4]);
                         queue.submit(Some(encoder.finish()));
                         device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
                     }
@@ -1780,5 +1806,19 @@ mod native_tests {
             let error = scope.pop().await;
             assert!(error.is_none(), "native environment GPU validation: {error:?}");
         });
+    }
+}
+
+#[cfg(test)]
+mod native_sky_visibility_tests {
+    use super::native_sky_surface_visible;
+
+    #[test]
+    fn flat_world_and_fastsky_never_display_the_physical_dome() {
+        assert!(native_sky_surface_visible(1, 0, false));
+        assert!(!native_sky_surface_visible(1, 0, true));
+        assert!(!native_sky_surface_visible(1, 1, false));
+        assert!(!native_sky_surface_visible(1, 1, true));
+        assert!(!native_sky_surface_visible(0, 0, false));
     }
 }

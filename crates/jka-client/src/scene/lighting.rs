@@ -10,6 +10,159 @@ use crate::scene::{
 };
 use crate::scene::{parse_light_triplet, parse_map_f32, SourceMapLighting};
 
+
+/// Relative shadow strength of a world-flare lamp versus an authored lamp of
+/// the same radius (1.0 = authored). Tune this one constant: lower = fainter
+/// flare shadows, higher = darker. 0.02 is very subtle, 0.08 clearly visible, 0.3 strong.
+pub(in crate::scene) const FLARE_SHADOW_STRENGTH: f32 = 0.3;
+
+/// Keep BSP MST_FLARE candidates independent of authored, shader and EFX
+/// emitters until the complete catalog is available. The renderer's shared
+/// 32-unit fixture grouping combines their *shadow selection*, not the baked
+/// irradiance or independently switchable source properties.
+///
+/// A flare is an omnidirectional point lamp at its authored origin. Its normal
+/// is NOT a trustworthy emitter direction: q3map2 gives every `light` entity
+/// flare the default -Z (or the spotlight target direction), and only
+/// shader-flare surfaces carry a real surface normal (already offset 2 units).
+/// `clear_origin` moves an origin that sits inside solid world geometry out
+/// to the nearest open space (see `flare_lamp_origin`); the static cubemap
+/// draws both sides of every triangle, so a lamp embedded in its fixture sees
+/// that fixture at every direction and its static visibility is zero
+/// everywhere. Returns (lamps added, lamps relocated).
+pub(in crate::scene) fn append_world_flare_shadow_sources(
+    static_bake_lights: &mut Vec<DynamicLight>,
+    flares: &[crate::scene::WorldFlare],
+    clear_origin: impl Fn([f32; 3]) -> [f32; 3],
+) -> (usize, usize) {
+    let mut inferred = 0;
+    let mut relocated = 0;
+    for flare in flares {
+        if !flare.origin.iter().chain(flare.color.iter()).all(|v| v.is_finite())
+            || !flare.radius.is_finite() || flare.color.iter().all(|c| *c <= 0.0)
+        {
+            continue;
+        }
+        let origin = clear_origin(flare.origin);
+        if origin != flare.origin { relocated += 1; }
+        let center = Vec3::from_array(render_position(origin));
+        // The BSP flare size is a sprite hint, not a physical falloff radius.
+        let radius = (flare.radius * 8.0).clamp(192.0, 512.0);
+        let max_color = flare.color.iter().copied().fold(0.0_f32, f32::max);
+        let color = flare.color.map(|c| (c.max(0.0) / max_color).clamp(0.0, 1.0));
+        // Receiver-side shadow strength uses the same energy convention as an
+        // authored unit-intensity point/area lamp (intensity * radius^2 * 0.35,
+        // see `shape.y` in upload_light_buffer). The previous constant 1000
+        // was ~56x weaker at r=400: the moving-caster correction removed only
+        // ~1-2% of the lightmap, so selected and correctly rendered flare
+        // shadows were visually absent.
+        // FLARE_SHADOW_STRENGTH then scales that down: at 1.0 the correction
+        // saturates the receiver's 52% cap out to ~225 units (too dark for a
+        // decorative lamp); 0.3 gives a strong shadow (r=400 -> power ~16800,
+        // several times a typical glow fixture) and keeps flares from
+        // outranking glow lamps for slots.
+        let intensity = 1.0_f32;
+        let shadow_power = intensity * radius * radius * 0.35 * FLARE_SHADOW_STRENGTH;
+        static_bake_lights.push(DynamicLight {
+            position: center.to_array(), color, radius, intensity,
+            shadow_power, falloff: DynamicLightFalloff::Smooth,
+            surface_lighting: true, emitter_normal: [0.0; 3],
+            emitter_two_sided: false, angle_attenuation: false,
+            angle_scale: 0.0, extra_distance: 0.0,
+            shader_promotion_mask: crate::scene::WORLD_FLARE_SHADOW_SOURCE,
+        });
+        inferred += 1;
+    }
+    (inferred, relocated)
+}
+
+/// True when `p` (JKA space) lies inside a solid brush of the world model.
+pub(in crate::scene) fn point_in_world_solid(bsp: &Bsp, p: [f32; 3]) -> bool {
+    const CONTENTS_SOLID: u32 = 0x0000_0001;
+    let Some(world) = bsp.models.first() else { return false; };
+    world.brushes.clone().any(|index| {
+        let Some(brush) = bsp.brushes.get(index) else { return false; };
+        if brush.sides.is_empty()
+            || bsp.shaders.get(brush.shader).is_none_or(|s| s.contents & CONTENTS_SOLID == 0)
+        {
+            return false;
+        }
+        brush.sides.clone().all(|side| {
+            bsp.brush_sides.get(side).and_then(|s| bsp.planes.get(s.plane)).is_some_and(|plane| {
+                plane.normal[0] * p[0] + plane.normal[1] * p[1] + plane.normal[2] * p[2]
+                    - plane.distance <= 0.0
+            })
+        })
+    })
+}
+
+/// Cubemap origin for a world flare. Open-space origins are returned
+/// unchanged. Inside a solid brush, the nearest axial exit within 64 units
+/// (plus a 2 unit margin) is used; with no exit the authored origin is kept.
+pub(in crate::scene) fn flare_lamp_origin(bsp: &Bsp, origin: [f32; 3]) -> [f32; 3] {
+    if !point_in_world_solid(bsp, origin) {
+        return origin;
+    }
+    let mut best: Option<(f32, [f32; 3])> = None;
+    for axis in 0..3 {
+        for sign in [-1.0_f32, 1.0] {
+            let mut distance = 2.0_f32;
+            while distance <= 64.0 && best.is_none_or(|(d, _)| distance < d) {
+                let mut candidate = origin;
+                candidate[axis] += sign * distance;
+                if !point_in_world_solid(bsp, candidate) {
+                    candidate[axis] += sign * 2.0;
+                    best = Some((distance, candidate));
+                    break;
+                }
+                distance += 2.0;
+            }
+        }
+    }
+    best.map_or(origin, |(_, p)| p)
+}
+
+#[cfg(test)]
+mod world_flare_shadow_tests {
+    use super::*;
+    use crate::scene::WorldFlare;
+
+    fn flare(origin: [f32; 3]) -> WorldFlare {
+        WorldFlare {
+            shader_clamp_time: None, origin, normal: [0.0, 0.0, 1.0],
+            color: [1.0, 0.4, 0.2], shader_index: 0,
+            fog: [0.0; 4], fog_is_global: false, radius: 30.0,
+            alpha_portal_stages: Vec::new(), stages: Vec::new(), clusters: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn flares_are_not_mutated_into_the_authored_irradiance_catalog() {
+        let authored = DynamicLight {
+            position: render_position([0.0, 0.0, 8.0]),
+            color: [1.0; 3], radius: 384.0, intensity: 0.5, shadow_power: 500.0,
+            falloff: DynamicLightFalloff::Smooth, surface_lighting: true,
+            emitter_normal: [0.0, 1.0, 0.0], emitter_two_sided: false,
+            angle_attenuation: true, angle_scale: 0.0, extra_distance: 0.0,
+            shader_promotion_mask: 0,
+        };
+        let mut catalog = vec![authored];
+        assert_eq!(append_world_flare_shadow_sources(
+            &mut catalog, &[flare([0.0; 3]), flare([2.0, 0.0, 0.0])], |o| o
+        ), (2, 0));
+        assert_eq!(catalog.len(), 3);
+        assert_eq!(catalog[0], authored);
+        for candidate in &catalog[1..] {
+            // Omnidirectional: the BSP flare normal must not become an emitter.
+            assert_eq!(candidate.emitter_normal, [0.0; 3]);
+            assert_eq!(candidate.shader_promotion_mask, crate::scene::WORLD_FLARE_SHADOW_SOURCE);
+            assert_eq!(candidate.radius, 240.0);
+            // Same strength convention as an authored lamp of equal radius.
+            assert_eq!(candidate.shadow_power, 240.0 * 240.0 * 0.35 * FLARE_SHADOW_STRENGTH);
+        }
+    }
+}
+
 pub(in crate::scene) fn decode_lightgrid_direction(lat_long: [u8; 2]) -> [f32; 3] {
     // OpenJK/Q3 stores longitude first and latitude second. The original
     // renderer indexes its 1024-entry trig table with byte * 4, which is

@@ -95,6 +95,7 @@ impl GameSession {
         // time. Apply that SAME clock to the followed player's snapshot PS.
         // Only origin, angles and velocity of this render copy are touched;
         // event, HUD, prediction and protocol state keep their original clock.
+        let mut held_ms = 0.0;
         if self.live && crate::cgame::remote_smoothing::mode() != 0 {
             self.remote_smoothing.apply_follow(&mut ps, std::time::Instant::now(), teleported);
         }
@@ -105,7 +106,7 @@ impl GameSession {
         // legacy remote-smoothing mode: modes 1-4 already resample the followed
         // player with their own visual clock/correction history.
         if self.live && crate::cgame::remote_smoothing::mode() == 0 {
-            self.spectator_follow_hold.apply(
+            held_ms = self.spectator_follow_hold.apply(
                 &mut ps,
                 self.current_snapshot.as_ref(),
                 self.next_snapshot.as_ref(),
@@ -125,6 +126,31 @@ impl GameSession {
         let error = prediction.map_or([0.0; 3], |prediction| prediction.error);
         let mut sample = sample_player_state(&ps, server_time, teleported, error)?;
         sample.presentation_time_ms = presentation_time_ms;
+        // TaystJK CG_OffsetThirdPersonView times its damping with
+        // predictedPlayerState.commandTime + predictedTimeFrac. While following
+        // there is no prediction, so that is the followed player's *command*
+        // clock interpolated between snapshots. Our render clock (integer
+        // server ms) makes the same origin path look 25% faster or slower per
+        // snapshot interval whenever the followed client's commandTime gap
+        // differs from the server frame gap, which the damping lag amplifies.
+        if sample.following && prediction.is_none() {
+            let snapshot_clock = self.current_snapshot.as_ref().map(|current| {
+                crate::cgame::player_state::follow_command_clock_ms(
+                    current, self.next_snapshot.as_ref(), presentation_time_ms)
+                    + held_ms
+            });
+            let clock = if self.live && crate::cgame::remote_smoothing::mode() != 0 {
+                self.remote_smoothing.follow_command_ms.or(snapshot_clock)
+            } else {
+                snapshot_clock
+            };
+            if let Some(clock) = clock.filter(|clock| *clock > 0.0) {
+                sample.damp_time_ms = self.spectator_follow_hold.monotonic_clock(
+                    sample.client_num, ps.persistant[4], teleported, clock);
+            }
+        } else {
+            self.spectator_follow_hold.clock_last = None;
+        }
         // TaystJK CG_TransitionPlayerState / CG_OffsetFirstPersonView:
         // viewheight changes instantly in Pmove, but the first-person eye
         // eases over DUCK_TIME (100 ms). Never modify the predicted PS or
@@ -170,6 +196,8 @@ struct SpectatorFollowFrame {
 #[derive(Default)]
 pub(in crate::app) struct SpectatorFollowHold {
     last: Option<SpectatorFollowFrame>,
+    /// (clientNum, spawnCount, camera clock) of the previous followed frame.
+    clock_last: Option<(i32, i32, f64)>,
 }
 
 impl SpectatorFollowHold {
@@ -182,17 +210,17 @@ impl SpectatorFollowHold {
         next: Option<&jka_protocol::server::Snapshot>,
         time_ms: f64,
         teleported: bool,
-    ) {
+    ) -> f64 {
         const PMF_FOLLOW: i32 = 4096;
-        let Some(current) = current else { self.reset(); return; };
+        let Some(current) = current else { self.reset(); return 0.0; };
         if ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW == 0
             || !time_ms.is_finite()
         {
             self.reset();
-            return;
+            return 0.0;
         }
-        let Some(raw) = finite_playerstate_vec3(ps, "origin") else { self.reset(); return; };
-        let Some(velocity) = finite_playerstate_vec3(ps, "velocity") else { self.reset(); return; };
+        let Some(raw) = finite_playerstate_vec3(ps, "origin") else { self.reset(); return 0.0; };
+        let Some(velocity) = finite_playerstate_vec3(ps, "velocity") else { self.reset(); return 0.0; };
         let client_num = ps.field_i32("clientNum").unwrap_or(-1);
         let spawn_count = ps.persistant[4];
         let pm_type = ps.field_i32("pm_type").unwrap_or(-1);
@@ -264,6 +292,20 @@ impl SpectatorFollowHold {
                 ps.set_field_bits(&format!("origin[{axis}]"), value.to_bits());
             }
         }
+        held_ms
+    }
+
+    /// Never let the camera clock run backwards while following one player:
+    /// extrapolated hold time can exceed the next snapshot's commandTime, and
+    /// a backwards clock would make the camera reset (snap) its damping.
+    fn monotonic_clock(&mut self, client_num: i32, spawn_count: i32, teleported: bool, clock: f64) -> f64 {
+        let clock = match self.clock_last {
+            Some((c, s, last)) if !teleported && c == client_num && s == spawn_count
+                && clock < last && last - clock <= 250.0 => last,
+            _ => clock,
+        };
+        self.clock_last = Some((client_num, spawn_count, clock));
+        clock
     }
 }
 
@@ -507,6 +549,7 @@ pub(in crate::app) fn sample_player_state(
     Some(DemoCameraSample {
         server_time,
         presentation_time_ms: f64::from(server_time),
+        damp_time_ms: f64::from(server_time),
         native_origin: view_origin,
         eye_position: scene::render_position(eye),
         player_position: scene::render_position(origin),

@@ -136,6 +136,9 @@ impl Renderer {
         };
         if self.fast_sky == mode { return; }
         self.fast_sky = mode;
+        // Fastsky replaces native sky; its filmic post must not stay active
+        // after that sky stops drawing (or be missing when restored).
+        self.rebuild_frame_plan();
         // GPU visibility and cached draw bundles must agree on sky exclusion.
         self.update_gpu_cull_settings();
         self.deferred_world_bundles.clear();

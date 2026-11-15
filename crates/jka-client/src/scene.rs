@@ -67,7 +67,7 @@ use geometry::{
 #[cfg(test)]
 use lighting::{append_surface_light_triangle, voxel_gi_index, voxel_gi_propagate};
 use lighting::{
-    bsp_surface_lights, build_voxel_probe_gi, prepare_static_light_grid,
+    append_world_flare_shadow_sources, bsp_surface_lights, build_voxel_probe_gi, prepare_static_light_grid,
     smoothstep_range, STATIC_BSP_AO_CACHE_VERSION,
 };
 use lightmaps::{
@@ -980,7 +980,8 @@ pub struct MapPrepareOptions {
     pub client_physics: bool,
     pub gen_normal_maps: bool,
     pub float_lightmap: bool,
-    /// Resolved OpenJK r_overBrightBits / r_mapOverBrightBits at map load.
+    /// Resolved output/map overbright at map load (JK2 auto range tracks
+    /// output bits so JK2MV preserves raw BSP lighting bytes at 0 and 1).
     /// This is part of the prep options so a JK2/JKA transition cannot reuse
     /// vertex colors or lightmaps prepared for the other lighting range.
     pub overbright_bits: u8,
@@ -1572,6 +1573,10 @@ pub struct PreparedSteamAudioScene {
     pub bake: Option<Arc<crate::steam_audio::SteamAudioBakeData>>,
     pub bake_request: Option<crate::steam_audio::SteamAudioBakeRequest>,
 }
+
+/// Shadow-only provenance for compiled RBSP flares. Deliberately outside
+/// materials::SHADER_LIGHT_ALL so it cannot promote map illumination.
+pub(crate) const WORLD_FLARE_SHADOW_SOURCE: u32 = 1 << 5;
 
 /// Immutable authored world flare, keyed by RBSP surface index. Kept out of
 /// triangle/material draw batches and reused by the independent flare renderer.

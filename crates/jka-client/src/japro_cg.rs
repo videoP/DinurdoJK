@@ -55,7 +55,7 @@ pub const JAPRO_PLUGIN_DISABLE_OPTIONS: &[PluginDisableOption] = &[
     PluginDisableOption {
         bit: 3,
         label: "No black sabers",
-        tooltip: "Clamp black saber colours to orange on this client, matching TaystJK's jaPRO plugin-disable behavior.",
+        tooltip: "Clamp black saber colours to orange on this client, using the jaPRO plugin-disable rules.",
     },
     PluginDisableOption {
         bit: 19,
@@ -155,7 +155,7 @@ pub const STYLE_TOGGLES: &[(u32, &str, &str)] = &[
     (
         style::DISABLE_BREATHING,
         "Disable breathing effects",
-        "Hide TaystJK cold breath and underwater bubbles on player models.",
+        "Hide cold breath and underwater bubbles on player models.",
     ),
     (
         style::SHELL,

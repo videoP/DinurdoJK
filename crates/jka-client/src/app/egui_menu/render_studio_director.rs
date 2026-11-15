@@ -1013,7 +1013,7 @@ impl App {
                         sui::prop_slider(ui, "Height", egui::Slider::new(&mut rig.vertical_offset, -512.0..=512.0));
                         sui::prop_slider(ui, "Side", egui::Slider::new(&mut rig.horizontal_offset, -512.0..=512.0));
                         sui::prop_toggle(ui, "Chase motion", &mut rig.motion_direction)
-                            .on_hover_text("Orient the chase camera from movement direction (TaystJK angle -1)");
+                            .on_hover_text("Orient the chase camera toward movement direction");
                         ui.add_enabled_ui(!rig.motion_direction, |ui| {
                             sui::prop_slider(ui, "Yaw", egui::Slider::new(&mut rig.yaw_offset, -180.0..=180.0).suffix("°"));
                         });

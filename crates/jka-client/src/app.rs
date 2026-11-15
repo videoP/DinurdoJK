@@ -140,6 +140,7 @@ mod hitch;
 mod map_editor;
 mod lead_indicator;
 mod quality;
+mod relighting_profiles;
 mod race_ghost;
 mod race_ghost_web;
 mod serverdump;
@@ -1233,6 +1234,7 @@ pub struct App {
     puddle_sky_blend: (f32, f32),
     dof_focus_target: f32,
     config_path: PathBuf,
+    relighting_profiles: relighting_profiles::RelightingProfiles,
     config_dirty: bool,
     background_jobs: background_jobs::BackgroundJobs,
     background_result_tx: Sender<background_jobs::JobResult>,

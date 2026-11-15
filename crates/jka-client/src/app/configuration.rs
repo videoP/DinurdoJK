@@ -64,6 +64,9 @@ impl App {
         // OpenJK archives the pending CVAR_LATCH value. Overlay only console
         // latches here; unconfirmed menu display changes above remain last-good.
         self.apply_latched_values_to_settings(&mut settings);
+        // A map's lighting profile is an overlay. Archive the normal lighting
+        // underneath it while still saving unrelated changes normally.
+        self.archive_normal_relighting(&mut settings);
 
         let presentation = config::ClientPresentationSettings {
             game_launch_screen: self.game_launch_screen,

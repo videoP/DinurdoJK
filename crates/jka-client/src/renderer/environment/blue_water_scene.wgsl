@@ -1,6 +1,6 @@
 #import naval_clouds::shadow::{CloudShadow, cloud_shadow}
 #import naval_sky::environment::{SkyEnvironment, env_irradiance}
-struct Frame { inverse_vp:mat4x4<f32>,eye:vec4<f32>,viewport:vec4<f32>,options:vec4<f32>,moon_light:vec4<f32>,moon_mode:vec4<f32> }
+struct Frame { inverse_vp:mat4x4<f32>,eye:vec4<f32>,viewport:vec4<f32>,options:vec4<f32>,moon_light:vec4<f32>,moon_mode:vec4<f32>,gain:vec4<f32> }
 @group(0) @binding(0) var<uniform> frame:Frame;
 @group(0) @binding(1) var scene_depth:texture_depth_2d;
 @group(0) @binding(2) var scene_color:texture_2d<f32>;
@@ -9,6 +9,7 @@ struct Frame { inverse_vp:mat4x4<f32>,eye:vec4<f32>,viewport:vec4<f32>,options:v
 // Prepass radial depth (JKA units): grass, water and other main-pass-only
 // surfaces in front of the marked world must still receive the live light.
 @group(0) @binding(4) var world_mask_depth:texture_2d<f32>;
+@group(0) @binding(5) var world_sky_normals:texture_2d<f32>;
 @group(1) @binding(0) var shadow_map:texture_2d<f32>;
 @group(1) @binding(1) var shadow_sampler:sampler;
 @group(1) @binding(2) var<uniform> shadow:CloudShadow;
@@ -67,6 +68,19 @@ fn moon_csm_visibility(world:vec3<f32>,normal:vec3<f32>)->f32 {
  }
  return mix(1.,visibility,clamp(csm.params.z,0.,1.));
 }
+fn sky_gain_calibrated(full:vec3<f32>,neutral:vec3<f32>,now_y:f32,params:vec4<f32>)->vec3<f32> {
+ let mode=u32(params.x+0.5);
+ if mode==0u {return full;}
+ let day_t=clamp((now_y+0.10)/0.30,0.,1.);
+ let day=day_t*day_t*(3.-2.*day_t);
+ if mode==1u {return mix(full,neutral,day);}
+ if params.z<0.5 {return neutral;}
+ let ref_t=clamp((params.y+0.10)/0.30,0.,1.);
+ let ref_day=ref_t*ref_t*(3.-2.*ref_t);
+ let ratio=clamp(mix(0.10,1.,day)/mix(0.10,1.,ref_day),0.15,2.);
+ let tint=full/max(dot(full,vec3<f32>(0.2126,0.7152,0.0722)),1e-4);
+ return neutral*ratio*mix(tint,vec3<f32>(1.),day);
+}
 @vertex fn vertex(@builtin(vertex_index) i:u32)->@builtin(position) vec4<f32> {
  let p=array<vec2<f32>,3>(vec2<f32>(-1.,-1.),vec2<f32>(3.,-1.),vec2<f32>(-1.,3.));return vec4<f32>(p[i],0.,1.);
 }
@@ -86,6 +100,12 @@ fn step_across(centre:vec3<f32>,forward:vec4<f32>,back:vec4<f32>)->vec3<f32> {
  let la=select(1e9,length(a),forward.w>0.&&length(a)>1e-6);
  let lb=select(1e9,length(b),back.w>0.&&length(b)>1e-6);
  return select(b,a,la<=lb);
+}
+fn sky_normal_decode(e:vec2<f32>)->vec3<f32> {
+ var n=vec3(e,1.-abs(e.x)-abs(e.y));
+ let t=max(-n.z,0.);
+ n.x+=select(t,-t,n.x>=0.);n.y+=select(t,-t,n.y>=0.);
+ return normalize(n);
 }
 @fragment fn light(@builtin(position) p:vec4<f32>)->@location(0) vec4<f32> {
  let pixel=vec2<i32>(p.xy);let color=textureLoad(scene_color,pixel,0);let depth=textureLoad(scene_depth,pixel,0);
@@ -109,6 +129,19 @@ fn step_across(centre:vec3<f32>,forward:vec4<f32>,back:vec4<f32>)->vec3<f32> {
  let mask_pixel=clamp(pixel,vec2<i32>(0),vec2<i32>(textureDimensions(world_mask))-1);
  let policy=textureLoad(world_mask,mask_pixel,0);
  let mask=policy.r;
+ // Only the matching static world prepass can supply sky normals. Keep
+ // geometric normals for shadow bias, models, movers and main-pass-only depth
+ // writers. A foreground model replaces policy/depth but not this MRT slot.
+ var sky_normal=normal;
+ if frame.eye.w>0.5 && abs(mask-0.125)>0.06 {
+  let encoded=textureLoad(world_sky_normals,pixel,0).rg;
+  let prepass_depth=textureLoad(world_mask_depth,mask_pixel,0).r;
+  let radial=distance(world,frame.eye.xyz)*frame.moon_mode.z;
+  if all(abs(encoded)<=vec2(1.001)) && abs(prepass_depth-radial)<=max(0.5,radial*0.001) {
+   sky_normal=sky_normal_decode(encoded);
+   if dot(sky_normal,frame.eye.xyz-world)<0. {sky_normal=-sky_normal;}
+  }
+ }
  // Models lit themselves (md3/ghoul2 sky_world_model_gain). No depth match:
  // the view weapon's depth hack moves its depth-buffer position, not its mask.
  let lit_model=frame.moon_mode.w>0.5 && abs(mask-0.125)<0.06;
@@ -120,16 +153,20 @@ fn step_across(centre:vec3<f32>,forward:vec4<f32>,back:vec4<f32>)->vec3<f32> {
  if frame.options.x>0. && !lit_model {
   // The input holds baked illumination. This opt-in estimate retains its
   // material detail and dark interiors; it cannot recover separate albedo/GI.
-  let ambient=env_irradiance(env_map,env_sampler,env,normal)/3.14159265;
+  let ambient=env_irradiance(env_map,env_sampler,env,sky_normal)/3.14159265;
+  let sky_incidence=max(dot(sky_normal,light_direction),0.);
   // Realtime sky lighting uses the existing cascades for its sun/moon key.
   // Baked mode never runs this sky gain; its shadow filtering is unchanged.
   var moon_visibility=1.;
-  if frame.options.w>0.5 && incidence>0. {
+  if frame.options.w>0.5 && sky_incidence>0. {
    moon_visibility=moon_csm_visibility(world,normal);
   }
-  let direct=light_color*light_intensity*incidence*shade*moon_visibility;
-  // options.x is the strength: 0 keeps the cloud-shadow-only gain, 1 replaces it.
-  gain=mix(gain,clamp(ambient*0.5+direct*0.2,vec3<f32>(0.03),vec3<f32>(4.)),frame.options.x);
+  let direct=light_color*light_intensity*sky_incidence*shade*moon_visibility;
+  // r_skyWorldGainMode (see sky_gain_calibrated): A original, B daylight fades to
+  // the cloud-only gain, C ratio to the map's authored time of day.
+  let sky_gain=sky_gain_calibrated(clamp(ambient*0.5+direct*0.2,vec3<f32>(0.03),vec3<f32>(4.)),gain,
+   select(light_direction.y,-1.,moon_active),frame.gain);
+  gain=mix(gain,sky_gain,frame.options.x);
  }
  let footprint=max(length(dx),length(dy));let expected=max(distance(world,frame.eye.xyz)*4./min(frame.viewport.x,frame.viewport.y),0.01);
  gain=mix(vec3<f32>(1.),gain,1.-smoothstep(expected*4.,expected*12.,footprint));

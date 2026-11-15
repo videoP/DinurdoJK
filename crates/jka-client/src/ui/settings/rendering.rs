@@ -1475,3 +1475,5 @@ pub const VIDEO_ROW_BAKED_LOCAL_ADDITIVE: usize = 115;
 pub const VIDEO_ROW_BAKED_LOCAL_EMISSIVE: usize = 116;
 pub const VIDEO_ROW_BAKED_LOCAL_SURFACELIGHT: usize = 117;
 pub const VIDEO_ROW_BAKED_LOCAL_FX: usize = 118;
+/// Appended without renumbering saved video setting rows.
+pub const VIDEO_ROW_BAKED_LOCAL_FLARES: usize = 121;

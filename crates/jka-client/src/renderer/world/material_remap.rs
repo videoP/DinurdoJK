@@ -857,6 +857,9 @@ impl Renderer {
         sun_textures.extend(map.replacement_textures.iter().cloned());
         let new_sun_geometry = remapped_sun_geometry(world, map, Arc::new(sun_textures));
         world.static_sun.replace_geometry(new_sun_geometry);
+        // Remaps can change which static stages establish depth and therefore
+        // contribute to the live sky normal field. Rebuild it on next use.
+        world.sky_normal_buffer = None;
         if let Some(cache)=world.baked_sun_cache.as_mut() {
             cache.strength = None;
             cache.invalidate_vertex_sky();

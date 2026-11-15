@@ -305,7 +305,7 @@ app_cvars! {
                 "cg_drawRewards",
                 "",
                 "0..2",
-                "TaystJK/JKA award medals: 0 off, 1 JKA voice/medals, 2 Quake 3 variants where available.",
+                "JKA award medals: 0 off, 1 JKA voice/medals, 2 Quake 3 variants where available.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -509,7 +509,7 @@ app_cvars! {
     }
 
     APP_CG_FOOTSTEPTRACE {
-        runtime: CvarDef::new("cg_footstepTrace", "0", "0|1", "Footstep ground-trace A/B: 0 existing BSP/world-only trace, 1 TaystJK CG_Trace-style solid entity trace (including func_door/func_static). Water probe stays world-only. Live and not archived.", CvarType::Bool, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("cg_footstepTrace", "0", "0|1", "JKA-only ground-trace A/B: 0 default BSP/world-only footsteps, 1 entity-aware CG_Trace (movers/doors). JK2 always uses MVSDK entity-aware CG_Trace regardless of this setting (compare with cg_footstepDebug 3). Live and not archived.", CvarType::Bool, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::Bool(app.audio.game.footstep_trace),
             |app, value| App::cvar_set_cg_footsteptrace(app, APP_CG_FOOTSTEPTRACE.entry.name, &value.to_string()))
             .with_text_setter(App::cvar_set_cg_footsteptrace, None),
@@ -659,7 +659,7 @@ app_cvars! {
     }
 
     APP_CG_KILLMESSAGE {
-        runtime: CvarDef::new("cg_killMessage", "", "0..3", "TaystJK kill center-print: 0 off, 1 normal with FFA place/score, 2 kill only, 3 higher on screen.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_killmessage(app)), |app, value| App::cvar_set_cg_killmessage(app, APP_CG_KILLMESSAGE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_killmessage, None),
+        runtime: CvarDef::new("cg_killMessage", "", "0..3", "Kill center-print: 0 off, 1 normal with FFA place/score, 2 kill only, 3 higher on screen.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_killmessage(app)), |app, value| App::cvar_set_cg_killmessage(app, APP_CG_KILLMESSAGE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_killmessage, None),
         config: CvarBinding {
                 load_audio: Some(|settings, _name, value| {
                     {

@@ -3,7 +3,7 @@ use crate::app::{session_tools, App, ChatMode, OverlayMode};
 
 use super::{CommandDef, CommandResult, CommandScope};
 commands! {
-    cmd_voicechat ["voicechat", ] ("voicechat", "Open TaystJK VGS when connected to a jaPRO server and ui_vgs is enabled.", CommandScope::Always) |self, command| {
+    cmd_voicechat ["voicechat", ] ("voicechat", "Open the VGS voice-command menu when connected to a jaPRO server with ui_vgs enabled.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
             [_verb] => {

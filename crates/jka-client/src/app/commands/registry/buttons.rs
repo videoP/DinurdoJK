@@ -37,7 +37,7 @@ commands! {
         "+zoom", "-zoom",
     ] (
         "+command / -command",
-        "Set or clear a held client input button (OpenJK/TaystJK kbutton semantics).",
+        "Set or clear a held client input button.",
         CommandScope::Always
     ) |self, command| {
         if self.execute_input_button_command(command) {

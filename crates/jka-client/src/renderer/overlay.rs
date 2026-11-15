@@ -2412,7 +2412,8 @@ impl Renderer {
                 self.config.width, self.config.height,
             );
             if ui::gameplay_hud_visible(&self.ui_state, self.config.width, self.config.height) {
-                if let Some(anchor) = dynamic_crosshair_world {
+                if let Some(anchor) = dynamic_crosshair_world
+                    .filter(|_| self.ui_state.crosshair.effective_dynamic_mode() != 0) {
                     let clip = view_proj * Vec3::from_array(anchor).extend(1.0);
                     if clip.w > 0.001 {
                         let ndc = clip.truncate() / clip.w;
@@ -2845,10 +2846,64 @@ pub(in crate::renderer) struct UiAvatarBuild {
     pub atlas: ui::AvatarAtlas,
 }
 
-/// Convert `model/skin` into only the real icon candidates the legacy HUD
-/// lookup might sample. Composite skins use the head icon, then default.
+/// Parse the same VFS-aware icon request used by the team-overlay portrait.
+/// Keep the originating team in the key: two players with the same requested
+/// `model/blue` may legitimately need different icon files on RED and BLUE.
+fn parse_team_avatar_icon_key(key: &str) -> Option<(&str, &str, i32, i32, bool)> {
+    let spec = key.strip_prefix("@team-model-icon\t")?;
+    let mut fields = spec.split('\t');
+    let (model, skin, team, gametype, jedi) =
+        (fields.next()?, fields.next()?, fields.next()?, fields.next()?, fields.next()?);
+    if fields.next().is_some()
+        || model.is_empty() || model.contains(&['/', '\\', ':'][..]) || model.contains("..")
+        || skin.is_empty() || skin.contains(&['/', '\\', ':'][..]) || skin.contains("..")
+    {
+        return None;
+    }
+    let jedi = match jedi { "0" => false, "1" => true, _ => return None };
+    Some((model, skin, team.parse().ok()?, gametype.parse().ok()?, jedi))
+}
+
+/// Resolve the same BG_ValidateSkinForTeam policy as the 3D player and the
+/// @team-model-icon team-overlay path, but on the existing avatar worker.
+/// Only the resolved skin (or its composite head) can contribute portrait art.
+fn ui_avatar_icon_qpaths<F>(key: &str, mut file_exists: F) -> Vec<String>
+where
+    F: FnMut(&str) -> bool,
+{
+    if key.starts_with("@team-model-icon\t") {
+        let Some((model, raw_skin, team, gametype, jedi)) =
+            parse_team_avatar_icon_key(key) else { return Vec::new(); };
+        let mut skin = raw_skin.to_owned();
+        if gametype >= crate::cgame::GT_TEAM
+            && gametype != crate::cgame::GT_SIEGE && !jedi
+        {
+            let _ = crate::cgame::validate_skin_for_team(
+                model, &mut skin, team, &mut file_exists,
+            );
+        }
+        let mut paths = vec![format!("models/players/{model}/icon_{skin}")];
+        if let Some((head, _)) = skin.split_once('|') {
+            paths.push(format!("models/players/{model}/icon_{head}"));
+        }
+        paths
+    } else {
+        let (model, skin) = key.split_once('/').unwrap_or((key, "default"));
+        vec![format!("models/players/{model}/icon_{skin}")]
+    }
+}
+
+/// Convert avatar requests into only the icon candidates this HUD may use.
+/// Team-mode requests remain distinct until the worker validates their skins;
+/// ordinary `model/skin` keys retain their existing default fallback.
 fn add_ui_avatar_candidates(keys: &mut BTreeSet<String>, key: &str) {
     let key = key.trim().to_ascii_lowercase();
+    if key.starts_with("@team-model-icon\t") {
+        if parse_team_avatar_icon_key(&key).is_some() {
+            keys.insert(key);
+        }
+        return;
+    }
     let (model, skin) = key.split_once('/').unwrap_or((key.as_str(), "default"));
     if model.is_empty() || model.contains("..") || model.contains('\\') || model.contains(':') {
         return;
@@ -2911,11 +2966,12 @@ pub(in crate::renderer) fn load_ui_avatar_atlas(
                 assets = AssetSearchPath::open_game_as(base, game, jk2).ok();
             }
             let cell = assets.as_mut().and_then(|assets| {
-                let (model, skin) = key.split_once('/')?;
-                let qpath = format!("models/players/{model}/icon_{skin}");
-                let image = try_load_texture_asset_from_search_path(
-                    assets, &qpath, true, false, true, "avatar",
-                )?;
+                // VFS checks happen only for a new requested portrait key,
+                // never for every frame or even on a cached atlas rebuild.
+                let paths = ui_avatar_icon_qpaths(key, |path| assets.contains_qpath(path));
+                let image = paths.iter().find_map(|qpath| try_load_texture_asset_from_search_path(
+                    assets, qpath, true, false, true, "avatar",
+                ))?;
                 let source = image::RgbaImage::from_raw(image.width, image.height, image.rgba.into_vec())?;
                 let cell = if source.width() == CELL && source.height() == CELL {
                     source
@@ -2965,6 +3021,40 @@ mod on_demand_avatar_tests {
         assert_eq!(keys.iter().map(String::as_str).collect::<Vec<_>>(), vec![
             "custom/default", "custom/red", "jan/blue", "jan/default",
         ]);
+    }
+
+    #[test]
+    fn team_avatar_resolves_the_rendered_team_skin_not_the_raw_configstring() {
+        // The user's JK2 configstring requests night elf/blue, while the
+        // actual player belongs to RED. BG_ValidateSkinForTeam forces red.
+        let red = "@team-model-icon\tnight elf\tblue\t1\t8\t0";
+        let blue = "@team-model-icon\tnight elf\tblue\t2\t8\t0";
+        assert_eq!(ui_avatar_icon_qpaths(red, |_| false), vec![
+            "models/players/night elf/icon_red",
+        ]);
+        assert_eq!(ui_avatar_icon_qpaths(blue, |_| false), vec![
+            "models/players/night elf/icon_blue",
+        ]);
+        // Missing-model fallback must also use RED; never load Kyle/blue.
+        assert_eq!(ui_avatar_icon_qpaths(
+            "@team-model-icon\tkyle\tblue\t1\t8\t0", |_| false,
+        ), vec!["models/players/kyle/icon_red"]);
+        let custom = "@team-model-icon\tjan\tcustom\t1\t8\t0";
+        assert_eq!(ui_avatar_icon_qpaths(custom, |path| path ==
+            "models/players/jan/model_custom_red.skin"), vec![
+            "models/players/jan/icon_custom_red",
+        ]);
+        let mut keys = BTreeSet::new();
+        add_ui_avatar_candidates(&mut keys, red);
+        add_ui_avatar_candidates(&mut keys, blue);
+        assert_eq!(keys.len(), 2, "opposing teams may not alias one raw skin key");
+        let mut atlas = ui::AvatarAtlas::default();
+        atlas.cells.insert("night elf/blue".to_owned(), 0);
+        assert_eq!(atlas.cell(red), None, "do not recover an opposite-team icon");
+        assert_eq!(ui_avatar_icon_qpaths(
+            "@team-model-icon\tnight elf\tblue\t1\t7\t0", |_| false,
+        ), vec!["models/players/night elf/icon_blue"], "siege is exempt");
+        assert!(ui_avatar_icon_qpaths("@team-model-icon\t../bad\tblue\t1\t8\t0", |_| false).is_empty());
     }
 
     #[test]

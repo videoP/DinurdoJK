@@ -1,5 +1,70 @@
 //! Scene ownership and cold brightness state transitions.
+//! JK2MV encoded-space gamma LUT. Built only for a settings transition, never
+//! for a rendered frame. 1024 samples in RGBA16F (8 KiB), bilinear filtered.
 use super::{GammaPostUniform, Renderer};
+
+const JK2_GAMMA_LUT_SIZE: u32 = 1024;
+
+pub(in crate::renderer) fn srgb_encode(v: f32) -> f32 {
+    if v <= 0.0031308 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+}
+
+pub(in crate::renderer) fn srgb_decode(v: f32) -> f32 {
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+
+// JK2MV's encoded-space gamma and output overbright, reused when composing
+// it into the grading cube. Both LUT paths must use exactly the same transfer.
+pub(in crate::renderer) fn jk2_output_transfer(linear: f32, gamma: f32, overbright_bits: u8) -> f32 {
+    let gain = if overbright_bits > 0 { 2.0 } else { 1.0 };
+    let encoded = srgb_encode(linear.clamp(0.0, 1.0)).powf(1.0 / gamma.clamp(0.05, 3.0));
+    srgb_decode((encoded * gain).min(1.0))
+}
+
+fn jk2_gamma_lut_bytes(gamma: f32, overbright_bits: u8) -> Vec<u8> {
+    let mut samples = Vec::with_capacity((JK2_GAMMA_LUT_SIZE * 8) as usize);
+    for index in 0..JK2_GAMMA_LUT_SIZE {
+        // Square the lookup coordinate: more precision where gamma > 1
+        // steepens the near-black response. The GPU only pays a sqrt.
+        let coordinate = index as f32 / (JK2_GAMMA_LUT_SIZE - 1) as f32;
+        let linear = coordinate * coordinate;
+        let corrected = jk2_output_transfer(linear, gamma, overbright_bits);
+        let sample = crate::materials::f32_to_f16_bits(corrected);
+        for component in [sample, sample, sample, crate::materials::f32_to_f16_bits(1.0)] {
+            samples.extend_from_slice(&component.to_le_bytes());
+        }
+    }
+    samples
+}
+
+pub(in crate::renderer) fn create_jk2_gamma_lut(
+    device: &wgpu::Device, queue: &wgpu::Queue, gamma: f32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("JK2MV gamma/overbright lookup (1024 RGBA16F)"),
+        size: wgpu::Extent3d { width: JK2_GAMMA_LUT_SIZE, height: 1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    upload_jk2_gamma_lut(queue, &texture, gamma, 0);
+    let view = texture.create_view(&Default::default());
+    (texture, view)
+}
+
+fn upload_jk2_gamma_lut(queue: &wgpu::Queue, texture: &wgpu::Texture, gamma: f32, bits: u8) {
+    queue.write_texture(
+        texture.as_image_copy(),
+        &jk2_gamma_lut_bytes(gamma, bits),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0, bytes_per_row: Some(JK2_GAMMA_LUT_SIZE * 8), rows_per_image: Some(1),
+        },
+        wgpu::Extent3d { width: JK2_GAMMA_LUT_SIZE, height: 1, depth_or_array_layers: 1 },
+    );
+}
 
 impl Renderer {
     pub(super) fn output_gamma(&self) -> f32 {
@@ -106,7 +171,26 @@ impl Renderer {
     }
 
     pub(super) fn refresh_output_gamma(&mut self) {
-        if self.split_toning.active() && self.rebuild_color_grading_lut() {
+        // Do not generate a LUT for JKA, or regenerate one for unrelated UI
+        // and color-grade changes. Only a JK2 gamma/overbright transition uploads.
+        let mut output_changed = false;
+        if self.jk2_legacy_color {
+            let key = (self.output_gamma().to_bits(), self.overbright_bits);
+            if self.jk2_gamma_lut_key != key {
+                upload_jk2_gamma_lut(&self.queue, &self._jk2_gamma_lut_texture,
+                    self.output_gamma(), self.overbright_bits);
+                self.jk2_gamma_lut_key = key;
+                output_changed = true;
+            }
+        }
+        let wants_fused = self.should_fuse_jk2_output_lut();
+        // Also rebuild on mode/HDR transitions: the same grading settings
+        // require a different texture when JK2's output transfer is fused.
+        if ((wants_fused && output_changed)
+            || wants_fused != self.jk2_gamma_baked
+            || (self.split_toning.active() && !wants_fused))
+            && self.rebuild_color_grading_lut()
+        {
             self.rebuild_color_lut_bind_groups();
         }
         self.queue.write_buffer(
@@ -115,16 +199,39 @@ impl Renderer {
             bytemuck::bytes_of(&GammaPostUniform {
                 values: [
                     self.output_gamma(),
-                    self.color_lut_effective_strength,
+                    if self.jk2_gamma_baked { 1.0 } else { self.color_lut_effective_strength },
                     if self.vignette_enabled { 1.0 } else { 0.0 },
                     self.color_grade.exposure_ev,
                 ],
-                flags: [if self.hdr_enabled { 1.0 } else { 0.0 }, if self.hdr_output.is_some() { 1.0 } else { 0.0 }, f32::from(self.overbright_bits), 0.0],
+                flags: [if self.hdr_enabled { 1.0 } else { 0.0 }, if self.hdr_output.is_some() { 1.0 } else { 0.0 }, f32::from(self.overbright_bits), if self.jk2_gamma_baked { 2.0 } else { f32::from(u8::from(self.jk2_legacy_color)) }],
             }),
         );
         self.rebuild_frame_plan();
         self.sync_ui_gamma_uniforms();
         self.update_post_uniform();
         self.rebuild_ui();
+    }
+}
+
+#[cfg(test)]
+mod jk2_gamma_lut_tests {
+    use super::*;
+
+    #[test]
+    fn jk2_gamma_lut_has_correct_endpoints_and_neutral_identity() {
+        let bytes = jk2_gamma_lut_bytes(1.0, 0);
+        assert_eq!(bytes.len(), (JK2_GAMMA_LUT_SIZE * 8) as usize);
+        assert_eq!(&bytes[0..2], &[0, 0]);
+        assert_eq!(&bytes[bytes.len() - 8..bytes.len() - 6],
+            &crate::materials::f32_to_f16_bits(1.0).to_le_bytes());
+    }
+    #[test]
+    fn legacy_overbright_saturates_at_one() {
+        let bytes = jk2_gamma_lut_bytes(1.0, 1);
+        let last = bytes.len() - 8;
+        assert_eq!(&bytes[last..last + 2],
+            &crate::materials::f32_to_f16_bits(1.0).to_le_bytes());
+        assert_ne!(&bytes[1024..1026],
+            &jk2_gamma_lut_bytes(1.0, 0)[1024..1026]);
     }
 }

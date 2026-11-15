@@ -12,7 +12,7 @@ use crate::cgame::player_presenter::{
     transform_jka_model_point, update_weapon_attachment, viewer_style_from, weapon_world_model,
     swim_tilt, move_lean::MoveLeanState, Arc, ClientGameState, DismemberPart, DismemberSourceSnap, DynamicModelAlphaMode,
     DynamicModelSurface, EntityPlayerState, FootstepStages, ForcedPlayerModels, Ghoul2Animator, CloakState, CloakVisual,
-    Ghoul2PresentationView, HashMap, HashSet, Instant, ModelResolution, PlayerAngleState,
+    Ghoul2PresentationView, HashMap, HashSet, Instant, Matrix3x4, ModelResolution, PlayerAngleState,
     PlayerAnimationState, PlayerPresenter, PresentedEntity, MindTrickFade, RagdollMode, SaberBladeLengthKey,
     SaberBladeLengthState, ViewerAnimDebug, BONE_ANGLES_POSTMULT, DEFAULT_SABER_BLADE_LENGTH_MAX,
     EF2_SHIP_DEATH, EF_DEAD, EF_JETPACK, EF_NODRAW, EF_RAG, ET_BODY, ET_NPC, ET_PLAYER, GT_SIEGE,
@@ -20,11 +20,14 @@ use crate::cgame::player_presenter::{
     MAX_CLIENTS, MAX_SABER_BLADES, TEAM_SPECTATOR, WP_SABER, FP_SEE, PW_CLOAKED,
 };
 
-/// One 1x1 material per team for the collision-world experiment. These are
-/// created on first use, not during map load, and the dynamic model renderer
-/// uploads each material at most once via its existing texture cache.
-/// This replaces player-body textures, not player geometry or attached weapons.
-fn collision_world_player_texture(team: i32) -> Arc<crate::materials::TextureData> {
+/// One 1x1 material per resolved player skin variant, uploaded through the
+/// existing dynamic-model material cache. The caller already applied OpenJK's
+/// BG_ValidateSkinForTeam (and cg_forceModel) before choosing this override.
+/// Do not derive the visual variant from a gametype/team a second time: FFA
+/// players can explicitly select model/red and model/blue too.
+fn collision_world_player_texture(
+    skin_name: &str, color_override: Option<[u8; 3]>,
+) -> Arc<crate::materials::TextureData> {
     use std::sync::OnceLock;
     fn solid(label: &str, rgb: [u8; 3]) -> Arc<crate::materials::TextureData> {
         Arc::new(crate::materials::TextureData {
@@ -39,16 +42,23 @@ fn collision_world_player_texture(team: i32) -> Arc<crate::materials::TextureDat
             srgb: true,
         })
     }
-    static BEIGE: OnceLock<Arc<crate::materials::TextureData>> = OnceLock::new();
+    static GREEN: OnceLock<Arc<crate::materials::TextureData>> = OnceLock::new();
     static RED: OnceLock<Arc<crate::materials::TextureData>> = OnceLock::new();
     static BLUE: OnceLock<Arc<crate::materials::TextureData>> = OnceLock::new();
-    match team {
-        crate::cgame::TEAM_RED => Arc::clone(RED.get_or_init(||
-            solid("collision-world-player-red", [158, 43, 39]))),
-        crate::cgame::TEAM_BLUE => Arc::clone(BLUE.get_or_init(||
-            solid("collision-world-player-blue", [43, 83, 158]))),
-        _ => Arc::clone(BEIGE.get_or_init(||
-            solid("collision-world-player-beige", [146, 105, 64]))),
+    // Resolved model_red / model_blue skins and custom _red/_blue team
+    // variants follow the same model-selection decision as the normal path.
+    // The colorOverride is how OpenJK represents special Jedi/RGB team skins.
+    let variant = skin_name.rsplit('_').next().unwrap_or(skin_name);
+    let red = color_override.is_some_and(|rgb| rgb[0] > rgb[2])
+        || variant.eq_ignore_ascii_case("red");
+    let blue = color_override.is_some_and(|rgb| rgb[2] > rgb[0])
+        || variant.eq_ignore_ascii_case("blue");
+    if red {
+        Arc::clone(RED.get_or_init(|| solid("collision-world-player-red", [158, 43, 39])))
+    } else if blue {
+        Arc::clone(BLUE.get_or_init(|| solid("collision-world-player-blue", [43, 83, 158])))
+    } else {
+        Arc::clone(GREEN.get_or_init(|| solid("collision-world-player-green", [43, 158, 73])))
     }
 }
 
@@ -69,6 +79,31 @@ pub(crate) fn collision_world_equipment_texture() -> Arc<crate::materials::Textu
         clamp: true,
         srgb: true,
     })))
+}
+
+/// Convert the JK2 Ghoul2 `lower_lumbar` bolt into the exact trace ray used by
+/// MVSDK `CG_FootstepForSurface`: bolt origin and its NEGATIVE_Y direction.
+/// The caller supplies the same model-to-world transform as visible players.
+fn jk2_lumbar_footstep_ray(
+    bolt: Matrix3x4,
+    render_axis: [[f32; 3]; 3],
+    render_origin: [f32; 3],
+) -> ([f32; 3], [f32; 3]) {
+    let local = [-bolt[0][1], -bolt[1][1], -bolt[2][1]];
+    let mut down = [0.0; 3];
+    for (j, out) in down.iter_mut().enumerate() {
+        *out = render_axis[0][j] * local[0]
+            + render_axis[1][j] * local[1]
+            + render_axis[2][j] * local[2];
+    }
+    let length = (down[0] * down[0] + down[1] * down[1] + down[2] * down[2]).sqrt();
+    let down = if length > f32::EPSILON {
+        [down[0] / length, down[1] / length, down[2] / length]
+    } else {
+        [0.0, 0.0, -1.0]
+    };
+    let point = [bolt[0][3], bolt[1][3], bolt[2][3]];
+    (transform_jka_model_point(point, render_axis, render_origin), down)
 }
 
 /// TaystJK `CG_Player` (`cg_players.c`): `EF_NODRAW` and
@@ -164,10 +199,12 @@ impl PlayerPresenter {
         };
         self.cloth.begin_frame(current_time);
         self.stage_view_position = view.map(|view| view.position.to_array());
-        // CG_BuildSolidList equivalent for the optional footstep-only CG_Trace.
-        // Reuse the existing entity-clip representation and snapshot trajectory
-        // evaluation. No per-frame list construction on the original A path.
-        if self.footstep_trace {
+        // JK2 MVSDK's CG_FootstepForSurface ALWAYS uses CG_Trace (brush models
+        // and solid entities included). Preserve the original allocation-free
+        // JKA world-only path unless its diagnostic cg_footstepTrace is enabled.
+        if self.footstep_trace
+            || (jka_assets::pk3::active_jk2().is_some() && self.footstep_stages.sounds)
+        {
             crate::net::solid_entities_into(entities, current_time, &mut self.footstep_solids);
         }
         // TaystJK CG_Player reads the viewing player's authoritative snapshot.
@@ -1513,7 +1550,7 @@ impl PlayerPresenter {
         // Keep that exact taunt instance masked after the clip ends; only this
         // animation input copy changes, never Pmove or the received entity.
         let emote_animation_state = runtime.emote_taunt.animation_state(&entity.state, local_emote.is_some());
-        runtime.animation.update(
+        let animation_update = runtime.animation.update(
             emote_animation_state.as_ref().unwrap_or(&entity.state),
             animations,
             &model.animation_gla,
@@ -1524,7 +1561,16 @@ impl PlayerPresenter {
             anim_blend && emote_animation_state.is_none() && !(swing_fix == 1 && swing_boundary),
             model.humanoid,
             jk2_version,
-        )?;
+        );
+        if let (Err(error), Some(_)) = (&animation_update, jk2_version) {
+            // A failed update leaves no frame pair for this frame: say so rather
+            // than let it look like a missed footstep.
+            self.jk2_footstep_diag.count(footsteps::Jk2Stage::UpdateError);
+            self.jk2_footstep_diag.line(current_time, || format!(
+                "ent={} animation update failed: {error}", entity.number,
+            ));
+        }
+        animation_update?;
 
         let anim_debug = ViewerAnimDebug {
             legs_input: entity.state.field_i32("legsAnim").unwrap_or(0),
@@ -1546,14 +1592,44 @@ impl PlayerPresenter {
         // frames and CG_FootStep wants ground under the player (a wall run excepted).
         let jk2 = jka_assets::pk3::active_jk2().is_some();
         let mut jk2_step = false;
-        if jk2 && self.footstep_stages.sounds && entity.entity_type != ET_BODY {
+        // (anim name, old frame, frame, groundEntityNum) of a due footfall, for cg_footstepDebug.
+        let mut jk2_step_info = ("", 0, 0, jka_movement::ENTITY_NONE);
+        if jk2 && entity.entity_type != ET_BODY {
             if let Some(step) = runtime.animation.legs_frame_step() {
-                jk2_step = footsteps::jk2_step_due(animations, step.anim, step.old_frame, step.frame)
-                    .is_some_and(|wall_run| {
-                        wall_run
-                            || entity.state.field_i32("groundEntityNum").unwrap_or(jka_movement::ENTITY_NONE)
-                                != jka_movement::ENTITY_NONE
-                    });
+                use footsteps::Jk2Stage;
+                let diag = &mut self.jk2_footstep_diag;
+                diag.count(Jk2Stage::Advance);
+                match footsteps::jk2_step_due(animations, step.anim, step.old_frame, step.frame) {
+                    None => diag.count(Jk2Stage::NotStep),
+                    Some(wall_run) => {
+                        diag.count(Jk2Stage::Due);
+                        let ground = entity.state.field_i32("groundEntityNum")
+                            .unwrap_or(jka_movement::ENTITY_NONE);
+                        let anim = jka_assets::animation::AnimationSet::name(step.anim).unwrap_or("?");
+                        jk2_step_info = (anim, step.old_frame, step.frame, ground);
+                        // CG_FootStep: only a wall run steps without ground under it.
+                        // cg_footsteps is not consulted by the animation path in MVSDK
+                        // (only the EV_FOOTSTEP handlers read it), but a player who
+                        // turned footsteps off still expects silence here.
+                        let reason = if !self.footstep_stages.sounds {
+                            Some((Jk2Stage::SoundsOff, "REJECTED cg_footsteps 0"))
+                        } else if !wall_run && ground == jka_movement::ENTITY_NONE {
+                            Some((Jk2Stage::NoGround, "REJECTED groundEntityNum NONE"))
+                        } else {
+                            None
+                        };
+                        match reason {
+                            Some((stage, text)) => {
+                                diag.count(stage);
+                                diag.line(current_time, || format!(
+                                    "ent={} anim={anim} frames={}->{} ground={ground} => {text}",
+                                    entity.number, step.old_frame, step.frame,
+                                ));
+                            }
+                            None => jk2_step = true,
+                        }
+                    }
+                }
             }
         }
         if !jk2
@@ -1599,20 +1675,57 @@ impl PlayerPresenter {
                     if view.sphere_outside(cull_origin, radius) {
                         self.perf.frustum_culled = self.perf.frustum_culled.saturating_add(1);
                         if !self.rt_shadow_casters_enabled && !self.studio_bone_masks.contains_key(&entity.number) {
-                            // Out of view is not out of earshot: the pose is not built,
-                            // so the feet are taken to be under the entity.
-                            if let (true, Some(world)) = (jk2_step, self.collision_world.as_mut()) {
-                                let down = [0.0, 0.0, -1.0];
-                                let step = if self.footstep_trace {
-                                    let mut trace = footsteps::FootstepEntityTrace::new(
-                                        world, &self.footstep_solids, self.viewer_client,
-                                        i32::from(entity.number),
-                                    );
-                                    footsteps::jk2_trace_footstep(&mut trace, entity.number, entity.origin, down)
+                            // MVSDK still uses the animated lower_lumbar bolt when
+                            // the player is offscreen. Only evaluate this one bone
+                            // (plus ancestors), and only on an actual footfall:
+                            // never force a full Ghoul2 pose at raster FPS.
+                            if jk2_step {
+                                let (render_axis, render_origin) = ghoul2_render_transform(entity, axis);
+                                let lumbar = if Arc::ptr_eq(&model.animation_gla, &model.gla)
+                                    && local_emote.is_none()
+                                {
+                                    Ghoul2Animator::bone_index(&model.gla, "lower_lumbar")
+                                        .and_then(|index| {
+                                            runtime.animation.animator
+                                                .evaluate_bone_openjk_root(&model.gla, current_time, index)
+                                                .ok()
+                                                .map(|skin| multiply_3x4(
+                                                    &skin, &model.gla.skeleton[index].base_pose,
+                                                ))
+                                        })
                                 } else {
-                                    footsteps::jk2_trace_footstep(world, entity.number, entity.origin, down)
+                                    // Retargeted/imported skeletons need the mesh pose
+                                    // binding; this only runs on a due step, not per frame.
+                                    runtime.animation.evaluate_pose_openjk_root(
+                                        &model.animation_gla, current_time,
+                                    ).ok().and_then(|pose| model.bind_animation_pose(pose).ok())
+                                        .and_then(|pose| model_bolt_matrix_timed(
+                                            &mut self.perf, &model.glm, &model.gla, &pose, "lower_lumbar",
+                                        ).ok().flatten())
                                 };
-                                self.jk2_footsteps.extend(step);
+                                let bolt_found = lumbar.is_some();
+                                let (origin, down) = lumbar.map_or(
+                                    (entity.origin, [0.0, 0.0, -1.0]),
+                                    |bolt| jk2_lumbar_footstep_ray(bolt, render_axis, render_origin),
+                                );
+                                if let Some(world) = self.collision_world.as_mut() {
+                                    footsteps::jk2_probe_step(
+                                        world, &self.footstep_solids, self.viewer_client,
+                                        &mut self.jk2_footstep_diag, &mut self.jk2_footsteps,
+                                        footsteps::Jk2StepContext {
+                                            time: current_time,
+                                            anim: jk2_step_info.0,
+                                            old_frame: jk2_step_info.1,
+                                            frame: jk2_step_info.2,
+                                            ground: jk2_step_info.3,
+                                            offscreen: true,
+                                            bolt_found,
+                                        },
+                                        entity.number, origin, down,
+                                    );
+                                } else {
+                                    self.jk2_footstep_diag.count(footsteps::Jk2Stage::NoWorld);
+                                }
                             }
                             if let (false, Some(world)) =
                                 (footsteps.is_empty(), self.collision_world.as_mut())
@@ -1876,40 +1989,34 @@ impl PlayerPresenter {
                 ..anim_debug
             });
         }
-        if let (true, Some(world)) = (jk2_step, self.collision_world.as_mut()) {
-            // CG_FootstepForSurface: from the lower-lumbar bolt, down its -Y axis.
-            let (origin, down) = match model_bolt_matrix_timed(
-                &mut self.perf, &model.glm, &model.gla, &pose, "lower_lumbar",
-            ) {
-                Ok(Some(m)) => {
-                    let local = [-m[0][1], -m[1][1], -m[2][1]];
-                    let mut down = [0.0; 3];
-                    for (j, out) in down.iter_mut().enumerate() {
-                        *out = render_axis[0][j] * local[0]
-                            + render_axis[1][j] * local[1]
-                            + render_axis[2][j] * local[2];
-                    }
-                    let length = (down[0] * down[0] + down[1] * down[1] + down[2] * down[2]).sqrt();
-                    let down = if length > f32::EPSILON {
-                        [down[0] / length, down[1] / length, down[2] / length]
-                    } else {
-                        [0.0, 0.0, -1.0]
-                    };
-                    let point = [m[0][3], m[1][3], m[2][3]];
-                    (transform_jka_model_point(point, render_axis, render_origin), down)
-                }
-                _ => (entity.origin, [0.0, 0.0, -1.0]),
-            };
-            let step = if self.footstep_trace {
-                let mut trace = footsteps::FootstepEntityTrace::new(
-                    world, &self.footstep_solids, self.viewer_client,
-                    i32::from(entity.number),
+        if jk2_step {
+            if let Some(world) = self.collision_world.as_mut() {
+                // CG_FootstepForSurface: from the lower-lumbar bolt, down its -Y axis.
+                let lumbar = model_bolt_matrix_timed(
+                    &mut self.perf, &model.glm, &model.gla, &pose, "lower_lumbar",
+                ).ok().flatten();
+                let bolt_found = lumbar.is_some();
+                let (origin, down) = lumbar.map_or(
+                    (entity.origin, [0.0, 0.0, -1.0]),
+                    |bolt| jk2_lumbar_footstep_ray(bolt, render_axis, render_origin),
                 );
-                footsteps::jk2_trace_footstep(&mut trace, entity.number, origin, down)
+                footsteps::jk2_probe_step(
+                    world, &self.footstep_solids, self.viewer_client,
+                    &mut self.jk2_footstep_diag, &mut self.jk2_footsteps,
+                    footsteps::Jk2StepContext {
+                        time: current_time,
+                        anim: jk2_step_info.0,
+                        old_frame: jk2_step_info.1,
+                        frame: jk2_step_info.2,
+                        ground: jk2_step_info.3,
+                        offscreen: false,
+                        bolt_found,
+                    },
+                    entity.number, origin, down,
+                );
             } else {
-                footsteps::jk2_trace_footstep(world, entity.number, origin, down)
-            };
-            self.jk2_footsteps.extend(step);
+                self.jk2_footstep_diag.count(footsteps::Jk2Stage::NoWorld);
+            }
         }
         if let (false, Some(world)) = (footsteps.is_empty(), self.collision_world.as_mut()) {
             // CG_PlayerFootsteps: the foot bolt in the legs' own frame.
@@ -2064,7 +2171,7 @@ impl PlayerPresenter {
             && crate::renderer::collision_world_only()
             && look.ghost == crate::japro_cg::Ghost::None;
         let body_custom = if flat_body {
-            Some((Some(collision_world_player_texture(info.team)),
+            Some((Some(collision_world_player_texture(&info.skin_name, info.team_color_override)),
                 DynamicModelAlphaMode::Opaque, false))
         } else {
             body_custom
@@ -2501,5 +2608,40 @@ mod mindtrick_fade_tests {
         assert_eq!(MindTrickFade::advance(Some(back), 1300, false).alpha, 255.0);
         // Demo seek backwards must reset time-dependent alpha.
         assert_eq!(MindTrickFade::advance(Some(shown), 500, true).alpha, 1.0);
+    }
+}
+
+#[cfg(test)]
+mod jk2_footstep_ray_tests {
+    use super::jk2_lumbar_footstep_ray;
+
+    #[test]
+    fn traces_from_the_bolt_along_negative_y_even_if_model_is_offscreen() {
+        let bolt = [
+            [1.0, 0.0, 0.0, 10.0],
+            [0.0, 0.0, 1.0, 20.0],
+            [0.0, 1.0, 0.0, 30.0],
+        ];
+        let axis = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]];
+        let (origin, down) = jk2_lumbar_footstep_ray(bolt, axis, [1.0, 2.0, 3.0]);
+        assert_eq!(origin, [21.0, 42.0, 63.0]);
+        assert_eq!(down, [0.0, 0.0, -1.0]);
+    }
+}
+
+#[cfg(test)]
+mod shitter_player_tint_tests {
+    use super::collision_world_player_texture;
+
+    #[test]
+    fn resolved_skin_controls_color_in_ffa_and_teams() {
+        let rgb = |skin, override_rgb| collision_world_player_texture(skin, override_rgb).rgba.to_vec();
+        assert_eq!(rgb("default", None), [43, 158, 73, 255]);
+        assert_eq!(rgb("red", None), [158, 43, 39, 255]);
+        assert_eq!(rgb("blue", None), [43, 83, 158, 255]);
+        assert_eq!(rgb("custom_red", None), [158, 43, 39, 255]);
+        assert_eq!(rgb("custom_blue", None), [43, 83, 158, 255]);
+        assert_eq!(rgb("default", Some([255, 0, 0])), [158, 43, 39, 255]);
+        assert_eq!(rgb("default", Some([0, 0, 255])), [43, 83, 158, 255]);
     }
 }

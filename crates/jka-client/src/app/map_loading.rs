@@ -1030,9 +1030,10 @@ impl App {
         self.apply_latched_console_cvars(ApplyLatchedScope::MapLoad);
         // Match OpenJK's renderer defaults per connected protocol. This command
         // precedes the BSP upload and also resets the menu when JK2 disconnects.
-        self.render_command(RenderCommand::SetOverbrightBits(
-            self.video.effective_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
-        ));
+        self.render_command(RenderCommand::SetOverbrightBits {
+            bits: self.video.effective_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
+            jk2_mode: self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some(),
+        });
         // PBR material selection is map-load scoped; synchronize the renderer at
         // the same boundary rather than when a latched cvar is typed. Rebuild the
         // local presentation asset cache so its VFS/material policy matches too.
@@ -1042,6 +1043,12 @@ impl App {
         self.initial_source = source.clone();
         self.latest_request_id = self.latest_request_id.wrapping_add(1);
         let request_id = self.latest_request_id;
+        if matches!(purpose, MapLoadPurpose::Gameplay | MapLoadPurpose::LivePrefetch)
+            && self.renderer_restart_started.is_none() {
+            // A real re-entry into the same map reapplies its default; renderer
+            // restarts and remap-only uploads retain unsaved lighting edits.
+            self.relighting_profiles.reload_request = Some(request_id);
+        }
         self.map_loader_latest_requested.store(request_id, std::sync::atomic::Ordering::Release);
         self.frontend_background_request_id =
             (purpose == MapLoadPurpose::FrontendBackground).then_some(request_id);

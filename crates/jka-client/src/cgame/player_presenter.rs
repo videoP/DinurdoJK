@@ -229,12 +229,14 @@ pub struct PlayerPresenter {
     footstep_stages: FootstepStages,
     /// Opt-in CG_Trace for ground footfalls (no changes to movement prediction).
     footstep_trace: bool,
-    /// Rebuilt once per presentation pass only when cg_footstepTrace is enabled.
+    /// Rebuilt for JK2's native CG_Trace footsteps, or JKA's optional A/B.
     footstep_solids: Vec<crate::net::SolidEntity>,
     /// This frame's footfalls that found ground (drained by the caller).
     footsteps: Vec<FootstepImpact>,
     /// This frame's JK2 footfalls (`CG_FootStep`): sound only, no dust or prints.
     jk2_footsteps: Vec<footsteps::Jk2Footstep>,
+    /// `cg_footstepDebug` stage counters for JK2 footstep candidates.
+    jk2_footstep_diag: footsteps::Jk2FootstepDiag,
     /// `Q_irand(0, 99)` for footsteps that only play some of the time.
     footstep_rng: u32,
     /// Snapshot time of the current presentation pass: the clock of shader

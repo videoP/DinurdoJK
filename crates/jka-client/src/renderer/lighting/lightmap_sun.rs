@@ -421,9 +421,6 @@ struct Key {
     /// Baked sky world illumination: 0 off, 1 smoothed normals, 2 normals and
     /// sky visibility traced at the original lightmap resolution (`sky_sizes`).
     sky: u8,
-    /// A/B sky normal algorithm: 0 smoothed (existing), 1 geometric face (live-pass parity).
-    /// Only effective when sky > 0; toggling invalidates the static bake key.
-    sky_ab: u8,
     sky_sizes: Vec<[u32; 2]>,
     local_sources: u32,
     local_sizes: Vec<[u32; 2]>,
@@ -878,24 +875,9 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
     };
     progress.set(1, 25);
     let receivers = geometry.sun_receivers(key.normals);
-    // B tests the normal the fullscreen shader sees on a flat BSP face.
-    // Only sky shading/sky rays use it; sunlight flux and shadow-terminator
-    // smoothing keep their original receiver normals in both A/B modes.
-    let sky_face_receivers: Option<Vec<crate::renderer::StaticAoLightmapTriangle>> =
-        (key.sky != 0 && key.sky_ab == 1).then(|| {
-            geometry.receivers.iter().cloned().map(|mut tri| {
-                let p = tri.positions.map(Vec3::from_array);
-                let mut normal = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
-                let authored = tri.normals.iter().fold(Vec3::ZERO, |a, &n| a + Vec3::from_array(n));
-                if normal.dot(authored) < 0.0 { normal = -normal; }
-                if normal.length_squared() < 0.5 {
-                    normal = authored.normalize_or_zero();
-                }
-                tri.normals = [normal.to_array(); 3];
-                tri
-            }).collect()
-        });
-    let sky_receivers = sky_face_receivers.as_deref().unwrap_or(receivers);
+    // Sky irradiance and sky visibility must use the same selected Phong
+    // receiver normals as the sun. Reconstructing geometric face normals here
+    // reintroduces BSP facets and bypasses r_bakedSunNormals entirely.
     let mut samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(
         receivers, &key.sizes, 1,
     );
@@ -1125,7 +1107,13 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                 if normal.length_squared() < 0.5 { normal = authored.normalize_or_zero(); }
                 for corner in 0..3 {
                     let index = batch.vertices.start as usize + tri_index * 3 + corner;
-                    positions.entry(index).or_insert(normal);
+                    // Preserve authored smooth patch/model normals. The face
+                    // normal is only a fallback for invalid vertex data.
+                    let authored = Vec3::from_array(triangle[corner].normal).normalize_or_zero();
+                    let shading = if authored.is_finite() && authored.length_squared() > 0.5 {
+                        authored
+                    } else { normal };
+                    positions.entry(index).or_insert(shading);
                 }
             }
         }
@@ -1176,7 +1164,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
         // The compositor reads direct visibility from the antialiased sun flux.
         let base_visibility: Vec<Vec<f32>> = if key.sky == 2 {
             let base_samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(
-                sky_receivers, &key.sky_sizes, 1,
+                receivers, &key.sky_sizes, 1,
             );
             const RAYS: usize = 16;
             let sky_total = base_samples.iter().map(|texels| texels.len() as u32).sum::<u32>().max(1);
@@ -1222,12 +1210,6 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
         } else {
             Vec::new()
         };
-        // A uses the static sun's smoothed luxel normals. B rasterizes
-        // geometric face normals into the same luxels, without changing sun
-        // flux or allocating any additional GPU textures.
-        let face_samples = sky_face_receivers.as_ref().map(|face| {
-            crate::renderer::static_ao::bvh::rasterize_lightmap_texels(face, &key.sizes, 1)
-        });
         let pack_done = AtomicU32::new(0);
         let pack_total = samples.len() as u32;
         samples.par_iter().zip(&page_ids).zip(&key.sizes).enumerate()
@@ -1257,11 +1239,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                     } else {
                         1.0
                     };
-                    let normal = face_samples.as_ref()
-                        .and_then(|pages| pages.get(page))
-                        .and_then(|page_samples| page_samples.get(i))
-                        .and_then(|sample| sample.as_ref())
-                        .map_or(Vec3::from_array(sample.normal), |face| Vec3::from_array(face.normal));
+                    let normal = Vec3::from_array(sample.normal);
                     // Luxel direct visibility stays in the existing R32F sun
                     // texture; these packed bits are only used by vertex sky.
                     pack_sky_normal(normal, exposure, 0.0)
@@ -1359,7 +1337,7 @@ impl Renderer {
         let light_sources = self.added_map_light_sources();
         let bake_local = light_sources != 0 && self.baked_sun_debug_mode == 0;
         let debug_layers = if matches!(self.lightmap_signal, 7 | 8) { self.lightmap_signal } else { 0 };
-        // B uses geometric normals and 16-ray ambient sky openness. Direct
+        // B uses selected receiver normals and 16-ray ambient sky openness. Direct
         // visibility comes from the existing sun/moon bake and its edge AA.
         let sky = if bake_sun && self.sun_override && self.sky_world_bake_ab != 0
             && self.sky_world_lighting_strength > 0.0 {
@@ -1414,7 +1392,6 @@ impl Renderer {
                     && k.terminator == self.sun_terminator
                     && k.debug_layers == debug_layers
                     && k.sky == sky
-                    && k.sky_ab == (if sky != 0 { 1 } else { 0 })
                     && k.local_sources
                         == if bake_local {
                             light_sources
@@ -1472,7 +1449,6 @@ impl Renderer {
             terminator: self.sun_terminator,
             debug_layers,
             sky,
-            sky_ab: if sky != 0 { 1 } else { 0 },
             sky_sizes: if sky == 2 { base.clone() } else { Vec::new() },
             local_sources: if bake_local {
                 light_sources
@@ -1934,7 +1910,6 @@ mod tests {
             terminator: false,
             debug_layers: 0,
             sky: 0,
-            sky_ab: 0,
             sky_sizes: Vec::new(),
             local_sources: 0,
             local_sizes: Vec::new(),
@@ -1965,6 +1940,49 @@ mod tests {
             cloudy[0][4 * 32 + 12] > 0.0 && cloudy[0][4 * 32 + 12] < 1.0,
             "an overcast roof must produce a geometric penumbra near its edge"
         );
+        // Exercise the actual sky trace/packing path, not just smoothing:
+        // geometric re-flattening used to discard the selected receiver set.
+        let mut sky_geometry = geometry.clone();
+        let edge_normal = Vec3::new(0.5, 0.866_025_4, 0.0).normalize();
+        let auto_normal = Vec3::new(-0.5, 0.866_025_4, 0.0).normalize();
+        for triangle in Arc::make_mut(&mut sky_geometry.sun_receivers) {
+            triangle.normals = [edge_normal.to_array(); 3];
+        }
+        for triangle in Arc::make_mut(&mut sky_geometry.auto_receivers) {
+            triangle.normals = [auto_normal.to_array(); 3];
+        }
+        // A vertex-lit curved patch has its own authored smooth normals.
+        let vertex_batch = &mut sky_geometry.batches[1];
+        vertex_batch.rgb_gen = jka_assets::shader::RgbGen::Vertex;
+        vertex_batch.modulate_lightmap = false;
+        vertex_batch.texture_is_lightmap = false;
+        vertex_batch.lightstyle_slot = 0;
+        vertex_batch.additive_companions.clear();
+        for vertex in &mut Arc::make_mut(&mut sky_geometry.vertices)[3..6] {
+            vertex.normal = edge_normal.to_array();
+        }
+        let normal_bits = !2047u32; // Ignore the two independently traced visibility fields.
+        for (mode, expected) in [(0, Vec3::Y), (1, edge_normal), (2, auto_normal)] {
+            let sky_key = Key {
+                sky: 2, sky_sizes: vec![[16, 16]], normals: mode, ..key.clone()
+            };
+            let output = trace(&sky_geometry, &sky_key, &cancel, &progress).unwrap();
+            assert_eq!(
+                output.sky[0][4 * 32 + 24] & normal_bits,
+                pack_sky_normal(expected, 0.0, 0.0) & normal_bits,
+                "sky luxels must retain receiver-normal mode {mode}"
+            );
+            let patch: Vec<_> = output.vertex_sky.iter()
+                .filter(|sample| (3..6).contains(&sample.gpu_index)).collect();
+            assert_eq!(patch.len(), 3);
+            for sample in patch {
+                assert_eq!(
+                    sample.packed & normal_bits,
+                    pack_sky_normal(edge_normal, 0.0, 0.0) & normal_bits,
+                    "vertex-lit patches must retain authored shading normals"
+                );
+            }
+        }
         assert!(
             pages[0][..32 * 32]
                 .iter()

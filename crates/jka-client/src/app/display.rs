@@ -1273,9 +1273,10 @@ impl App {
             self.applied_ocean = self.video.ocean;
             self.applied_texture_compression = self.video.texture_compression;
             // A menu with no loaded BSP still needs the output-gain setting.
-            self.render_command(RenderCommand::SetOverbrightBits(
-                self.video.effective_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
-            ));
+            self.render_command(RenderCommand::SetOverbrightBits {
+                bits: self.video.effective_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
+                jk2_mode: self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some(),
+            });
             self.publish_ui();
             return;
         }
@@ -1382,9 +1383,10 @@ impl App {
                 self.render = Some(render);
                 // A restarted renderer begins with overbright disabled. Restore
                 // the resolved protocol default before cached BSP reupload.
-                self.render_command(RenderCommand::SetOverbrightBits(
-                    self.video.effective_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
-                ));
+                self.render_command(RenderCommand::SetOverbrightBits {
+                    bits: self.video.effective_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
+                    jk2_mode: self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some(),
+                });
                 self.profile_background_requested=None;
                 // Renderer restarts recreate these lightweight runtime flags;
                 // immediately restore the classic world-lighting controls from

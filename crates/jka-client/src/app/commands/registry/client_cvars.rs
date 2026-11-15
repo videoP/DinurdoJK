@@ -6,7 +6,7 @@ app_cvars! {
     APP_CG_DRAWGUN {
         runtime: CvarDef::new(
             "cg_drawGun", "1", "0..4",
-            "TaystJK: 0 hide view gun; 1 stock; 2 no weapon bob; 3 no landing dip; 4 no idle drift (cumulative).",
+            "0 hide view gun; 1 stock; 2 no weapon bob; 3 no landing dip; 4 no idle drift (cumulative).",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.view_weapon.draw_gun.to_string()),
             |app, value| {
@@ -32,7 +32,7 @@ app_cvars! {
     APP_CG_GUNX {
         runtime: CvarDef::new(
             "cg_gunX", "0", "number",
-            "TaystJK CG_AddViewWeapon: offset view gun in native units along camera forward axis.",
+            "Offset the first-person gun in native units along the camera's forward axis.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.view_weapon.gun_x.to_string()),
             |app, value| {
@@ -55,7 +55,7 @@ app_cvars! {
     APP_CG_GUNY {
         runtime: CvarDef::new(
             "cg_gunY", "0", "number",
-            "TaystJK CG_AddViewWeapon: offset view gun in native units along camera left axis.",
+            "Offset the first-person gun in native units along the camera's left axis.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.view_weapon.gun_y.to_string()),
             |app, value| {
@@ -78,7 +78,7 @@ app_cvars! {
     APP_CG_GUNZ {
         runtime: CvarDef::new(
             "cg_gunZ", "0", "number",
-            "TaystJK CG_AddViewWeapon: offset view gun in native units along camera up axis.",
+            "Offset the first-person gun in native units along the camera's up axis.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.view_weapon.gun_z.to_string()),
             |app, value| {
@@ -101,7 +101,7 @@ app_cvars! {
     APP_CG_FOVVIEWMODEL {
         runtime: CvarDef::new(
             "cg_fovViewmodel", "80", "0 or 1..140",
-            "TaystJK: independent horizontal viewmodel FOV; 0 inherits cg_fov. Scales hand forward axis and MD3 tags.",
+            "Independent horizontal viewmodel FOV; 0 inherits cg_fov. Scales hand forward axis and MD3 tags.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.view_weapon.fov_viewmodel.to_string()),
             |app, value| {
@@ -130,7 +130,7 @@ app_cvars! {
     APP_CG_FOVVIEWMODELADJUST {
         runtime: CvarDef::new(
             "cg_fovViewmodelAdjust", "1", "0|1",
-            "TaystJK: lower the first-person hand origin by 0.2 units for every viewmodel FOV degree above 90.",
+            "Lower the first-person hand origin by 0.2 units for every viewmodel FOV degree above 90.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(u8::from(app.view_weapon.fov_viewmodel_adjust).to_string()),
             |app, value| {
@@ -156,7 +156,7 @@ app_cvars! {
     APP_CG_GUNALPHA {
         runtime: CvarDef::new(
             "cg_gunAlpha", "1", "0..1",
-            "jaPRO/TaystJK: first-person gun translucency (0 and 1 are opaque in upstream).",
+            "First-person gun opacity: 0 and 1 are opaque; intermediate values are translucent.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.view_weapon.gun_alpha.to_string()),
             |app, value| {
@@ -216,7 +216,7 @@ app_cvars! {
     APP_IN_MOUSEREPEAT {
         runtime: CvarDef::new(
             "in_mouserepeat", "0", "0|1|2",
-            "TaystJK: 0 off, 1 repeat held MOUSE4 and MOUSE5, 2 repeat MOUSE4 only. Real-time cadence is decoupled from render FPS.",
+            "0 off, 1 repeat held MOUSE4 and MOUSE5, 2 repeat MOUSE4 only. Real-time cadence is decoupled from render FPS.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.in_mouserepeat.to_string()),
             |app, value| {
@@ -243,7 +243,7 @@ app_cvars! {
     APP_IN_MOUSEREPEATDELAY {
         runtime: CvarDef::new(
             "in_mouserepeatDelay", "0", "0..2000 (ms)",
-            "Optional delay before MOUSE4/MOUSE5 begin repeating; default 0 matches TaystJK's lack of a deliberate repeat delay. Subsequent repeats are approximately every 16ms.",
+            "Optional delay before MOUSE4/MOUSE5 begin repeating; default 0 has no added delay. Subsequent repeats are approximately every 16 ms.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.in_mouserepeat_delay.to_string()),
             |app, value| {
@@ -270,7 +270,7 @@ app_cvars! {
     APP_CG_ANIMBLEND {
         runtime: CvarDef::new(
             "cg_animBlend", "1", "0|1",
-            "Blend player animation transitions as in TaystJK. Session-only; rewind the demo after changing. Disabling also bypasses the saber spine transition blend.",
+            "Blend player animation transitions. Session-only; rewind the demo after changing. Disabling also bypasses the saber spine transition blend.",
             CvarType::String, CvarFlags::NONE, LatchScope::None,
             |_app| CvarValue::String(u8::from(crate::cgame::player_presenter::animation_blend_enabled()).to_string()),
             |_app, value| {
@@ -320,7 +320,7 @@ app_cvars! {
     }
     APP_CG_BOBUP {
         runtime: CvarDef::new(
-            "cg_bobUp", "0", "number", "TaystJK vertical walking/running view bob.",
+            "cg_bobUp", "0", "number", "Vertical walking/running view bob.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(format!("{}", app.view_bob.bob_up)),
             |app, value| {
@@ -342,7 +342,7 @@ app_cvars! {
     }
     APP_CG_BOBPITCH {
         runtime: CvarDef::new(
-            "cg_bobPitch", "0", "number", "TaystJK bobCycle-driven first-person pitch.",
+            "cg_bobPitch", "0", "number", "First-person pitch driven by the walking/running bob cycle.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(format!("{}", app.view_bob.bob_pitch)),
             |app, value| {
@@ -364,7 +364,7 @@ app_cvars! {
     }
     APP_CG_BOBROLL {
         runtime: CvarDef::new(
-            "cg_bobRoll", "0", "number", "TaystJK alternating footstep view roll.",
+            "cg_bobRoll", "0", "number", "Alternating first-person roll with footsteps.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(format!("{}", app.view_bob.bob_roll)),
             |app, value| {
@@ -386,7 +386,7 @@ app_cvars! {
     }
     APP_CG_RUNPITCH {
         runtime: CvarDef::new(
-            "cg_runPitch", "0", "number", "TaystJK forward-velocity first-person pitch tilt.",
+            "cg_runPitch", "0", "number", "Forward-velocity first-person pitch tilt.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(format!("{}", app.view_bob.run_pitch)),
             |app, value| {
@@ -408,7 +408,7 @@ app_cvars! {
     }
     APP_CG_RUNROLL {
         runtime: CvarDef::new(
-            "cg_runRoll", "0", "number", "TaystJK lateral-velocity first-person roll tilt.",
+            "cg_runRoll", "0", "number", "Lateral-velocity first-person roll tilt.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(format!("{}", app.view_bob.run_roll)),
             |app, value| {
@@ -564,7 +564,7 @@ app_cvars! {
     }
 
     APP_CG_CLEANCHATBOX {
-        runtime: CvarDef::new("cg_cleanChatbox", "", "0|1|2", "TaystJK: 0 off, 1 filter spam/duplicates and strip message-body colors, 2 filter spam/duplicates and recolor an initial message-body color green.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_cleanchatbox(app)), |app, value| App::cvar_set_cg_cleanchatbox(app, "cg_cleanChatbox", &value.to_string())).with_text_setter(App::cvar_set_cg_cleanchatbox, None),
+        runtime: CvarDef::new("cg_cleanChatbox", "", "0|1|2", "0 off, 1 filter spam/duplicates and strip message-body colors, 2 filter spam/duplicates and recolor an initial message-body color green.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_cleanchatbox(app)), |app, value| App::cvar_set_cg_cleanchatbox(app, "cg_cleanChatbox", &value.to_string())).with_text_setter(App::cvar_set_cg_cleanchatbox, None),
         config: CvarBinding {
             load_presentation: Some(|settings, _name, value| {
                 if let Ok(mode) = value.trim().parse::<u8>() {
@@ -639,7 +639,7 @@ app_cvars! {
     }
 
     APP_CG_DYNAMICCROSSHAIR {
-        runtime: CvarDef::new("cg_dynamicCrosshair", "", "0|1|2", "TaystJK dynamic crosshair: 0 static screen-center trace, 1 always trace from the weapon/player muzzle, 2 use the dynamic trace except for the original melee/saber/racemode/strafehelper static overrides.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_dynamiccrosshair(app)), |app, value| App::cvar_set_cg_dynamiccrosshair(app, APP_CG_DYNAMICCROSSHAIR.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_dynamiccrosshair, None),
+        runtime: CvarDef::new("cg_dynamicCrosshair", "", "0|1|2", "Dynamic crosshair: 0 fixed at screen center, 1 trace from the weapon/player muzzle, 2 dynamic except for melee/saber/race/strafehelper static overrides. The jaPRO Line crosshair always stays centered.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_dynamiccrosshair(app)), |app, value| App::cvar_set_cg_dynamiccrosshair(app, APP_CG_DYNAMICCROSSHAIR.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_dynamiccrosshair, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     if let Ok(mode) = value.trim().parse::<u8>() {
@@ -682,7 +682,7 @@ app_cvars! {
                 "cg_fkDuration",
                 "",
                 "integer",
-                "TaystJK flipkick sequence frame duration.",
+                "Flipkick sequence frame duration.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -728,7 +728,7 @@ app_cvars! {
                 "cg_fkFirstJumpDuration",
                 "",
                 "integer",
-                "TaystJK flipkick first jump duration.",
+                "Flipkick first jump duration.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -785,7 +785,7 @@ app_cvars! {
                 "cg_fkSecondJumpDelay",
                 "",
                 "integer",
-                "TaystJK flipkick second jump delay.",
+                "Flipkick second jump delay.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -878,7 +878,7 @@ app_cvars! {
                 "cg_fov",
                 "",
                 "1..140",
-                "TaystJK horizontal FOV on the legacy 4:3 baseline.",
+                "Horizontal FOV on the legacy 4:3 baseline.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -979,7 +979,7 @@ app_cvars! {
     }
 
     APP_CG_SABERSTAFFMULTICOLOR {
-        runtime: CvarDef::new("cg_saberStaffMultiColor", "", "0..1", "TaystJK staff-saber option: use the secondary saber color for primary-saber blades after blade 0.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_saberstaffmulticolor(app)), |app, value| App::cvar_set_cg_saberstaffmulticolor(app, APP_CG_SABERSTAFFMULTICOLOR.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_saberstaffmulticolor, None),
+        runtime: CvarDef::new("cg_saberStaffMultiColor", "", "0..1", "Staff-saber option: use the secondary saber color for primary-saber blades after blade 0.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_saberstaffmulticolor(app)), |app, value| App::cvar_set_cg_saberstaffmulticolor(app, APP_CG_SABERSTAFFMULTICOLOR.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_saberstaffmulticolor, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     {
@@ -1020,7 +1020,7 @@ app_cvars! {
     }
 
     APP_CG_SABERTEAMCOLORS {
-        runtime: CvarDef::new("cg_saberTeamColors", "", "0..1", "TaystJK team saber colors: force red-team sabers red and blue-team sabers blue outside Siege/Jedi-vs-Merc.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_saberteamcolors(app)), |app, value| App::cvar_set_cg_saberteamcolors(app, APP_CG_SABERTEAMCOLORS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_saberteamcolors, None),
+        runtime: CvarDef::new("cg_saberTeamColors", "", "0..1", "Team saber colors: force red-team sabers red and blue-team sabers blue outside Siege/Jedi-vs-Merc.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_saberteamcolors(app)), |app, value| App::cvar_set_cg_saberteamcolors(app, APP_CG_SABERTEAMCOLORS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_saberteamcolors, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     {
@@ -1058,7 +1058,7 @@ app_cvars! {
     APP_CG_SPEEDTRAIL {
         runtime: CvarDef::new(
             "cg_speedTrail", "1", "0|1",
-            "TaystJK Force Speed player-model afterimages: 0 off, 1 on.",
+            "Force Speed player-model afterimages: 0 off, 1 on.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(i32::from(app.speed_trail).to_string()),
             |app, value| {
@@ -1124,7 +1124,7 @@ app_cvars! {
                 "cg_scoreDeaths",
                 "",
                 "0..3",
-                "TaystJK scoreboard deaths: 0 off, 1 server data, 2 local fallback, 3 local count.",
+                "Scoreboard deaths: 0 off, 1 server data, 2 local fallback, 3 local count.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -1228,7 +1228,7 @@ app_cvars! {
     APP_CG_SIMULATEDPROJECTILES {
         runtime: CvarDef::new(
             "cg_simulatedProjectiles", "0", "0|1",
-            "TaystJK: immediately simulate your own projectile visuals on jaPRO servers with jcinfo UNLAGGEDPROJ. When jcinfo advertises pseudorandom fire, use the exact predicted firing usercmd seed. Cosmetic only; off by default.",
+            "Immediately simulate your own projectile visuals on jaPRO servers with jcinfo UNLAGGEDPROJ. When jcinfo advertises pseudorandom fire, use the exact predicted firing usercmd seed. Cosmetic only; off by default.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(u8::from(app.simulated_projectiles).to_string()),
             |app, value| {
@@ -1290,7 +1290,7 @@ app_cvars! {
     APP_CG_HEADLOOK {
         runtime: CvarDef::new(
             "cg_headLook", "", "0|1|2",
-            "Client-only automatic player head look targets: 0 off, 1 original OpenJK/TaystJK tracking, 2 gradual tracking with frame-rate-independent yaw smoothing. Does not change server target selection or player aim.",
+            "Client-only automatic player head tracking: 0 off, 1 standard tracking, 2 gradual tracking with frame-rate-independent yaw smoothing. Does not change server target selection or player aim.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(App::cvar_get_cg_headlook(app)),
             |app, value| App::cvar_set_cg_headlook(app, APP_CG_HEADLOOK.entry.name, &value.to_string()),
@@ -1456,7 +1456,7 @@ app_cvars! {
     }
 
     APP_CG_SPECCAMERAMOTION {
-        runtime: CvarDef::new("cg_specCameraMotion", "", "0|1", "Third-person spectator camera faces the current presented direction of motion (TaystJK cg_thirdPersonAngle -1 behavior).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_speccameramotion(app)), |app, value| App::cvar_set_cg_speccameramotion(app, APP_CG_SPECCAMERAMOTION.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_speccameramotion, None),
+        runtime: CvarDef::new("cg_specCameraMotion", "", "0|1", "Third-person spectator camera faces the followed player's current horizontal movement direction.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_speccameramotion(app)), |app, value| App::cvar_set_cg_speccameramotion(app, APP_CG_SPECCAMERAMOTION.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_speccameramotion, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     {
@@ -1919,7 +1919,7 @@ app_cvars! {
                 "cg_thirdPersonRange",
                 "",
                 "units",
-                "TaystJK third-person camera range.",
+                "Third-person camera range.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -1972,7 +1972,7 @@ app_cvars! {
     }
 
     APP_CG_THIRDPERSONSPECIALCAM {
-        runtime: CvarDef::new("cg_thirdPersonSpecialCam", "", "0..1", "TaystJK action camera during saber special moves; Rust action-camera branch is not ported yet.", CvarType::String, CvarFlags::NONE, LatchScope::None,
+        runtime: CvarDef::new("cg_thirdPersonSpecialCam", "", "0..1", "Action camera during saber special moves; not implemented yet (setting currently has no effect).", CvarType::String, CvarFlags::NONE, LatchScope::None,
          |app| CvarValue::String(App::cvar_get_cg_thirdpersonspecialcam(app)),
          |app, value| App::cvar_set_cg_thirdpersonspecialcam(app, APP_CG_THIRDPERSONSPECIALCAM.entry.name, &value.to_string())
         ).with_text_setter(App::cvar_set_cg_thirdpersonspecialcam, None),
@@ -2142,7 +2142,7 @@ app_cvars! {
                 "cg_zoomFov",
                 "",
                 "number",
-                "TaystJK held +zoom target field of view.",
+                "Held +zoom target field of view.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -2261,7 +2261,7 @@ app_cvars! {
                 "cl_mouseAccel",
                 "",
                 "float",
-                "TaystJK legacy style-0 mouse acceleration; 0 disables it.",
+                "Legacy style-0 mouse acceleration; 0 disables it.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -2447,7 +2447,7 @@ app_cvars! {
     APP_CON_SCALE {
         runtime: CvarDef::new(
             "con_scale", "1.0", "0.2..10.0",
-            "TaystJK/JK2MV: scale console characters and prompt; updates immediately.",
+            "Scale console characters and prompt; updates immediately.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.console_scale.to_string()),
             |app, value| App::cvar_set_con_scale(app, "con_scale", &value.to_string()),
@@ -2485,7 +2485,7 @@ app_cvars! {
                 "con_notifylines",
                 "",
                 "integer",
-                "TaystJK/OpenJK: number of recent console rows considered by the top-left notify overlay.",
+                "Number of recent console rows considered by the top-left notify overlay.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -2525,7 +2525,7 @@ app_cvars! {
     }
 
     APP_CON_NOTIFYWORDS {
-        runtime: CvarDef::new("con_notifywords", "0", "0 | -1 | word [word ...]", "TaystJK: desktop/highlight notification words for chat. Up to 8 space-separated terms; -1 alerts on every chat.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_con_notifywords(app)), |app, value| App::cvar_set_con_notifywords(app, "con_notifywords", &value.to_string())).with_text_setter(App::cvar_set_con_notifywords, None),
+        runtime: CvarDef::new("con_notifywords", "0", "0 | -1 | word [word ...]", "Desktop/highlight notification words for chat. Up to 8 space-separated terms; -1 alerts on every chat.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_con_notifywords(app)), |app, value| App::cvar_set_con_notifywords(app, "con_notifywords", &value.to_string())).with_text_setter(App::cvar_set_con_notifywords, None),
         config: CvarBinding {
             load_presentation: Some(|settings, _name, value| {
                 let value = value.trim();
@@ -2556,7 +2556,7 @@ app_cvars! {
     }
 
     APP_CON_NOTIFYCONNECT {
-        runtime: CvarDef::new("con_notifyconnect", "0", "0..1", "TaystJK: request desktop attention for connect/disconnect server messages.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_con_notifyconnect(app)), |app, value| App::cvar_set_con_notifyconnect(app, "con_notifyconnect", &value.to_string())).with_text_setter(App::cvar_set_con_notifyconnect, None),
+        runtime: CvarDef::new("con_notifyconnect", "0", "0..1", "Request desktop attention for connect/disconnect server messages.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_con_notifyconnect(app)), |app, value| App::cvar_set_con_notifyconnect(app, "con_notifyconnect", &value.to_string())).with_text_setter(App::cvar_set_con_notifyconnect, None),
         config: CvarBinding {
             load_presentation: Some(|settings, _name, value| {
                 settings.console_notify_connect = parse_bool(value).unwrap_or(settings.console_notify_connect);
@@ -2580,7 +2580,7 @@ app_cvars! {
     }
 
     APP_CON_NOTIFYVOTE {
-        runtime: CvarDef::new("con_notifyvote", "1", "0..1", "TaystJK: request desktop attention when someone calls a vote.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_con_notifyvote(app)), |app, value| App::cvar_set_con_notifyvote(app, "con_notifyvote", &value.to_string())).with_text_setter(App::cvar_set_con_notifyvote, None),
+        runtime: CvarDef::new("con_notifyvote", "1", "0..1", "Request desktop attention when someone calls a vote.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_con_notifyvote(app)), |app, value| App::cvar_set_con_notifyvote(app, "con_notifyvote", &value.to_string())).with_text_setter(App::cvar_set_con_notifyvote, None),
         config: CvarBinding {
             load_presentation: Some(|settings, _name, value| {
                 settings.console_notify_vote = parse_bool(value).unwrap_or(settings.console_notify_vote);
@@ -2628,7 +2628,7 @@ app_cvars! {
     }
 
     APP_CON_NOTIFYTIME {
-        runtime: CvarDef::new("con_notifytime", "3", "float", "TaystJK/OpenJK Con_DrawNotify lifetime in seconds. Negative values suppress notify drawing while console printing continues.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(App::cvar_get_con_notifytime(app)), |app, value| App::cvar_set_con_notifytime(app, "con_notifytime", &value.to_string())).with_text_setter(App::cvar_set_con_notifytime, None),
+        runtime: CvarDef::new("con_notifytime", "3", "float", "Lifetime of top-left console notifications in seconds. Negative values suppress the overlay while console printing continues.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(App::cvar_get_con_notifytime(app)), |app, value| App::cvar_set_con_notifytime(app, "con_notifytime", &value.to_string())).with_text_setter(App::cvar_set_con_notifytime, None),
         config: CvarBinding::NONE,
         implementations: [
             impl App {
@@ -2732,7 +2732,7 @@ app_cvars! {
                 "m_pitch",
                 "",
                 "float",
-                "TaystJK vertical mouse scale.",
+                "Vertical mouse scale.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -2781,7 +2781,7 @@ app_cvars! {
                 "m_yaw",
                 "",
                 "float",
-                "TaystJK horizontal mouse scale.",
+                "Horizontal mouse scale.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -2880,7 +2880,7 @@ app_cvars! {
                 "sensitivity",
                 "",
                 "float",
-                "TaystJK mouse sensitivity multiplier.",
+                "Mouse sensitivity multiplier.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -2963,7 +2963,7 @@ app_cvars! {
                 "sv_master1",
                 "",
                 "host[:port]",
-                "TaystJK master slot 1 (Raven); empty disables it.",
+                "Master slot 1 (Raven); empty disables it.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -3019,7 +3019,7 @@ app_cvars! {
                 "sv_master2",
                 "",
                 "host[:port]",
-                "TaystJK master slot 2 (JKHub); empty disables it.",
+                "Master slot 2 (JKHub); empty disables it.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -3075,7 +3075,7 @@ app_cvars! {
                 "sv_master3",
                 "",
                 "host[:port]",
-                "TaystJK master slot 3 (Ouned); empty disables it.",
+                "Master slot 3 (Ouned); empty disables it.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -3131,7 +3131,7 @@ app_cvars! {
                 "sv_master4",
                 "",
                 "host[:port]",
-                "TaystJK custom master slot 4; empty disables it.",
+                "Custom master slot 4; empty disables it.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -3187,7 +3187,7 @@ app_cvars! {
                 "sv_master5",
                 "",
                 "host[:port]",
-                "TaystJK custom master slot 5; empty disables it.",
+                "Custom master slot 5; empty disables it.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -3243,7 +3243,7 @@ app_cvars! {
                 "ui_vgs",
                 "",
                 "0=off, nonzero=on",
-                "TaystJK: use the jaPRO VGS canned-voice menu.",
+                "Enable the jaPRO VGS canned-voice menu.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,

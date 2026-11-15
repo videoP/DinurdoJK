@@ -261,6 +261,8 @@ impl PlayerAnimationState {
         current_time: i32,
         anim_blend: bool,
     ) -> Result<(), String> {
+        // A failed update must not leave last frame's footfall to be read again.
+        self.legs_step = None;
         let force_active = field_i32(entity, "forcePowersActive");
         let legs_speed = if force_active & (1 << FP_RAGE) != 0 {
             1.3
@@ -1013,5 +1015,133 @@ mod tests {
         let mut speed = 1.0;
         apply_broken_arm_speed(1 << BROKENLIMB_LARM, &mut speed);
         assert_eq!(speed, 0.65);
+    }
+}
+
+/// The animation half of the JK2 footstep pipeline: the legs lerp frame
+/// (`CG_RunLerpFrame`) fed to the footfall test (`CG_InWalkingAnim`) at the
+/// frame rates a client actually renders at. MVSDK runs this once per
+/// `cg.time`, so the footfalls must not depend on how often it is called.
+#[cfg(test)]
+mod jk2_footstep_cadence_tests {
+    use super::*;
+    use crate::cgame::footsteps::jk2_step_due;
+    use jka_assets::animation::{animation_index, parse_animation_cfg};
+    use jka_protocol::gamestate::ENTITY_FIELDS;
+
+    /// A GLA with the bones `CG_SetLerpFrameAnimation` drives and room for the
+    /// test animations. Only the bone animator is exercised, never a pose.
+    fn humanoid_gla() -> GlaAnimation {
+        let mut gla = jka_assets::ghoul2::openjk_default_gla().unwrap();
+        let template = gla.skeleton[0].clone();
+        gla.skeleton.clear();
+        for name in ["model_root", "Motion", "lower_lumbar", "upper_lumbar"] {
+            let mut bone = template.clone();
+            bone.name = name.into();
+            bone.parent = -1;
+            bone.children.clear();
+            gla.skeleton.push(bone);
+        }
+        gla.num_frames = 4000;
+        gla
+    }
+
+    fn entity(anim: &str) -> EntityState {
+        let mut state = EntityState { number: 1, fields: [0; ENTITY_FIELDS.len()] };
+        let anim = animation_index(anim).unwrap() as u32;
+        for name in ["legsAnim", "torsoAnim"] {
+            state.fields[ENTITY_FIELDS.iter().position(|(field, _)| *field == name).unwrap()] = anim;
+        }
+        state
+    }
+
+    /// Times (ms) at which the footfall test fires, calling `update` every
+    /// `frame_ms` of render time, exactly as `present_player` does per frame.
+    fn footfalls(version: u8, anim: &str, frame_ms: f64, duration_ms: f64) -> Vec<i32> {
+        let animations = parse_animation_cfg(b"BOTH_RUN1 100 24 0 20
+BOTH_WALK1 300 30 0 20
+BOTH_STAND1 0 30 0 20
+").unwrap();
+        let gla = humanoid_gla();
+        let info = ClientInfo::solo_model("kyle/default");
+        let entity = entity(anim);
+        let mut state = PlayerAnimationState::new(&gla, 1000).unwrap();
+        let mut times = Vec::new();
+        let mut now = 1000.0;
+        while now < 1000.0 + duration_ms {
+            let time = now as i32;
+            state
+                .update(&entity, &animations, &gla, &info, &SaberAnimationScales::default(), time, true, true, Some(version))
+                .unwrap();
+            if let Some(step) = state.legs_frame_step() {
+                if jk2_step_due(&animations, step.anim, step.old_frame, step.frame).is_some() {
+                    times.push(time);
+                }
+            }
+            now += frame_ms;
+        }
+        times
+    }
+
+    #[test]
+    fn a_run_cycle_steps_twice_regardless_of_render_rate() {
+        // 24 frames at 50 ms: steps at +3 and +18, so 750 ms then 450 ms apart.
+        for version in [2, 4] {
+            let reference = footfalls(version, "BOTH_RUN1", 1.0, 6000.0);
+            assert_eq!(reference.len(), 10, "v{version}: 5 cycles of two steps in 6 s: {reference:?}");
+            for frame_ms in [1000.0 / 600.0, 4.0, 1000.0 / 144.0, 16.7, 33.0] {
+                let steps = footfalls(version, "BOTH_RUN1", frame_ms, 6000.0);
+                assert_eq!(steps.len(), reference.len(), "v{version} {frame_ms} ms/frame: {steps:?}");
+                for (step, expected) in steps.iter().zip(&reference) {
+                    // One render frame of lateness, no more.
+                    assert!(f64::from((step - expected).abs()) <= frame_ms * 2.0 + 2.0,
+                        "v{version} {frame_ms} ms/frame: {steps:?} vs {reference:?}");
+                }
+            }
+            let gaps: Vec<i32> = reference.windows(2).map(|pair| pair[1] - pair[0]).collect();
+            for (index, gap) in gaps.iter().enumerate() {
+                let expected = if index % 2 == 0 { 750 } else { 450 };
+                assert!((gap - expected).abs() <= 6, "v{version} gap {index}: {gaps:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_walk_steps_and_standing_does_not() {
+        assert!(footfalls(4, "BOTH_WALK1", 1000.0 / 300.0, 4000.0).len() >= 6);
+        assert!(footfalls(4, "BOTH_STAND1", 1000.0 / 300.0, 4000.0).is_empty());
+    }
+
+    #[test]
+    fn a_failed_update_leaves_no_footfall_to_read_twice() {
+        let animations = parse_animation_cfg(b"BOTH_RUN1 100 24 0 20
+").unwrap();
+        let mut gla = humanoid_gla();
+        let info = ClientInfo::solo_model("kyle/default");
+        let entity = entity("BOTH_RUN1");
+        let mut state = PlayerAnimationState::new(&gla, 1000).unwrap();
+        let mut time = 1000;
+        while state.legs_frame_step().is_none() {
+            time += 10;
+            state.update(&entity, &animations, &gla, &info, &SaberAnimationScales::default(), time, true, true, Some(4)).unwrap();
+            assert!(time < 2000, "the legs frame never advanced");
+        }
+        // The next animation range no longer fits the GLA: the update fails.
+        gla.num_frames = 8;
+        let other = entity_with(&entity, "BOTH_STAND1");
+        let animations = parse_animation_cfg(b"BOTH_RUN1 100 24 0 20
+BOTH_STAND1 0 30 0 20
+").unwrap();
+        assert!(state.update(&other, &animations, &gla, &info, &SaberAnimationScales::default(), time + 60, true, true, Some(4)).is_err());
+        assert_eq!(state.legs_frame_step(), None);
+    }
+
+    fn entity_with(base: &EntityState, anim: &str) -> EntityState {
+        let mut state = base.clone();
+        let anim = animation_index(anim).unwrap() as u32;
+        for name in ["legsAnim", "torsoAnim"] {
+            state.fields[ENTITY_FIELDS.iter().position(|(field, _)| *field == name).unwrap()] = anim;
+        }
+        state
     }
 }

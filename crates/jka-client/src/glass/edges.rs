@@ -3,6 +3,11 @@
 //! pane boundaries. Normal discontinuities also seed bevels on faceted models.
 use wgpu::util::DeviceExt;
 
+// Coverage has a private glass-only depth attachment. It is always 32-bit,
+// even when the main scene selects Depth16Unorm via the iGPU depth A/B.
+pub(crate) const COVERAGE_DEPTH_FORMAT: wgpu::TextureFormat =
+    wgpu::TextureFormat::Depth32Float;
+
 pub struct Resources {
     pub mask: wgpu::TextureView,
     _mask_texture: wgpu::Texture,
@@ -112,7 +117,7 @@ impl Resources {
         let depth = texture(
             width,
             height,
-            wgpu::TextureFormat::Depth32Float,
+            COVERAGE_DEPTH_FORMAT,
             samples,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
             "Glass-only depth",

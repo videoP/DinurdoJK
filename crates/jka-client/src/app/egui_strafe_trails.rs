@@ -101,7 +101,7 @@ impl App {
                 settings_changed |= right.add(egui::Slider::new(&mut self.strafe_trails.settings.life_seconds, 0.5..=60.0).text("Live trail life (s)")).changed();
                 settings_changed |= right.add(egui::Slider::new(&mut self.strafe_trails.settings.fps, 1.0..=125.0).text("Recorded SV_FPS")).changed();
                 settings_changed |= right.checkbox(&mut self.strafe_trails.settings.plums, "Second markers (plums)").changed();
-                right.label(egui::RichText::new("Plums use Recorded SV_FPS to label loaded CFG trails at 1-second intervals, matching jaPRO/TaystJK.").weak().small());
+                right.label(egui::RichText::new("Plums use recorded SV_FPS to label loaded CFG trails at 1-second intervals.").weak().small());
                 right.label(egui::RichText::new("Loaded CFGs use a 2D spatial index; only nearby segments are handed to the existing threaded FX line tessellator.").weak().small());
 
                 right.add_space(10.0);

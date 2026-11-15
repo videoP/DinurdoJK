@@ -100,6 +100,7 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", baked_sun_removal_contour: false", "")
         .replace(", relighting_mode: 0", "")
         .replace(", sky_world_light_isolation: false", "")
+        .replace(", sky_world_gain_mode: 2", "")
         .replace(", sky_world_lighting_strength: 1.0", "")
         .replace(", relight_time: 15.0", "")
         .replace(", baked_sun_cache: false", "")
@@ -625,7 +626,7 @@ seta r_saberFlares 0
     )
     .unwrap();
     let settings = config::load_video_settings(&path);
-    assert!(!settings.flares);
+    assert_eq!(settings.flares, 0);
     assert!(settings.world_flares);
     assert!(settings.world_flares_active());
     assert!(!settings.saber_flares);
@@ -646,6 +647,26 @@ seta r_saberFlares 0
     ] {
         assert!(saved.lines().any(|line| line == expected), "missing {expected}");
     }
+}
+
+#[test]
+fn enhanced_flare_mode_archives_and_legacy_values_remain_compatible() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("flare-enhanced.cfg");
+    fs::write(&path, "seta r_flares 2\nseta r_worldFlares 0\n").unwrap();
+    let settings = config::load_video_settings(&path);
+    assert_eq!(settings.world_flare_mode(), 2);
+    config::save_video_settings(
+        &path, settings, &crate::keybinds::Bindings::default(),
+        &config::ClientPresentationSettings::default(), &config::AudioSettings::default(),
+    ).unwrap();
+    assert!(fs::read_to_string(&path).unwrap().contains("seta r_flares \"2\""));
+    assert_eq!(config::load_video_settings(&path).world_flare_mode(), 2);
+
+    fs::write(&path, "seta r_flares 1\n").unwrap();
+    assert_eq!(config::load_video_settings(&path).world_flare_mode(), 1);
+    fs::write(&path, "seta r_flares 0\n").unwrap();
+    assert_eq!(config::load_video_settings(&path).world_flare_mode(), 0);
 }
 
 #[test]

@@ -459,7 +459,7 @@ impl Renderer {
                 halation: if self.halation_enabled { 1.0 } else { 0.0 },
                 chromatic_aberration: self.chromatic_aberration_strength,
                 vignette: if self.vignette_enabled { 1.0 } else { 0.0 },
-                lut_strength: self.color_lut_effective_strength,
+                lut_strength: if self.jk2_gamma_baked { 1.0 } else { self.color_lut_effective_strength },
             },
             grain: PostGrainSettings {
                 strength: self.film_grain_strength,
@@ -664,8 +664,10 @@ impl Renderer {
                     0.0
                 },
                 0.0,
-                0.0,
-                f32::from(self.overbright_bits), // reserved .w: OpenJK output shift
+                if self.jk2_legacy_color && !self.hdr_enabled {
+                    if self.jk2_gamma_baked { 2.0 } else { 1.0 }
+                } else { 0.0 }, // .z: legacy SDR (2 = 3D grade contains output gamma)
+                f32::from(self.overbright_bits), // .w: output overbright
             ],
             // The optics only exist with the GPU ocean; a plain BSP water
             // shader gets no underwater treatment, so clouds are left alone.
@@ -901,6 +903,7 @@ impl Renderer {
                             self.targets.dof.as_ref(),
                             &self.color_lut_view,
                             &self.color_lut_sampler,
+                            &self.jk2_gamma_lut_view,
                             &cloud_noise.detail_view,
                             &cloud_noise.sampler,
                             &self.targets.cloud_transfer_views[cloud_index],
@@ -942,6 +945,7 @@ impl Renderer {
             self.targets.dof.as_ref(),
             &self.color_lut_view,
             &self.color_lut_sampler,
+            &self.jk2_gamma_lut_view,
             &noise.detail_view,
             &noise.sampler,
             &self.targets.cloud_transfer_views[0],
@@ -963,6 +967,7 @@ impl Renderer {
             &self.gamma_post_buffer,
             &self.color_lut_view,
             &self.color_lut_sampler,
+            &self.jk2_gamma_lut_view,
         );
     }
 

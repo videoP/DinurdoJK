@@ -51,7 +51,7 @@ app_cvars! {
     }
 
     APP_CG_MOVEMENTKEYS {
-        runtime: CvarDef::new("cg_movementKeys", "", "0..4", "TaystJK movement-key HUD mode: 0 off, 1 original, 2 +attack, 3 compact centered, 4 compact movable.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_movementkeys(app)), |app, value| App::cvar_set_cg_movementkeys(app, APP_CG_MOVEMENTKEYS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_movementkeys, None),
+        runtime: CvarDef::new("cg_movementKeys", "", "0..4", "Movement-key HUD mode: 0 off, 1 original, 2 +attack, 3 compact centered, 4 compact movable.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_movementkeys(app)), |app, value| App::cvar_set_cg_movementkeys(app, APP_CG_MOVEMENTKEYS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_movementkeys, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     if let Ok(mode) = value.trim().parse::<u8>() {
@@ -93,7 +93,7 @@ app_cvars! {
                 "cg_movementKeysSize",
                 "",
                 "0.25..4",
-                "TaystJK movement-key HUD scale.",
+                "Movement-key HUD scale.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -199,7 +199,7 @@ app_cvars! {
                 "cg_movementKeysX",
                 "",
                 "float",
-                "TaystJK movement-key HUD horizontal offset.",
+                "Movement-key HUD horizontal offset.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -252,7 +252,7 @@ app_cvars! {
                 "cg_movementKeysY",
                 "",
                 "float",
-                "TaystJK movement-key HUD vertical offset.",
+                "Movement-key HUD vertical offset.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -301,7 +301,7 @@ app_cvars! {
     }
 
     APP_CG_STRAFEHELPER {
-        runtime: CvarDef::new("cg_strafeHelper", "", "bitmask", "Strafehelper style/direction bitmask: TaystJK bits 0..21; Xonotic (1<<22), Q3 DeFRaG CGaz (1<<23); mode extras in 24..29; Warsow/Warfork triangular StrafeHUD bit 30.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_strafehelper(app)), |app, value| App::cvar_set_cg_strafehelper(app, APP_CG_STRAFEHELPER.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_strafehelper, None),
+        runtime: CvarDef::new("cg_strafeHelper", "", "bitmask", "Strafehelper style/direction bitmask: jaPRO bits 0..21; Xonotic (1<<22), Q3 DeFRaG CGaz (1<<23); mode extras in 24..29; Warsow/Warfork triangular StrafeHUD bit 30.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_strafehelper(app)), |app, value| App::cvar_set_cg_strafehelper(app, APP_CG_STRAFEHELPER.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_strafehelper, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     if let Ok(flags) = value.trim().parse::<u32>() {
@@ -337,7 +337,7 @@ app_cvars! {
     }
 
     APP_CG_STRAFEHELPER_FPS {
-        runtime: CvarDef::new("cg_strafeHelper_FPS", "", "0..1000", "Strafehelper physics FPS override; 0 uses movement cadence/server fixed Pmove for Xonotic/Q3DF/Warsow, and com_maxfps (125 uncapped) for TaystJK styles.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_strafehelper_fps(app)), |app, value| App::cvar_set_cg_strafehelper_fps(app, APP_CG_STRAFEHELPER_FPS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_strafehelper_fps, None),
+        runtime: CvarDef::new("cg_strafeHelper_FPS", "", "0..1000", "Strafehelper physics FPS override; 0 uses movement cadence/server fixed Pmove for Xonotic/Q3DF/Warsow, and com_maxfps (125 uncapped) for jaPRO styles.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_strafehelper_fps(app)), |app, value| App::cvar_set_cg_strafehelper_fps(app, APP_CG_STRAFEHELPER_FPS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_strafehelper_fps, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, _name, value| {
                     let finite = || {
@@ -380,7 +380,7 @@ app_cvars! {
                 "cg_strafeHelperActiveColor",
                 "",
                 "R G B A",
-                "TaystJK active Strafehelper line color.",
+                "Active strafehelper line color.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -515,7 +515,7 @@ app_cvars! {
                 "cg_strafeHelperInactiveAlpha",
                 "",
                 "0..255",
-                "TaystJK inactive Strafehelper line alpha.",
+                "Inactive strafehelper line alpha.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -632,7 +632,7 @@ app_cvars! {
                 "cg_strafeHelperOffset",
                 "",
                 "float",
-                "TaystJK Strafehelper angular offset in hundredths of a degree.",
+                "Strafehelper angular offset in hundredths of a degree.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -693,7 +693,7 @@ app_cvars! {
                 "cg_strafeHelperPrecision",
                 "",
                 "100..10000",
-                "TaystJK Strafehelper projection precision/sensitivity.",
+                "Strafehelper projection precision/sensitivity.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,

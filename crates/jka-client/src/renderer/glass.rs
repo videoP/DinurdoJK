@@ -209,7 +209,7 @@ fn mask_pipeline(
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
-            format: depth_format(),
+            format: crate::glass::edges::COVERAGE_DEPTH_FORMAT,
             depth_write_enabled: Some(true),
             depth_compare: Some(camera_depth_compare()),
             stencil: Default::default(),

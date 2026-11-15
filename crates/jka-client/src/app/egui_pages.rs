@@ -125,7 +125,7 @@ impl App {
                 theme::row(
                     ui,
                     "Special camera",
-                    "cg_thirdPersonSpecialCam. In TaystJK this switches to CG_ThirdPersonActionCam during saber special moves and falls back to the normal third-person camera if that action cam cannot be used. The Rust action-camera branch is not ported yet, so this switch is currently inert.",
+                    "cg_thirdPersonSpecialCam. Intended to use an action camera during saber special moves, falling back to normal third-person view when unavailable. This action-camera mode is not implemented yet; this switch currently has no effect.",
                     theme::Reset::None,
                     |ui| {
                         if let Some(value) = theme::switch(ui, self.third_person.special_cam) {
@@ -166,7 +166,7 @@ impl App {
                     }
                 });
 
-                theme::section(ui, "FIRST-PERSON WEAPON", "TaystJK viewmodel controls. Only your first-person weapon is affected.");
+                theme::section(ui, "FIRST-PERSON WEAPON", "First-person viewmodel controls. Only your own first-person weapon is affected.");
                 theme::row(ui, "Draw gun", "cg_drawGun: 0 hide, 1 normal, 2 no gun bob, 3 no landing dip, 4 no idle sway (cumulative).", theme::Reset::None, |ui| {
                     let mut mode = self.view_weapon.draw_gun;
                     egui::ComboBox::from_id_salt("cg_drawGun_mode")
@@ -206,12 +206,12 @@ impl App {
                         let _ = self.set_console_cvar("cg_fovViewmodel", &value.to_string());
                     }
                 });
-                theme::row(ui, "Lower at high FOV", "cg_fovViewmodelAdjust: lower the view gun above 90 degrees as in TaystJK.", theme::Reset::None, |ui| {
+                theme::row(ui, "Lower at high FOV", "cg_fovViewmodelAdjust: lower the view gun when the viewmodel FOV exceeds 90 degrees.", theme::Reset::None, |ui| {
                     if let Some(value) = theme::switch(ui, self.view_weapon.fov_viewmodel_adjust) {
                         let _ = self.set_console_cvar("cg_fovViewmodelAdjust", if value { "1" } else { "0" });
                     }
                 });
-                theme::row(ui, "Gun alpha", "cg_gunAlpha: opacity; 0 and 1 are opaque in TaystJK, intermediate values are translucent.", theme::Reset::None, |ui| {
+                theme::row(ui, "Gun alpha", "cg_gunAlpha: viewmodel opacity; 0 and 1 are opaque, intermediate values are translucent.", theme::Reset::None, |ui| {
                     let mut value = self.view_weapon.gun_alpha;
                     if ui.add(egui::DragValue::new(&mut value).range(0.0..=1.0)
                         .speed(0.01).max_decimals(2).update_while_editing(false)).changed() {
@@ -343,7 +343,7 @@ impl App {
                 theme::row(
                     ui,
                     "HTTP downloads",
-                    "cl_allowHttpDownload. Allow PK3 downloads from TaystJK-compatible mvhttp/mvhttpurl endpoints. Preferred over legacy UDP when available.",
+                    "cl_allowHttpDownload. Allow PK3 downloads from mvhttp/mvhttpurl endpoints. Preferred over legacy UDP when available.",
                     theme::Reset::None,
                     |ui| {
                         if let Some(enabled) = theme::switch(ui, self.network.allow_http_downloads) {
@@ -981,7 +981,7 @@ impl App {
         theme::row(
             ui,
             "Face direction of motion",
-            "cg_specCameraMotion. In spectator Third person, use the followed player's current presented horizontal velocity as camera yaw, matching TaystJK cg_thirdPersonAngle -1 behavior.",
+            "cg_specCameraMotion. In spectator Third Person, orient the chase camera using the followed player's current horizontal movement direction.",
             theme::Reset::None,
             |ui| {
                 ui.add_enabled_ui(self.spectator_camera.mode == crate::camera::SpectatorCameraMode::ThirdPerson, |ui| {

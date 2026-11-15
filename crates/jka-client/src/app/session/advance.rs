@@ -1232,21 +1232,38 @@ impl GameSession {
         let stages = self.player_presenter.footstep_stages();
         // JK2 CG_FootStep: boot or clank, no dust or prints.
         for step in self.player_presenter.drain_jk2_footsteps() {
-            if stages.sounds && !self.suppress_audio {
-                if let Some(sound) = &mut self.sound_presenter {
-                    let kind = if step.metal {
-                        crate::cgame::footsteps::Jk2StepKind::Metal
-                    } else {
-                        crate::cgame::footsteps::Jk2StepKind::Boot
-                    };
-                    let variant = crate::cgame::footsteps::jk2_sound_variant(step.entity, target_server_time);
-                    sound.play_footstep(
-                        &crate::cgame::footsteps::jk2_step_sound(kind, variant),
-                        step.entity,
-                        step.position,
-                    );
-                }
+            use crate::cgame::footsteps::{self as steps, Jk2Stage};
+            if !stages.sounds {
+                continue;
             }
+            if self.suppress_audio {
+                self.player_presenter.jk2_footstep_diag_mut().count(Jk2Stage::AudioSuppressed);
+                continue;
+            }
+            let played = self.sound_presenter.as_mut().map(|sound| {
+                let kind = if step.metal { steps::Jk2StepKind::Metal } else { steps::Jk2StepKind::Boot };
+                let variant = steps::jk2_sound_variant(step.entity, target_server_time);
+                let path = steps::jk2_step_sound(kind, variant);
+                let played = sound.play_footstep(&path, step.entity, step.position);
+                (played, path)
+            });
+            let diag = self.player_presenter.jk2_footstep_diag_mut();
+            match played {
+                Some((true, path)) => {
+                    diag.count(Jk2Stage::Submitted);
+                    diag.line(target_server_time, || format!("ent={} submitted {path}", step.entity));
+                }
+                Some((false, path)) => {
+                    diag.count(Jk2Stage::SoundFailed);
+                    diag.line(target_server_time, || format!("ent={} FAILED to submit {path}", step.entity));
+                }
+                None => diag.count(Jk2Stage::SoundFailed),
+            }
+        }
+        if crate::cgame::footsteps::debug_level() > 0 {
+            let audio = self.sound_presenter.as_ref().and_then(|sound| sound.info())
+                .map(|info| (info.active_voices, info.max_voices, info.channel_replacements, info.capacity_kicks));
+            self.player_presenter.jk2_footstep_diag_mut().summary(target_server_time, || audio);
         }
         for impact in self.player_presenter.drain_footsteps() {
             if stages.sounds && !self.suppress_audio {

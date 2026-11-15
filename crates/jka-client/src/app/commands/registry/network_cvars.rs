@@ -513,7 +513,7 @@ settings_cvars! { NetworkSettings;
     APP_CG_PREDICTKNOCKBACK {
         runtime: CvarDef::new(
             "cg_predictKnockback", "0", "0..5",
-            "TaystJK jaPRO race rocket-jump knockback. Requires cg_simulatedProjectiles 1 and jcinfo UNLAGGEDPROJ: 0 off, 1 on, 2..5 diagnostics. Uses shared missile trajectory plus server-event reconciliation.",
+            "jaPRO race rocket-jump knockback. Requires cg_simulatedProjectiles 1 and jcinfo UNLAGGEDPROJ: 0 off, 1 on, 2..5 diagnostics. Uses shared missile trajectory plus server-event reconciliation.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(App::cvar_get_cg_predictknockback(app)),
             |app, value| App::cvar_set_cg_predictknockback(app, APP_CG_PREDICTKNOCKBACK.entry.name, &value.to_string()),
@@ -2355,7 +2355,7 @@ settings_cvars! { NetworkSettings;
     }
 
     APP_NET_PORT {
-        runtime: CvarDef::new("net_port", "", "0..65535", "Preferred local UDP port for the live game connection. Like TaystJK/OpenJK, the client tries this port and the next 9 if it is busy; 0 lets the OS choose.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(App::cvar_get_net_port(app)), |app, value| App::cvar_set_net_port(app, APP_NET_PORT.entry.name, &value.to_string())).with_text_setter(App::cvar_set_net_port, None),
+        runtime: CvarDef::new("net_port", "", "0..65535", "Preferred local UDP port for the live game connection. Tries this port and the next 9 if busy; 0 lets the OS choose.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(App::cvar_get_net_port(app)), |app, value| App::cvar_set_net_port(app, APP_NET_PORT.entry.name, &value.to_string())).with_text_setter(App::cvar_set_net_port, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, name, value| {
                     let _ = settings.network.set_cvar(name, value);

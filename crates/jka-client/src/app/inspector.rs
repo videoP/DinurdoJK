@@ -445,6 +445,7 @@ impl App {
         const STAT_HEALTH: usize = 0;
 
         let settings = self.crosshair;
+        let dynamic_mode = settings.effective_dynamic_mode();
         let session_supports_crosshair = self.game_session.as_ref().is_some_and(|session| {
             session.live
                 || (!session.live
@@ -455,7 +456,7 @@ impl App {
         // DOF autofocus also consumes this endpoint when available.
         let active = (force_chat_scan
             || (settings.style != 0
-                && (settings.dynamic != 0
+                && (dynamic_mode != 0
                     || settings.identify_target
                     || settings.names != 0.0
                     || (self.video.depth_of_field_strength > 0.001 && self.video.dof_mode == ui::DofMode::On && self.video.dof_autofocus))
@@ -474,7 +475,7 @@ impl App {
             return;
         }
         let dof_autofocus = self.video.depth_of_field_strength > 0.001 && self.video.dof_mode == ui::DofMode::On && self.video.dof_autofocus;
-        let scan_interval = if force_chat_scan || settings.dynamic != 0 || dof_autofocus {
+        let scan_interval = if force_chat_scan || dynamic_mode != 0 || dof_autofocus {
             Duration::ZERO
         } else {
             SCAN_INTERVAL
@@ -573,7 +574,7 @@ impl App {
         // TaystJK staticCrosshairOverride: Smart-only restrictions. JK2 uses
         // different weapon ids; the race stat is meaningful only on jaPRO.
         let is_jk2 = self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2();
-        let static_override = settings.dynamic == 2 && smart_crosshair_static_override(
+        let static_override = dynamic_mode == 2 && smart_crosshair_static_override(
             is_jk2,
             viewer.weapon,
             session.client_game.is_japro() && ps.stats[crate::japro_cg::STAT_RACEMODE] != 0,
@@ -581,7 +582,7 @@ impl App {
         );
         // If BSP collision is unavailable, the world-space endpoint cannot be
         // produced; keep a visible static crosshair rather than silently losing it.
-        let dynamic = settings.dynamic != 0 && !static_override
+        let dynamic = dynamic_mode != 0 && !static_override
             && viewer.client >= 0 && self.map_collision.is_some();
 
         // CG_CrosshairTrace. TaystJK deliberately uses two different angle sources in

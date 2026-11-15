@@ -530,6 +530,8 @@ pub(in crate::renderer) struct WorldGpu {
     /// Shitter reuses the native BSP geometry and its current PVS selection.
     /// Only this compact draw-argument stream is lazily allocated.
     pub(in crate::renderer) native_flat_draw: Option<crate::renderer::collision_world::NativeFlatDraw>,
+    pub(in crate::renderer) native_flat_draw_gray: Option<crate::renderer::collision_world::NativeFlatDraw>,
+    pub(in crate::renderer) shitter_slope_cache: Option<crate::renderer::collision_world::ShitterSlopeCache>,
     /// Immutable index source retained for material-only AUTO4 recipe rebinding.
     pub(in crate::renderer) remap_index_source: Arc<Vec<u32>>,
     /// Remap-only reuse key; never consulted by frame/draw code.
@@ -601,6 +603,9 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) inline_models: Vec<InlineModelGpu>,
     pub(in crate::renderer) inline_transform: Option<super::inline_transform::InlineTransformGpu>,
     pub(in crate::renderer) vertex_buffer: wgpu::Buffer,
+    /// Separate, immutable lighting normals. Authored material/caster normals
+    /// and CPU/GPU mover transforms never overwrite this static-world stream.
+    pub(in crate::renderer) sky_normal_buffer: Option<wgpu::Buffer>,
     pub(in crate::renderer) index_buffer: wgpu::Buffer,
     /// Opaque, static-world index ranges eligible for the ray-query BLAS.
     pub(in crate::renderer) rt_shadow_ranges: Vec<std::ops::Range<u32>>,
@@ -650,6 +655,12 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) dynamic_lights: Vec<scene::DynamicLight>,
     pub(in crate::renderer) runtime_light_count: usize,
     pub(in crate::renderer) static_bake_sources: Vec<(usize, scene::DynamicLight)>,
+    /// Static physical-fixture identity for every source (32-unit grouping).
+    /// Source lighting is still independent; at most one group member gets
+    /// a local-shadow cubemap slot.
+    pub(in crate::renderer) lamp_shadow_group_by_light: Vec<usize>,
+    /// Count MST_FLARE surfaces even when malformed colors/positions prevent promotion.
+    pub(in crate::renderer) compiled_world_flare_count: usize,
     pub(in crate::renderer) cluster_compute_bind_group: wgpu::BindGroup,
     pub(in crate::renderer) lighting_bind_group: wgpu::BindGroup,
     pub(in crate::renderer) lighting_bind_group_lean: wgpu::BindGroup,

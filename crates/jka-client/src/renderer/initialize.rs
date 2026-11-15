@@ -417,12 +417,10 @@ impl Renderer {
         if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
             config.usage |= wgpu::TextureUsages::COPY_SRC;
         }
-        // Blue Water scene capture can sample the presentation image directly
-        // only when the actual WGPU surface advertises this capability.
-        // Otherwise the renderer uses the existing lazy sampleable-scene path.
-        if caps.usages.contains(wgpu::TextureUsages::TEXTURE_BINDING) {
-            config.usage |= wgpu::TextureUsages::TEXTURE_BINDING;
-        }
+        // No TEXTURE_BINDING on the swapchain: a sampled presentation image
+        // costs every frame's submit (NVIDIA/Vulkan clear-only probe: submit
+        // 0.047 -> 0.074 ms). Blue Water scene capture uses the lazy
+        // sampleable-scene path instead, only on frames that read the scene.
         // r_earlySubmit copies the offscreen frame into the acquired image.
         if caps.usages.contains(wgpu::TextureUsages::COPY_DST) {
             config.usage |= wgpu::TextureUsages::COPY_DST;
@@ -508,6 +506,7 @@ impl Renderer {
                 storage_buffer_entry(24, true, wgpu::ShaderStages::FRAGMENT),
                 unfilterable_texture_entry(25),
                 depth_texture_entry(26),
+                texture_entry(27), // JK2MV gamma/overbright LUT (same pass)
             ],
         });
         let post_shader = create_shader_module_timed(
@@ -1596,6 +1595,7 @@ impl Renderer {
                 uniform_entry(2, wgpu::ShaderStages::FRAGMENT),
                 texture_3d_entry(3),
                 sampler_entry(4),
+                texture_entry(5), // JK2MV gamma/overbright LUT
             ],
         });
         let gamma_post_shader = create_shader_module_timed(
@@ -1729,6 +1729,9 @@ impl Renderer {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
+        let gamma = 1.0;
+        let (jk2_gamma_lut_texture, jk2_gamma_lut_view) =
+            super::brightness_settings::create_jk2_gamma_lut(&device, &queue, gamma);
         // Finalized cloud path is lazy: the shared post pipeline is compiled once,
         // while the heavy 96^3 noise/cached-FBM texture is only generated and
         // uploaded if volumetric clouds are actually enabled.
@@ -1785,7 +1788,6 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let gamma = 1.0;
         let post_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("JKA post-process uniform"),
             contents: bytemuck::bytes_of(&PostUniform {
@@ -2033,6 +2035,7 @@ impl Renderer {
                             targets.dof.as_ref(),
                             &color_lut_view,
                             &color_lut_sampler,
+                            &jk2_gamma_lut_view,
                             &cloud_noise_fallback.detail_view,
                             &cloud_noise_fallback.sampler,
                             &targets.cloud_transfer_views[cloud_index],
@@ -2095,6 +2098,7 @@ impl Renderer {
             targets.dof.as_ref(),
             &color_lut_view,
             &color_lut_sampler,
+            &jk2_gamma_lut_view,
             &cloud_noise_fallback.detail_view,
             &cloud_noise_fallback.sampler,
             &targets.cloud_transfer_views[0],
@@ -2116,6 +2120,7 @@ impl Renderer {
             &gamma_post_buffer,
             &color_lut_view,
             &color_lut_sampler,
+            &jk2_gamma_lut_view,
         );
         let gpu_profiler = GpuProfiler::new(
             &device,
@@ -2475,7 +2480,7 @@ impl Renderer {
             world_flares: Default::default(),
             world_flares_sky: Default::default(),
             world_flares_planar: std::array::from_fn(|_| Default::default()),
-            world_flares_enabled: false,
+            world_flares_mode: 0,
             ocean_layout,
             ocean_interaction,
             ocean_optics_layout: cloud_shadow_layout,
@@ -2688,6 +2693,7 @@ impl Renderer {
             detail_texture_fade_distance: 512.0,
             gamma,
             overbright_bits: 0,
+            jk2_legacy_color: false,
             baked_brightness: crate::renderer::brightness::BakedBrightness::default(),
             gamma_method: crate::gamma::GammaMethod::Shader,
             hardware_gamma_active: false,
@@ -2742,6 +2748,7 @@ impl Renderer {
             sun_terminator: false,
             sky_world_bake_ab: 1,
             sky_world_light_isolation: false,
+            sky_world_gain_mode: 2,
             sky_world_lighting_strength: 1.0,
             bake_threads: 0,
             sun_bake_deferred: false,
@@ -2836,6 +2843,10 @@ impl Renderer {
             _color_lut_texture: color_lut_texture,
             color_lut_view,
             color_lut_sampler,
+            _jk2_gamma_lut_texture: jk2_gamma_lut_texture,
+            jk2_gamma_lut_view,
+            jk2_gamma_lut_key: (gamma.to_bits(), 0),
+            jk2_gamma_baked: false,
             cloud_noise_resources,
             cloud_noise_fallback,
             frame_plan: FramePlan::default(),
@@ -2846,6 +2857,7 @@ impl Renderer {
             compact_group_scratch: Vec::new(),
             face_plane_cull_scratch: Vec::new(),
             cpu_compact_indirect_scratch: Vec::new(),
+            shitter_gray_draw_scratch: Vec::new(),
             cpu_compact_count_scratch: Vec::new(),
             cpu_compact_uploaded: None,
             reflection_compact_scratch: Vec::new(),
@@ -2911,6 +2923,8 @@ impl Renderer {
             baked_local_shadows: false,
             baked_local_had_casters: false,
             lamp_shadow_ab: 0,
+            lamp_shadow_debug_pending: false,
+            lamp_shadow_debug_post_encode_pending: false,
             csm_coverage_ab: false,
             irradiance_volume_enabled: false,
             voxel_probe_gi_enabled: false,
@@ -2948,6 +2962,7 @@ impl Renderer {
             ssr_frame_index: 0,
             depth_prepass_pipeline,
             depth_prepass_mask_pipeline,
+            realtime_sky_normals: None,
             rain_depth_prepass_pipeline,
             rain_depth_prepass_mask_pipeline,
             hiz_prepass_pipeline,

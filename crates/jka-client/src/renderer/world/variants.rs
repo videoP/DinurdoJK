@@ -17,6 +17,8 @@ pub(in crate::renderer) struct WorldShaderVariantKey {
     /// World shader *input format* (0 WGSL, 1 round-trip validated SPIR-V).
     /// Included in all pipeline identity keys so different inputs never alias.
     pub(in crate::renderer) shader_input_mode: u8,
+    /// JK2MV encoded-space legacy LDR lightmap modulation (JKA remains linear).
+    pub(in crate::renderer) jk2_legacy_color: bool,
     pub(in crate::renderer) pbr: bool,
     pub(in crate::renderer) pom: bool,
     pub(in crate::renderer) pbr_shared_material_eval: bool,
@@ -106,6 +108,10 @@ pub(in crate::renderer) const MATERIAL_FLAGS_W_BAKED_ADDITIVE: u32 = 1 << 19;
 /// Prepared post-lightmap environmental overlay; uses composed sky gain only.
 /// Keep separate from foliage wind (bit 18) and baked additive gain (bit 19).
 pub(in crate::renderer) const MATERIAL_FLAGS_W_SKY_OVERLAY: u32 = 1 << 20;
+/// Alpha-blended `rgbGen identityLighting` stage over a q3map_nolightmap (vertex-lit)
+/// surface. Authored, it repaints the lit base at full brightness, so relighting
+/// scales it by the base's relit/authored vertex-light ratio (never above 1).
+pub(in crate::renderer) const MATERIAL_FLAGS_W_VERTEX_OVERLAY: u32 = 1 << 22;
 
 /// TaystJK-style per-material fragment specialization (r_fragmentShaderMode 1).
 ///
@@ -137,8 +143,8 @@ impl MaterialFragmentKey {
         Self {
             flags: header[2] & !MATERIAL_FLAGS_UNREAD,
             flags_mask: !MATERIAL_FLAGS_UNREAD,
-            flags_w: header[3] & (MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS | MATERIAL_FLAGS_W_SKY_OVERLAY | MATERIAL_FLAGS_W_BAKED_ADDITIVE | crate::foliage::MATERIAL_FLAG),
-            flags_w_mask: MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS | MATERIAL_FLAGS_W_SKY_OVERLAY | MATERIAL_FLAGS_W_BAKED_ADDITIVE | crate::foliage::MATERIAL_FLAG,
+            flags_w: header[3] & (MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS | MATERIAL_FLAGS_W_SKY_OVERLAY | MATERIAL_FLAGS_W_VERTEX_OVERLAY | MATERIAL_FLAGS_W_BAKED_ADDITIVE | crate::foliage::MATERIAL_FLAG),
+            flags_w_mask: MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS | MATERIAL_FLAGS_W_SKY_OVERLAY | MATERIAL_FLAGS_W_VERTEX_OVERLAY | MATERIAL_FLAGS_W_BAKED_ADDITIVE | crate::foliage::MATERIAL_FLAG,
             tc_gen: header[0],
             alpha_func: if alpha_cutoff > 0.0 {
                 2
@@ -212,7 +218,7 @@ impl MaterialFragmentKey {
             fix_tc_gen = true;
         }
         if variant.baked_sun_relight {
-            keep_w |= MATERIAL_FLAGS_W_SKY_OVERLAY;
+            keep_w |= MATERIAL_FLAGS_W_SKY_OVERLAY | MATERIAL_FLAGS_W_VERTEX_OVERLAY;
         }
         if variant.classic_render_flags || variant.baked_sun_relight {
             keep |= MATERIAL_FLAG_EXPLICIT_LIGHTMAP
@@ -446,6 +452,8 @@ impl WorldShaderVariantKey {
             ),
             ("ENABLE_SKY_DEBUG", f64::from(u8::from(self.sky_debug))),
         ];
+        // Keep this at the end so established specialization indices stay stable.
+        constants.push(("JK2_LEGACY_COLOR", f64::from(u8::from(self.jk2_legacy_color))));
         // The stock BSP shaders intentionally do not declare the experimental
         // ray-query override. Only the lazily-created RT shader receives it, so
         // selecting any raster shadow mode keeps the normal WGSL/layout exactly
@@ -461,6 +469,9 @@ impl WorldShaderVariantKey {
         match self.shader_input_mode {
             1 => enabled.push("spv"),
             _ => {}
+        }
+        if self.jk2_legacy_color {
+            enabled.push("jk2-ldr");
         }
         if self.pbr {
             enabled.push("pbr");

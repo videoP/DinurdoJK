@@ -193,6 +193,7 @@ pub(in crate::renderer) fn build_world(
     let pbr_baked_color_flags = u32::from(pbr_legacy_baked_color)
         | (u32::from(pbr_legacy_baked_color && map.lightmaps.iter().any(|image| image.rgba16f.is_some())) << 1);
     let sky_portal = map.sky_portal;
+    let compiled_world_flare_count = map.world_flares.len();
     let PreparedMap {
         vertices,
         patch_draws,
@@ -2151,6 +2152,9 @@ pub(in crate::renderer) fn build_world(
         if let Some(index)=dynamic_lights.iter().position(|l| { let mut candidate=*l; candidate.shader_promotion_mask=light.shader_promotion_mask; candidate==light }) { static_bake_sources.push((index,light)); }
         else { static_bake_sources.push((dynamic_lights.len(),light)); dynamic_lights.push(light); }
     }
+    // Group after map FX promotion so flare, EFX, authored and shader lamps
+    // share the same shadow-cubemap fixture identity.
+    let lamp_shadow_group_by_light = crate::renderer::lighting::local_shadows::static_lamp_shadow_groups(&dynamic_lights);
     let light_count = u32::try_from(dynamic_lights.len()).unwrap_or(0);
     let shadow_slot_by_light = vec![0_u32; dynamic_lights.len()];
     // Static map lights occupy the prefix; transient CGame/FX lights use the
@@ -2530,6 +2534,8 @@ pub(in crate::renderer) fn build_world(
             weather_anchor,
             collision_mesh: None,
             native_flat_draw: None,
+            native_flat_draw_gray: None,
+            shitter_slope_cache: None,
             remap_index_source: Arc::clone(&auto4_source_indices),
             remap_asset_source,
             remap_asset_hash,
@@ -2611,6 +2617,8 @@ pub(in crate::renderer) fn build_world(
             dynamic_lights,
         runtime_light_count,
         static_bake_sources,
+        lamp_shadow_group_by_light,
+        compiled_world_flare_count,
             cluster_compute_bind_group,
             lighting_bind_group,
             lighting_bind_group_lean,
@@ -2670,6 +2678,7 @@ pub(in crate::renderer) fn build_world(
             static_ao_source,
             static_ao_source_to_gpu,
             static_ao_gpu_vertices,
+            sky_normal_buffer: None,
             static_ao_lightmap_active: false,
             texture_clamp,
             detail_texture_by_base,

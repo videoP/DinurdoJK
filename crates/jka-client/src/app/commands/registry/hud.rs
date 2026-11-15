@@ -34,17 +34,17 @@ macro_rules! video_cvars {
 
 video_cvars! {
     DRAW_2D, APP_DRAW_2D, "cg_draw2D", "1", "0|1",
-    "TaystJK: 0 hides gameplay 2D (HUD, scoreboard, crosshair, FPS, overlays) for clean screenshots; console, chat entry and menus remain usable.",
+    "0 hides gameplay 2D (HUD, scoreboard, crosshair, FPS, overlays) for clean screenshots; console, chat entry and menus remain usable.",
     CvarType::Bool, Bool, draw_2d, |value| value,
     |app| { app.mark_config_dirty(); app.publish_ui(); };
 
     DRAW_HUD, APP_DRAW_HUD, "cg_drawHud", "1", "0|1",
-    "TaystJK: 0 hides the main health/shield/ammo/force status HUD; crosshair, movement tools, chat, timer and scoreboard remain.",
+    "0 hides the main health/shield/ammo/force status HUD; crosshair, movement tools, chat, timer and scoreboard remain.",
     CvarType::Bool, Bool, draw_hud, |value| value,
     |app| { app.mark_config_dirty(); app.publish_ui(); };
 
     TINT_HUD, APP_TINT_HUD, "cg_tintHud", "1", "0|1",
-    "TaystJK/jaPRO team-color tint: native JK2/JKA status HUD red/blue; DinurdoJK-style panel chrome red/blue. Only team modes, not Siege.",
+    "Team-color tint: native JK2/JKA status HUD red/blue; DinurdoJK-style panel chrome red/blue. Only team modes, not Siege.",
     CvarType::Bool, Bool, tint_hud, |value| value,
     |app| { app.mark_config_dirty(); app.publish_ui(); };
 
@@ -69,7 +69,7 @@ video_cvars! {
     |app| { app.mark_config_dirty(); app.publish_ui(); };
 
     DRAW_TIMER, APP_DRAW_TIMER, "cg_drawTimer", "0", "0|1",
-    "TaystJK/OpenJK match timer: elapsed time since level start as M:SS.",
+    "Match timer: elapsed time since level start as M:SS.",
     CvarType::Bool, Bool, draw_timer, |value| value,
     |app| { app.game_timer_shown = None; app.mark_config_dirty(); app.publish_transient_ui(); };
 }

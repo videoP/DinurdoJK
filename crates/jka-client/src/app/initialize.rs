@@ -885,6 +885,7 @@ impl App {
             ),
             dof_focus_target: 4096.0,
             config_path,
+            relighting_profiles: Default::default(),
             config_dirty,
             background_jobs,
             background_result_tx,

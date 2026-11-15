@@ -29,7 +29,7 @@ pub(super) struct Scene {
 /// direct key, in `DynamicEntityLightingUniform::sky_world` layout. The moon
 /// override matches `light` so models keep the look the post pass gave them.
 const MODEL_SKY_LIGHT: &str = "#import naval_sky::environment::{SkyEnvironment, env_irradiance}
-struct Params { strength:vec4<f32>, moon:vec4<f32> }
+struct Params { strength:vec4<f32>, moon:vec4<f32>, gain:vec4<f32> }
 @group(0) @binding(0) var<storage, read_write> model_sky:array<vec4<f32>,8>;
 @group(0) @binding(1) var<uniform> params:Params;
 @group(1) @binding(0) var env_map:texture_2d<f32>;
@@ -41,8 +41,14 @@ struct Params { strength:vec4<f32>, moon:vec4<f32> }
  if i==0u {
   let moon=params.strength.y>0.5;
   let color=select(env.light_color*env.light_intensity,vec3<f32>(0.70,0.82,1.)*params.moon.w,moon);
-  model_sky[6]=vec4<f32>(color*0.2,params.strength.x);
-  model_sky[7]=vec4<f32>(select(env.light_direction,params.moon.xyz,moon),params.strength.z);
+  let direction=select(env.light_direction,params.moon.xyz,moon);
+  // Models fade with daylight whenever calibration is on (modes B and C);
+  // mix(1,full,s*(1-day)) equals fading the full gain to 1 by day.
+  let day_t=clamp((select(direction.y,-1.,moon)+0.10)/0.30,0.,1.);
+  let day=day_t*day_t*(3.-2.*day_t);
+  let fade=select(1.-day,1.,params.gain.x<0.5);
+  model_sky[6]=vec4<f32>(color*0.2,params.strength.x*fade);
+  model_sky[7]=vec4<f32>(direction,params.strength.z);
  }
 }
 ";
@@ -152,6 +158,7 @@ impl Scene {
                 tex(2, false),
                 tex(3, false),
                 tex(4, false),
+                tex(5, false),
             ],
         });
         let csm_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -221,7 +228,7 @@ impl Scene {
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("native scene light camera"),
-            size: 144,
+            size: 160,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -383,7 +390,7 @@ impl Scene {
         });
         let model_sky_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("native model sky light params"),
-            size: 32,
+            size: 48,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -545,13 +552,16 @@ impl Scene {
         moon_csm: Option<(&wgpu::TextureView, &wgpu::Sampler, &wgpu::Buffer)>,
         // Depth-prepass policy mask, and whether lightmapped world pixels in it
         // already carry this sky light from the composed lightmap.
-        world_mask: (&wgpu::TextureView, &wgpu::TextureView, bool),
+        world_mask: (&wgpu::TextureView, &wgpu::TextureView, bool, Option<&wgpu::TextureView>),
         // Model pixels (policy R 0.125) lit by their own shader: skip them too.
         models_lit: bool,
+        // r_skyWorldGainMode calibration (mode, authored toward-sun Y, valid).
+        gain: [f32; 4],
     ) {
-        let mut values = [0f32; 36];
+        let mut values = [0f32; 40];
         values[..16].copy_from_slice(&camera.inverse_view_projection);
         values[16..19].copy_from_slice(&camera.position);
+        values[19] = u8::from(world_mask.3.is_some()) as f32;
         values[20..24].copy_from_slice(&camera.viewport);
         values[24] = world.clamp(0.0, 1.0);
         values[25] = u8::from(shadows) as f32;
@@ -565,6 +575,7 @@ impl Scene {
         values[33] = u8::from(world_mask.2) as f32;
         values[34] = crate::ocean::OCEAN_UNITS_PER_METER;
         values[35] = u8::from(models_lit) as f32;
+        values[36..40].copy_from_slice(&gain);
         queue.write_buffer(&self.uniform, 0, bytemuck::cast_slice(&values));
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("native lighting inputs"),
@@ -589,6 +600,10 @@ impl Scene {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(world_mask.1),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(world_mask.3.unwrap_or(world_mask.1)),
                 },
             ],
         });
@@ -637,8 +652,9 @@ impl Scene {
         isolation: bool,
         moon_light: Option<([f32; 3], f32)>,
         target: (&wgpu::Buffer, u64),
+        gain: [f32; 4],
     ) {
-        let mut params = [0f32; 8];
+        let mut params = [0f32; 12];
         params[0] = strength.clamp(0.0, 1.0);
         params[2] = u8::from(isolation) as f32;
         if let Some((direction, intensity)) = moon_light {
@@ -646,6 +662,7 @@ impl Scene {
             params[4..7].copy_from_slice(&direction);
             params[7] = intensity;
         }
+        params[8..12].copy_from_slice(&gain);
         queue.write_buffer(&self.model_sky_uniform, 0, bytemuck::cast_slice(&params));
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {

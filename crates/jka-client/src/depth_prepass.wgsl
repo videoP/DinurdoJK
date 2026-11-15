@@ -70,6 +70,29 @@ struct MaskVertexOut {
     @location(2) world_position: vec3<f32>,
 };
 
+// Only the live sky variants fetch this second stream. Original normals in
+// VertexIn remain authoritative for authored UV generation and materials.
+struct SkyVertexIn {
+    @location(0) position: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) lightmap_uv: vec2<f32>,
+    @location(5) normal: vec3<f32>,
+    @location(3) color: vec4<f32>,
+    @location(6) sky_normal: vec3<f32>,
+};
+struct SkyVertexOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) world_position: vec3<f32>,
+    @location(1) sky_normal: vec3<f32>,
+};
+struct SkyMaskVertexOut {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) alpha_multiplier: f32,
+    @location(2) world_position: vec3<f32>,
+    @location(3) sky_normal: vec3<f32>,
+};
+
 // JaPro: subtract the remap offset, then apply a positive clampTime.
 // vector_t.w is reserved for the limit; zero leaves the clock unbounded.
 fn shader_stage_time() -> f32 {
@@ -176,6 +199,45 @@ struct FragmentOut {
     // B: cached roughness hint; A: probe available.
     @location(2) reflection_policy: vec4<f32>,
 };
+struct SkyFragmentOut {
+    @location(0) linear_depth: f32,
+    @location(1) motion_vector: vec2<f32>,
+    @location(2) reflection_policy: vec4<f32>,
+    @location(3) sky_normal: vec2<f32>,
+};
+
+@vertex fn vs_sky(input: SkyVertexIn) -> SkyVertexOut {
+    return SkyVertexOut(camera.view_proj * vec4(input.position, 1.0), input.position, input.sky_normal);
+}
+@vertex fn vs_sky_mask(input: SkyVertexIn) -> SkyMaskVertexOut {
+    let authored = VertexIn(input.position, input.uv, input.lightmap_uv, input.normal, input.color);
+    var alpha = material.color.a;
+    if ((material.header.z & 1u) != 0u) { alpha *= input.color.a; }
+    return SkyMaskVertexOut(camera.view_proj * vec4(input.position, 1.0),
+        generated_uv(authored), alpha, input.position, input.sky_normal);
+}
+fn sky_normal_encoded(normal: vec3<f32>) -> vec2<f32> {
+    // Out-of-range sentinel for movers/invalid data. No stale world normal
+    // may be applied to main-pass-only surfaces or foreground model pixels.
+    if dot(normal, normal) < 0.5 { return vec2(2.0); }
+    let n = normal / (abs(normal.x) + abs(normal.y) + abs(normal.z));
+    if n.z < 0.0 {
+        return (vec2(1.0) - abs(n.yx)) * select(vec2(-1.0), vec2(1.0), n.xy >= vec2(0.0));
+    }
+    return n.xy;
+}
+@fragment fn fs_sky(input: SkyVertexOut) -> SkyFragmentOut {
+    let base = depth_fragment(input.world_position);
+    return SkyFragmentOut(base.linear_depth, base.motion_vector, base.reflection_policy,
+        sky_normal_encoded(input.sky_normal));
+}
+@fragment fn fs_sky_mask(input: SkyMaskVertexOut) -> SkyFragmentOut {
+    let alpha = textureSample(base_texture, base_sampler, input.uv).a * input.alpha_multiplier;
+    if (material.params.x > 0.0 && alpha < material.params.x || material.params.x < 0.0 && alpha >= -material.params.x) { discard; }
+    let base = depth_fragment(input.world_position);
+    return SkyFragmentOut(base.linear_depth, base.motion_vector, base.reflection_policy,
+        sky_normal_encoded(input.sky_normal));
+}
 
 fn material_matches_planar_plane(selected_plane: vec4<f32>) -> bool {
     let material_len2 = dot(material.planar_plane.xyz, material.planar_plane.xyz);
@@ -335,20 +397,23 @@ fn nir_world_reflectance() -> f32 {
     return reflectance;
 }
 
-@fragment
-fn fs_main(input: VertexOut) -> FragmentOut {
+fn depth_fragment(world_position: vec3<f32>) -> FragmentOut {
     var out: FragmentOut;
-    out.linear_depth = radial_depth(input.world_position);
+    out.linear_depth = radial_depth(world_position);
     // SSR, fog, AO and depth consumers do not need Bevy motion vectors.
     // Only TAA samples this attachment. Avoid two extra 4x4 matrix transforms
     // per BSP pixel when TAA is off (the attachment remains bound for the
     // other prepass consumers; full MRT specialization can follow separately).
     out.motion_vector = vec2<f32>(0.0);
     if ((camera.render_flags.y & 4u) != 0u) {
-        out.motion_vector = bevy_motion_vector(input.world_position);
+        out.motion_vector = bevy_motion_vector(world_position);
     }
-    out.reflection_policy = reflection_policy(input.world_position);
+    out.reflection_policy = reflection_policy(world_position);
     return out;
+}
+
+@fragment fn fs_main(input: VertexOut) -> FragmentOut {
+    return depth_fragment(input.world_position);
 }
 
 @fragment

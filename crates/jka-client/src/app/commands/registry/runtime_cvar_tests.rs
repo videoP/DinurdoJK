@@ -725,11 +725,11 @@ fn baked_local_controls_apply_live_and_round_trip_independently() {
     let fixture=Fixture::new();let path=fixture.0.join("DinurdoJK.cfg");fs::write(&path,"").unwrap();
     let mut app=App::new(fixture.0.clone(),None,crate::scene::MapSource::Bsp("mp/ffa3".into()),false,event_loop.create_proxy()).unwrap();
     let runtime_promotion=(app.video.promote_shader_glow,app.video.promote_shader_additive,app.video.promote_shader_emissive,app.video.emissive_area_lights,app.video.promote_fx_lights);
-    for (name,value) in [("r_bakedLocalLights","1"),("r_bakedLocalGlow","0"),("r_bakedLocalEmissive","0"),("r_bakedLocalAdditive","1"),("r_bakedLocalSurfacelight","1"),("r_bakedLocalFx","1")] {
+    for (name,value) in [("r_bakedLocalLights","1"),("r_bakedLocalGlow","0"),("r_bakedLocalEmissive","0"),("r_bakedLocalAdditive","1"),("r_bakedLocalSurfacelight","1"),("r_bakedLocalFx","1"),("r_bakedLocalFlares","1")] {
         assert_eq!(crate::app::cvar_registry().find(name).unwrap().entry.latch,crate::console::LatchScope::None);
         app.set_console_cvar(name,value).unwrap();
     }
-    assert_eq!(app.video.added_map_light_sources(), 0);assert_eq!(app.video.baked_local_sources,2|8|16);
+    assert_eq!(app.video.added_map_light_sources(), 0);assert_eq!(app.video.baked_local_sources,2|8|16|32);
     app.set_console_cvar("r_dynamicShadows","csm_entities").unwrap();
     app.set_console_cvar("r_sunShadowStrength","0.75").unwrap();
     app.set_console_cvar("r_playerContactShadows","1").unwrap();
@@ -741,17 +741,17 @@ fn baked_local_controls_apply_live_and_round_trip_independently() {
     assert!(crate::app::cvar_registry().find("r_bakedLocalShadows").is_none(), "master cvar was removed");
     assert_eq!(runtime_promotion,(app.video.promote_shader_glow,app.video.promote_shader_additive,app.video.promote_shader_emissive,app.video.emissive_area_lights,app.video.promote_fx_lights));
     app.flush_config();let restored=crate::config::load_video_settings(&path);
-    assert_eq!(restored.added_map_light_sources(), 0);assert_eq!(restored.baked_local_sources,2|8|16);
+    assert_eq!(restored.added_map_light_sources(), 0);assert_eq!(restored.baked_local_sources,2|8|16|32);
     assert_eq!(restored.player_contact_shadows, 0.0);
     assert_eq!(restored.dynamic_shadows, crate::ui::DynamicShadowsMode::CascadedShadowMapsEntities);
     assert!(restored.cascaded_shadows);
     assert_eq!(restored.sun_shadow_strength, 0.75);
     assert!(app.set_console_cvar("r_bakedLocalLights","banana").is_err());
-    app.set_console_cvar("r_bakedLocalLights","0").unwrap();assert_eq!(app.video.added_map_light_sources(), 0);assert_eq!(app.video.baked_local_sources,2|8|16);
+    app.set_console_cvar("r_bakedLocalLights","0").unwrap();assert_eq!(app.video.added_map_light_sources(), 0);assert_eq!(app.video.baked_local_sources,2|8|16|32);
     // Selecting a lamp source does not turn on experimental illumination.
-    assert_eq!(app.video.added_map_light_sources(), 0);assert_eq!(app.video.baked_local_sources,2|8|16);
+    assert_eq!(app.video.added_map_light_sources(), 0);assert_eq!(app.video.baked_local_sources,2|8|16|32);
     app.flush_config();let shadows_only=crate::config::load_video_settings(&path);
-    assert_eq!(shadows_only.added_map_light_sources(), 0);assert_eq!(shadows_only.baked_local_sources,2|8|16);
+    assert_eq!(shadows_only.added_map_light_sources(), 0);assert_eq!(shadows_only.baked_local_sources,2|8|16|32);
 }
 
 #[test]

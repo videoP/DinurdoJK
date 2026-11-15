@@ -383,6 +383,40 @@ pub fn jk2_trace_footstep(
     origin: [f32; 3],
     down: [f32; 3],
 ) -> Option<Jk2Footstep> {
+    jk2_probe_footstep(world, entity, origin, down).step
+}
+
+/// `CG_FootstepForSurface`'s trace together with what it returned, so a missing
+/// footstep can be told apart: no surface in reach, `SURF_NOSTEPS`, or a hit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Jk2ProbeResult {
+    pub step: Option<Jk2Footstep>,
+    pub fraction: f32,
+    /// `trace.entityNum`.
+    pub hit_entity: i32,
+    pub surface_flags: i32,
+    pub start_solid: bool,
+}
+
+impl Jk2ProbeResult {
+    /// Why this probe made no step; `None` when it did.
+    pub fn rejection(&self) -> Option<Jk2Stage> {
+        if self.step.is_some() {
+            None
+        } else if self.fraction >= 1.0 {
+            Some(Jk2Stage::TraceMiss)
+        } else {
+            Some(Jk2Stage::TraceNoSteps)
+        }
+    }
+}
+
+pub fn jk2_probe_footstep(
+    world: &mut impl TraceWorld,
+    entity: u16,
+    origin: [f32; 3],
+    down: [f32; 3],
+) -> Jk2ProbeResult {
     let end = [
         origin[0] + down[0] * JK2_PROBE_LENGTH,
         origin[1] + down[1] * JK2_PROBE_LENGTH,
@@ -396,10 +430,225 @@ pub fn jk2_trace_footstep(
         pass_entity: i32::from(entity),
         mask: MASK_PLAYERSOLID,
     });
-    if hit.fraction >= 1.0 || hit.surface_flags & JK2_SURF_NOSTEPS != 0 {
-        return None;
+    let step = (hit.fraction < 1.0 && hit.surface_flags & JK2_SURF_NOSTEPS == 0).then_some(Jk2Footstep {
+        entity,
+        position: origin,
+        metal: hit.surface_flags & JK2_SURF_METALSTEPS != 0,
+    });
+    Jk2ProbeResult {
+        step,
+        fraction: hit.fraction,
+        hit_entity: hit.entity,
+        surface_flags: hit.surface_flags,
+        start_solid: hit.start_solid != 0,
     }
-    Some(Jk2Footstep { entity, position: origin, metal: hit.surface_flags & JK2_SURF_METALSTEPS != 0 })
+}
+
+// ---------------------------------------------------------------------------
+// `cg_footstepDebug`: where does a JK2 footstep candidate stop?
+//
+// A footstep passes through the legs lerp frame (animation), the step-frame test,
+// the ground gate, the lumbar bolt, the CG_Trace probe and finally the sound
+// backend. Each stage counts what reaches and leaves it, so a silent step can be
+// attributed to the first stage that differs from MVSDK instead of guessed at.
+// ---------------------------------------------------------------------------
+
+static JK2_DEBUG: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `cg_footstepDebug`: 0 off, 1 one summary line per two seconds, 2 also one
+/// line per footstep candidate (rate limited), 3 as 2 with the JK2 ground probe
+/// restricted to the world BSP (A/B against the entity-aware `CG_Trace`).
+pub fn debug_level() -> u8 {
+    JK2_DEBUG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_debug_level(level: u8) {
+    JK2_DEBUG.store(level.min(3), std::sync::atomic::Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Jk2Stage {
+    /// The legs lerp frame moved (`CG_RunLerpFrame` advanced and had a previous pair).
+    Advance,
+    /// ... but the animation/frame pair is not a footfall.
+    NotStep,
+    /// A footfall by the frame test (`CG_InWalkingAnim` + crossing).
+    Due,
+    /// Due, but `cg_footsteps` is 0.
+    SoundsOff,
+    /// Due, but `groundEntityNum == ENTITYNUM_NONE` (a wall run is exempt).
+    NoGround,
+    /// Due and gated through, but there is no collision world to trace.
+    NoWorld,
+    /// The probe ran while the player was outside the view frustum.
+    Offscreen,
+    /// The probe ran without the lumbar bolt (origin/straight down fallback).
+    BoltFallback,
+    /// `tr.fraction == 1`: nothing within 64 units along the bolt.
+    TraceMiss,
+    /// The surface has `SURF_NOSTEPS`.
+    TraceNoSteps,
+    /// A footfall that found a stepping surface and was queued for audio.
+    Queued,
+    /// ... of which `SURF_METALSTEPS`.
+    Metal,
+    /// `PlayerAnimationState::update` failed, so no frame data for the frame.
+    UpdateError,
+    /// Handed to the sound backend.
+    Submitted,
+    /// Dropped because the session's audio is suppressed (seeking, etc.).
+    AudioSuppressed,
+    /// The sound presenter had no backend or could not load the sample.
+    SoundFailed,
+}
+
+impl Jk2Stage {
+    const COUNT: usize = 16;
+}
+
+/// What the presenter knew when a footfall came due.
+#[derive(Clone, Copy, Debug)]
+pub struct Jk2StepContext<'a> {
+    pub time: i32,
+    pub anim: &'a str,
+    pub old_frame: i32,
+    pub frame: i32,
+    pub ground: i32,
+    pub offscreen: bool,
+    pub bolt_found: bool,
+}
+
+const DEBUG_LINES_PER_SECOND: u8 = 24;
+const DEBUG_SUMMARY_MS: i32 = 2000;
+
+/// Per-presenter counters for `cg_footstepDebug`. Counting is a few integer
+/// increments on an actual footfall; printing only happens when enabled.
+#[derive(Default)]
+pub struct Jk2FootstepDiag {
+    counts: [u32; Jk2Stage::COUNT],
+    printed: [u32; Jk2Stage::COUNT],
+    last_summary: Option<i32>,
+    window_start: i32,
+    window_lines: u8,
+    dropped_lines: u32,
+}
+
+impl Jk2FootstepDiag {
+    pub fn count(&mut self, stage: Jk2Stage) {
+        self.counts[stage as usize] = self.counts[stage as usize].wrapping_add(1);
+    }
+
+    pub fn get(&self, stage: Jk2Stage) -> u32 {
+        self.counts[stage as usize]
+    }
+
+    /// One candidate line (`cg_footstepDebug` >= 2), at most
+    /// `DEBUG_LINES_PER_SECOND` per second of `now`.
+    pub fn line(&mut self, now: i32, text: impl FnOnce() -> String) {
+        if debug_level() < 2 {
+            return;
+        }
+        if now < self.window_start || now - self.window_start >= 1000 {
+            self.window_start = now;
+            self.window_lines = 0;
+        }
+        if self.window_lines >= DEBUG_LINES_PER_SECOND {
+            self.dropped_lines += 1;
+            return;
+        }
+        self.window_lines += 1;
+        println!("JK2 FOOTSTEP t={now} {}", text());
+    }
+
+    /// The counter summary (`cg_footstepDebug` >= 1), when it changed and two
+    /// seconds have passed. `audio` is `(active, capacity, replaced, kicked)`
+    /// of the sound backend.
+    pub fn summary(&mut self, now: i32, audio: impl FnOnce() -> Option<(usize, usize, u64, u64)>) {
+        if debug_level() == 0 {
+            return;
+        }
+        if self.last_summary.is_some_and(|last| now >= last && now - last < DEBUG_SUMMARY_MS) {
+            return;
+        }
+        self.last_summary = Some(now);
+        if self.counts == self.printed {
+            return;
+        }
+        self.printed = self.counts;
+        let c = |stage| self.get(stage);
+        let backend = audio().map_or_else(String::new, |(active, capacity, replaced, kicked)| {
+            format!(" voices={active}/{capacity} replaced={replaced} kicked={kicked}")
+        });
+        println!(
+            "JK2 FOOTSTEP SUMMARY t={now} advance={} notStep={} due={} | soundsOff={} noGround={} noWorld={} \
+             | probe offscreen={} boltFallback={} miss={} noSteps={} | queued={} metal={} updateErr={} \
+             | audio submitted={} muted={} failed={}{backend} droppedLines={}",
+            c(Jk2Stage::Advance), c(Jk2Stage::NotStep), c(Jk2Stage::Due),
+            c(Jk2Stage::SoundsOff), c(Jk2Stage::NoGround), c(Jk2Stage::NoWorld),
+            c(Jk2Stage::Offscreen), c(Jk2Stage::BoltFallback), c(Jk2Stage::TraceMiss), c(Jk2Stage::TraceNoSteps),
+            c(Jk2Stage::Queued), c(Jk2Stage::Metal), c(Jk2Stage::UpdateError),
+            c(Jk2Stage::Submitted), c(Jk2Stage::AudioSuppressed), c(Jk2Stage::SoundFailed),
+            self.dropped_lines,
+        );
+    }
+}
+
+/// Run one due JK2 footfall's probe and record it. The default probe is the
+/// entity-aware `CG_Trace` of MVSDK `CG_FootstepForSurface`; `cg_footstepDebug 3`
+/// restricts it to the world BSP to compare against.
+#[allow(clippy::too_many_arguments)]
+pub fn jk2_probe_step(
+    world: &mut CollisionWorld,
+    solids: &[SolidEntity],
+    viewer_client: i32,
+    diag: &mut Jk2FootstepDiag,
+    out: &mut Vec<Jk2Footstep>,
+    ctx: Jk2StepContext<'_>,
+    entity: u16,
+    origin: [f32; 3],
+    down: [f32; 3],
+) {
+    let probe = if debug_level() >= 3 {
+        jk2_probe_footstep(world, entity, origin, down)
+    } else {
+        let mut trace = FootstepEntityTrace::new(world, solids, viewer_client, i32::from(entity));
+        jk2_probe_footstep(&mut trace, entity, origin, down)
+    };
+    if ctx.offscreen {
+        diag.count(Jk2Stage::Offscreen);
+    }
+    if !ctx.bolt_found {
+        diag.count(Jk2Stage::BoltFallback);
+    }
+    match (probe.step, probe.rejection()) {
+        (Some(step), _) => {
+            diag.count(Jk2Stage::Queued);
+            if step.metal {
+                diag.count(Jk2Stage::Metal);
+            }
+            out.push(step);
+        }
+        (None, Some(stage)) => diag.count(stage),
+        (None, None) => {}
+    }
+    diag.line(ctx.time, || {
+        format!(
+            "ent={entity} anim={} frames={}->{} ground={} {} bolt={} org=({:.0} {:.0} {:.0}) down=({:.2} {:.2} {:.2}) \
+             frac={:.3} hit={} flags={:#x}{} => {}",
+            ctx.anim, ctx.old_frame, ctx.frame, ctx.ground,
+            if ctx.offscreen { "offscreen" } else { "onscreen" },
+            if ctx.bolt_found { "lumbar" } else { "FALLBACK" },
+            origin[0], origin[1], origin[2], down[0], down[1], down[2],
+            probe.fraction, probe.hit_entity, probe.surface_flags,
+            if probe.start_solid { " startsolid" } else { "" },
+            match (probe.step, probe.rejection()) {
+                (Some(step), _) if step.metal => "step (metal)",
+                (Some(_), _) => "step",
+                (None, Some(Jk2Stage::TraceNoSteps)) => "REJECTED SURF_NOSTEPS",
+                _ => "REJECTED no surface within 64u",
+            },
+        )
+    });
 }
 
 /// `cgs.media.footsteps[type][rand()&3]` for a JK2 step: `boot`, or `clank` on
@@ -641,6 +890,90 @@ BOTH_STAND1 400 30 0 20
     fn standing_and_a_held_frame_make_no_step() {
         assert_eq!(due("BOTH_STAND1", 402, 403), None);
         assert_eq!(due("BOTH_RUN1", 103, 103), None);
+    }
+
+    struct Jk2Probe {
+        fraction: f32,
+        flags: i32,
+    }
+
+    impl TraceWorld for Jk2Probe {
+        fn trace(&mut self, query: TraceQuery) -> TraceResult {
+            assert_eq!(query.start, [10.0, 20.0, 30.0]);
+            assert_eq!(query.end, [10.0, 20.0, -34.0]);
+            assert_eq!(query.mins, JK2_HULL_MINS);
+            assert_eq!(query.maxs, JK2_HULL_MAXS);
+            assert_eq!(query.pass_entity, 7);
+            assert_eq!(query.mask, MASK_PLAYERSOLID);
+            let mut hit = TraceResult::clear(query.end);
+            hit.fraction = self.fraction;
+            hit.surface_flags = self.flags;
+            hit
+        }
+
+        fn point_contents(&mut self, _point: [f32; 3], _pass_entity: i32) -> i32 { 0 }
+    }
+
+    #[test]
+    fn jk2_probe_uses_mvsdk_hull_and_preserves_surface_gating() {
+        let probe = |fraction, flags| Jk2Probe { fraction, flags };
+        let args = (7, [10.0, 20.0, 30.0], [0.0, 0.0, -1.0]);
+        assert_eq!(
+            jk2_trace_footstep(&mut probe(0.5, JK2_SURF_METALSTEPS), args.0, args.1, args.2),
+            Some(Jk2Footstep { entity: 7, position: args.1, metal: true }),
+        );
+        assert_eq!(
+            jk2_trace_footstep(&mut probe(0.5, 0), args.0, args.1, args.2),
+            Some(Jk2Footstep { entity: 7, position: args.1, metal: false }),
+        );
+        assert!(jk2_trace_footstep(&mut probe(0.5, JK2_SURF_NOSTEPS), args.0, args.1, args.2).is_none());
+        assert!(jk2_trace_footstep(&mut probe(1.0, 0), args.0, args.1, args.2).is_none());
+    }
+
+    #[test]
+    fn a_silent_probe_says_which_stage_rejected_it() {
+        let reason = |fraction, flags| {
+            jk2_probe_footstep(&mut Jk2Probe { fraction, flags }, 7, [10.0, 20.0, 30.0], [0.0, 0.0, -1.0]).rejection()
+        };
+        assert_eq!(reason(1.0, 0), Some(Jk2Stage::TraceMiss));
+        assert_eq!(reason(0.4, JK2_SURF_NOSTEPS), Some(Jk2Stage::TraceNoSteps));
+        // A metal or plain hit is not a rejection.
+        assert_eq!(reason(0.4, JK2_SURF_METALSTEPS), None);
+        assert_eq!(reason(0.4, 0), None);
+    }
+
+    #[test]
+    fn diag_lines_are_rate_limited_and_the_summary_only_prints_changes() {
+        let mut diag = Jk2FootstepDiag::default();
+        diag.count(Jk2Stage::Due);
+        diag.count(Jk2Stage::Due);
+        assert_eq!(diag.get(Jk2Stage::Due), 2);
+        assert_eq!(diag.get(Jk2Stage::Queued), 0);
+        // Nothing prints (or is built) while the diagnostic is off.
+        set_debug_level(0);
+        diag.line(1000, || panic!("a disabled diagnostic must not format"));
+        diag.summary(1000, || panic!("a disabled diagnostic must not query audio"));
+        // Level 2: a second's worth of lines, then drops until the next second.
+        set_debug_level(2);
+        let mut built = 0;
+        for _ in 0..100 {
+            diag.line(5000, || { built += 1; String::new() });
+        }
+        assert_eq!(built, usize::from(DEBUG_LINES_PER_SECOND));
+        assert_eq!(diag.dropped_lines, 100 - u32::from(DEBUG_LINES_PER_SECOND));
+        diag.line(6000, || { built += 1; String::new() });
+        assert_eq!(built, usize::from(DEBUG_LINES_PER_SECOND) + 1);
+        // The summary prints once, then not again until a counter moves.
+        let mut queried = 0;
+        diag.summary(10_000, || { queried += 1; None });
+        diag.summary(12_500, || { queried += 1; None });
+        assert_eq!(queried, 1, "unchanged counters: nothing to print");
+        diag.count(Jk2Stage::Queued);
+        diag.summary(12_600, || { queried += 1; None });
+        assert_eq!(queried, 1, "inside the two-second window");
+        diag.summary(14_600, || { queried += 1; None });
+        assert_eq!(queried, 2);
+        set_debug_level(0);
     }
 
     #[test]

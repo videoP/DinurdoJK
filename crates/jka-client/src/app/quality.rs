@@ -70,7 +70,8 @@ impl QualityPreset {
                     "r_rgb565" => *value = "1", // native RGB565 swapchain when supported (latched)
                     "r_competitiveAB" => *value = "5", // retained for ordinary renderer A/B; the flat-world path bypasses authored stages
                     "r_collisionWorld" => *value = "1", // native BSP flat-shaded multidraw, independent of audio
-                    "r_shitterTexture" => *value = "1", // universal factory/base image, no material stages
+                    "r_shitterTexture" => *value = "1", // jaPRO grid images, no material stages
+                    "r_texturemode" => *value = "GL_NEAREST", // pixel-sharp low-cost ShitteR grid sampling
                     "r_fragmentShaderMode" => *value = "5", // current measured compact-world family
                     "r_drawfog" => *value = "0", // avoid Legacy 2 FP16/post on fog maps
                     "r_fullbright" => *value = "0", // BSP baked global lightmaps, not forced unlit
@@ -158,6 +159,9 @@ impl QualityPreset {
                 ("r_picmip", "3"),
                 ("fx_physics", "0"),
                 ("r_promoteFxLights", "0"),
+                // Anisotropy's 0 setter selects trilinear. Apply it before the
+                // filter cvar so ShitteR can override the latter with NEAREST.
+                ("r_ext_texture_filter_anisotropic", "0"),
                 ("r_texturemode", "GL_LINEAR_MIPMAP_LINEAR"),
                 ("r_autoDetailTextures", "0"),
                 ("r_hdr", "0"),
@@ -619,6 +623,11 @@ mod tests {
     fn quality_presets_restore_shitter_overrides() {
         let baseline = QualityPreset::Minimal.settings();
         let shitter = QualityPreset::Shitter.settings();
+        assert!(shitter.contains(&("r_texturemode", "GL_NEAREST")));
+        assert!(shitter.contains(&("r_ext_texture_filter_anisotropic", "0")));
+        let anisotropy_index = shitter.iter().position(|(name, _)| *name == "r_ext_texture_filter_anisotropic").unwrap();
+        let filter_index = shitter.iter().position(|(name, _)| *name == "r_texturemode").unwrap();
+        assert!(anisotropy_index < filter_index, "anisotropy=0 must not undo ShitteR NEAREST");
         for (name, on, off) in [
             ("r_pvsMode", "auto", "auto"),
             ("r_igpuAB", "19", "0"),

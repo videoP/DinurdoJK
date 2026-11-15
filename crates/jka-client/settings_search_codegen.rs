@@ -18,6 +18,7 @@ const SOURCES: &[(&str, usize, &str)] = &[
     ("src/app/egui_settings/models.rs", 3, "Geometry"),
     ("src/app/egui_settings/lighting.rs", 3, "Lighting"),
     ("src/app/egui_settings/relighting.rs", 3, "Relighting"),
+    ("src/app/egui_settings/relighting_profiles.rs", 3, "Relighting"),
     ("src/app/egui_settings/materials.rs", 3, "Materials"),
     ("src/app/egui_settings/effects.rs", 3, "Effects"),
     ("src/app/egui_settings/reflections.rs", 3, "Effects"),

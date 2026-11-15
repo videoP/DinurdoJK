@@ -251,7 +251,7 @@ pub fn build_crosshair_vertices(
     // TaystJK DF_DrawStrafeHUD owns the line crosshair, separately from
     // CG_DrawCrosshair: it is fixed at 320,240, including in dynamic mode.
     // Draw it only in the stable HUD batch, never the projected render tail.
-    if helper_line && screen_position.is_some() { return; }
+    if screen_position.is_some() && (helper_line || ui.crosshair.is_line_shape()) { return; }
     if !helper_line && ui.zoom_scope.is_some() && ui.crosshair.scope_mode != 1 {
         return;
     }

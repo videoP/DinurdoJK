@@ -125,7 +125,7 @@ fn print_r_speeds(
             }
         }
         5 => println!("zFar: {:.0}", camera.far_distance()),
-        6 => println!("[r_speeds 6] world flares enabled={}; add/test/render counters not yet instrumented", renderer.world_flares_enabled),
+        6 => println!("[r_speeds 6] world flare mode={}; add/test/render counters not yet instrumented", renderer.world_flares_mode),
         7 => {
             let vtx = world.vertex_buffer.size() as f64 / (1024.0 * 1024.0);
             let idx = world.index_buffer.size() as f64 / (1024.0 * 1024.0);
@@ -188,10 +188,10 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetWorldStageDebug { .. } => "SetWorldStageDebug",
         RenderCommand::SetFastSky(..) => "SetFastSky",
         RenderCommand::SetCompetitiveAb(..) => "SetCompetitiveAb",
-        RenderCommand::SetWorldFlares(..) => "SetWorldFlares",
+        RenderCommand::SetWorldFlares { .. } => "SetWorldFlares",
         RenderCommand::SetFpsCap(..) => "SetFpsCap",
         RenderCommand::SetGamma(..) => "SetGamma",
-        RenderCommand::SetOverbrightBits(..) => "SetOverbrightBits",
+        RenderCommand::SetOverbrightBits { .. } => "SetOverbrightBits",
         RenderCommand::SetGammaMethod(..) => "SetGammaMethod",
         RenderCommand::SetHardwareGammaActive(..) => "SetHardwareGammaActive",
         RenderCommand::PrepareGammaMethod(..) => "PrepareGammaMethod",
@@ -249,6 +249,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetClassicWorldLighting { .. } => "SetClassicWorldLighting",
         RenderCommand::SetAddedMapLightSources(..) => "SetAddedMapLightSources",
         RenderCommand::SetLampShadowSources(..) => "SetLampShadowSources",
+        RenderCommand::SetLampShadowDebug(..) => "SetLampShadowDebug",
         RenderCommand::SetEntityFixtureLightingAB(..) => "SetEntityFixtureLightingAB",
         RenderCommand::SetEntityAmbientLighting(..) => "SetEntityAmbientLighting",
         RenderCommand::SetVoxelProbeGi(..) => "SetVoxelProbeGi",
@@ -726,6 +727,7 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
         sun_terminator: video.sun_terminator,
         sky_world_bake_ab: effective_lighting.sky_world_bake_ab,
         sky_world_light_isolation: effective_lighting.sky_world_light_isolation,
+        sky_world_gain_mode: effective_lighting.sky_world_gain_mode,
         sky_world_lighting_strength: effective_lighting.sky_world_lighting_strength,
         bake_threads: video.bake_threads,
         baked_sun_shadow_map: video.baked_sun_shadow_map,
@@ -1589,15 +1591,30 @@ pub(in crate::renderer) fn render_thread_main(
                         }
                         renderer.set_competitive_ab(mode);
                     },
-                    Ok(RenderCommand::SetWorldFlares(enabled)) => {
-                        if renderer.world_flares_enabled != enabled {
-                            renderer.world_flares.invalidate_history();
-                            renderer.world_flares_sky.invalidate_history();
+                    Ok(RenderCommand::SetWorldFlares { mode, enhanced_intensity, enhanced_core, enhanced_wash, enhanced_locality }) => {
+                        if renderer.world_flares_mode != mode {
+                            renderer.world_flares.set_mode(mode);
+                            renderer.world_flares_sky.set_mode(mode);
                             for flare_view in &mut renderer.world_flares_planar {
-                                flare_view.invalidate_history();
+                                flare_view.set_mode(mode);
                             }
                         }
-                        renderer.world_flares_enabled = enabled;
+                        // A uniform change only: no pipeline recompilation, no map reload.
+                        renderer.world_flares.set_enhanced_intensity(enhanced_intensity);
+                        renderer.world_flares.set_enhanced_core(enhanced_core);
+                        renderer.world_flares.set_enhanced_wash(enhanced_wash);
+                        renderer.world_flares.set_enhanced_locality(enhanced_locality);
+                        renderer.world_flares_sky.set_enhanced_intensity(enhanced_intensity);
+                        renderer.world_flares_sky.set_enhanced_core(enhanced_core);
+                        renderer.world_flares_sky.set_enhanced_wash(enhanced_wash);
+                        renderer.world_flares_sky.set_enhanced_locality(enhanced_locality);
+                        for flare_view in &mut renderer.world_flares_planar {
+                            flare_view.set_enhanced_intensity(enhanced_intensity);
+                            flare_view.set_enhanced_core(enhanced_core);
+                            flare_view.set_enhanced_wash(enhanced_wash);
+                            flare_view.set_enhanced_locality(enhanced_locality);
+                        }
+                        renderer.world_flares_mode = mode.min(2);
                     }
                     Ok(RenderCommand::SetFpsCap(cap)) => {
                         if let Some(mut sweep) = shitter_sweep.take() {
@@ -1609,10 +1626,22 @@ pub(in crate::renderer) fn render_thread_main(
                         }
                     },
                     Ok(RenderCommand::SetGamma(gamma)) => renderer.set_gamma(gamma),
-                    Ok(RenderCommand::SetOverbrightBits(bits)) => {
-                        if renderer.overbright_bits != bits.min(1) {
-                            renderer.overbright_bits = bits.min(1);
+                    Ok(RenderCommand::SetOverbrightBits { bits, jk2_mode }) => {
+                        let bits = bits.min(1);
+                        if renderer.overbright_bits != bits || renderer.jk2_legacy_color != jk2_mode {
+                            renderer.overbright_bits = bits;
+                            let color_mode_changed = renderer.jk2_legacy_color != jk2_mode;
+                            renderer.jk2_legacy_color = jk2_mode;
+                            if color_mode_changed {
+                                if let Some(world) = renderer.world.as_mut() {
+                                    world.fast_pipelines.clear();
+                                }
+                            }
                             renderer.refresh_output_gamma();
+                            // The cached BSP pipeline key includes the JK2 color
+                            // specialization. No draw pass or hot-path branch is
+                            // added to the normal JKA shader.
+                            renderer.activate_world_pipeline_variant();
                         }
                     },
                     Ok(RenderCommand::SetGammaMethod(method)) => {
@@ -1888,6 +1917,9 @@ pub(in crate::renderer) fn render_thread_main(
                     }
                     Ok(RenderCommand::SetLampShadowAB(mode)) => {
                         renderer.set_lamp_shadow_ab(mode);
+                    }
+                    Ok(RenderCommand::SetLampShadowDebug(mode)) => {
+                        renderer.request_lamp_shadow_debug(mode);
                     }
                     Ok(RenderCommand::SetEntityFixtureLightingAB(enabled)) => {
                         renderer.set_entity_fixture_lighting_ab(enabled);

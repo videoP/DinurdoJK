@@ -650,6 +650,9 @@ pub(in crate::renderer) fn auto4_evict_lru_geometry(
     let Auto4GeometryState::Ready { range, .. } = old else {
         return false;
     };
+    if let Some(shitter) = world.shitter_slope_cache.as_mut() {
+        shitter.forget_collapsed(range.start);
+    }
     world.auto4_collapse_cache.release(range);
     world.auto4_collapse_cache.evictions = world.auto4_collapse_cache.evictions.saturating_add(1);
     auto4_set_geometry_range(queue, world, victim, 0..0);
@@ -712,6 +715,21 @@ pub(in crate::renderer) fn auto4_accept_collapse(
             u64::from(range.start) * std::mem::size_of::<u32>() as u64,
             bytemuck::cast_slice(&result.indices),
         );
+    }
+    // AUTO4 reuses GPU index-cache address ranges as the viewer moves. When a
+    // ShitteR-only slope cache exists, classify this actual collapsed geometry
+    // once at installation, not during the subsequent frame/draw path.
+    if crate::renderer::collision_world_only() && crate::renderer::shitter_texture_enabled() {
+        let WorldGpu { shitter_slope_cache, static_ao_gpu_vertices, inline_models, .. } = &mut *world;
+        if let Some(cache) = shitter_slope_cache.as_mut() {
+            cache.cache_collapsed(range.start, &result.indices, |vertex_index| {
+                if let Some(vertex) = static_ao_gpu_vertices.get(vertex_index as usize) {
+                    return Some(vertex.position);
+                }
+                inline_models.iter().find_map(|model| vertex_index.checked_sub(model.gpu_vertex_start)
+                    .and_then(|offset| model.base.get(offset as usize).map(|vertex| vertex.position)))
+            });
+        }
     }
     let active_range = range.start..range.start+result.indices.len() as u32;
     world.patch_lod.note_collapse(geometry,range.clone(),result.indices.len() as u64*4);

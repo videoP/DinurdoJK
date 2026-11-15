@@ -22,7 +22,7 @@ static void *callback_context;
 typedef char jk2_trigger_capacity_check[JK2_SNAPSHOT_ENTITIES == MAX_ENTITIES_IN_SNAPSHOT ? 1 : -1];
 
 void QDECL Com_Printf(const char *format, ...) { (void)format; }
-void QDECL Com_Error(int level, const char *format, ...) {
+void QDECL Com_Error(errorParm_t level, const char *format, ...) {
     va_list args; (void)level;
     va_start(args, format); vsnprintf(last_error, sizeof(last_error), format, args); va_end(args);
     longjmp(error_target, 1);

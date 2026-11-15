@@ -130,6 +130,9 @@ struct FollowSample {
     source: Source,
     continuous: bool,
     used_command_time: bool,
+    /// Followed player's commandTime at this visual sample, fractional:
+    /// TaystJK `predictedPlayerState.commandTime + predictedTimeFrac`.
+    command_ms: f64,
 }
 
 struct Sample {
@@ -208,6 +211,8 @@ pub(crate) struct RemoteSmoothing {
     follow_continuity: VisualContinuity,
     follow_samples: [u64; 4], // interpolated, extrapolated, held, command-time segments
     follow_skip_until: Option<i32>, // prevent rewinding across follow switch/teleport
+    /// Camera clock of the last `apply_follow` sample; `None` when it did not sample.
+    pub(crate) follow_command_ms: Option<f64>,
 }
 
 impl Default for RemoteSmoothing {
@@ -219,7 +224,7 @@ impl Default for RemoteSmoothing {
             automatic_delay_ms: None, last_delay_wall: None,
             last_visual_time: None, follow_last_client: None,
             follow_continuity: VisualContinuity::default(), follow_samples: [0; 4],
-            follow_skip_until: None }
+            follow_skip_until: None, follow_command_ms: None }
     }
 }
 
@@ -299,6 +304,7 @@ impl RemoteSmoothing {
         self.follow_continuity = VisualContinuity::default();
         self.follow_samples = [0; 4];
         self.follow_skip_until = None;
+        self.follow_command_ms = None;
         self.last_mode = selected;
     }
 
@@ -562,7 +568,8 @@ impl RemoteSmoothing {
                 // at the old position until the new snapshot is due.
                 return Some(FollowSample { origin: a.origin, angles: a.angles,
                     velocity: a.velocity, source: Source::Discontinuity,
-                    continuous: false, used_command_time: false });
+                    continuous: false, used_command_time: false,
+                    command_ms: f64::from(a.command_time) });
             }
             let elapsed = f64::from(new.time - old.time);
             if elapsed <= 0.0 { return None; }
@@ -594,6 +601,10 @@ impl RemoteSmoothing {
                 velocity: std::array::from_fn(|axis| a.velocity[axis] + f * (b.velocity[axis] - a.velocity[axis])),
                 source: Source::Interpolated, continuous: true,
                 used_command_time: usable_command,
+                // CG_InterpolatePlayerState: commandTime of snap + f * gap. A
+                // backwards commandTime (client restart) never rewinds the clock.
+                command_ms: f64::from(a.command_time)
+                    + server_f * f64::from((b.command_time - a.command_time).max(0)),
             });
         }
         // An underrun. Mode 1 holds. Mode 2/3/4 predicts only a short,
@@ -628,7 +639,9 @@ impl RemoteSmoothing {
         }
         Some(FollowSample { origin, angles, velocity: a.velocity,
             source: if extrap > 0.0 && elapsed <= extrap { Source::Extrapolated } else { Source::Held },
-            continuous: true, used_command_time: false })
+            continuous: true, used_command_time: false,
+            // The extrapolated pose moved `extrap` ms along its velocity.
+            command_ms: f64::from(a.command_time) + extrap })
     }
 
     /// Called after the original playerState has been chosen and input
@@ -636,6 +649,7 @@ impl RemoteSmoothing {
     /// and shadows are derived. Never change server gameplay/discrete fields.
     pub(crate) fn apply_follow(&mut self, ps: &mut PlayerState, now: Instant, teleported: bool) {
         let selected = mode();
+        self.follow_command_ms = None;
         if selected == 0 || teleported {
             if teleported {
                 // The old buffered timeline contains the position from before
@@ -707,6 +721,7 @@ impl RemoteSmoothing {
             _ => {},
         }
         if sampled.used_command_time { self.follow_samples[3] += 1; }
+        self.follow_command_ms = Some(sampled.command_ms);
         for (axis, name) in ["origin[0]", "origin[1]", "origin[2]"].iter().enumerate() {
             ps.set_field_bits(name, sampled.origin[axis].to_bits());
         }
