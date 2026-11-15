@@ -612,22 +612,36 @@ impl App {
                     });
                     // The chat filter may hold the text back until it has
                     // been checked; the console row then starts out held too.
+                    let received_display = self.chat_translation.message_ref(chat_id)
+                        .map_or_else(|| text.clone(), |message| message.received_display_line());
                     let filtered_line = self.chat_llm_received(chat_id);
+                    let shown = filtered_line.unwrap_or_else(|| received_display.clone());
+                    if let Some(message) = self.chat_translation.message_mut_ref(chat_id) {
+                        // Async filter/translation replacements match this exact
+                        // suffix, while the message's wire text remains raw.
+                        message.set_console_shown(shown.clone());
+                    }
                     if chat_from_demo {
                         self.queue_demo_chat_console_row(
-                            text.clone(), filtered_line.unwrap_or_else(|| text.clone()), chat_id, console_kind,
+                            text.clone(),
+                            shown,
+                            chat_id, console_kind,
                         );
                     } else {
-                        self.push_console_chat_line(filtered_line.unwrap_or_else(|| text.clone()), console_kind, chat_id);
+                        self.push_console_chat_line(
+                            shown,
+                            console_kind, chat_id,
+                        );
                     }
                     if self.chat_lines.len() >= crate::app::chat_anim::KEEP_LINES {
                         self.chat_lines.pop_front();
                     }
                     let now = Instant::now();
                     let demo_elapsed_ms = self.current_demo_elapsed_ms(now);
-                    // Keep raw server text in console/history/logs; clean only the
-                    // dedicated chatbox presentation, as controlled by the cvar.
-                    let display_text = clean_chatbox_colors(&text, self.clean_chatbox);
+                    // Wire history/logs stay raw; decode only the presentation.
+                    let display_text = clean_chatbox_colors(
+                        &received_display, self.clean_chatbox,
+                    );
                     let censor = self
                         .chat_translation
                         .message_ref(chat_id)

@@ -38,47 +38,34 @@ pub(in crate::ui) fn draw_chat_marks(out: &mut Vec<UiVertex>, flags: u8, x: f32,
 
 pub(in crate::ui) fn wrap_fixed_chat_text(value: &str, max_columns: usize) -> String {
     let max_columns = max_columns.max(1);
-    let bytes = crate::cgame::text_to_jka_bytes(value);
     let mut out = String::with_capacity(value.len() + value.len() / max_columns.max(8));
     let mut line_start = 0usize;
     let mut line_columns = 0usize;
     let mut last_space_out = None::<usize>;
-    let mut index = 0usize;
-
-    while index < bytes.len() {
-        if let Some((skip, _)) = color_escape(&bytes, index, 1.0) {
-            out.extend(bytes[index..index + skip].iter().map(|&byte| byte as char));
-            index += skip;
+    let mut chars = value.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if let Some((skip, _)) = color_escape(value.as_bytes(), index, 1.0) {
+            out.push_str(&value[index..index + skip]);
+            while chars.peek().is_some_and(|(at, _)| *at < index + skip) { chars.next(); }
             continue;
         }
-        let byte = bytes[index];
-        if byte == b'\n' {
-            out.push('\n');
-            line_start = out.len();
-            line_columns = 0;
-            last_space_out = None;
-            index += 1;
-            continue;
+        if ch == '\n' {
+            out.push('\n'); line_start = out.len(); line_columns = 0;
+            last_space_out = None; continue;
         }
-        if byte == b' ' {
-            last_space_out = Some(out.len());
-        }
-        out.push(byte as char);
+        if ch == ' ' { last_space_out = Some(out.len()); }
+        out.push(ch);
         line_columns += 1;
-
         if line_columns >= max_columns {
             if let Some(space) = last_space_out.filter(|space| *space >= line_start) {
                 out.replace_range(space..=space, "\n");
                 line_start = space + 1;
                 line_columns = visible_jka_chars(&out[line_start..]);
             } else {
-                out.push('\n');
-                line_start = out.len();
-                line_columns = 0;
+                out.push('\n'); line_start = out.len(); line_columns = 0;
             }
             last_space_out = None;
         }
-        index += 1;
     }
     out
 }
@@ -109,6 +96,10 @@ pub(in crate::ui) fn build_chat_history(
         return;
     }
     if ui.chat_lines.is_empty() {
+        return;
+    }
+    if ui.chat_settings.font() != super::ChatFont::Classic {
+        build_classic_selected_history(out, ui, small_font, w, h);
         return;
     }
 
@@ -248,6 +239,39 @@ pub(in crate::ui) fn build_chat_history(
     }
 }
 
+fn build_classic_selected_history(out: &mut Vec<UiVertex>, ui: &UiSnapshot,
+    small_font: Option<&ProportionalFont>, w: u32, h: u32,
+) {
+    let txt = super::text::UiText::chat(ui, small_font, w, h);
+    let sy = h.max(1) as f32 / 480.0;
+    let step = CHATBOX_FONT_HEIGHT * CHATBOX_FONT_SCALE * sy;
+    let px = small_font.map_or(CHATBOX_FONT_HEIGHT, |font| f32::from(font.height)) * CHATBOX_FONT_SCALE * sy;
+    let max_width = (CHATBOX_CUTOFF * ui.hud_layout.chat.extent[0]).clamp(120.0, 2200.0) * sy;
+    let max_lines = ((52.0 * ui.hud_layout.chat.extent[1])
+        / (CHATBOX_FONT_HEIGHT * CHATBOX_FONT_SCALE)).floor().max(1.0) as usize;
+    let mut rows = Vec::new();
+    for line in &ui.chat_lines {
+        let alpha = line.alpha.clamp(0.0, 1.0);
+        if alpha <= 0.01 { continue; }
+        for (index, part) in super::chat_dock::wrap(&txt, &line.text, px, max_width).into_iter().enumerate() {
+            rows.push((part, alpha, if index == 0 { line.flags } else { 0 }));
+        }
+    }
+    let skip = rows.len().saturating_sub(max_lines);
+    let rows = &rows[skip..];
+    let x = 30.0 * w as f32 / 640.0;
+    let mut baseline = CHATBOX_Y * sy - step * rows.len() as f32;
+    for (value, alpha, flags) in rows {
+        if *flags != 0 {
+            let size = step * 0.62;
+            let marks = chat_marks_width(*flags, size);
+            draw_chat_marks(out, *flags, (x - marks).max(0.0), baseline + step * 0.5, size, *alpha, w, h);
+        }
+        txt.draw(out, value, x, baseline, px, [1.0, 1.0, 1.0, *alpha]);
+        baseline += step;
+    }
+}
+
 /// TaystJK/OpenJK `Con_DrawNotify`: recent console output over the top-left of
 /// gameplay. These are console/game notices, not chatbox history.
 pub(in crate::ui) fn build_console_notify(
@@ -285,7 +309,7 @@ pub(in crate::ui) fn build_console_notify(
 pub(in crate::ui) fn build_chat_input(
     out: &mut Vec<UiVertex>,
     ui: &UiSnapshot,
-    _small_font: Option<&ProportionalFont>,
+    small_font: Option<&ProportionalFont>,
     w: u32,
     h: u32,
 ) {
@@ -316,7 +340,13 @@ pub(in crate::ui) fn build_chat_input(
         ChatMode::Direct(_) => "TELL:",
     };
     let field = format!("{prompt} {}_", ui.chat_input);
-    let wrapped = wrap_fixed_chat_text(&field, max_columns);
+    let selected_font = (ui.chat_settings.font() != super::ChatFont::Classic)
+        .then(|| super::text::UiText::chat(ui, small_font, w, h));
+    let wrapped = if let Some(txt) = &selected_font {
+        super::chat_dock::wrap(txt, &field, big_char, width - padding_x * 2.0).join("\n")
+    } else {
+        wrap_fixed_chat_text(&field, max_columns)
+    };
     let line_count = wrapped.bytes().filter(|&byte| byte == b'\n').count() + 1;
     let height = padding_y * 2.0 + big_char * line_count as f32 + underline;
     let x = margin;
@@ -335,6 +365,14 @@ pub(in crate::ui) fn build_chat_input(
         w,
         h,
     );
+    if let Some(txt) = selected_font {
+        let mut baseline = y + padding_y + (big_char + txt.cap(big_char)) * 0.5;
+        for line in wrapped.split('\n') {
+            txt.draw(out, line, x + padding_x, baseline, big_char, CHAT_WHITE);
+            baseline += big_char;
+        }
+        return;
+    }
     fixed_charset_text(
         out,
         &wrapped,

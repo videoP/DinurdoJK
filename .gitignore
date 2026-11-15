@@ -4,7 +4,7 @@
 /.ocean-work/
 /base/
 /assets/temp
-# Ignore scripts except the GitHub release signer.
+# Keep maintained build/release helpers and focused regression captures.
 /scripts/*
 !/scripts/make_signed_release.py
 !/scripts/make_signed_linux_release.py
@@ -14,6 +14,7 @@
 !/scripts/build-cache-report.ps1
 !/scripts/ensure-smaa-vendor.ps1
 !/scripts/ensure-openal-runtime.ps1
+!/scripts/test-sky-transport.ps1
 /.codex/
 *.zip
 /tools/

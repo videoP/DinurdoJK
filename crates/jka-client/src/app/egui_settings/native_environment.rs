@@ -167,7 +167,7 @@ impl App {
         let d = crate::blue_water_environment::Settings::default();
         let mut changed = false;
         let sun_defaults = super::VideoSettings::default();
-        let (sun_yaw, sun_pitch) = if self.video.sun_override {
+        let (sun_yaw, sun_pitch) = if self.video.sun_override || self.video.sky_sun_custom {
             (self.video.sun_yaw, self.video.sun_pitch)
         } else {
             self.map_sun_editor_values()
@@ -177,7 +177,7 @@ impl App {
         theme::section(
             ui,
             "MOON",
-            "Blue Water sky only. Map moon illumination uses Relight map, while the Sky bake A/B controls baked sky ambient in Relighting (requires CSM and baked sun cache). Phase controls illumination and moves the automatic moon; unlock position to hold it in place.",
+            "Blue Water sky only. Relighting controls whether the moon illuminates the world. Phase controls appearance and automatic moon position; unlock position to hold it in place. Advanced environment holds sky-lightmap diagnostics.",
         );
         changed |= sky_slider(ui, "Moon phase", "0 and 1 are new moon; 0.5 is full. The automatic moon light follows phase, independently of its position lock.", &mut s.moon_phase, d.moon_phase, 0.0, 1.0);
         theme::row(ui, "Moon intensity", "Direct moonlight strength for Blue Water nighttime Relighting (with cast shadows from CSM). Locked: follows the lunar phase (0 new, 2.5 full). Unlock to author 0..16 independently. The world needs Relight map; the water always follows it. Separate from moon disc brightness.", theme::Reset::None, |ui| {

@@ -20,6 +20,8 @@ fn video_section_label(section: VideoSection) -> &'static str {
         VideoSection::Geometry => "Geometry",
         VideoSection::Lighting => "Lighting",
         VideoSection::Relighting => "Relighting",
+        VideoSection::EnvironmentLooks => "Looks & profiles",
+        VideoSection::AdvancedEnvironment => "Advanced environment",
         VideoSection::Materials => "Material rendering",
         VideoSection::Effects => "Effects",
 
@@ -41,10 +43,11 @@ fn video_section_label(section: VideoSection) -> &'static str {
 
 impl App {
     pub(in crate::app) fn egui_video_page(&mut self, ui: &mut egui::Ui) {
-        // All sky/sun edits still publish live preview uniforms while dragging.
-        // Only the expensive static lightmap ray trace waits for pointer release.
-        let defer = matches!(self.video_section, VideoSection::Sun | VideoSection::Relighting | VideoSection::Clouds)
-            && ui.input(|i| i.pointer.primary_down());
+        // Defer heavy static ray tracing only for an actual widget drag.
+        // Holding the mouse on blank menu space must not alter baked lighting.
+        let defer = matches!(self.video_section, VideoSection::Sun | VideoSection::Relighting | VideoSection::AdvancedEnvironment | VideoSection::Clouds)
+            && ui.input(|i| i.pointer.primary_down())
+            && ui.ctx().dragged_id().is_some();
         if self.relight_bake_deferred != defer {
             self.relight_bake_deferred = defer;
             self.render_command(crate::renderer::RenderCommand::SetRelightBakeDeferred(defer));
@@ -69,7 +72,9 @@ impl App {
                 "World visibility, curved surfaces and model rendering.",
             ),
             VideoSection::Lighting => ("LIGHTING", "Ambient, local lights, sun and entity shadows."),
-            VideoSection::Relighting => ("RELIGHTING", "Reshape authored map lighting at runtime. Settings are retained while disabled."),
+            VideoSection::Relighting => ("RELIGHTING", "Enable world illumination from the selected sky and time."),
+            VideoSection::EnvironmentLooks => ("ENVIRONMENT LOOKS", "Save and load complete sky, atmosphere and lighting looks, with optional per-map defaults."),
+            VideoSection::AdvancedEnvironment => ("ADVANCED ENVIRONMENT", "Technical relighting overrides and diagnostic experiments."),
             VideoSection::Materials => ("MATERIAL RENDERING", "Physically based material shading and texture sources."),
             VideoSection::Effects => (
                 "EFFECTS",
@@ -158,6 +163,8 @@ impl App {
                 }
                 VideoSection::Lighting => self.egui_lighting(ui),
                 VideoSection::Relighting => self.egui_relighting(ui),
+                VideoSection::EnvironmentLooks => self.egui_environment_looks(ui),
+                VideoSection::AdvancedEnvironment => self.egui_relighting_advanced(ui),
                 VideoSection::Materials => self.egui_material_rendering(ui),
                 VideoSection::Effects => {
                     self.egui_effects(ui);

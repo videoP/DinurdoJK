@@ -29,6 +29,7 @@ struct Composition {
 /// sample a sun-elevation curve; the existing dummy atlas satisfies bindings.
 pub(in crate::renderer) struct SkyInputs<'a> {
     pub normals: &'a [GpuImage],
+    pub transport: &'a [GpuImage],
     pub environment: Option<&'a ::blue_water_sky::environment::EnvironmentMap>,
     pub moon: Option<([f32; 3], f32)>,
     pub vanilla_toward_sun: Option<[f32; 3]>,
@@ -404,6 +405,16 @@ impl LightmapCache {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -523,7 +534,7 @@ impl LightmapCache {
                     let authored_color = original.get(gpu_index as usize)
                         .map_or(sample.authored_color, |vertex| vertex.color);
                     unique.entry(gpu_index).or_insert(VertexSkyInput {
-                        gpu_index, packed: sample.packed, reserved: [0; 2],
+                        gpu_index, packed: sample.packed, reserved: sample.transport.map(f32::to_bits),
                         authored_color,
                     });
                 }
@@ -708,7 +719,10 @@ impl LightmapCache {
                 direction_strength: composition.map_or([0.0; 4], |c| {
                     [c.direction[0], c.direction[1], c.direction[2], c.strength]
                 }),
-                smoothing: [smoothing as f32, signal as f32, if self.has_charts { 1.0 } else { 0.0 }, u8::from(composition.is_some_and(|c| c.isolate_sky)) as f32],
+                smoothing: [smoothing as f32, signal as f32, if self.has_charts { 1.0 } else { 0.0 },
+                    if composition.is_some_and(|c| c.isolate_sky) {
+                        if sky.as_ref().is_some_and(|s| s.transport.get(index).is_some()) { 2.0 } else { 1.0 }
+                    } else { 0.0 }],
                 sky: [
                     sky_strength,
                     if sky.as_ref().is_some_and(|s| s.normals.get(index).is_some()) {
@@ -800,6 +814,15 @@ impl LightmapCache {
                             .map_or(&self.dummy_environment.2, |e| &e.uniforms)
                             .as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 12,
+                        resource: wgpu::BindingResource::TextureView(
+                            // The auxiliary dummy is also bound as a storage
+                            // output. Reuse a read-only dummy instead: even an
+                            // untaken diagnostic branch cannot alias that write.
+                            &sky.as_ref().and_then(|s| s.transport.get(index)).unwrap_or(&self.dummy_environment.0).view,
+                        ),
+                    },
                 ],
             });
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -864,6 +887,10 @@ impl Renderer {
     /// All callers meet here: sun changes, removal controls, AO uploads and
     /// worker completion only invalidate inputs; warm frames allocate nothing.
     pub(in crate::renderer) fn sync_baked_sun_lightmap_cache(&mut self) {
+        // Keep the last *complete* lightmap composition visible during a UI
+        // drag. Deferring a ray trace must not turn off sky gain, sun removal
+        // or residual-light grading for the duration of a mouse press.
+        if self.sun_bake_deferred { return; }
         let sun = self.relit_celestial();
         let moon_light = if self.blue_water_night() {
             let direction = self.blue_water_moon_toward();
@@ -886,7 +913,6 @@ impl Renderer {
             && requested_removal > 0.0
             && self.baked_sun_debug_mode == 0;
         let sun_ready = self.baked_sun_cache
-            && !self.sun_bake_deferred
             && world.static_sun.ready()
             && (removal || requested_removal <= 0.0 || world.sun.is_none());
         let local_ready = (self.added_map_light_sources() != 0) && world.static_sun.local_ready();
@@ -962,7 +988,11 @@ impl Renderer {
             });
         // Smoothing is also available without relighting, including vanilla maps.
         let smoothing = self.lightmap_smoothing.min(2);
-        let signal = self.lightmap_signal.min(8);
+        // Transport diagnostics never change the legacy OFF / vanilla path.
+        let signal = if self.lightmap_signal >= 9
+            && (!self.sky_world_light_isolation || self.sky_backend != 1) {
+            0
+        } else { self.lightmap_signal.min(11) };
         let desired = removal || composition.is_some()
             || ((smoothing != 0 || signal != 0) && !world.source_map && !world.lightmaps.is_empty());
         let strength = if removal { requested_removal } else { 0.0 };
@@ -1029,6 +1059,9 @@ impl Renderer {
                 },
                 sky_light.map(|_| SkyInputs {
                     normals: &world.static_sun.sky_normals,
+                    transport: if self.sky_world_light_isolation && self.sky_backend == 1 {
+                        &world.static_sun.sky_transport
+                    } else { &[] },
                     environment: self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1)
                         .map(|atmosphere| atmosphere.sky.environment()),
                     moon: if self.sky_backend == 1 { moon_light } else { None },
@@ -1148,6 +1181,103 @@ mod tests {
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(&source)));
         }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn room_protection_darkens_outdoor_shadows_and_preserves_room_on_gpu() {
+        crate::renderer::block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+            let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let image = |format, width, height, data: &[u8]| {
+                let texture = device.create_texture_with_data(&queue, &wgpu::TextureDescriptor {
+                    label: Some("room protection regression input"),
+                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                    format, usage: wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[],
+                }, wgpu::util::TextureDataOrder::LayerMajor, data);
+                let view = texture.create_view(&Default::default());
+                GpuImage::new(texture, view)
+            };
+            let source = image(wgpu::TextureFormat::Rgba32Float, 2, 1, bytemuck::cast_slice(&[1.0f32; 8]));
+            let mut cache = LightmapCache::new(&device, &queue, &[source], &[vec![1, 2]]);
+            // BOTH receivers have no direct sky access and no current moonlight.
+            // Only the courtyard has bounced sky transport. The old visibility
+            // heuristic incorrectly preserved the full daytime lightmap in both.
+            let flux = vec![image(wgpu::TextureFormat::R32Float, 2, 2,
+                bytemuck::cast_slice(&[0.0f32, 0.0, 1.0, 1.0]))];
+            let up = 0x80000000u32 | (1023 << 21) | (512 << 11);
+            let normals = vec![image(wgpu::TextureFormat::R32Uint, 2, 1, bytemuck::cast_slice(&[up; 2]))];
+            let transport = vec![image(wgpu::TextureFormat::Rg32Float, 2, 1,
+                bytemuck::cast_slice(&[0.0f32, 0.0, 0.0, 0.2]))];
+            let locals = {
+                let texture = device.create_texture_with_data(&queue, &wgpu::TextureDescriptor {
+                    label: Some("independent local room fixtures"),
+                    size: wgpu::Extent3d { width: 2, height: 1, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R32Float, usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                }, wgpu::util::TextureDataOrder::LayerMajor, bytemuck::cast_slice(&[0.25f32; 2]));
+                let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default()
+                });
+                vec![GpuImage::new(texture, view)]
+            };
+            // Sky protection must not suppress geometrically valid old-sun
+            // subtraction. Receiver aliases are resolved before baking masks.
+            for old_removal in [false, true] {
+                for (isolated, local, strength) in [(true, false, 1.0), (true, true, 1.0), (false, false, 1.0), (true, false, 0.0), (false, false, 0.0), (true, false, 1.0)] {
+                    let composition = Composition {
+                        generation: 1, radiance: [0.0; 3], direction: [0.0, -1.0, 0.0],
+                        strength: 0.0, moving_strength: 0.0, mode: 0.0,
+                        adjust: [1.0, 1.0, 0.0, 0.0], curve: [1.0, 1.0, 0.0, 0.0],
+                        static_csm: false, isolate_sky: isolated, sky: Some((strength, [0; 6])), gain: [0.0; 4],
+                    };
+                    let encoding = old_removal.then_some(crate::scene::BakedSunEncoding {
+                        exposure: 0.0, gamma: 1.0, compensate: 1.0, brightness: 1.0,
+                        deviance: 0.0, samples: 1,
+                    });
+                    cache.compose(&device, &queue, encoding, [0.4; 3], if old_removal { 0.5 } else { 0.0 }, Some(&composition), 0, 0,
+                        &flux, if local { &locals } else { &[] },
+                        if local { &[[1.0, 0.0, 0.0, 1.0]] } else { &[] },
+                        Some(SkyInputs { normals: &normals, transport: &transport, environment: None,
+                            moon: Some(([0.0, 1.0, 0.0], 0.0)), vanilla_toward_sun: None }));
+                    let read = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: None, size: 256, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    });
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    encoder.copy_texture_to_buffer(cache.corrected[0]._texture.as_image_copy(),
+                        wgpu::TexelCopyBufferInfo { buffer: &read, layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0, bytes_per_row: Some(256), rows_per_image: Some(1),
+                        } }, wgpu::Extent3d { width: 2, height: 1, depth_or_array_layers: 1 });
+                    queue.submit([encoder.finish()]);
+                    read.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
+                    device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+                    let bytes = read.slice(..).get_mapped_range().unwrap();
+                    for x in 0..2 {
+                        for c in 0..3 {
+                            let at = x * 8 + c * 2;
+                            let bits = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+                            let e = (bits >> 10) & 31;
+                            let m = (bits & 1023) as f32 / 1024.0;
+                            let actual = if e == 0 { m * 2f32.powi(-14) } else { (1.0 + m) * 2f32.powi(e as i32 - 15) };
+                            let source = if old_removal { 0.8 } else { 1.0 };
+                            let gain = if strength == 0.0 || (isolated && x == 0) { 1.0 } else { 0.03 };
+                            let expected = source * gain + if local && c == 0 { 0.25 } else { 0.0 };
+                            assert!((actual - expected).abs() < 0.003,
+                                "old_removal={old_removal} isolated={isolated} local={local} strength={strength} receiver={x} channel={c}: {actual} vs {expected}");
+                        }
+                    }
+                }
+            }
+            assert!(scope.pop().await.is_none());
+        });
     }
 
     #[test]

@@ -32,78 +32,111 @@ impl App {
     }
 
     pub(in crate::app::egui_settings) fn egui_relighting(&mut self, ui: &mut egui::Ui) {
-        self.egui_relighting_profiles(ui);
-        let defaults = VideoSettings::default();
-        const MODES: [(u8, &str); 3] = [(0, "Off"), (1, "Baked"), (2, "Realtime")];
-        if let Some(mode) = segmented_row(ui, "Relighting",
-            "Off preserves authored illumination. Baked uses cached sun/sky lightmaps (and Blue Water sky caching). Realtime uses Blue Water live sky lighting or vanilla change-triggered lightmaps with live CSM shadows. Saved settings are retained when switching modes.",
-            theme::Reset::Environment(ui::ENV_ROW_SUN_SOURCE), self.video.active_relighting_mode(), &MODES)
-        {
-            self.set_relighting_mode(mode);
+        if theme::ghost_button(ui, "OPEN LOOKS / SAVE & LOAD").clicked() {
+            self.video_section = VideoSection::EnvironmentLooks;
         }
-        let baked_mode = self.video.active_relighting_mode() == 1;
-        if self.video.active_relighting_mode() == 2 {
-            theme::hint(ui, "Realtime uses Blue Water's live sky pass or vanilla's change-triggered lightmap lighting with live world CSM. Cascaded Shadow Maps are required for world shadows.", theme::TEXT_DIM());
-        }
-        ui.add_enabled_ui(self.video.sun_override, |ui| {
-            theme::section(ui, "TIME OF DAY", "Artistic 24-hour cycle; sunrise 6 AM, noon 12 PM, sunset 6 PM. Sun and moon positions update together; lunar phase and original map lighting stay independently adjustable.");
-            theme::row(ui, "Time", "3 AM to the following 3 AM. Match system time uses the PC's local clock; Realtime follows it, Baked captures it at map load. Manual slider and shadow/sky selection are otherwise unchanged.", theme::Reset::None, |ui| {
-                let matching = self.video.relight_match_system_time;
-                // The disabled slider is a clock readout, not the archived
-                // manual position. Baked mode may still be using a sample
-                // captured at map load; display the current local time without
-                // changing that sample or triggering another bake.
-                let mut time = if matching {
-                    use chrono::Timelike;
-                    let now = chrono::Local::now();
-                    crate::app::settings::graphics::system_clock_relighting_hour(now.hour(), now.minute())
-                } else {
-                    self.video.relight_time
-                };
-                let minutes = ((time.rem_euclid(24.0) * 60.0).round() as u32) % (24 * 60);
-                let hours = minutes / 60;
-                let hh = hours % 12;
-                let readout = format!("{}:{:02} {}", if hh == 0 { 12 } else { hh }, minutes % 60, if hours < 12 { "AM" } else { "PM" });
-                ui.horizontal(|ui| {
-                    // Reserve room for the adjacent toggle: the theme's slider
-                    // uses its available width to size the Taffy track.
-                    let slider_width = (ui.available_width() - 150.0).max(210.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(slider_width, 24.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add_enabled_ui(!matching, |ui| {
-                                if theme::slider_default(ui, &mut time, 3.0..=27.0, &readout, 15.0) {
-                                    self.set_relighting_time((time * 4.0).round() * 0.25);
-                                }
-                            });
-                        },
-                    );
-                    if theme::chip(ui, "MATCH SYSTEM TIME", matching).clicked() {
-                        self.set_relighting_match_system_time(!matching);
-                    }
-                });
+        theme::section(ui, "WORLD ILLUMINATION", "Sky appearance, time and sun position are independent of map relighting.");
+        theme::row(ui, "Relight world",
+            "Off preserves the map's authored illumination while the sky remains freely customizable. On replaces outdoor lighting using the shared Baked/Realtime mode selected on Sky.",
+            theme::Reset::Environment(ui::ENV_ROW_SUN_SOURCE), |ui| {
+                if let Some(enabled) = theme::switch(ui, self.video.sun_override) {
+                    self.set_sun_override(enabled, enabled);
+                }
             });
-            if self.video.relight_match_system_time && self.video.active_relighting_mode() == 1 {
-                let hint = if self.relight_clock_effective.is_some() {
-                    "Baked: map lighting uses the time captured at map load. The disabled slider shows the current PC clock, which may have moved on."
-                } else {
-                    "Baked: the system clock will first be applied at the next map load. The disabled slider shows the current PC clock."
-                };
-                theme::hint(ui, hint, theme::TEXT_DIM());
-            }
-            if self.video.sky_backend != 1 || self.video.fast_sky != 0 {
-                theme::hint(ui, "Blue Water Sky gives the clock a matching sunrise, sunset and night sky; other sky modes retain their own appearance.", theme::TEXT_DIM());
-            }
-        });
-        if theme::ghost_button(ui, "OPEN SKY / SUN & MOON").clicked() {
+        let mode = if self.video.environment_mode == 0 { "Baked" } else { "Realtime" };
+        theme::hint(ui, &format!("Environment mode: {mode}. Sky controls and rendering mode are on Sky; settings are retained when world relighting is off."), theme::TEXT_DIM());
+        if theme::ghost_button(ui, "OPEN SKY / TIME & SUN").clicked() {
             self.video_section = VideoSection::Sun;
         }
-        if theme::ghost_button(ui, "RESET ALL RELIGHTING SETTINGS").clicked() {
+        if self.video.sun_override {
+            if self.video.environment_mode == 0 {
+                theme::hint(ui, "Baked: changing the time or locked sun controls automatically refreshes affected lightmap caches after dragging. Match system time is sampled once per map load.", theme::TEXT_DIM());
+            } else {
+                theme::hint(ui, "Realtime: world lighting updates live. The Sky page still controls the shared sun and moon.", theme::TEXT_DIM());
+            }
+        } else {
+            theme::hint(ui, "Relighting is off. Authored map lightmaps remain intact; independent sky customization still works.", theme::TEXT_DIM());
+        }
+        let baked_mode = self.video.sun_override && self.video.environment_mode == 0;
+        if baked_mode {
+            let defaults = VideoSettings::default();
+            theme::section(ui, "BAKED LIGHT BALANCE", "Adjust residual authored illumination. These controls do not change textures or output gamma.");
+            self.baked_slider(
+                ui,
+                "Baked indirect brightness",
+                "Brightness multiplier for residual baked illumination only, separate from gamma and runtime sun. Default 1.0. Does not change gamma.",
+                theme::Reset::None,
+                0.0..=2.0,
+                defaults.baked_indirect_scale,
+                |v| &mut v.baked_indirect_scale,
+            );
+            self.baked_slider(
+                ui,
+                "Baked indirect saturation",
+                "Saturation multiplier for residual baked illumination only, not textures or dynamic sunlight. Default 1.0. Does not change gamma.",
+                theme::Reset::None,
+                0.0..=2.0,
+                defaults.baked_indirect_saturation,
+                |v| &mut v.baked_indirect_saturation,
+            );
+            self.baked_slider(
+                ui,
+                "Baked indirect power",
+                "Nonlinear night-mode darkening of remaining baked light: 1.0 unchanged, 2.0 squared, 3.0 cubed. Preserves RGB hue by shaping linear luminance, not individual channels. Try 2.5 with brightness 1.0.",
+                theme::Reset::None,
+                1.0..=4.0,
+                defaults.baked_indirect_power,
+                |v| &mut v.baked_indirect_power,
+            );
+            self.baked_slider(
+                ui,
+                "Baked highlight preservation",
+                "0 darkens all baked light with the power curve. 1 preserves high-intensity baked light pools (including likely lamps). This is luminance-based, not actual spotlight separation.",
+                theme::Reset::None,
+                0.0..=1.0,
+                defaults.baked_indirect_highlight_preserve,
+                |v| &mut v.baked_indirect_highlight_preserve,
+            );
+        }
+        if theme::ghost_button(ui, "ADVANCED ENVIRONMENT SETTINGS").clicked() {
+            self.video_section = VideoSection::AdvancedEnvironment;
+        }
+    }
+
+    pub(in crate::app::egui_settings) fn egui_relighting_advanced(&mut self, ui: &mut egui::Ui) {
+        let defaults = VideoSettings::default();
+        let baked_mode = self.video.active_relighting_mode() == 1;
+        theme::hint(ui, "Expert controls for sun removal, sky illumination, room protection, and experimental map lights. The normal workflow is on Sky and Relighting.", theme::TEXT_DIM());
+        if theme::ghost_button(ui, "OPEN RELIGHTING").clicked() {
+            self.video_section = VideoSection::Relighting;
+        }
+        if theme::ghost_button(ui, "RESTORE ADVANCED RELIGHTING DEFAULTS").clicked() {
             self.reset_relighting_page();
         }
         if !self.video.sun_override {
-            theme::banner(ui, "Relighting is off. Your settings are retained; the map uses its authored lighting. Lamp shadows remain available in Lighting.", theme::TEXT_DIM());
+            theme::hint(ui, "Enable Relight world on Relighting to preview these settings. Saved advanced values are retained while disabled.", theme::TEXT_DIM());
+        }
+        theme::section(ui, "SKY / SUN DIAGNOSTICS", "These overrides affect the selected sky even if world relighting is disabled.");
+        const VISIBILITY: [(ui::SunVisibilityMode, &str); 3] = [
+            (ui::SunVisibilityMode::Legacy, "Legacy"),
+            (ui::SunVisibilityMode::SkyPortals, "Sky portals"),
+            (ui::SunVisibilityMode::Filtered, "Filtered / High"),
+        ];
+        if let Some(target) = segmented_row(ui, "Sun visibility",
+            "Sky portals requires sky along the ray; Filtered also evaluates translucent surfaces with alpha coverage.",
+            theme::Reset::Environment(ui::ENV_ROW_SUN_VISIBILITY),
+            self.video.sun_visibility, &VISIBILITY) {
+            self.video.sun_visibility = target;
+            self.sync_post_effects();
+            self.mark_config_dirty();
+        }
+        if self.video.sky_backend == 1 {
+            if let Some(mode) = segmented_row(ui, "Blue Water cached sky override",
+                "Normally leave B: Cached. In shared Environment Baked, A uses the live sky shader for comparison. Realtime always uses the live shader. Native Blue Water clouds and weather can also require the live fallback.",
+                theme::Reset::None, self.video.blue_sky_cube_ab,
+                &[(0u8, "A: Live"), (1u8, "B: Cached")]) {
+                let _ = self.set_console_cvar("r_blueSkyCubeAB", &mode.to_string());
+            }
         }
         ui.add_enabled_ui(self.video.sun_override, |ui| {
             let authored = self.map_sun_editor_values();
@@ -298,46 +331,6 @@ impl App {
                     self.touch_baked_sun_debug();
                 }
             });
-            ui.add_enabled_ui(baked_mode, |ui| {
-                theme::section(ui, "REMAINING BAKED LIGHT", "Baked mode only. Adjust residual baked illumination; these controls do not change texture colors or output gamma. Saved values are retained in Realtime.");
-                self.baked_slider(
-                    ui,
-                    "Baked indirect brightness",
-                    "Brightness multiplier for residual baked illumination only, separate from gamma and runtime sun. Default 1.0. Does not change gamma.",
-                    theme::Reset::None,
-                    0.0..=2.0,
-                    defaults.baked_indirect_scale,
-                    |v| &mut v.baked_indirect_scale,
-                );
-                self.baked_slider(
-                    ui,
-                    "Baked indirect saturation",
-                    "Saturation multiplier for residual baked illumination only, not textures or dynamic sunlight. Default 1.0. Does not change gamma.",
-                    theme::Reset::None,
-                    0.0..=2.0,
-                    defaults.baked_indirect_saturation,
-                    |v| &mut v.baked_indirect_saturation,
-                );
-                self.baked_slider(
-                    ui,
-                    "Baked indirect power",
-                    "Nonlinear night-mode darkening of remaining baked light: 1.0 unchanged, 2.0 squared, 3.0 cubed. Preserves RGB hue by shaping linear luminance, not individual channels. Try 2.5 with brightness 1.0.",
-                    theme::Reset::None,
-                    1.0..=4.0,
-                    defaults.baked_indirect_power,
-                    |v| &mut v.baked_indirect_power,
-                );
-                self.baked_slider(
-                    ui,
-                    "Baked highlight preservation",
-                    "0 darkens all baked light with the power curve. 1 preserves high-intensity baked light pools (including likely lamps). This is luminance-based, not actual spotlight separation.",
-                    theme::Reset::None,
-                    0.0..=1.0,
-                    defaults.baked_indirect_highlight_preserve,
-                    |v| &mut v.baked_indirect_highlight_preserve,
-                );
-            });
-
             ui.collapsing("Advanced sun removal / diagnostics", |ui| {
                 const BAKED_PREVIEW: [(u8, &str); 3] = [
                     (0, "Auto on drag"),
@@ -396,21 +389,29 @@ impl App {
                 }
             });
             theme::section(ui, "SKY ILLUMINATION", "Sky illumination uses cached lightmaps in Baked. Realtime uses live Blue Water lighting or a cached vanilla sun-elevation approximation with live CSM shadows.");
-            theme::row(ui, "Protect authored room lighting", "A/B: OFF uses the original sky multiplier (including indoors). ON weights sky tint by traced sky openness, preserving enclosed room/point lighting. Newly simulated map lights are added after sky tint. With Blue Water Realtime, static BSP surfaces use the cached sky bake instead of the fullscreen multiplier; live CSM remains. This is an approximation, not complete indirect-light separation. For Blue Water only; vanilla already uses traced openness. Requires CSM and the sky bake.", theme::Reset::None, |ui| {
+            theme::row(ui, "Protect authored room lighting", "A/B: OFF uses the original sky multiplier (including indoors). ON estimates daylight dependence from direct sky access and two diffuse bounces: enclosed rooms retain local illumination while outdoor shadows follow the current sky. Newly simulated map lights are added after sky tint. With Blue Water Realtime, static BSP surfaces use the cached sky bake instead of the fullscreen multiplier; live CSM remains. This is an approximation, not complete indirect-light separation. Blue Water uses sky transport; Vanilla uses precomputed sky openness. Relighting automatically enables CSM; the sky bake must remain enabled.", theme::Reset::None, |ui| {
                 if let Some(enabled) = theme::switch(ui, self.video.sky_world_light_isolation) {
                     let _ = self.set_console_cvar("r_skyWorldLightIsolation", if enabled { "1" } else { "0" });
                 }
             });
             if self.video.sky_world_light_isolation {
-                if self.video.sky_backend != 1 || !self.video.dynamic_shadows.is_csm() {
-                    theme::hint(ui, "For Blue Water, select Cascaded Shadow Maps to protect indoor lighting. Vanilla uses traced sky openness automatically.", theme::TEXT_DIM());
-                } else if baked_mode && (!self.video.baked_sun_cache || self.video.sky_world_bake_ab == 0) {
+                if self.video.sky_backend == 1 {
+                    if let Some(mode) = segmented_row(
+                        ui, "Sky transport preview",
+                        "Diagnostic white-sky response on static BSP lightmaps: Direct shows sky access; Bounced follows two diffuse reflections; Total combines them. Brighter means more sky response, not the fraction of authored daylight. Uses a fixed 60% reflectance and no artificial lights. The smoothed transport drives room protection; weak response is preserved and sustained sky access follows day/night lighting. Requires CSM and the sky bake. Magenta means unavailable. Use r_lightmap 1 to hide textures; r_lightmap 0 restores them.",
+                        theme::Reset::None, self.video.lightmap_signal,
+                        &[(0, "Off"), (9, "Direct"), (10, "Bounced"), (11, "Total")],
+                    ) {
+                        let _ = self.set_console_cvar("r_lightmapSignal", &mode.to_string());
+                    }
+                }
+                if baked_mode && (!self.video.baked_sun_cache || self.video.sky_world_bake_ab == 0) {
                     theme::hint(ui, "Baked mode needs B: Sky bake and the baked sun cache enabled for room protection.", theme::TEXT_DIM());
                 } else if !baked_mode {
                     theme::hint(ui, "Realtime world sky is cached and recomposed when the sky changes (up to once/second); realtime caster shadows are still live. No full-screen sky multiplier.", theme::TEXT_DIM());
                 }
             }
-            if let Some(mode) = segmented_row(ui, "Sky gain calibration", "How the Blue Water sky gain is scaled against the authored lightmap. A: original absolute gain (can darken shadows by day). B: daylight fades the gain to the authored exposure by sun elevation. C: ratio of the current time of day to the map's authored time, taken from q3map_sun or the detected baked sun; if neither is known the gain stays neutral. Dusk and night keep the Blue Water tint. Vanilla sky is unaffected.", theme::Reset::None,
+            if let Some(mode) = segmented_row(ui, "Sky gain calibration", "Shared day/night calibration for Vanilla and Blue Water map illumination. A: absolute gain. B: daylight approaches authored exposure. C: compare the current time of day to the map's authored sunlight (or the assumed daytime reference when missing). Blue Water additionally contributes atmospheric tint and optional moonlight; Vanilla does not.", theme::Reset::None,
                 self.video.sky_world_gain_mode, &[(0, "A: Original"), (1, "B: Daylight"), (2, "C: Map time")]) {
                 let _ = self.set_console_cvar("r_skyWorldGainMode", &mode.to_string());
             }
@@ -429,16 +430,16 @@ impl App {
                 let _ = self.set_console_cvar("r_skyWorldBakeAB", if target { "1" } else { "0" });
             }
             });
-            if baked_mode && self.video.sky_world_bake_ab != 0 && (!self.video.dynamic_shadows.is_csm() || !self.video.baked_sun_cache) {
-                ui.small("B requires Cascaded Shadow Maps and r_bakedSunCache 1.");
+            if baked_mode && self.video.sky_world_bake_ab != 0 && !self.video.baked_sun_cache {
+                ui.small("B requires r_bakedSunCache 1. Cascades are managed automatically while relighting is on.");
             }
             theme::section(ui, "ENTITY FIXTURE EXPERIMENT", "Compare existing model lighting with a restrained per-pixel accent from authored map fixtures. Original world lightmaps stay intact; world accents below are independent.");
             if let Some(target) = segmented_row(ui, "Fixture lighting on models", "Session-only. Requires Relight map and Cascaded Shadow Maps. B preserves baked entity lighting and adds individually shadowed fixture accents on players and lit models. Hardware RT retains its existing model receiver. Wait for pipeline compilation before comparing.", theme::Reset::None,
                 self.video.entity_fixture_lighting_ab, &[(false,"A: Existing"),(true,"B: Fixtures")]) {
                 let _ = self.set_console_cvar("r_entityFixtureLightingAB", if target {"1"} else {"0"});
             }
-            if self.video.entity_fixture_lighting_ab && !self.video.dynamic_shadows.is_csm() {
-                ui.small("Select Cascaded Shadow Maps in Lighting to activate B.");
+            if self.video.entity_fixture_lighting_ab && !self.video.effective_shadow_mode().is_csm() {
+                ui.small("Cascaded Shadow Maps are needed to activate B.");
             }
             if self.video.entity_fixture_lighting_ab && self.video.dynamic_lights == crate::ui::DynamicLightsMode::RayTracedHardware {
                 ui.small("Hardware ray tracing keeps its existing model lighting; this experiment applies to raster lighting.");
@@ -497,10 +498,6 @@ impl App {
         self.video.baked_indirect_power = d.baked_indirect_power;
         self.video.baked_indirect_highlight_preserve = d.baked_indirect_highlight_preserve;
         self.video.sun_lighting = d.sun_lighting;
-        self.video.relight_time = d.relight_time;
-        self.video.relight_match_system_time = d.relight_match_system_time;
-        self.relight_clock_effective = None;
-        self.apply_relighting_celestial_time(d.relight_time);
         self.video.static_world_csm = d.static_world_csm;
         self.video.promote_shader_glow = d.promote_shader_glow;
         self.video.promote_shader_additive = d.promote_shader_additive;
@@ -514,6 +511,11 @@ impl App {
         self.video.sky_world_lighting_strength = d.sky_world_lighting_strength;
         self.baked_sun_debug_view = 0;
         self.sun_ray_until = None;
-        self.set_sun_override(false, false);
+        self.sync_added_map_lights();
+        self.sync_map_light_simulation();
+        self.sync_cascaded_shadows();
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
     }
 }

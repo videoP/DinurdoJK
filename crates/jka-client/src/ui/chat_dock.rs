@@ -1,4 +1,4 @@
-//! Docked chat (`cg_chatStyle 1/2`): the typing field sits at the bottom of the
+//! Docked chat (`cg_chatStyle 1`): the typing field sits at the bottom of the
 //! chat feed, inside one glass panel with the recent history, instead of a
 //! bar across the top of the screen. It eases in and out, the caret blinks,
 //! and three dots come and go while you pause mid-message.
@@ -13,7 +13,7 @@ use taffy::prelude::AlignItems;
 
 /// Greedy word wrap measured with the text it will be drawn in. Colour codes
 /// carry over to the next line so a wrapped message keeps its colour.
-fn wrap(txt: &UiText, value: &str, px: f32, max_width: f32) -> Vec<String> {
+pub(super) fn wrap(txt: &UiText, value: &str, px: f32, max_width: f32) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
     let mut colour = String::new();
@@ -81,13 +81,7 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, small_font:
         return;
     }
     let s = (h as f32 / 1080.0).clamp(0.6, 2.0);
-    // Style 2 keeps the dock, animation and layout of style 1, but uses
-    // the original JKA small font for every feed and composer glyph.
-    let txt = if ui.chat_settings.style == 2 {
-        UiText::legacy_with_wide(ui, small_font, w, h)
-    } else {
-        UiText::new(ui, small_font, w, h)
-    };
+    let txt = UiText::chat(ui, small_font, w, h);
     let px = 17.5 * s;
     let line_h = 25.0 * s;
     let anim = ui.chat_anim;

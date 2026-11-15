@@ -29,14 +29,15 @@ fn sky_octahedral_decode(e: vec2<f32>) -> vec3<f32> {
     return normalize(n);
 }
 // Shared analytic sky gain is included in the Rust shader builder.
-fn vertex_sky_gain(packed: u32) -> vec3<f32> {
+fn vertex_sky_gain(packed: u32, transport: vec2<f32>) -> vec3<f32> {
     if (settings.flags.x == 0u || (packed & 0x80000000u) == 0u) { return vec3(1.0); }
     let e = vec2(f32((packed >> 11u) & 1023u), f32((packed >> 21u) & 1023u)) / 1023.0 * 2.0 - 1.0;
     let n = sky_octahedral_decode(e);
     let ambient_visibility = f32(packed & 63u) / 63.0;
     if (settings.flags.w & 1u) != 0u {
         return vanilla_sky_gain(n, settings.moon.xyz, ambient_visibility,
-            clamp(bitcast<f32>(settings.flags.z), 0.0, 1.0));
+            clamp(bitcast<f32>(settings.flags.z), 0.0, 1.0),
+            (settings.flags.w & 2u) != 0u, settings.gain);
     }
     let direct_visibility = f32((packed >> 6u) & 31u) / 31.0;
     let ambient = env_irradiance(sky_atlas, sky_atlas_sampler, sky_environment, n) / 3.14159265 * ambient_visibility;
@@ -47,10 +48,12 @@ fn vertex_sky_gain(packed: u32) -> vec3<f32> {
     let direct = color * intensity * max(dot(n, direction), 0.0) * direct_visibility;
     let full_gain = sky_gain_calibrated(clamp(ambient * 0.5 + direct * 0.2, vec3(0.03), vec3(4.0)),
         vec3(1.0), select(direction.y, -1.0, moon_active), settings.gain);
-    let incidence = max(dot(n, direction), 0.0);
-    let exposure = clamp(max(ambient_visibility, direct_visibility * incidence), 0.0, 1.0);
     let isolation = (settings.flags.w & 2u) != 0u;
-    let weight = select(1.0, exposure, isolation);
+    var weight = 1.0;
+    if isolation {
+        let response = select(vec2(ambient_visibility, 0.0), transport, all(transport >= vec2(0.0)));
+        weight = sky_transport_daylight_share(response);
+    }
     return mix(vec3(1.0), full_gain,
         clamp(bitcast<f32>(settings.flags.z), 0.0, 1.0) * weight);
 }
@@ -59,7 +62,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let index = id.x + (settings.flags.w >> 2u);
     if (index >= arrayLength(&receivers)) { return; }
     let receiver = receivers[index];
-    let gain = vertex_sky_gain(receiver.packed);
+    let gain = vertex_sky_gain(receiver.packed, bitcast<vec2<f32>>(receiver.reserved));
     let offset = receiver.gpu_index * 15u + 10u;
     world_vertex_words[offset] = bitcast<u32>(receiver.authored_color.x * gain.x);
     world_vertex_words[offset + 1u] = bitcast<u32>(receiver.authored_color.y * gain.y);

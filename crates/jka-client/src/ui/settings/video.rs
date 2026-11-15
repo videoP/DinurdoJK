@@ -374,6 +374,14 @@ pub struct VideoSettings {
     /// 0/1 retain the legacy Off/On meaning; 2 selects realtime sky lighting.
     /// sun_override remains the master gate for legacy callers.
     pub relighting_mode: u8,
+    /// Shared sky/world processing preference: 0 Baked, 1 Realtime.
+    /// Kept while Relight world is disabled.
+    pub environment_mode: u8,
+    /// Visual sun can be edited without altering authored BSP illumination.
+    pub sky_sun_custom: bool,
+    /// Independent Time-of-Day locks: yaw=1, pitch=2, intensity=4.
+    /// Cleared bits are persistent absolute user overrides.
+    pub sun_time_locks: u8,
     /// User's manual Relighting time, 3 AM through the following 3 AM (3..27).
     pub relight_time: f32,
     /// Use the OS local clock. Realtime follows it; Baked samples only at map upload.
@@ -407,7 +415,7 @@ pub struct VideoSettings {
     pub lightmap_smoothing: u8,
     /// Bake-only static sunlight shadow-edge AA. 0=legacy, 1=edge filter, 2=2x2, 3=4x4.
     pub baked_sun_aa: u8,
-    /// Session-only r_lightmapSignal: composed-lightmap signal debug view 0..8.
+    /// Session-only r_lightmapSignal: composed-lightmap signal debug view 0..11.
     pub lightmap_signal: u8,
     /// Session-only r_bakedSunNormals: 0 authored, 1 shared-edge, 2 auto-smooth.
     pub sun_receiver_normals: u8,
@@ -441,7 +449,7 @@ pub struct VideoSettings {
     /// Experimental Star Nest procedural override of map-authored sky faces.
     pub sky_fractal_override: bool,
     pub sky_backend: u8,
-    /// Saved A/B for the clear Blue Water sky in Relighting Baked:
+    /// Advanced override for the clear Blue Water sky in Environment Baked:
     /// 0 = live atmospheric shader, 1 = cached sky faces.
     pub blue_sky_cube_ab: u8,
     /// Session-only Blue Water GPU pass isolation; diagnostic, never archived.
@@ -1010,6 +1018,9 @@ impl Default for VideoSettings {
             fog_strength: 0.0,
             sun_override: false,
             relighting_mode: 0,
+            environment_mode: 0,
+            sky_sun_custom: false,
+            sun_time_locks: 7,
             relight_time: 15.0,
             relight_match_system_time: false,
             // Matches the renderer's legacy fallback direction when a map has no authored sun.
@@ -1252,6 +1263,10 @@ impl VideoSettings {
 }
 
 impl VideoSettings {
+    pub const SUN_LOCK_YAW: u8 = 1;
+    pub const SUN_LOCK_PITCH: u8 = 2;
+    pub const SUN_LOCK_INTENSITY: u8 = 4;
+
     pub fn active_relighting_mode(&self) -> u8 {
         if self.sun_override { self.relighting_mode.clamp(1, 2) } else { 0 }
     }
@@ -1265,14 +1280,18 @@ impl VideoSettings {
         }
     }
 
-    /// Baked retains the saved nearby-world shadow option. Realtime includes
-    /// world casters; the main shadow method remains the user's choice.
+    /// World relighting needs CSM's sunlight visibility, including the static
+    /// bake when the player's quality preset has shadows Off. Resolve this at
+    /// render time instead of overwriting the user's saved shadow preference.
+    /// Baked uses entity cascades plus the static lightmap compositor unless
+    /// nearby world casters were explicitly requested; Realtime needs world CSM.
     pub fn effective_shadow_mode(&self) -> DynamicShadowsMode {
-        if self.dynamic_shadows == DynamicShadowsMode::CascadedShadowMapsEntities
-            && self.sun_override
-            && (self.static_world_csm || self.active_relighting_mode() == 2)
-        {
-            DynamicShadowsMode::CascadedShadowMaps
+        if self.sun_override {
+            if self.static_world_csm || self.active_relighting_mode() == 2 {
+                DynamicShadowsMode::CascadedShadowMaps
+            } else {
+                DynamicShadowsMode::CascadedShadowMapsEntities
+            }
         } else {
             self.dynamic_shadows
         }
@@ -1305,7 +1324,7 @@ impl VideoSettings {
             if self.sky_backend == 1 {
                 // Preserve the newer isolation path: trace sky receivers into
                 // cached lighting instead of fullscreen tinting enclosed rooms.
-                let traced_sky = self.sky_world_light_isolation && self.dynamic_shadows.is_csm();
+                let traced_sky = self.sky_world_light_isolation && self.effective_shadow_mode().is_csm();
                 if traced_sky {
                     effective.blue_water_environment.world_lighting = 0.0;
                     effective.baked_sun_cache = true;
@@ -1357,6 +1376,37 @@ impl VideoSettings {
 #[cfg(test)]
 mod relighting_tests {
     use super::*;
+
+    #[test]
+    fn environment_mode_is_preserved_when_relighting_is_off() {
+        let mut video = VideoSettings::default();
+        video.environment_mode = 1;
+        assert_eq!(video.active_relighting_mode(), 0);
+        assert_eq!(video.environment_mode, 1);
+        video.sun_override = true;
+        video.relighting_mode = video.environment_mode + 1;
+        assert_eq!(video.active_relighting_mode(), 2);
+        video.sun_override = false;
+        assert_eq!(video.active_relighting_mode(), 0);
+        assert_eq!(video.environment_mode, 1);
+    }
+
+    #[test]
+    fn relighting_auto_enables_effective_csm_after_minimal_and_restores_saved_shadows_when_off() {
+        let mut video = VideoSettings::default();
+        video.dynamic_shadows = DynamicShadowsMode::Off; // Minimal preset.
+        video.sun_override = true;
+        video.relighting_mode = 1;
+        assert_eq!(video.effective_shadow_mode(), DynamicShadowsMode::CascadedShadowMapsEntities);
+        video.relighting_mode = 2;
+        assert_eq!(video.effective_shadow_mode(), DynamicShadowsMode::CascadedShadowMaps);
+        video.relighting_mode = 1;
+        video.static_world_csm = true;
+        assert_eq!(video.effective_shadow_mode(), DynamicShadowsMode::CascadedShadowMaps);
+        video.sun_override = false;
+        assert_eq!(video.effective_shadow_mode(), DynamicShadowsMode::Off);
+        assert_eq!(video.dynamic_shadows, DynamicShadowsMode::Off);
+    }
 
     #[test]
     fn vanilla_realtime_uses_cached_world_light_without_blue_water_atmosphere() {
@@ -1416,10 +1466,11 @@ mod relighting_tests {
         assert!(protected.sun_lighting, "daytime sky gain is 1, so Realtime adds the sun explicitly");
         assert_eq!(v.effective_shadow_mode(), DynamicShadowsMode::CascadedShadowMaps);
         v.dynamic_shadows = DynamicShadowsMode::Off;
-        let fallback = v.effective_relighting();
-        assert_eq!(fallback.sky_world_bake_ab, 0,
-            "without CSM the existing realtime fallback is retained");
-        assert!(fallback.blue_water_environment.world_lighting > 0.0);
+        let protected_minimal = v.effective_relighting();
+        assert_eq!(v.effective_shadow_mode(), DynamicShadowsMode::CascadedShadowMaps);
+        assert_eq!(protected_minimal.sky_world_bake_ab, 1,
+            "Minimal must not disable the protected sky's CSM prerequisite");
+        assert_eq!(protected_minimal.blue_water_environment.world_lighting, 0.0);
     }
 
     #[test]

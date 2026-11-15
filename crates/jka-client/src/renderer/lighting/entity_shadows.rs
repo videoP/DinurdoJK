@@ -261,7 +261,7 @@ impl Renderer {
                 }
             }
             world.sun?;
-            let toward = -Vec3::from_array(self.active_sun().direction);
+            let toward = -Vec3::from_array(self.authored_sun().direction);
             Some((toward.try_normalize().unwrap_or(Vec3::Y), 0.6))
         };
         let Some((mut toward_light, strength)) = from_grid.or_else(from_world) else {

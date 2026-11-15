@@ -44,6 +44,7 @@ UPDATE_FILES = (
 )
 
 NOTICE_FILES = (
+    "Jura-OFL.txt",
     "OpenAL-Soft-LGPL-2.0.txt",
     "EalMan-LGPL-2.1.txt",
     "Bevy-Solari-MIT.txt",
@@ -54,6 +55,7 @@ NOTICE_FILES = (
     "FFmpeg-SOURCE-NOTICE.txt",
 )
 REQUIRED_NOTICES = (
+    "Jura-OFL.txt",
     "OpenAL-Soft-LGPL-2.0.txt",
     "NVIDIA-DLSS-SDK-LICENSE.txt",
     "DXC-LICENSE.txt",
@@ -137,7 +139,7 @@ def create(runtime, output, tag):
         if source.is_file():
             payload[name] = read_file(source)
     for required in ("DinurdoJK.exe", *(DEPENDENCY_PREFIX + dll for dll in
-                     ("OpenALSoft.x86_64.dll", "nvngx_dlss.dll", "dxcompiler.dll", "dxil.dll")),
+                     ("phonon.dll", "OpenALSoft.x86_64.dll", "nvngx_dlss.dll", "dxcompiler.dll", "dxil.dll")),
                      CLIENT_ASSET):
         if required not in payload:
             raise ValueError(f"mandatory update file is missing: {required}")

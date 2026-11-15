@@ -3181,7 +3181,69 @@ pub fn unicode_input_char_to_jka_char(ch: char) -> char {
     }
     // Leading-zero Windows ALT codes and Latin-1 paste paths can already carry
     // the desired raw 8-bit value. Preserve those when CP437 has no match.
-    char::from(u8::try_from(code).unwrap_or(b'?'))
+    u8::try_from(code).map(char::from).unwrap_or(ch)
+}
+
+/// Count the actual bytes if text is sent as an old JKA byte where possible,
+/// and UTF-8 only for characters outside the legacy glyph range.
+pub fn unicode_input_wire_len(text: &str) -> usize {
+    text.chars().map(|ch| if ch as u32 <= 0xff { 1 } else { ch.len_utf8() }).sum()
+}
+
+/// A Unicode-aware byte stream is appropriate only for chat commands, not
+/// userinfo, configstrings or arbitrary engine commands.
+pub fn unicode_chat_wire_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    for ch in text.chars() {
+        if let Ok(byte) = u8::try_from(ch as u32) {
+            out.push(byte);
+        } else {
+            let mut utf8 = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut utf8).as_bytes());
+        }
+    }
+    out
+}
+
+/// Decode only the message body; sender names retain their stock byte glyphs.
+/// Offsets refer to characters in the original lossless wire text. Records,
+/// translation input, logs and demo indexing keep that original text.
+pub fn received_chat_for_display(value: &str, body_start: Option<usize>) -> String {
+    let start = body_start.and_then(|start| value.char_indices().nth(start).map(|(at, _)| at))
+        .unwrap_or_else(|| if body_start.is_some() { value.len() } else { 0 });
+    let (prefix, body) = value.split_at(start);
+    // Translated/censored text may already be genuine Unicode.
+    if body.chars().any(|ch| ch as u32 > 0xff) { return value.to_owned(); }
+    let bytes = text_to_jka_bytes(body);
+    if let Ok(utf8) = std::str::from_utf8(&bytes) { return format!("{prefix}{utf8}"); }
+    // The chat wire can mix legacy bytes (including TaystJK's 0xB0 percent
+    // substitution) with UTF-8. Preserve invalid bytes individually when
+    // valid UTF-8 spans contain wide glyphs; never insert U+FFFD.
+    let mut mixed = String::with_capacity(body.len());
+    let mut rest = bytes.as_slice();
+    while !rest.is_empty() {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => { mixed.push_str(valid); break; }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                mixed.push_str(std::str::from_utf8(&rest[..valid]).expect("validated UTF-8 prefix"));
+                let end = valid + error.error_len().unwrap_or(rest.len() - valid);
+                mixed.extend(rest[valid..end].iter().copied().map(char::from));
+                rest = &rest[end..];
+            }
+        }
+    }
+    if mixed.chars().any(|ch| ch as u32 > 0xff) {
+        return format!("{prefix}{mixed}");
+    }
+    let decoded = crate::chat_translation::text::decode(
+        &bytes, crate::chat_translation::text::Codepage::Auto,
+    );
+    if decoded.chars().filter(|ch| ('\u{0400}'..='\u{052f}').contains(ch)).count() >= 2 {
+        format!("{prefix}{decoded}")
+    } else {
+        value.to_owned()
+    }
 }
 
 pub fn unicode_input_to_jka_text(value: &str) -> String {
@@ -3947,6 +4009,26 @@ fn entity_vec3(entity: &EntityState, prefix: &str) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unicode_chat_display_preserves_names_and_decodes_only_the_body() {
+        let prefix = "\u{e9}\u{c3}\u{a9}^7: ^2";
+        let start = Some(prefix.chars().count());
+        let utf8 = bytes_to_lossless_ascii("Привет Ёжик".as_bytes());
+        assert_eq!(received_chat_for_display(&format!("{prefix}{utf8}"), start),
+            format!("{prefix}Привет Ёжик"));
+        let cp1251 = bytes_to_lossless_ascii(&[0xcf, 0xf0, 0xe8, 0xe2, 0xe5, 0xf2]);
+        assert_eq!(received_chat_for_display(&format!("{prefix}{cp1251}"), start),
+            format!("{prefix}Привет"));
+        let mixed = unicode_chat_wire_bytes("Привет \u{b0}/.!");
+        assert_eq!(received_chat_for_display(&bytes_to_lossless_ascii(&mixed), None), "Привет \u{b0}/.!");
+        assert_eq!(received_chat_for_display("hi \u{b0}", None), "hi \u{b0}");
+        assert_eq!(received_chat_for_display("Жук", None), "Жук");
+        assert_eq!(unicode_input_char_to_jka_char('Ж'), 'Ж');
+        assert_eq!(unicode_input_char_to_jka_char('é'), '\u{82}');
+        assert_eq!(unicode_input_wire_len("A\u{b0}Ж你"), 7);
+        assert_eq!(text_to_jka_bytes("AЖ"), b"A?");
+    }
 
     #[test]
     fn japro_weapon_feature_bits_are_read_from_the_correct_mask() {

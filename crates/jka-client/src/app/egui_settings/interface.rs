@@ -858,9 +858,17 @@ impl App {
     fn egui_chat_settings(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, "CHAT", "The chat box at the bottom left. Move and size it with EDIT HUD.");
         let chat = self.chat_settings;
-        theme::row(ui, "Style", "cg_chatStyle: Classic uses the stock top bar; Docked and Docked (JKA font) share the new chat layout.", theme::Reset::None, |ui| {
-            for (style, label) in [(1, "Docked"), (2, "Docked (JKA font)"), (0, "Classic")] {
-                if theme::chip(ui, label, chat.style == style).clicked() && chat.style != style {
+        theme::row(ui, "Font", "Choose the classic JKA font, Jura Bold, or the existing modern UI font. Applies to chat history and message entry in either style.", theme::Reset::None, |ui| {
+            for (font, label) in [(crate::ui::ChatFont::Classic, "Classic"), (crate::ui::ChatFont::Jura, "Jura"), (crate::ui::ChatFont::Modern, "Modern")] {
+                if theme::chip(ui, label, chat.font() == font).clicked() && chat.font() != font {
+                    let _ = self.set_console_cvar("cg_chatFont", &(font as u8).to_string());
+                }
+                ui.add_space(3.0);
+            }
+        });
+        theme::row(ui, "Style", "Docked places message entry below the feed; Classic uses the top bar. Changing style keeps your font selection.", theme::Reset::None, |ui| {
+            for (style, label) in [(1, "Docked"), (0, "Classic")] {
+                if theme::chip(ui, label, chat.docked() == (style != 0)).clicked() && chat.docked() != (style != 0) {
                     let _ = self.set_console_cvar("cg_chatStyle", &style.to_string());
                 }
                 ui.add_space(3.0);

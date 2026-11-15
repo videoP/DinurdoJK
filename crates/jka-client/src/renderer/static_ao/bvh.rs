@@ -540,8 +540,20 @@ impl StaticAoBvh {
         origin: Vec3,
         direction: Vec3,
         max_distance: f32,
-        mut accept: impl FnMut(usize, [f32; 3]) -> bool,
+        accept: impl FnMut(usize, [f32; 3]) -> bool,
     ) -> Option<f32> {
+        self.trace_hit_filtered(origin, direction, max_distance, accept).map(|hit| hit.0)
+    }
+
+    /// Closest accepted hit, including source triangle and barycentrics for
+    /// cold-path light transport. Callback visits are not distance ordered.
+    pub(in crate::renderer) fn trace_hit_filtered(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+        max_distance: f32,
+        mut accept: impl FnMut(usize, [f32; 3]) -> bool,
+    ) -> Option<(f32, usize, [f32; 3])> {
         let inverse_direction = Vec3::new(
             if direction.x.abs() >= 1.0e-8 {
                 1.0 / direction.x
@@ -570,7 +582,7 @@ impl StaticAoBvh {
         )?;
 
         let mut closest = max_distance;
-        let mut hit = false;
+        let mut hit = None;
         // Near-first traversal lets a close hit tighten `closest` before we visit
         // the far branch, pruning a large amount of work in dense BSP scenes.
         let mut stack = [(0_u32, 0.0_f32); 64];
@@ -592,7 +604,7 @@ impl StaticAoBvh {
                     {
                         if distance < closest && accept(triangle_index as usize, barycentric) {
                             closest = distance;
-                            hit = true;
+                            hit = Some((distance, triangle_index as usize, barycentric));
                         }
                     }
                 }
@@ -642,7 +654,7 @@ impl StaticAoBvh {
                 (None, None) => {}
             }
         }
-        hit.then_some(closest)
+        hit
     }
 }
 

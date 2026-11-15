@@ -11,6 +11,101 @@ thread_local! {
     static NWH_RGB_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+// Renderer-scoped companion font. Only active while constructing one UI batch,
+// like NWH color scope; no global font override and no per-frame rasterization.
+thread_local! {
+    static UNICODE_FALLBACK: std::cell::RefCell<Option<std::sync::Arc<super::UnicodeFallbackFont>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct UnicodeFallbackScope(Option<std::sync::Arc<super::UnicodeFallbackFont>>);
+
+impl UnicodeFallbackScope {
+    pub(crate) fn enter(font: Option<std::sync::Arc<super::UnicodeFallbackFont>>) -> Self {
+        Self(UNICODE_FALLBACK.with(|cell| cell.replace(font)))
+    }
+}
+
+impl Drop for UnicodeFallbackScope {
+    fn drop(&mut self) {
+        UNICODE_FALLBACK.with(|cell| { cell.replace(self.0.take()); });
+    }
+}
+
+/// The only lookup performed for non-JKA Unicode: the glyph has already been
+/// rasterized and packed at initialization. No font searches in the hot path.
+fn jura_glyph(ch: char) -> Option<(ProportionalGlyph, i16, f32)> {
+    UNICODE_FALLBACK.with(|cell| {
+        let borrowed = cell.borrow();
+        let font = borrowed.as_ref()?;
+        Some((*font.glyphs.get(&ch)?, font.height, font.cap_height))
+    })
+}
+
+const JURA_GLYPH_SOURCE: f32 = 11.0;
+const JURA_FIXED_GLYPH_SOURCE: f32 = 12.0;
+
+/// For byte-compatible characters, always select the exact existing JKA glyph
+/// and atlas. For everything else, use Jura only when it actually contains it.
+fn proportional_glyph(font: &ProportionalFont, ch: char) -> (ProportionalGlyph, f32, f32) {
+    if let Ok(byte) = u8::try_from(ch as u32) {
+        return (font.glyphs[byte as usize], 1.0, 2.0);
+    }
+    if let Some((glyph, jura_height, _)) = jura_glyph(ch) {
+        return (glyph, f32::from(font.height) / f32::from(jura_height.max(1)), JURA_GLYPH_SOURCE);
+    }
+    (font.glyphs[b'?' as usize], 1.0, 2.0)
+}
+
+/// Fit a Jura glyph into the existing monospaced JKA character cell, leaving
+/// cursor advances, console columns and all legacy bytes unchanged.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::ui) fn charset_glyph(
+    out: &mut Vec<UiVertex>, ch: char, x: f32, y: f32,
+    glyph_w: f32, glyph_h: f32, color: [f32; 4], w: u32, h: u32,
+) {
+    if let Ok(byte) = u8::try_from(ch as u32) {
+        glyph_quad_sized(out, byte, x, y, glyph_w, glyph_h, color, w, h);
+    } else if let Some((glyph, _, cap_height)) = jura_glyph(ch) {
+        if glyph.width == 0 || glyph.height == 0 { return; }
+        // The stock 8x16 charsgrid has 14px capitals and a baseline at 15px.
+        // Exclude the atlas's transparent padding when fitting the ink.
+        let pad = super::ttf_font::PAD as f32;
+        let ink_w = f32::from(glyph.width) - 2.0 * pad;
+        let ink_h = f32::from(glyph.height) - 2.0 * pad;
+        if ink_w <= 0.0 || ink_h <= 0.0 { return; }
+        let baseline = glyph.baseline as f32 - pad;
+        let scale_y = glyph_h * (14.0 / 16.0) / cap_height.max(1.0);
+        let scale_x = scale_y
+            .min(glyph_w / f32::from(glyph.horiz_advance.max(0)).max(ink_w).max(1.0));
+        let draw_x = x + (glyph_w - f32::from(glyph.horiz_advance.max(0)) * scale_x) * 0.5
+            + (f32::from(glyph.horiz_offset) + pad) * scale_x;
+        let cell_baseline = y + glyph_h * (15.0 / 16.0);
+        let draw_y = cell_baseline - baseline * scale_y;
+        let du = (glyph.s2 - glyph.s) / f32::from(glyph.width);
+        let dv = (glyph.t2 - glyph.t) / f32::from(glyph.height);
+        let (u0, v0) = (glyph.s + pad * du, glyph.t + pad * dv);
+        let (u1, v1) = (glyph.s2 - pad * du, glyph.t2 - pad * dv);
+        let draw_w = ink_w * scale_x;
+        let below = (ink_h - baseline).max(0.0);
+        let below_space = (y + glyph_h - cell_baseline).max(0.0);
+        if below * scale_y > below_space && baseline > 0.0 && baseline < ink_h {
+            // Keep the larger body on the stock baseline, fitting the tail
+            // into the remaining cell instead of overlapping the next row.
+            let split_v = v0 + baseline * dv;
+            textured_rect_with_source(out, draw_x, draw_y, draw_w, baseline * scale_y,
+                [u0, v0], [u1, split_v], color, JURA_FIXED_GLYPH_SOURCE, w, h);
+            textured_rect_with_source(out, draw_x, cell_baseline, draw_w, below_space,
+                [u0, split_v], [u1, v1], color, JURA_FIXED_GLYPH_SOURCE, w, h);
+        } else {
+            textured_rect_with_source(out, draw_x, draw_y, draw_w, ink_h * scale_y,
+                [u0, v0], [u1, v1], color, JURA_FIXED_GLYPH_SOURCE, w, h);
+        }
+    } else {
+        glyph_quad_sized(out, b'?', x, y, glyph_w, glyph_h, color, w, h);
+    }
+}
+
 pub(crate) struct NwhColorScope(bool);
 
 impl NwhColorScope {
@@ -212,148 +307,102 @@ pub fn parse_fontdat(bytes: &[u8]) -> Result<ProportionalFont, String> {
 }
 
 pub(in crate::ui) fn truncate_jka_text(value: &str, max_visible: usize) -> String {
-    let bytes = crate::cgame::text_to_jka_bytes(value);
-    let mut out = Vec::with_capacity(bytes.len().min(max_visible + 8));
-    let mut visible = 0usize;
-    let mut index = 0usize;
-    while index < bytes.len() && visible < max_visible {
-        if let Some((skip, _)) = color_escape(&bytes, index, 1.0) {
-            out.extend_from_slice(&bytes[index..index + skip]);
-            index += skip;
-            continue;
+    if max_visible == 0 { return String::new(); }
+    let mut result = String::new();
+    let mut visible = 0;
+    let mut chars = value.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if visible >= max_visible { break; }
+        if let Some((skip, _)) = color_escape(value.as_bytes(), index, 1.0) {
+            result.push_str(&value[index..index + skip]);
+            while chars.peek().is_some_and(|(at, _)| *at < index + skip) { chars.next(); }
+        } else {
+            result.push(ch);
+            visible += 1;
         }
-        out.push(bytes[index]);
-        visible += 1;
-        index += 1;
     }
-    out.into_iter().map(char::from).collect()
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::ui) fn text(
-    out: &mut Vec<UiVertex>,
-    value: &str,
-    x: f32,
-    y: f32,
-    scale: f32,
-    color: [f32; 4],
-    width: u32,
-    height: u32,
+    out: &mut Vec<UiVertex>, value: &str, x: f32, y: f32,
+    scale: f32, color: [f32; 4], width: u32, height: u32,
 ) {
     let mut cursor_x = x;
     let mut cursor_y = y;
     let mut active_color = color;
-    let bytes = crate::cgame::text_to_jka_bytes(value);
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte == b'\n' {
-            cursor_x = x;
-            cursor_y += 9.0 * scale;
-            index += 1;
+    let mut chars = value.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if ch == '\n' {
+            cursor_x = x; cursor_y += 9.0 * scale;
             continue;
         }
-        if let Some((skip, code)) = color_escape(&bytes, index, color[3]) {
+        if let Some((skip, code)) = color_escape(value.as_bytes(), index, color[3]) {
             active_color = code;
-            index += skip;
+            while chars.peek().is_some_and(|(at, _)| *at < index + skip) { chars.next(); }
             continue;
         }
-        if byte == b' ' {
-            cursor_x += 6.0 * scale;
-            index += 1;
-            continue;
+        if ch != ' ' {
+            if let Ok(byte) = u8::try_from(ch as u32) {
+                glyph_quad(out, byte, cursor_x, cursor_y, scale, active_color, width, height);
+            } else {
+                charset_glyph(out, ch, cursor_x, cursor_y, 6.0 * scale, 8.0 * scale,
+                    active_color, width, height);
+            }
         }
-        glyph_quad(
-            out,
-            byte,
-            cursor_x,
-            cursor_y,
-            scale,
-            active_color,
-            width,
-            height,
-        );
         cursor_x += 6.0 * scale;
-        index += 1;
     }
 }
 
-pub(in crate::ui) fn proportional_text_width(
-    value: &str,
-    font: &ProportionalFont,
-    scale: f32,
-) -> f32 {
-    let bytes = crate::cgame::text_to_jka_bytes(value);
-    let mut width = 0.0f32;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if let Some((skip, _)) = color_escape(&bytes, index, 1.0) {
-            index += skip;
+pub(in crate::ui) fn proportional_text_width(value: &str, font: &ProportionalFont, scale: f32) -> f32 {
+    let mut width = 0.0;
+    let mut chars = value.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if let Some((skip, _)) = color_escape(value.as_bytes(), index, 1.0) {
+            while chars.peek().is_some_and(|(at, _)| *at < index + skip) { chars.next(); }
             continue;
         }
-        if bytes[index] == b'\n' {
-            break;
-        }
-        width += font.glyphs[bytes[index] as usize].horiz_advance.max(0) as f32 * scale;
-        index += 1;
+        if ch == '\n' { break; }
+        let (glyph, ratio, _) = proportional_glyph(font, ch);
+        width += f32::from(glyph.horiz_advance.max(0)) * scale * ratio;
     }
     width
 }
 
 pub(in crate::ui) fn wrap_proportional_text(
-    value: &str,
-    font: &ProportionalFont,
-    scale: f32,
-    max_width: f32,
+    value: &str, font: &ProportionalFont, scale: f32, max_width: f32,
 ) -> String {
-    if proportional_text_width(value, font, scale) <= max_width {
-        return value.to_owned();
-    }
-
-    let bytes = crate::cgame::text_to_jka_bytes(value);
+    if proportional_text_width(value, font, scale) <= max_width { return value.to_owned(); }
     let mut out = String::with_capacity(value.len() + value.len() / 32);
-    let mut line_width = 0.0f32;
+    let mut line_width = 0.0;
     let mut line_start = 0usize;
     let mut last_space_out = None::<usize>;
-    let mut index = 0usize;
-
-    while index < bytes.len() {
-        if let Some((skip, _)) = color_escape(&bytes, index, 1.0) {
-            out.extend(bytes[index..index + skip].iter().map(|&byte| byte as char));
-            index += skip;
+    let mut chars = value.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if let Some((skip, _)) = color_escape(value.as_bytes(), index, 1.0) {
+            out.push_str(&value[index..index + skip]);
+            while chars.peek().is_some_and(|(at, _)| *at < index + skip) { chars.next(); }
             continue;
         }
-        let byte = bytes[index];
-        if byte == b'\n' {
-            out.push('\n');
-            line_width = 0.0;
-            line_start = out.len();
-            last_space_out = None;
-            index += 1;
+        if ch == '\n' {
+            out.push('\n'); line_width = 0.0; line_start = out.len(); last_space_out = None;
             continue;
         }
-
-        if byte == b' ' {
-            last_space_out = Some(out.len());
-        }
-        out.push(byte as char);
-        line_width += font.glyphs[byte as usize].horiz_advance.max(0) as f32 * scale;
-
+        if ch == ' ' { last_space_out = Some(out.len()); }
+        out.push(ch);
+        let (glyph, ratio, _) = proportional_glyph(font, ch);
+        line_width += f32::from(glyph.horiz_advance.max(0)) * scale * ratio;
         if line_width >= max_width {
-            let break_at = last_space_out.filter(|space| *space >= line_start);
-            if let Some(space) = break_at {
+            if let Some(space) = last_space_out.filter(|space| *space >= line_start) {
                 out.replace_range(space..=space, "\n");
-                let tail = out[space + 1..].to_owned();
-                line_width = proportional_text_width(&tail, font, scale);
                 line_start = space + 1;
+                line_width = proportional_text_width(&out[line_start..], font, scale);
             } else {
-                out.push('\n');
-                line_width = 0.0;
-                line_start = out.len();
+                out.push('\n'); line_width = 0.0; line_start = out.len();
             }
             last_space_out = None;
         }
-        index += 1;
     }
     out
 }
@@ -425,61 +474,35 @@ fn proportional_text_with_x_scale(
         let mut cursor_x = x;
         let mut cursor_y = baseline_y;
         let mut active_color = color;
-        let bytes = crate::cgame::text_to_jka_bytes(value);
-        let mut index = 0usize;
-        while index < bytes.len() {
-            let byte = bytes[index];
-            if byte == b'\n' {
-                cursor_x = x;
-                cursor_y += line_step;
-                index += 1;
-                continue;
-            }
-            if let Some((skip, code)) = color_escape(&bytes, index, color[3]) {
+        let mut chars = value.char_indices().peekable();
+        while let Some((index, ch)) = chars.next() {
+            if ch == '\n' { cursor_x = x; cursor_y += line_step; continue; }
+            if let Some((skip, code)) = color_escape(value.as_bytes(), index, color[3]) {
                 active_color = code;
-                index += skip;
+                while chars.peek().is_some_and(|(at, _)| *at < index + skip) { chars.next(); }
                 continue;
             }
-
-            let glyph = font.glyphs[byte as usize];
-            if glyph.width > 0 && glyph.height > 0 && byte != b' ' {
-                // Only CENTERPRINT uses TaystJK's actual FONT_MEDIUM drop
-                // shadow (dark gray with the same fade alpha as the text).
-                // Other HUD/chat text retains the existing tight screen-space
-                // black shadow, avoiding unrelated visual regressions.
+            let (glyph, factor, texture_source) = proportional_glyph(font, ch);
+            if glyph.width > 0 && glyph.height > 0 && ch != ' ' {
                 let (shadow_offset_x, shadow_offset_y) = if !shadow_pass {
                     (0.0, 0.0)
                 } else if tayst_centerprint_shadow {
                     (centerprint_shadow_offset * x_scale, centerprint_shadow_offset * y_scale)
-                } else {
-                    (1.0, 1.0)
-                };
-                let draw_color = if !shadow_pass {
-                    active_color
-                } else if tayst_centerprint_shadow {
-                    [0.15, 0.15, 0.15, color[3]]
-                } else {
-                    [0.0, 0.0, 0.0, color[3] * 0.72]
-                };
-                let draw_x =
-                    cursor_x + glyph.horiz_offset as f32 * scale * x_scale + shadow_offset_x;
-                let draw_y = cursor_y - glyph.baseline as f32 * scale * y_scale + shadow_offset_y;
+                } else { (1.0, 1.0) };
+                let draw_color = if !shadow_pass { active_color }
+                    else if tayst_centerprint_shadow { [0.15, 0.15, 0.15, color[3]] }
+                    else { [0.0, 0.0, 0.0, color[3] * 0.72] };
                 textured_rect_with_source(
                     out,
-                    draw_x,
-                    draw_y,
-                    glyph.width as f32 * scale * x_scale,
-                    glyph.height as f32 * scale * y_scale,
-                    [glyph.s, glyph.t],
-                    [glyph.s2, glyph.t2],
-                    draw_color,
-                    2.0,
-                    width,
-                    height,
+                    cursor_x + f32::from(glyph.horiz_offset) * scale * factor * x_scale + shadow_offset_x,
+                    cursor_y - glyph.baseline as f32 * scale * factor * y_scale + shadow_offset_y,
+                    f32::from(glyph.width) * scale * factor * x_scale,
+                    f32::from(glyph.height) * scale * factor * y_scale,
+                    [glyph.s, glyph.t], [glyph.s2, glyph.t2], draw_color,
+                    texture_source, width, height,
                 );
             }
-            cursor_x += glyph.horiz_advance.max(0) as f32 * scale * x_scale;
-            index += 1;
+            cursor_x += f32::from(glyph.horiz_advance.max(0)) * scale * factor * x_scale;
         }
     };
 
@@ -599,86 +622,34 @@ pub fn build_world_player_label_vertices(
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::ui) fn fixed_charset_text(
-    out: &mut Vec<UiVertex>,
-    value: &str,
-    x: f32,
-    y: f32,
-    glyph_w: f32,
-    glyph_h: f32,
-    advance: f32,
-    color: [f32; 4],
-    shadow: bool,
-    width: u32,
-    height: u32,
+    out: &mut Vec<UiVertex>, value: &str, x: f32, y: f32,
+    glyph_w: f32, glyph_h: f32, advance: f32, color: [f32; 4],
+    shadow: bool, width: u32, height: u32,
 ) {
-    if shadow {
-        let mut cursor_x = x + 2.0;
-        let mut cursor_y = y + 2.0;
-        let bytes = crate::cgame::text_to_jka_bytes(value);
-        let mut index = 0usize;
-        while index < bytes.len() {
-            let byte = bytes[index];
-            if byte == b'\n' {
-                cursor_x = x + 2.0;
+    for shadow_pass in [true, false] {
+        if shadow_pass && !shadow { continue; }
+        let mut cursor_x = x + if shadow_pass { 2.0 } else { 0.0 };
+        let mut cursor_y = y + if shadow_pass { 2.0 } else { 0.0 };
+        let mut active_color = color;
+        let mut chars = value.char_indices().peekable();
+        while let Some((index, ch)) = chars.next() {
+            if ch == '\n' {
+                cursor_x = x + if shadow_pass { 2.0 } else { 0.0 };
                 cursor_y += glyph_h;
-                index += 1;
                 continue;
             }
-            if let Some((skip, _)) = color_escape(&bytes, index, color[3]) {
-                index += skip;
+            if let Some((skip, code)) = color_escape(value.as_bytes(), index, color[3]) {
+                if !shadow_pass { active_color = code; }
+                while chars.peek().is_some_and(|(at, _)| *at < index + skip) { chars.next(); }
                 continue;
             }
-            if byte != b' ' {
-                glyph_quad_sized(
-                    out,
-                    byte,
-                    cursor_x,
-                    cursor_y,
-                    glyph_w,
-                    glyph_h,
-                    [0.0, 0.0, 0.0, color[3]],
-                    width,
-                    height,
-                );
+            if ch != ' ' {
+                charset_glyph(out, ch, cursor_x, cursor_y, glyph_w, glyph_h,
+                    if shadow_pass { [0.0, 0.0, 0.0, color[3]] } else { active_color },
+                    width, height);
             }
             cursor_x += advance;
-            index += 1;
         }
-    }
-
-    let mut cursor_x = x;
-    let mut cursor_y = y;
-    let mut active_color = color;
-    let bytes = crate::cgame::text_to_jka_bytes(value);
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte == b'\n' {
-            cursor_x = x;
-            cursor_y += glyph_h;
-            index += 1;
-            continue;
-        }
-        if let Some((skip, code)) = color_escape(&bytes, index, color[3]) {
-            active_color = code;
-            index += skip;
-            continue;
-        }
-        if byte != b' ' {
-            glyph_quad_sized(
-                out,
-                byte,
-                cursor_x,
-                cursor_y,
-                glyph_w,
-                glyph_h,
-                active_color,
-                width,
-                height,
-            );
-        }
-        cursor_x += advance;
-        index += 1;
     }
 }
 
@@ -704,36 +675,19 @@ pub(in crate::ui) fn console_text_sized(
     let mut cursor_x = x;
     let mut cursor_y = y;
     let mut active_color = color;
-    let bytes = crate::cgame::text_to_jka_bytes(value);
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte == b'\n' {
-            cursor_x = x;
-            cursor_y += char_height;
-            index += 1;
-            continue;
-        }
-        if let Some((skip, code)) = color_escape(&bytes, index, color[3]) {
+    let mut chars = value.char_indices().peekable();
+    while let Some((index, ch)) = chars.next() {
+        if ch == '\n' { cursor_x = x; cursor_y += char_height; continue; }
+        if let Some((skip, code)) = color_escape(value.as_bytes(), index, color[3]) {
             active_color = code;
-            index += skip;
+            while chars.peek().is_some_and(|(at, _)| *at < index + skip) { chars.next(); }
             continue;
         }
-        if byte != b' ' {
-            glyph_quad_sized(
-                out,
-                byte,
-                cursor_x,
-                cursor_y,
-                char_width,
-                char_height,
-                active_color,
-                width,
-                height,
-            );
+        if ch != ' ' {
+            charset_glyph(out, ch, cursor_x, cursor_y, char_width, char_height,
+                active_color, width, height);
         }
         cursor_x += char_width;
-        index += 1;
     }
 }
 
@@ -967,6 +921,7 @@ pub(in crate::ui) const CLEAN_FONT_SOURCE: f32 = 8.0;
 /// without it, the JKA proportional font and then the charsgrid stand in.
 #[derive(Clone, Copy)]
 pub(in crate::ui) struct UiText<'a> {
+    jura: bool,
     clean: Option<&'a ProportionalFont>,
     legacy: Option<&'a ProportionalFont>,
     /// TrueType font that lends its Cyrillic glyphs to JKA-font text.
@@ -1010,12 +965,12 @@ fn colour_after(run: &str, mut active: [f32; 4], alpha: f32) -> [f32; 4] {
 
 impl<'a> UiText<'a> {
     pub(in crate::ui) fn new(ui: &'a crate::ui::UiSnapshot, legacy: Option<&'a ProportionalFont>, w: u32, h: u32) -> Self {
-        Self { clean: ui.clean_font.as_deref(), legacy, wide: None, w, h }
+        Self { jura: false, clean: ui.clean_font.as_deref(), legacy, wide: None, w, h }
     }
 
     /// Render redesigned UI geometry with the original JKA small font.
     pub(in crate::ui) fn legacy_only(legacy: Option<&'a ProportionalFont>, w: u32, h: u32) -> Self {
-        Self { clean: None, legacy, wide: None, w, h }
+        Self { jura: false, clean: None, legacy, wide: None, w, h }
     }
 
     /// `legacy_only`, but characters the JKA font cannot have (Cyrillic in
@@ -1026,8 +981,68 @@ impl<'a> UiText<'a> {
         w: u32,
         h: u32,
     ) -> Self {
-        let wide = ui.clean_font.as_deref().filter(|font| !font.cyrillic.is_empty());
-        Self { clean: None, legacy, wide: wide.filter(|_| legacy.is_some()), w, h }
+        // Jura takes priority for missing glyphs. Without the bundled Jura
+        // file, retain the preexisting clean-TTF Cyrillic fallback behavior.
+        let jura_loaded = UNICODE_FALLBACK.with(|cell| cell.borrow().is_some());
+        let wide = if jura_loaded { None } else {
+            ui.clean_font.as_deref().filter(|font| !font.cyrillic.is_empty())
+        };
+        Self { jura: false, clean: None, legacy, wide: wide.filter(|_| legacy.is_some()), w, h }
+    }
+
+    pub(in crate::ui) fn chat(ui: &'a crate::ui::UiSnapshot, legacy: Option<&'a ProportionalFont>, w: u32, h: u32) -> Self {
+        match ui.chat_settings.font() {
+            super::ChatFont::Classic => Self::legacy_with_wide(ui, legacy, w, h),
+            super::ChatFont::Modern => Self::new(ui, legacy, w, h),
+            super::ChatFont::Jura => {
+                let mut text = Self::legacy_with_wide(ui, legacy, w, h);
+                text.jura = UNICODE_FALLBACK.with(|cell| cell.borrow().is_some());
+                text
+            }
+        }
+    }
+
+    fn jura_width(value: &str, px: f32) -> f32 {
+        let mut width = 0.0;
+        let mut chars = value.char_indices().peekable();
+        while let Some((index, ch)) = chars.next() {
+            if let Some((skip, _)) = color_escape(value.as_bytes(), index, 1.0) {
+                while chars.peek().is_some_and(|(at, _)| *at < index + skip) { chars.next(); }
+                continue;
+            }
+            if let Some((glyph, height, _)) = jura_glyph(ch).or_else(|| jura_glyph('?')) {
+                width += f32::from(glyph.horiz_advance.max(0)) * px / f32::from(height.max(1));
+            }
+        }
+        width
+    }
+
+    fn jura_draw(&self, out: &mut Vec<UiVertex>, value: &str, x: f32, baseline: f32, px: f32, color: [f32; 4]) {
+        for shadow in [true, false] {
+            let mut cursor = x;
+            let mut active = color;
+            let mut chars = value.char_indices().peekable();
+            while let Some((index, ch)) = chars.next() {
+                if let Some((skip, code)) = color_escape(value.as_bytes(), index, color[3]) {
+                    active = code;
+                    while chars.peek().is_some_and(|(at, _)| *at < index + skip) { chars.next(); }
+                    continue;
+                }
+                let Some((glyph, height, _)) = jura_glyph(ch).or_else(|| jura_glyph('?')) else { continue };
+                let scale = px / f32::from(height.max(1));
+                let offset = if shadow { 1.0 } else { 0.0 };
+                if glyph.width > 0 && glyph.height > 0 && ch != ' ' {
+                    textured_rect_with_source(out,
+                        cursor + f32::from(glyph.horiz_offset) * scale + offset,
+                        baseline - glyph.baseline as f32 * scale + offset,
+                        f32::from(glyph.width) * scale, f32::from(glyph.height) * scale,
+                        [glyph.s, glyph.t], [glyph.s2, glyph.t2],
+                        if shadow { [0.0, 0.0, 0.0, color[3] * 0.55] } else { active },
+                        JURA_GLYPH_SOURCE, self.w, self.h);
+                }
+                cursor += f32::from(glyph.horiz_advance.max(0)) * scale;
+            }
+        }
     }
 
     fn clean_width(font: &ProportionalFont, value: &str, px: f32) -> f32 {
@@ -1104,6 +1119,7 @@ impl<'a> UiText<'a> {
 
     /// Advance width of `value`, colour codes excluded.
     pub(in crate::ui) fn width(&self, value: &str, px: f32) -> f32 {
+        if self.jura { return Self::jura_width(value, px); }
         if let Some(font) = self.clean {
             Self::clean_width(font, value, px)
         } else if let (Some(font), Some(wide)) = (self.legacy, self.wide_for(value)) {
@@ -1127,6 +1143,9 @@ impl<'a> UiText<'a> {
 
     /// Height of a capital letter, for centring a line on a box.
     pub(in crate::ui) fn cap(&self, px: f32) -> f32 {
+        if self.jura {
+            return jura_glyph('H').map_or(px * 0.65, |(_, height, cap)| cap * px / f32::from(height.max(1)));
+        }
         if let Some(font) = self.clean {
             let glyph = font.glyphs[usize::from(b'H')];
             (glyph.baseline as f32 - 2.0).max(1.0) * px / f32::from(font.height.max(1))
@@ -1143,6 +1162,7 @@ impl<'a> UiText<'a> {
     }
 
     pub(in crate::ui) fn draw(&self, out: &mut Vec<UiVertex>, value: &str, x: f32, baseline: f32, px: f32, color: [f32; 4]) {
+        if self.jura { self.jura_draw(out, value, x, baseline, px, color); return; }
         let (w, h) = (self.w, self.h);
         if let Some(font) = self.clean {
             self.clean_draw(out, font, value, x, baseline, px, color, color);
@@ -1182,6 +1202,118 @@ impl<'a> UiText<'a> {
 #[cfg(test)]
 mod widescreen_font_tests {
     use super::*;
+
+    #[test]
+    fn jura_console_glyph_height_does_not_shrink_with_wide_letters() {
+        let mut glyphs = std::collections::HashMap::new();
+        for (ch, width) in [('Ж', 40), ('І', 8)] {
+            glyphs.insert(ch, ProportionalGlyph {
+                width, height: 20, horiz_advance: width, baseline: 18,
+                s2: 1.0, t2: 1.0, ..Default::default()
+            });
+        }
+        let _scope = UnicodeFallbackScope::enter(Some(std::sync::Arc::new(
+            super::super::UnicodeFallbackFont { glyphs, height: 32, cap_height: 16.0 },
+        )));
+        let mut out = Vec::new();
+        fixed_charset_text(&mut out, "ЖІ", 10.0, 20.0, 8.0, 16.0,
+            8.0, [1.0; 4], false, 640, 480);
+        assert_eq!(out.len(), 12);
+        let bounds = |vertices: &[UiVertex]| {
+            let min_x = vertices.iter().map(|v| v.position[0]).fold(f32::INFINITY, f32::min);
+            let max_x = vertices.iter().map(|v| v.position[0]).fold(f32::NEG_INFINITY, f32::max);
+            let min_y = vertices.iter().map(|v| v.position[1]).fold(f32::INFINITY, f32::min);
+            let max_y = vertices.iter().map(|v| v.position[1]).fold(f32::NEG_INFINITY, f32::max);
+            ((max_x - min_x) * 320.0, (max_y - min_y) * 240.0)
+        };
+        let wide = bounds(&out[..6]);
+        let narrow = bounds(&out[6..]);
+        assert!(wide.0 <= 8.001 && narrow.0 <= 8.001);
+        assert!((wide.1 - 14.0).abs() < 0.001);
+        assert!((wide.1 - narrow.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn jura_fallback_preserves_every_stock_glyph_vertex() {
+        let legacy = test_font();
+        let value: String = (0..=255u8).map(char::from).collect();
+        let _empty = UnicodeFallbackScope::enter(None);
+        let mut before = Vec::new();
+        proportional_text_uniform(&mut before, &value, &legacy, 10.0, 24.0,
+            1.0, [1.0; 4], true, 1920, 1080);
+        let glyphs = value.chars().map(|ch| (ch, ProportionalGlyph::default())).collect();
+        let _loaded = UnicodeFallbackScope::enter(Some(std::sync::Arc::new(
+            super::super::UnicodeFallbackFont { glyphs, height: 64, cap_height: 40.0 },
+        )));
+        let mut after = Vec::new();
+        proportional_text_uniform(&mut after, &value, &legacy, 10.0, 24.0,
+            1.0, [1.0; 4], true, 1920, 1080);
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&before), bytemuck::cast_slice::<_, u8>(&after));
+    }
+
+    #[test]
+    fn jura_fallback_measurement_wrapping_color_and_scope_agree() {
+        let legacy = test_font();
+        let mut glyphs = std::collections::HashMap::new();
+        glyphs.insert('Ж', ProportionalGlyph {
+            width: 16, height: 22, horiz_advance: 36, baseline: 20,
+            s2: 1.0, t2: 1.0, ..Default::default()
+        });
+        let _empty = UnicodeFallbackScope::enter(None);
+        {
+            let _loaded = UnicodeFallbackScope::enter(Some(std::sync::Arc::new(
+                super::super::UnicodeFallbackFont { glyphs, height: 24, cap_height: 18.0 },
+            )));
+            assert_eq!(proportional_text_width("^1AЖ", &legacy, 1.0), 27.0);
+            assert_eq!(wrap_proportional_text("A ЖA", &legacy, 1.0, 27.0), "A\nЖA\n");
+            assert_eq!(truncate_jka_text("^1AЖ你", 2), "^1AЖ");
+            assert_eq!(crate::ui::chat::wrap_fixed_chat_text("^1ЖЖЖ", 2), "^1ЖЖ\nЖ");
+            let mut out = Vec::new();
+            fixed_charset_text(&mut out, "^1AЖ", 0.0, 0.0, 8.0, 16.0,
+                8.0, [1.0; 4], true, 640, 480);
+            assert_eq!(out.len(), 24);
+            assert!(out[18..].iter().all(|v| v.textured == JURA_FIXED_GLYPH_SOURCE
+                && v.color == [255, 0, 0, 255]));
+        }
+        assert_eq!(proportional_text_width("Ж", &legacy, 1.0), 9.0);
+        let mut missing = Vec::new();
+        let mut question = Vec::new();
+        text(&mut missing, "你", 0.0, 0.0, 1.0, [1.0; 4], 640, 480);
+        text(&mut question, "?", 0.0, 0.0, 1.0, [1.0; 4], 640, 480);
+        assert_eq!(bytemuck::cast_slice::<_, u8>(&missing), bytemuck::cast_slice::<_, u8>(&question));
+    }
+
+    #[test]
+    fn jura_fallback_never_replaces_a_stock_byte_glyph() {
+        let legacy = test_font();
+        let mut glyphs = std::collections::HashMap::new();
+        glyphs.insert('Ж', ProportionalGlyph {
+            width: 8, height: 12, horiz_advance: 9, baseline: 10,
+            s2: 1.0, t2: 1.0, ..Default::default()
+        });
+        let _scope = UnicodeFallbackScope::enter(Some(std::sync::Arc::new(
+            super::super::UnicodeFallbackFont { glyphs, height: 12, cap_height: 8.0 },
+        )));
+        let mut out = Vec::new();
+        proportional_text_uniform(&mut out, "AЖA", &legacy, 10.0, 24.0,
+            1.0, [1.0; 4], false, 640, 480);
+        assert_eq!(out.len(), 18);
+        assert!(out[..6].iter().all(|v| v.textured == 2.0));
+        assert!(out[6..12].iter().all(|v| v.textured == JURA_GLYPH_SOURCE));
+        assert!(out[12..].iter().all(|v| v.textured == 2.0));
+        assert_eq!(proportional_text_width("AЖA", &legacy, 1.0), 27.0);
+    }
+
+    #[test]
+    fn missing_wide_character_keeps_legacy_question_mark_fallback() {
+        let legacy = test_font();
+        let _scope = UnicodeFallbackScope::enter(None);
+        let mut out = Vec::new();
+        proportional_text_uniform(&mut out, "A你", &legacy, 10.0, 24.0,
+            1.0, [1.0; 4], false, 640, 480);
+        assert_eq!(out.len(), 12);
+        assert!(out.iter().all(|v| v.textured == 2.0));
+    }
 
     #[test]
     fn wide_text_is_split_from_byte_text_and_keeps_its_colour() {

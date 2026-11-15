@@ -13,6 +13,10 @@ use std::sync::{
     mpsc,
 };
 
+#[path = "sky_transport.rs"]
+mod sky_transport;
+use sky_transport::TransportBake;
+
 /// Choose a bake-only Rayon worker count without touching any of the game's
 /// other thread pools. The automatic policy budgets for the main thread, the
 /// render thread, one audio callback thread, this bake's coordinator(s), and
@@ -422,6 +426,8 @@ struct Key {
     /// sky visibility traced at the original lightmap resolution (`sky_sizes`).
     sky: u8,
     sky_sizes: Vec<[u32; 2]>,
+    /// Diagnostic transport is gated by authored-room protection (Blue Water).
+    sky_transport: bool,
     local_sources: u32,
     local_sizes: Vec<[u32; 2]>,
     locals: Vec<(usize, scene::DynamicLight)>,
@@ -437,6 +443,8 @@ pub(in crate::renderer) struct VertexSkySample {
     /// Original compiled RGB for inline models (world RGB uses AO-adjusted source).
     pub authored_color: [f32; 4],
     pub packed: u32,
+    /// Stable direct/bounced white-sky response; negative when protection is OFF.
+    pub transport: [f32; 2],
 }
 
 struct BakeOutput {
@@ -445,6 +453,7 @@ struct BakeOutput {
     /// Per sun page: valid bit, octahedral normal, ambient and direct visibility.
     sky: Vec<Vec<u32>>,
     vertex_sky: Vec<VertexSkySample>,
+    transport: Option<Arc<TransportBake>>,
 }
 
 /// Worker counts real completed receiver luxels.  The UI reserves 2% for the
@@ -488,6 +497,10 @@ pub(in crate::renderer) struct StaticSun {
     /// R32Uint packed smoothed normal + sky visibility per sun page.
     pub sky_normals: Vec<GpuImage>,
     pub vertex_sky: Vec<VertexSkySample>,
+    /// One original-resolution transport result per map/receiver configuration.
+    /// Independent of celestial direction; replaced, never accumulated.
+    transport: Option<Arc<TransportBake>>,
+    pub sky_transport: Vec<GpuImage>,
     pub local_lights: Vec<(usize, scene::DynamicLight)>,
     pub generation: u64,
     failed: Option<Key>,
@@ -783,13 +796,16 @@ fn sun_edge_indices(
     out
 }
 
-fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakeProgress) -> Result<BakeOutput, String> {
+fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakeProgress,
+    cached_transport: Option<&Arc<TransportBake>>) -> Result<BakeOutput, String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
     progress.set(1, 5);
+    let cached_transport = cached_transport.filter(|c| key.sky_transport && c.matches(key));
     let mut triangles = Vec::new();
     let mut filters = Vec::new();
+    let mut bounce_normals = Vec::new();
     let mut sky = Vec::new();
     for (index, batch) in geometry.batches.iter().enumerate() {
         if !key.models && geometry.model_materials[index] {
@@ -836,6 +852,13 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                 sky.push(triangle);
             } else {
                 triangles.push(triangle);
+                if key.sky_transport {
+                    let p = v.map(|v| Vec3::from_array(v.position));
+                    let mut n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+                    let authored = v.iter().fold(Vec3::ZERO, |n, v| n + Vec3::from_array(v.normal));
+                    if n.dot(authored) < 0.0 { n = -n; }
+                    bounce_normals.push(n);
+                }
                 filters.push((masked || translucent).then_some((index, v, translucent)));
             }
         }
@@ -874,6 +897,16 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
         if blocked { 0.0 } else { transmission }
     };
     progress.set(1, 25);
+    let transport_surface = |index: usize, bary| {
+        let Some((batch, v, translucent)) = &filters[index] else { return Some(0.0); };
+        let batch = &geometry.batches[*batch];
+        let alpha = batch.texture.and_then(|t| geometry.textures.get(t))
+            .map_or(1.0, |image| alpha_at(batch, v, bary, image));
+        if *translucent { return Some(1.0 - alpha.clamp(0.0, 1.0)); }
+        let covered = if batch.alpha_cutoff > 0.0 { alpha >= batch.alpha_cutoff }
+            else { alpha < -batch.alpha_cutoff };
+        covered.then_some(0.0)
+    };
     let receivers = geometry.sun_receivers(key.normals);
     // Sky irradiance and sky visibility must use the same selected Phong
     // receiver normals as the sun. Reconstructing geometric face normals here
@@ -922,7 +955,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
             })
             .collect();
         progress.set(6, 955);
-        return Ok(BakeOutput { sun: pages, local: Vec::new(), sky: Vec::new(), vertex_sky: Vec::new() });
+        return Ok(BakeOutput { sun: pages, local: Vec::new(), sky: Vec::new(), vertex_sky: Vec::new(), transport: None });
     }
     if key.bake_sun && key.terminator {
         samples.par_iter_mut().zip(&page_ids).zip(&key.sizes)
@@ -1148,11 +1181,18 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                     position: position.to_array(), normal: normal.to_array(),
                 }) / facing).clamp(0.0, 1.0)
             } else { 0.0 };
-            Some(VertexSkySample { gpu_index, authored_color: vertex.color, packed: pack_sky_normal(normal, open / RAYS as f32, direct) })
+            let transport = if key.sky_transport {
+                cached_transport.and_then(|c| c.vertex_response(gpu_index)).unwrap_or_else(||
+                    sky_transport::sample(position, normal, gpu_index, solid.as_ref(), sky.as_ref(),
+                        &bounce_normals, &transport_surface, cancel))
+            } else { [-1.0; 2] };
+            Some(VertexSkySample { gpu_index, authored_color: vertex.color,
+                packed: pack_sky_normal(normal, open / RAYS as f32, direct), transport })
         }).collect()
     } else { Vec::new() };
     if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
 
+    let mut transport = None;
     let sky_pages = if key.bake_sun && key.sky != 0 {
         // The previous 87% "EDGE AA" state hid all sky tracing time. Reserve
         // a measured interval for the sky's 16 ambient hemisphere rays.
@@ -1172,7 +1212,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
             base_samples.par_iter().map(|texels| texels.par_iter().enumerate().map(|(ordinal, sample)| {
                 if ordinal % 64 == 0 {
                     let n = sky_done.fetch_add(64, Ordering::Relaxed) + 64;
-                    progress.fraction(785, 100, n, sky_total);
+                    progress.fraction(785, if key.sky_transport { 50 } else { 100 }, n, sky_total);
                 }
                 let Some(sample) = sample else { return -1.0; };
                 if cancel.load(Ordering::Relaxed) { return -1.0; }
@@ -1202,6 +1242,10 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
         } else {
             Vec::new()
         };
+        transport = sky_transport::bake(
+            key, cached_transport, receivers, solid.as_ref(), sky.as_ref(), &bounce_normals,
+            &transport_surface, cancel, progress, &vertex_sky,
+        );
         progress.set(4, 885);
         let base_charts: Vec<Vec<u32>> = if key.sky == 2 {
             let mut charted = receivers.to_vec();
@@ -1314,7 +1358,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
     if cancel.load(Ordering::Relaxed) {
         Err("cancelled".into())
     } else {
-        Ok(BakeOutput { sun: pages, local, sky: sky_pages, vertex_sky })
+        Ok(BakeOutput { sun: pages, local, sky: sky_pages, vertex_sky, transport })
     }
 }
 
@@ -1328,7 +1372,7 @@ impl Renderer {
         let sun = if self.sun_override {
             self.relit_celestial()
         } else {
-            self.active_sun()
+            self.authored_sun()
         };
         let bake_sun = self.baked_sun_cache
             && self.baked_sun_debug_mode == 0
@@ -1345,10 +1389,15 @@ impl Renderer {
         } else {
             0
         };
+        let sky_transport = sky == 2 && self.sky_backend == 1 && self.sky_world_light_isolation;
         let Some(world) = self.world.as_mut() else {
             return;
         };
         let state = &mut world.static_sun;
+        if !sky_transport {
+            state.transport = None;
+            state.sky_transport.clear();
+        }
         if self.sun_bake_deferred {
             // A drag can begin while a previous trace is still running.
             // Dropping Pending cancels it; no new worker starts until release.
@@ -1392,6 +1441,7 @@ impl Renderer {
                     && k.terminator == self.sun_terminator
                     && k.debug_layers == debug_layers
                     && k.sky == sky
+                    && k.sky_transport == sky_transport
                     && k.local_sources
                         == if bake_local {
                             light_sources
@@ -1450,6 +1500,7 @@ impl Renderer {
             debug_layers,
             sky,
             sky_sizes: if sky == 2 { base.clone() } else { Vec::new() },
+            sky_transport,
             local_sources: if bake_local {
                 light_sources
             } else {
@@ -1487,6 +1538,32 @@ impl Renderer {
             state.pending = None;
             match outcome {
                 Ok(pages) => {
+                    if let Some(transport) = pages.transport {
+                        if !state.transport.as_ref().is_some_and(|old| Arc::ptr_eq(old, &transport)) {
+                            use wgpu::util::DeviceExt;
+                            state.sky_transport = transport.pages.iter().zip(&key.sky_sizes).map(|(pixels, size)| {
+                                let texture = self.device.create_texture_with_data(
+                                    &self.queue,
+                                    &wgpu::TextureDescriptor {
+                                        label: Some("diagnostic direct and bounced white-sky transport"),
+                                        size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+                                        mip_level_count: 1, sample_count: 1,
+                                        dimension: wgpu::TextureDimension::D2,
+                                        format: wgpu::TextureFormat::Rg32Float,
+                                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                                        view_formats: &[],
+                                    },
+                                    wgpu::util::TextureDataOrder::LayerMajor, bytemuck::cast_slice(pixels),
+                                );
+                                let view = texture.create_view(&Default::default());
+                                GpuImage::new(texture, view)
+                            }).collect();
+                        }
+                        state.transport = Some(transport);
+                    } else if key.debug_layers == 0 {
+                        state.transport = None;
+                        state.sky_transport.clear();
+                    }
                     state.flux = pages
                         .sun
                         .iter()
@@ -1610,7 +1687,14 @@ impl Renderer {
             return;
         }
         if state.pending.is_none() {
+            // Drop superseded pages before starting a different configuration.
+            // StaticSun::replace_geometry also drops this cache on map/remap changes.
+            if state.transport.as_ref().is_some_and(|transport| !transport.matches(&key)) {
+                state.transport = None;
+                state.sky_transport.clear();
+            }
             let geometry = state.geometry.clone().unwrap();
+            let transport = state.transport.as_ref().map(Arc::clone);
             let worker_key = key.clone();
             let cancel = Arc::new(AtomicBool::new(false));
             let worker_cancel = Arc::clone(&cancel);
@@ -1626,7 +1710,7 @@ impl Renderer {
                         .num_threads(workers)
                         .build();
                     let result = pool.map_err(|e| e.to_string()).and_then(|pool| {
-                        pool.install(|| trace(&geometry, &worker_key, &worker_cancel, &worker_progress))
+                        pool.install(|| trace(&geometry, &worker_key, &worker_cancel, &worker_progress, transport.as_ref()))
                     });
                     let _ = tx.send(result);
                 }) {
@@ -1911,6 +1995,7 @@ mod tests {
             debug_layers: 0,
             sky: 0,
             sky_sizes: Vec::new(),
+            sky_transport: false,
             local_sources: 0,
             local_sizes: Vec::new(),
             locals: Vec::new(),
@@ -1927,11 +2012,11 @@ mod tests {
         assert!(bake_worker_count(0, 2) >= 1);
         let cancel = AtomicBool::new(false);
         let progress = BakeProgress::default();
-        let pages = trace(&geometry, &key, &cancel, &progress).unwrap().sun;
+        let pages = trace(&geometry, &key, &cancel, &progress, None).unwrap().sun;
         assert_eq!(pages[0][4 * 32 + 4], 0.0, "roof blocks the sun");
         assert_eq!(pages[0][4 * 32 + 24], 1.0, "open floor receives the sun");
         let cloudy_key = Key { cloud_coverage_steps: 20, ..key.clone() };
-        let cloudy = trace(&geometry, &cloudy_key, &cancel, &progress).unwrap().sun;
+        let cloudy = trace(&geometry, &cloudy_key, &cancel, &progress, None).unwrap().sun;
         assert!(
             cloudy[0].iter().zip(&cloudy[0][32 * 32..]).all(|(flux, facing)| flux <= &(facing + 1e-6)),
             "angular visibility cannot exceed the unoccluded central cosine"
@@ -1966,7 +2051,7 @@ mod tests {
             let sky_key = Key {
                 sky: 2, sky_sizes: vec![[16, 16]], normals: mode, ..key.clone()
             };
-            let output = trace(&sky_geometry, &sky_key, &cancel, &progress).unwrap();
+            let output = trace(&sky_geometry, &sky_key, &cancel, &progress, None).unwrap();
             assert_eq!(
                 output.sky[0][4 * 32 + 24] & normal_bits,
                 pack_sky_normal(expected, 0.0, 0.0) & normal_bits,
@@ -1983,6 +2068,22 @@ mod tests {
                 );
             }
         }
+        let transport_key = Key { sky: 2, sky_sizes: vec![[16, 16]], sky_transport: true, ..key.clone() };
+        let diagnostic = trace(&geometry, &transport_key, &cancel, &progress, None).unwrap();
+        let transport = diagnostic.transport.as_ref().unwrap();
+        let legacy_key = Key { sky_transport: false, ..transport_key.clone() };
+        let legacy = trace(&geometry, &legacy_key, &cancel, &progress, None).unwrap();
+        assert!(legacy.transport.is_none(), "protection OFF does not bake transport");
+        assert_eq!(diagnostic.sun, legacy.sun, "diagnostics must not change celestial light");
+        assert_eq!(diagnostic.sky, legacy.sky, "diagnostics must not change the existing sky blend");
+        let moved_sun = Key { direction: [1.0, 0.0, 0.0], cloud_coverage_steps: 20, ..transport_key.clone() };
+        assert!(transport.matches(&moved_sun), "transport is independent of live celestial lighting");
+        assert!(!transport.matches(&Key { normals: 2, ..transport_key.clone() }));
+        assert!(!transport.matches(&Key { models: !transport_key.models, ..transport_key.clone() }));
+        let reused = trace(&geometry, &moved_sun, &cancel, &progress, Some(transport)).unwrap();
+        assert!(Arc::ptr_eq(transport, reused.transport.as_ref().unwrap()));
+        assert!(sky_transport::bake(&legacy_key, Some(transport), &[], None, None, &[],
+            &|_, _| Some(0.0), &cancel, &progress, &[]).is_none(), "OFF never reuses transport");
         assert!(
             pages[0][..32 * 32]
                 .iter()
@@ -2022,7 +2123,7 @@ mod tests {
                 },
             ),
         ];
-        let local = trace(&geometry, &local_key, &cancel, &progress).unwrap().local;
+        let local = trace(&geometry, &local_key, &cancel, &progress, None).unwrap().local;
         let receiver = 4 * 32 + 4;
         assert_eq!(local[0][receiver], 0.0, "roof blocks the upper lamp");
         assert!(
@@ -2045,6 +2146,6 @@ mod tests {
             "negative alphaFunc must stay live too"
         );
         cancel.store(true, Ordering::Relaxed);
-        assert!(trace(&geometry, &key, &cancel, &progress).is_err());
+        assert!(trace(&geometry, &key, &cancel, &progress, None).is_err());
     }
 }

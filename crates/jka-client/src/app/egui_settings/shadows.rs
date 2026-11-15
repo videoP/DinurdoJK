@@ -40,6 +40,9 @@ impl App {
             self.video_selected = ui::VIDEO_ROW_DYNAMIC_SHADOWS;
             self.change_video_setting(target as i32 - current as i32);
         }
+        if self.video.sun_override && self.video.effective_shadow_mode() != self.video.dynamic_shadows {
+            ui.small("Relight world automatically enables Cascaded Shadow Maps. The method above is your saved preference for when relighting is off.");
+        }
         let mut contact = self.video.player_contact_shadows;
         if ui.add(egui::Slider::new(&mut contact, 0.0..=4.0).text("Player contact multiplier")).on_hover_text(
             "0 disables player foot-contact blobs; 1 is normal and 2 doubles their opacity. Multiplies the shadow strength below and keeps the existing airborne fade. Classic Blob mode is unchanged."

@@ -138,7 +138,7 @@ impl Renderer {
         self.contact_shadows_enabled = effects.contact_shadows && !photographic_ir;
         self.weather.fog.mode = effects.fog_mode;
         self.weather.fog.strength = effects.fog_strength.clamp(0.0, ui::MAX_FOG_STRENGTH);
-        let previous_sun = (self.sun_override, self.sun_yaw, self.sun_pitch,
+        let previous_sun = (self.sun_override, self.sky_sun_custom, self.sun_yaw, self.sun_pitch,
                             self.sun_intensity, self.sun_color);
         let previous_relight_cloud = (self.clouds_enabled, self.cloud_coverage);
         let previous_sky_backend = self.sky_backend;
@@ -152,6 +152,7 @@ impl Renderer {
         );
         self.relighting_mode = effects.relighting_mode.min(2);
         self.sun_override = effects.sun_override;
+        self.sky_sun_custom = effects.sky_sun_custom;
         if previous_sun.0 != self.sun_override && self.entity_fixture_lighting_ab {
             if let Some(world) = &mut self.world { world.local_shadows.selection_position = None; }
             if !self.sun_override { self.dynamic_model_renderer.fixture_lighting = None; }
@@ -172,7 +173,7 @@ impl Renderer {
         self.baked_sun_cache = effects.baked_sun_cache;
         self.lightmap_smoothing = effects.lightmap_smoothing.min(2);
         self.baked_sun_aa = effects.baked_sun_aa.min(3);
-        self.lightmap_signal = effects.lightmap_signal.min(8);
+        self.lightmap_signal = effects.lightmap_signal.min(11);
         self.sun_receiver_normals = effects.sun_receiver_normals.min(2);
         self.sun_terminator = effects.sun_terminator;
         self.sky_world_bake_ab = effects.sky_world_bake_ab.min(1);
@@ -192,7 +193,7 @@ impl Renderer {
         self.baked_indirect_highlight_preserve = effects.baked_indirect_highlight_preserve.clamp(0.0, 1.0);
         self.baked_sun_edge_softness = effects.baked_sun_edge_softness.clamp(0.0, 24.0);
         self.baked_sun_direct_limit = effects.baked_sun_direct_limit.clamp(0.0, 0.9);
-        let current_sun = (self.sun_override, self.sun_yaw, self.sun_pitch,
+        let current_sun = (self.sun_override, self.sky_sun_custom, self.sun_yaw, self.sun_pitch,
                            self.sun_intensity, self.sun_color);
         let solar_uniforms_changed = old_baked_sun_removal != (self.baked_sun_removal, self.baked_sun_removal_auto, self.baked_sun_removal_contour)
             || old_baked_sun_shadow_map != self.baked_sun_shadow_map

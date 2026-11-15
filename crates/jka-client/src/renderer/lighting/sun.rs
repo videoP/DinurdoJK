@@ -97,8 +97,10 @@ impl Renderer {
         );
     }
 
+    /// Visual/atmospheric sun may be customized without touching the BSP's
+    /// authored world light and its shadow/ambient reconstruction.
     pub(in crate::renderer) fn active_sun(&self) -> DirectionalSun {
-        if self.sun_override {
+        if self.sun_override || self.sky_sun_custom {
             return DirectionalSun::from_q3_angles(
                 self.sun_color,
                 self.sun_intensity,
@@ -106,6 +108,11 @@ impl Renderer {
                 self.sun_pitch,
             );
         }
+        self.authored_sun()
+    }
+
+    /// Original map sun for world lighting when Relight world is disabled.
+    pub(in crate::renderer) fn authored_sun(&self) -> DirectionalSun {
         self.world
             .as_ref()
             .and_then(|world| world.sun)
@@ -120,7 +127,7 @@ impl Renderer {
     /// injecting real-time sunlight into the BSP after it sets. This does not
     /// alter the map's baked lightmap (which requires baked-sun removal).
     pub(in crate::renderer) fn relit_sun(&self) -> DirectionalSun {
-        let mut sun = self.active_sun();
+        let mut sun = if self.sun_override { self.active_sun() } else { self.authored_sun() };
         if self.sun_override {
             // Both sky backends share the sun's horizon. `direction` is
             // light travel, so positive Y is below the horizon.

@@ -1264,6 +1264,9 @@ impl ApplicationHandler<UserEvent> for App {
                 // but BEFORE its first sky/lightmap configuration and upload.
                 // Baked never follows the clock again during this map session.
                 self.sync_relighting_system_clock(true, true);
+                if !self.video.relight_match_system_time && self.video.sky_sun_custom {
+                    self.apply_relighting_celestial_time(self.video.relight_time);
+                }
                 self.map_authored_oceans = map.authored_oceans.clone();
                 self.authored_ocean_preview = false;
                 // jaPRO sailing prediction: this map's markers, then (in

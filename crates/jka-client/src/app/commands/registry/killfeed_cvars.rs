@@ -219,13 +219,13 @@ app_cvars! {
 
 
     APP_CG_CHATSTYLE {
-        runtime: CvarDef::new("cg_chatStyle", "2", "0..2",
-            "Chat style: 0 classic top bar, 1 docked with modern font, 2 docked with classic JKA font.",
+        runtime: CvarDef::new("cg_chatStyle", "1", "0|1 (2 legacy)",
+            "Chat layout: 0 classic top bar, 1 docked. Font is selected separately with cg_chatFont. Legacy value 2 selects docked/classic font.",
             CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| CvarValue::Int(i32::from(app.chat_settings.style)),
+            |app: &App| CvarValue::Int(i32::from(app.chat_settings.docked())),
             |app, value| {
                 let CvarValue::Int(v) = value else { unreachable!("validated cvar type") };
-                app.chat_settings.style = v.clamp(0, 2) as u8;
+                app.chat_settings.set_style(v.clamp(0, 2) as u8);
                 app.mark_config_dirty();
                 app.publish_ui();
                 app.publish_transient_ui();
@@ -235,7 +235,32 @@ app_cvars! {
             load_presentation: Some(|settings, _name, value| {
                 if let Ok(v) = value.trim().parse::<i32>() { settings.chat.style = v.clamp(0, 2) as u8; }
             }),
-            archive: Some((28120, |state| state.presentation.chat.style.to_string())),
+            archive: Some((28120, |state| u8::from(state.presentation.chat.docked()).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_CG_CHATFONT {
+        runtime: CvarDef::new("cg_chatFont", "0", "0..2",
+            "Chat font: 0 Classic (JKA), 1 Jura Bold, 2 Modern UI font. Independent of cg_chatStyle.",
+            CvarType::Int { min: 0, max: 2 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.chat_settings.font() as i32),
+            |app, value| {
+                let CvarValue::Int(v) = value else { unreachable!("validated cvar type") };
+                app.chat_settings.font_override = Some(crate::ui::ChatFont::from_index(v));
+                app.mark_config_dirty();
+                app.publish_ui();
+                app.publish_transient_ui();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Ok(v) = value.trim().parse::<i32>() {
+                    settings.chat.font_override = Some(crate::ui::ChatFont::from_index(v.clamp(0, 2)));
+                }
+            }),
+            archive: Some((28128, |state| (state.presentation.chat.font() as u8).to_string())),
             ..CvarBinding::NONE
         },
         implementations: []

@@ -8,7 +8,7 @@ use super::{ProportionalFont, ProportionalGlyph};
 /// small text.
 const LINE_PIXELS: f32 = 64.0;
 /// Empty texels around each glyph bitmap.
-const PAD: i32 = 2;
+pub(super) const PAD: i32 = 2;
 /// Glyph cells start on this grid so every mip level stays separated.
 const CELL_ALIGN: u32 = 8;
 const ATLAS_WIDTH: u32 = 1024;
@@ -332,6 +332,149 @@ pub fn rasterize(bytes: &[u8]) -> Result<RasterizedFont, String> {
     })
 }
 
+/// Unicode-only companion atlas. Stock fontdat and charsgrid UVs are never
+/// replaced: these glyphs are sampled from their own UI texture binding.
+#[derive(Debug)]
+pub struct UnicodeFallbackFont {
+    pub glyphs: std::collections::HashMap<char, ProportionalGlyph>,
+    pub height: i16,
+    /// Unpadded capital height in atlas pixels, for fixed-cell console fitting.
+    pub cap_height: f32,
+}
+
+pub struct RasterizedUnicodeFallback {
+    pub width: u32,
+    pub height: u32,
+    pub mip_level_count: u32,
+    pub rgba: Vec<u8>,
+    pub font: UnicodeFallbackFont,
+}
+
+/// Rasterize the Unicode ranges Jura can reasonably cover. Only codepoints
+/// actually present in the supplied font are allocated. This is one-time work
+/// during UI initialization, with a hard atlas-size limit (no per-frame work).
+/// A future CJK fallback needs a separate font and atlas: Jura has no CJK glyphs.
+pub fn rasterize_unicode_fallback(bytes: &[u8]) -> Result<RasterizedUnicodeFallback, String> {
+    let face = ttf_parser::Face::parse(bytes, 0).map_err(|e| format!("{e}"))?;
+    let units = f32::from(face.ascender()) - f32::from(face.descender());
+    if units <= 0.0 { return Err("fallback font has no vertical metrics".into()); }
+    let scale = LINE_PIXELS / units;
+    let cap_height = face.capital_height().filter(|height| *height > 0)
+        .map(f32::from)
+        .or_else(|| face.glyph_index('H').and_then(|id| {
+            face.outline_glyph(id, &mut NullBuilder).map(|bounds| f32::from(bounds.y_max))
+        }).filter(|height| *height > 0.0))
+        .unwrap_or(units * 0.65) * scale;
+    // Byte glyphs are used only when Jura is explicitly selected for chat.
+    // Automatic missing-glyph fallback still preserves every stock byte.
+    const RANGES: &[(u32, u32)] = &[
+        (0x0020, 0x00FF), // Explicit Jura chat font (including ASCII)
+        (0x0100, 0x024F), // Extended Latin
+        (0x0250, 0x02FF), // IPA and modifiers
+        (0x0300, 0x036F), // Combining marks (shaping remains separate)
+        (0x0370, 0x052F), // Greek and Cyrillic
+        (0x1C80, 0x1C8F), // Cyrillic Extended-C
+        (0x1E00, 0x1EFF), // Latin Extended Additional
+        (0x2000, 0x218F), // Punctuation, currency, arrows, math symbols
+        (0x2C60, 0x2C7F), // Latin Extended-C
+        (0xA640, 0xA69F), // Cyrillic Extended-B
+    ];
+    struct Bitmap { ch: char, width: u32, height: u32, coverage: Vec<f32> }
+    let mut bitmaps = Vec::new();
+    let mut glyphs = std::collections::HashMap::new();
+    let mut bitmap_pixels = 0usize;
+    for &(first, last) in RANGES {
+        for code in first..=last {
+            let Some(ch) = char::from_u32(code) else { continue };
+            let Some(id) = face.glyph_index(ch) else { continue };
+            let advance = face.glyph_hor_advance(id).map_or(0.0, |n| f32::from(n) * scale);
+            let mut glyph = ProportionalGlyph {
+                horiz_advance: advance.round().clamp(0.0, i16::MAX as f32) as i16,
+                ..ProportionalGlyph::default()
+            };
+            let Some(bounds) = face.outline_glyph(id, &mut NullBuilder) else {
+                glyphs.insert(ch, glyph);
+                continue;
+            };
+            let left = (f32::from(bounds.x_min) * scale).floor() as i32 - PAD;
+            let top = (f32::from(bounds.y_max) * scale).ceil() as i32 + PAD;
+            let right = (f32::from(bounds.x_max) * scale).ceil() as i32 + PAD;
+            let bottom = (f32::from(bounds.y_min) * scale).floor() as i32 - PAD;
+            let (width, height) = ((right - left).max(1) as u32, (top - bottom).max(1) as u32);
+            // Bound allocations before rasterizing, including malformed fonts
+            // with extreme bounds/vertical metrics. Packing adds further gaps.
+            bitmap_pixels += width as usize * height as usize;
+            if width > ATLAS_WIDTH || height > 8192
+                || bitmap_pixels > ATLAS_WIDTH as usize * 8192
+                || i16::try_from(left).is_err()
+            {
+                return Err("Jura glyph bitmaps exceed the fallback atlas limit".into());
+            }
+            let mut outline = Outline {
+                scale, offset: [-left as f32, top as f32],
+                start: [0.0; 2], last: [0.0; 2], lines: Vec::new(),
+            };
+            face.outline_glyph(id, &mut outline);
+            glyph.width = width as i16;
+            glyph.height = height as i16;
+            glyph.horiz_offset = left as i16;
+            glyph.baseline = top;
+            glyphs.insert(ch, glyph);
+            bitmaps.push(Bitmap {
+                ch, width, height,
+                coverage: rasterize_lines(&outline.lines, width as usize, height as usize),
+            });
+        }
+    }
+    if bitmaps.is_empty() { return Err("Jura has no glyphs in the expected Unicode ranges".into()); }
+    bitmaps.sort_by_key(|bitmap| std::cmp::Reverse(bitmap.height));
+    let align = |v: u32| v.div_ceil(CELL_ALIGN) * CELL_ALIGN;
+    let mut places = Vec::with_capacity(bitmaps.len());
+    let (mut x, mut y, mut shelf) = (0u32, 0u32, 0u32);
+    for bitmap in &bitmaps {
+        let (w, h) = (align(bitmap.width + 1), align(bitmap.height + 1));
+        if w > ATLAS_WIDTH { return Err("Jura glyph exceeds atlas width".into()); }
+        if x + w > ATLAS_WIDTH { x = 0; y += shelf; shelf = 0; }
+        places.push((x, y));
+        x += w;
+        shelf = shelf.max(h);
+    }
+    let atlas_height = (y + shelf).max(CELL_ALIGN).next_power_of_two();
+    if atlas_height > 8192 { return Err("Jura fallback glyph atlas exceeds 8192px height".into()); }
+    let (aw, ah) = (ATLAS_WIDTH as usize, atlas_height as usize);
+    let mut alpha = vec![0.0f32; aw * ah];
+    for (bitmap, &(px, py)) in bitmaps.iter().zip(&places) {
+        for row in 0..bitmap.height as usize {
+            let source = &bitmap.coverage[row * bitmap.width as usize..][..bitmap.width as usize];
+            alpha[(py as usize + row) * aw + px as usize..][..source.len()].copy_from_slice(source);
+        }
+        let glyph = glyphs.get_mut(&bitmap.ch).expect("glyph inserted before packing");
+        glyph.s = px as f32 / aw as f32;
+        glyph.t = py as f32 / ah as f32;
+        glyph.s2 = (px + bitmap.width) as f32 / aw as f32;
+        glyph.t2 = (py + bitmap.height) as f32 / ah as f32;
+    }
+    let mut rgba = Vec::new();
+    let (mut level, mut lw, mut lh) = (alpha, aw, ah);
+    let mut mip_level_count = 0;
+    while mip_level_count < MIP_LEVELS && lw > 0 && lh > 0 {
+        rgba.extend(level.iter().flat_map(|&a| [255, 255, 255, (a * 255.0).round() as u8]));
+        mip_level_count += 1;
+        if lw == 1 || lh == 1 { break; }
+        let (nw, nh) = (lw / 2, lh / 2);
+        level = (0..nw * nh).map(|i| {
+            let (x, y) = (i % nw * 2, i / nw * 2);
+            0.25 * (level[y * lw + x] + level[y * lw + x + 1]
+                + level[(y + 1) * lw + x] + level[(y + 1) * lw + x + 1])
+        }).collect();
+        (lw, lh) = (nw, nh);
+    }
+    Ok(RasterizedUnicodeFallback {
+        width: ATLAS_WIDTH, height: atlas_height, mip_level_count, rgba,
+        font: UnicodeFallbackFont { glyphs, height: LINE_PIXELS as i16, cap_height },
+    })
+}
+
 /// Bounds-only pass.
 struct NullBuilder;
 impl ttf_parser::OutlineBuilder for NullBuilder {
@@ -345,6 +488,32 @@ impl ttf_parser::OutlineBuilder for NullBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jura_packaged_font_rasterizes_to_bounded_unicode_atlas() {
+        use std::io::Read;
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/dinurdo-assets.pk4");
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        archive.by_name("fonts/Jura-Bold.ttf").unwrap().read_to_end(&mut bytes).unwrap();
+        assert_eq!(ttf_parser::Face::parse(&bytes, 0).unwrap().weight().to_number(), 700);
+        let atlas = rasterize_unicode_fallback(&bytes).unwrap();
+        assert_eq!(atlas.width, ATLAS_WIDTH);
+        assert!(atlas.height <= 8192 && atlas.height.is_power_of_two());
+        assert_eq!(atlas.mip_level_count, MIP_LEVELS);
+        assert!(atlas.font.cap_height > 0.0 && atlas.font.cap_height < LINE_PIXELS);
+        assert!(atlas.font.glyphs.contains_key(&'Ж') && atlas.font.glyphs.contains_key(&'λ'));
+        assert!(!atlas.font.glyphs.contains_key(&'你'));
+        assert!(atlas.font.glyphs.contains_key(&'A') && atlas.font.glyphs.contains_key(&'?'));
+        assert!(atlas.font.glyphs.values().all(|g| g.s >= 0.0 && g.t >= 0.0
+            && g.s2 <= 1.0 && g.t2 <= 1.0));
+        let expected: usize = (0..MIP_LEVELS)
+            .map(|mip| (atlas.width >> mip) as usize * (atlas.height >> mip) as usize * 4).sum();
+        assert_eq!(atlas.rgba.len(), expected);
+        assert!(atlas.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        assert!(rasterize_unicode_fallback(b"invalid font").is_err());
+    }
 
     #[test]
     fn square_coverage_is_exact_inside_and_partial_on_edges() {

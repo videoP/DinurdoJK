@@ -139,7 +139,7 @@ pub(in crate::renderer) fn create_ui_texture_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
-    images: [&GpuImage; 10],
+    images: [&GpuImage; 11],
     encoded: bool,
 ) -> wgpu::BindGroup {
     let views: Vec<_> = images.iter().map(|image| {
@@ -160,6 +160,7 @@ pub(in crate::renderer) fn create_ui_texture_group(
             wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(&views[7]) },
             wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&views[8]) },
             wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&views[9]) },
+            wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&views[10]) },
         ],
     })
 }
@@ -481,6 +482,7 @@ impl Renderer {
             &self._ui_font, &self._ui_small_font, splash, &self._ui_keys,
             &self._ui_icons, &self._ui_team_icons, &self._ui_ext_images,
             &self._ui_clean_font, &self._ui_avatars, &self._ui_remap_thumbs,
+            &self._ui_jura_font,
         ];
         self.ui_bind_group = create_ui_texture_group(
             &self.device, &self.ui_texture_layout, &self._ui_font_sampler, images, false);
@@ -2192,6 +2194,7 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn rebuild_retained_ui(&mut self) {
+        let _unicode_scope = ui::UnicodeFallbackScope::enter(self.ui_jura_metrics.clone());
         let trace_started = self.ui_trace.then(Instant::now);
         if self.ui_state.video.skip_ui {
             self.ui_vertex_count = 0;
@@ -2230,6 +2233,7 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn rebuild_dynamic_ui(&mut self) {
+        let _unicode_scope = ui::UnicodeFallbackScope::enter(self.ui_jura_metrics.clone());
         let trace_started = self.ui_trace.then(Instant::now);
         self.ui_dynamic_vertices.clear();
         self.ui_dynamic_stable_vertex_count = 0;
@@ -2288,6 +2292,7 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn rebuild_movement_ui(&mut self) {
+        let _unicode_scope = ui::UnicodeFallbackScope::enter(self.ui_jura_metrics.clone());
         let trace_started = self.ui_trace.then(Instant::now);
         if self.ui_state.video.skip_ui {
             self.ui_dynamic_vertex_count = 0;
@@ -2335,6 +2340,7 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn rebuild_transient_ui(&mut self) {
+        let _unicode_scope = ui::UnicodeFallbackScope::enter(self.ui_jura_metrics.clone());
         let trace_started = self.ui_trace.then(Instant::now);
         self.ui_transient_vertices.clear();
         if self.ui_state.video.skip_ui {
@@ -2381,6 +2387,7 @@ impl Renderer {
         view_proj: Mat4,
         dynamic_crosshair_world: Option<[f32; 3]>,
     ) {
+        let _unicode_scope = ui::UnicodeFallbackScope::enter(self.ui_jura_metrics.clone());
         self.ui_transient_vertices
             .truncate(self.ui_transient_stable_vertex_count);
         if self.ui_state.video.skip_ui {
@@ -3468,6 +3475,47 @@ pub(in crate::renderer) fn load_ui_clean_font(
         }
     }
     (empty_ui_font_texture("JKA missing clean UI font"), None)
+}
+
+/// Built-in Unicode fallback companion. This is deliberately not a replacement
+/// for `ocr_a` or any other JKA font. Missing file disables fallback cleanly.
+/// The shipped Jura-Bold.ttf belongs in GameData/DinurdoJK/fonts/.
+pub(in crate::renderer) fn load_ui_jura_fallback(
+    base: &Path, game: Option<&Path>,
+) -> (TextureData, Option<ui::UnicodeFallbackFont>) {
+    const MAX_BYTES: usize = 16 * 1024 * 1024;
+    let root = base.parent().unwrap_or(base);
+    let bundled = root.join("DinurdoJK").join("fonts").join("Jura-Bold.ttf");
+    let bytes = (|| {
+        use std::io::Read;
+        let file = std::fs::File::open(&bundled).ok()?;
+        if file.metadata().ok()?.len() > MAX_BYTES as u64 { return None; }
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes).ok()?;
+        (bytes.len() <= MAX_BYTES).then_some(bytes)
+    })().or_else(|| {
+        let mut assets = AssetSearchPath::open_game(base, game).ok()?;
+        Some(assets.read("fonts/Jura-Bold.ttf", MAX_BYTES).ok()??.bytes)
+    });
+    let Some(bytes) = bytes else {
+        eprintln!("Unicode fallback disabled: put Jura-Bold.ttf in {}", bundled.display());
+        return (empty_ui_font_texture("Jura Unicode fallback unavailable"), None);
+    };
+    match ui::rasterize_unicode_fallback(&bytes) {
+        Ok(fallback) => (
+            TextureData {
+                label: "Jura Unicode missing-glyph atlas".to_owned(),
+                source: None, width: fallback.width, height: fallback.height,
+                rgba: fallback.rgba.into(), rgba16f: None,
+                mip_level_count: fallback.mip_level_count, clamp: true, srgb: false,
+            },
+            Some(fallback.font),
+        ),
+        Err(error) => {
+            eprintln!("Unicode fallback Jura-Bold.ttf: {error}");
+            (empty_ui_font_texture("Jura Unicode fallback error"), None)
+        }
+    }
 }
 
 /// Studio overlay font for `choice`: `ui::STUDIO_FONT_CLASSIC` is JKA's

@@ -677,7 +677,7 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
         .set_mode(&renderer.queue, video.footprints);
     let effective_lighting = video.effective_relighting();
     // Session-only A/B still needs to apply if changed before renderer startup.
-    renderer.blue_sky_cube_ab = video.blue_sky_cube_ab.min(1);
+    renderer.blue_sky_cube_ab = if video.environment_mode == 0 { video.blue_sky_cube_ab.min(1) } else { 0 };
     renderer.set_post_effects(PostEffects {
         thermal_vision: video.thermal_vision,
         hdr: video.hdr,
@@ -708,6 +708,7 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
         fog_strength: video.fog_strength,
         relighting_mode: video.active_relighting_mode(),
         sun_override: video.sun_override,
+        sky_sun_custom: video.sky_sun_custom,
         sun_yaw: video.sun_yaw,
         sun_pitch: video.sun_pitch,
         sun_intensity: video.sun_intensity,

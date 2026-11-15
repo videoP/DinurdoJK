@@ -1224,6 +1224,7 @@ impl Renderer {
                 texture_entry(8),
                 texture_entry(9),
                 texture_entry(10),
+                texture_entry(11),
             ],
         });
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1304,6 +1305,8 @@ impl Renderer {
         let ui_small_font = upload_cached_texture(&device, &queue, &ui_small_font_data);
         let (ui_clean_font_data, ui_clean_font_metrics) = load_ui_clean_font(base, game);
         let ui_clean_font = upload_cached_texture(&device, &queue, &ui_clean_font_data);
+        let (ui_jura_data, ui_jura_metrics) = super::overlay::load_ui_jura_fallback(base, game);
+        let ui_jura_font = upload_cached_texture(&device, &queue, &ui_jura_data);
         // Filled in the background the first time a scoreboard is shown.
         let ui_avatars = upload_cached_texture(&device, &queue, &empty_ui_font_texture("JKA UI avatar atlas (not loaded)"));
         let ui_remap_thumbs = upload_cached_texture(&device, &queue, &empty_ui_font_texture("Shader Remaps thumbnails (not loaded)"));
@@ -1351,7 +1354,7 @@ impl Renderer {
         let ui_images = [
             &ui_font, &ui_small_font, &ui_splash, &ui_keys, &ui_icons,
             &ui_team_icons, &ui_ext_images, &ui_clean_font, &ui_avatars,
-            &ui_remap_thumbs,
+            &ui_remap_thumbs, &ui_jura_font,
         ];
         let ui_bind_group = super::overlay::create_ui_texture_group(
             &device, &ui_texture_layout, &ui_font_sampler, ui_images, false);
@@ -2586,6 +2589,8 @@ impl Renderer {
             ui_bind_group,
             ui_encoded_bind_group,
             _ui_font: ui_font,
+            _ui_jura_font: ui_jura_font,
+            ui_jura_metrics: ui_jura_metrics.map(std::sync::Arc::new),
             _ui_small_font: ui_small_font,
             _ui_clean_font: ui_clean_font,
             ui_clean_font_metrics: ui_clean_font_metrics.map(std::sync::Arc::new),
@@ -2729,6 +2734,7 @@ impl Renderer {
             contact_shadows_enabled: false,
             relighting_mode: 0,
             sun_override: false,
+            sky_sun_custom: false,
             sun_yaw: 314.25595,
             sun_pitch: 57.04725,
             sun_intensity: 250.0,

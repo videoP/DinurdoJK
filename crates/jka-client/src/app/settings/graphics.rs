@@ -357,7 +357,7 @@ impl App {
     }
 
     pub(in crate::app) fn set_sun_override(&mut self, enabled: bool, seed_from_map: bool) {
-        if enabled && !self.video.sun_override && seed_from_map && !self.sun_custom_initialized {
+        if enabled && !self.video.sun_override && seed_from_map && !self.sun_custom_initialized && !self.video.sky_sun_custom {
             if let Some((yaw, pitch, intensity, color)) = self.map_sun_editor_values() {
                 self.video.sun_yaw = yaw;
                 self.video.sun_pitch = pitch;
@@ -367,16 +367,11 @@ impl App {
         }
         if enabled {
             self.sun_custom_initialized = true;
-            if !self.video.sun_override {
-                // Enabling relighting also enables entity cascaded shadows.
-                // This is a one-way default: turning relighting off leaves the
-                // selected shadow method alone, and users can change it later.
-                self.video.cascaded_shadows = true;
-                self.video.dynamic_shadows = crate::ui::DynamicShadowsMode::CascadedShadowMapsEntities;
-            }
+            // The relighting renderer now resolves the needed CSM mode without
+            // mutating the saved quality-preset or ordinary shadow selection.
         }
         self.video.sun_override = enabled;
-        self.video.relighting_mode = if enabled { self.video.relighting_mode.clamp(1, 2) } else { 0 };
+        self.video.relighting_mode = if enabled { self.video.environment_mode.min(1) + 1 } else { 0 };
         if !enabled {
             self.baked_sun_debug_view = 0;
             self.sun_ray_until = None;
@@ -396,23 +391,76 @@ impl App {
     }
 
     pub(in crate::app) fn set_relighting_mode(&mut self, mode: u8) {
-        self.video.relighting_mode = mode.min(2);
+        if mode != 0 {
+            self.video.environment_mode = mode.min(2) - 1;
+        }
         self.set_sun_override(mode != 0, mode != 0);
+        self.render_command(RenderCommand::SetBlueSkyCubeAB(
+            if self.video.environment_mode == 0 { self.video.blue_sky_cube_ab } else { 0 },
+        ));
+    }
+
+    /// One shared Baked/Realtime choice, even if world relighting is off.
+    pub(in crate::app) fn set_environment_mode(&mut self, mode: u8) {
+        self.video.environment_mode = mode.min(1);
+        self.video.relighting_mode = if self.video.sun_override { self.video.environment_mode + 1 } else { 0 };
+        self.render_command(RenderCommand::SetBlueSkyCubeAB(
+            if self.video.environment_mode == 0 { self.video.blue_sky_cube_ab } else { 0 },
+        ));
+        if self.video.environment_mode == 1 && self.video.relight_match_system_time {
+            self.sync_relighting_system_clock(false, true);
+        }
+        // Baked needs entity cascades for the static bake; Realtime needs full
+        // world cascades. Switching modes must reselect them even if Relight
+        // world was already on before a preset changed r_dynamicShadows.
+        self.sync_cascaded_shadows();
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
+
+    /// Computed sun values only affect axes whose time lock remains enabled.
+    pub(in crate::app) fn automatic_relighting_sun(&self, hour: f32) -> (f32, f32, f32) {
+        let authored = self.map_sun_editor_values();
+        let defaults = crate::ui::VideoSettings::default();
+        let noon_yaw = authored.map_or(defaults.sun_yaw, |sun| sun.0);
+        let arc = relighting_celestial_arc(hour, noon_yaw);
+        let noon_intensity = authored.map_or(defaults.sun_intensity, |sun| sun.2);
+        let daylight = (arc.sun_elevation.to_radians().sin() / 60_f32.to_radians().sin()).clamp(0.0, 1.0);
+        (arc.sun_yaw, arc.sun_elevation, noon_intensity * daylight)
+    }
+
+    pub(in crate::app) fn set_sun_time_lock(&mut self, bit: u8, locked: bool) {
+        let bit = bit & 7;
+        if locked { self.video.sun_time_locks |= bit; }
+        else { self.video.sun_time_locks &= !bit; }
+        if locked {
+            let hour = self.relight_clock_effective.unwrap_or(self.video.relight_time);
+            self.apply_relighting_celestial_time(hour);
+        }
+        self.video.sky_sun_custom = true;
+        self.touch_sun_ray();
+        self.sync_post_effects();
+        self.mark_config_dirty();
+        self.publish_ui();
     }
 
     /// Apply one point on the existing artistic sun/moon arc. The caller chooses
     /// whether it is a user edit (archived) or a sampled OS clock (transient).
     pub(in crate::app) fn apply_relighting_celestial_time(&mut self, hour: f32) {
-        let noon_yaw = self.map_sun_editor_values()
-            .map(|(yaw, _, _, _)| yaw)
-            .unwrap_or_else(|| crate::ui::VideoSettings::default().sun_yaw);
-        let arc = relighting_celestial_arc(hour, noon_yaw);
-        self.video.sun_yaw = arc.sun_yaw;
-        self.video.sun_pitch = arc.sun_elevation;
-        // Retain authored intensity/color, moon phase and chosen shadow method.
-        self.video.blue_water_environment.moon_custom = true;
-        self.video.blue_water_environment.moon_azimuth = arc.moon_azimuth;
-        self.video.blue_water_environment.moon_elevation = arc.moon_elevation;
+        let (yaw, pitch, intensity) = self.automatic_relighting_sun(hour);
+        if self.video.sun_time_locks & crate::ui::VideoSettings::SUN_LOCK_YAW != 0 {
+            self.video.sun_yaw = yaw;
+        }
+        if self.video.sun_time_locks & crate::ui::VideoSettings::SUN_LOCK_PITCH != 0 {
+            self.video.sun_pitch = pitch;
+        }
+        if self.video.sun_time_locks & crate::ui::VideoSettings::SUN_LOCK_INTENSITY != 0 {
+            self.video.sun_intensity = intensity;
+        }
+        // Leave manually overridden moon angles alone; Blue Water derives
+        // automatic lunar angles from the effective sun and selected phase.
+        self.video.sky_sun_custom = true;
         self.sun_custom_initialized = true;
     }
 
@@ -437,7 +485,7 @@ impl App {
         // In Realtime, changing the source should be effective immediately.
         self.relight_clock_effective = None;
         if enabled {
-            if self.video.active_relighting_mode() == 2 {
+            if self.video.environment_mode == 1 {
                 self.sync_relighting_system_clock(false, true);
             }
             // In Baked, choosing the clock does not touch this map's bake.
@@ -456,10 +504,10 @@ impl App {
     /// Realtime is polled at most once a second and applied once per minute;
     /// Baked is only sampled at the MapPrepared -> LoadMap boundary.
     pub(in crate::app) fn sync_relighting_system_clock(&mut self, at_map_load: bool, force: bool) {
-        if !self.video.relight_match_system_time || !self.video.sun_override {
+        if !self.video.relight_match_system_time {
             return;
         }
-        if !at_map_load && self.video.active_relighting_mode() != 2 {
+        if !at_map_load && self.video.environment_mode != 1 {
             return;
         }
         if !force && !at_map_load && self.relight_clock_last_poll.elapsed() < std::time::Duration::from_secs(1) {
@@ -531,6 +579,8 @@ impl App {
 
     pub(in crate::app) fn set_sun_yaw(&mut self, yaw: f32) {
         self.video.sun_yaw = yaw.rem_euclid(360.0);
+        self.video.sun_time_locks &= !crate::ui::VideoSettings::SUN_LOCK_YAW;
+        self.video.sky_sun_custom = true;
         self.sun_custom_initialized = true;
         self.touch_sun_ray();
         self.sync_post_effects();
@@ -540,6 +590,8 @@ impl App {
 
     pub(in crate::app) fn set_sun_pitch(&mut self, pitch: f32) {
         self.video.sun_pitch = pitch.clamp(-90.0, 90.0);
+        self.video.sun_time_locks &= !crate::ui::VideoSettings::SUN_LOCK_PITCH;
+        self.video.sky_sun_custom = true;
         self.sun_custom_initialized = true;
         self.touch_sun_ray();
         self.sync_post_effects();
@@ -549,6 +601,8 @@ impl App {
 
     pub(in crate::app) fn set_sun_intensity(&mut self, intensity: f32) {
         self.video.sun_intensity = intensity.max(0.0);
+        self.video.sun_time_locks &= !crate::ui::VideoSettings::SUN_LOCK_INTENSITY;
+        self.video.sky_sun_custom = true;
         self.sun_custom_initialized = true;
         self.sync_post_effects();
         self.mark_config_dirty();
@@ -557,6 +611,7 @@ impl App {
 
     pub(in crate::app) fn set_sun_color(&mut self, color: [f32; 3]) {
         self.video.sun_color = color.map(|channel| channel.clamp(0.0, 1.0));
+        self.video.sky_sun_custom = true;
         self.sun_custom_initialized = true;
         self.sync_post_effects();
         self.mark_config_dirty();
@@ -784,6 +839,7 @@ impl App {
             fog_strength: self.video.fog_strength,
             relighting_mode: self.video.active_relighting_mode(),
             sun_override: self.video.sun_override,
+            sky_sun_custom: self.video.sky_sun_custom,
             sun_yaw: self.video.sun_yaw,
             sun_pitch: self.video.sun_pitch,
             sun_intensity: self.video.sun_intensity,

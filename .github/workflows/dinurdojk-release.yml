@@ -192,7 +192,7 @@ jobs:
           # All notices are tracked files. Fail NOW, before 30 minutes of Cargo.
           foreach ($name in @('FFmpeg-GPL-3.0.txt', 'FFmpeg-SOURCE-NOTICE.txt',
                                'OpenAL-Soft-LGPL-2.0.txt', 'DXC-LICENSE.txt',
-                               'DXC-ThirdPartyNotices.txt')) {
+                               'DXC-ThirdPartyNotices.txt', 'Jura-OFL.txt')) {
             if (-not (Test-Path -LiteralPath (Join-Path 'release-licenses' $name) -PathType Leaf)) {
               throw "Missing committed release-licenses/$name. Run release-licenses/Fetch-Official-Notices.cmd locally, then commit the files."
             }
@@ -412,7 +412,7 @@ jobs:
           }
           # The packager understands either staging layout, but always publishes
           # the updated DinurdoJK/dependencies layout in its signed manifest.
-          foreach ($dll in @('nvngx_dlss.dll', 'OpenALSoft.x86_64.dll')) {
+          foreach ($dll in @('phonon.dll', 'nvngx_dlss.dll', 'OpenALSoft.x86_64.dll')) {
             if (-not (Test-Path "target/release/DinurdoJK/dependencies/$dll" -PathType Leaf) -and
                 -not (Test-Path "target/release/$dll" -PathType Leaf)) {
               throw "Missing required runtime $dll (checked dependencies and legacy staging)."
@@ -430,7 +430,7 @@ jobs:
           New-Item -ItemType Directory -Force $licenseDir | Out-Null
           foreach ($name in @('OpenAL-Soft-LGPL-2.0.txt', 'DXC-LICENSE.txt',
                               'DXC-ThirdPartyNotices.txt', 'FFmpeg-GPL-3.0.txt',
-                              'FFmpeg-SOURCE-NOTICE.txt')) {
+                              'FFmpeg-SOURCE-NOTICE.txt', 'Jura-OFL.txt')) {
             Copy-Item -LiteralPath (Join-Path 'release-licenses' $name) -Destination (Join-Path $licenseDir $name) -ErrorAction Stop
           }
           Copy-Item (Join-Path $env:DLSS_SDK 'LICENSE.txt') (Join-Path $licenseDir 'NVIDIA-DLSS-SDK-LICENSE.txt') -ErrorAction Stop
@@ -450,7 +450,7 @@ jobs:
           # The full ZIP is for new/manual installations. Individual assets
           # are for the updater; the signed manifest binds their exact hashes.
           $archive = "dist/release/DinurdoJK-${{ steps.version.outputs.tag }}-full.zip"
-          python -c 'import sys, json, zipfile, pathlib, hashlib; p=pathlib.Path(sys.argv[1]); d=p.parent; z=zipfile.ZipFile(p); m=json.loads((d/"release-manifest.json").read_bytes()); files=set(m["files"]); names=set(z.namelist()); notices={n for n in names if n.startswith("licenses/")}; required={"licenses/FFmpeg-GPL-3.0.txt","licenses/FFmpeg-SOURCE-NOTICE.txt","licenses/OpenAL-Soft-LGPL-2.0.txt","licenses/DXC-LICENSE.txt","licenses/DXC-ThirdPartyNotices.txt","licenses/NVIDIA-DLSS-SDK-LICENSE.txt"}; assert m["format"]==2; assert names==files|notices; assert required<=notices; assert all(not n.lower().endswith(".txt") for n in files); assert {"DinurdoJK.exe","DinurdoJK/shared/dinurdo-assets.pk4","DinurdoJK/dependencies/dxcompiler.dll","DinurdoJK/dependencies/dxil.dll","DinurdoJK/dependencies/ffmpeg.exe"}<=files; assert all(hashlib.sha256(z.read(n)).hexdigest()==f["sha256"] for n,f in m["files"].items()); print("Verified runtime-only signed manifest and full ZIP license notices")' $archive
+          python -c 'import sys, json, zipfile, pathlib, hashlib; p=pathlib.Path(sys.argv[1]); d=p.parent; z=zipfile.ZipFile(p); m=json.loads((d/"release-manifest.json").read_bytes()); files=set(m["files"]); names=set(z.namelist()); notices={n for n in names if n.startswith("licenses/")}; required={"licenses/Jura-OFL.txt","licenses/FFmpeg-GPL-3.0.txt","licenses/FFmpeg-SOURCE-NOTICE.txt","licenses/OpenAL-Soft-LGPL-2.0.txt","licenses/DXC-LICENSE.txt","licenses/DXC-ThirdPartyNotices.txt","licenses/NVIDIA-DLSS-SDK-LICENSE.txt"}; assert m["format"]==2; assert names==files|notices; assert required<=notices; assert all(not n.lower().endswith(".txt") for n in files); assert {"DinurdoJK.exe","DinurdoJK/shared/dinurdo-assets.pk4","DinurdoJK/dependencies/dxcompiler.dll","DinurdoJK/dependencies/dxil.dll","DinurdoJK/dependencies/ffmpeg.exe"}<=files; assert all(hashlib.sha256(z.read(n)).hexdigest()==f["sha256"] for n,f in m["files"].items()); print("Verified runtime-only signed manifest and full ZIP license notices")' $archive
           if ($LASTEXITCODE -ne 0) { throw 'Release layout, notices or hashes failed verification.' }
 
       - name: Upload signed updater artifact
@@ -591,7 +591,7 @@ jobs:
           binary=target/release/DinurdoJK
           test -x "$binary"
           lipo -archs "$binary" | tr ' ' '\n' | grep -Fx '${{ matrix.arch }}'
-          phonon="$(ls -t target/release/build/audionimbus-sys-*/out/lib/libphonon.dylib 2>/dev/null | head -n 1 || true)"
+          phonon="$(ls -t target/release/build/audionimbus-sys-*/out/lib/libphonon.dylib target/release/build/audionimbus-sys/*/out/lib/libphonon.dylib 2>/dev/null | head -n 1 || true)"
           test -n "$phonon" || { echo 'Steam Audio libphonon.dylib not found in the build output' >&2; exit 1; }
           lipo -archs "$phonon" | tr ' ' '\n' | grep -Fx '${{ matrix.arch }}'
           mkdir -p dist/stage
@@ -790,7 +790,7 @@ jobs:
           readelf -h "$binary" | grep -q 'Machine:.*Advanced Micro Devices X86-64'
           readelf -d "$binary" | grep -Fq '$ORIGIN/DinurdoJK/dependencies'
           # Valve's library from this build's audionimbus OUT_DIR; never a system phonon.
-          phonon="$(ls -t target/release/build/audionimbus-sys-*/out/lib/libphonon.so 2>/dev/null | head -n 1 || true)"
+          phonon="$(ls -t target/release/build/audionimbus-sys-*/out/lib/libphonon.so target/release/build/audionimbus-sys/*/out/lib/libphonon.so 2>/dev/null | head -n 1 || true)"
           test -n "$phonon" || { echo 'Steam Audio libphonon.so not found in the build output' >&2; exit 1; }
           readelf -h "$phonon" | grep -q 'Machine:.*Advanced Micro Devices X86-64'
           mkdir -p dist/linux-check/DinurdoJK/dependencies

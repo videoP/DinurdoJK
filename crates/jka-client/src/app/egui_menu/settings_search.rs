@@ -31,6 +31,8 @@ fn category(item: SearchItem) -> &'static str {
             VideoSection::Geometry => "Geometry",
             VideoSection::Lighting => "Lighting",
             VideoSection::Relighting => "Relighting",
+            VideoSection::EnvironmentLooks => "Looks & profiles",
+            VideoSection::AdvancedEnvironment => "Advanced environment",
             VideoSection::Materials => "Material rendering",
             VideoSection::Effects => "Effects",
             VideoSection::PostProcessing => "Post processing",

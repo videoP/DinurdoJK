@@ -102,6 +102,25 @@ fn clock_ticks_do_not_mark_a_profile_modified_but_manual_edits_do() {
 }
 
 #[test]
+fn locked_time_axes_are_transient_but_unlocked_absolute_overrides_are_edits() {
+    let mut video = VideoSettings::default();
+    video.relight_match_system_time = true;
+    let saved = capture(&video);
+    video.sun_yaw += 15.0;
+    video.sun_pitch -= 8.0;
+    video.sun_intensity *= 0.4;
+    assert!(values_match(&capture(&video), &saved));
+    video.sun_time_locks &= !VideoSettings::SUN_LOCK_YAW;
+    assert!(!values_match(&capture(&video), &saved));
+    video.sun_time_locks = 7;
+    let mut manual = video;
+    manual.sun_time_locks = 0;
+    let manual_snapshot = capture(&manual);
+    manual.sun_pitch += 10.0;
+    assert!(!values_match(&capture(&manual), &manual_snapshot));
+}
+
+#[test]
 fn library_round_trip_map_folders_rename_and_failed_save_preserve_work() {
     let fixture = crate::cvar_compatibility::Fixture::new();
     let root = fixture.0.join("light_profiles");

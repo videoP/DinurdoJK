@@ -1,19 +1,25 @@
-// Analytic day/night gain for the *vanilla* JKA sky backend. Unlike the Blue
-// Water path this never samples an atmosphere atlas or changes the sky art.
-// A deliberately conservative approximation: preserve authored daytime
-// lightmaps, dim their sky-dependent share toward night, and retain more light
-// inside sheltered spaces. Local promoted lights are composed separately.
-fn vanilla_sky_gain(normal: vec3<f32>, toward_sun: vec3<f32>, sky_open: f32, strength: f32) -> vec3<f32> {
-    let elevation = clamp(toward_sun.y, -1.0, 1.0);
-    let t = clamp((elevation + 0.10) / 0.30, 0.0, 1.0);
-    let day = t * t * (3.0 - 2.0 * t);
-    let openness = clamp(sky_open, 0.0, 1.0);
-    // Sheltered receivers retain baked interior illumination; exposed
-    // receivers can approach genuine night darkness. Up-facing surfaces
-    // receive somewhat more sky contribution than walls/undersides.
-    let facing = 0.70 + 0.30 * max(normal.y, 0.0);
-    let darkening = (1.0 - day) * (0.08 + 0.87 * openness * facing);
-    return vec3<f32>(mix(1.0, clamp(1.0 - darkening, 0.05, 1.0), clamp(strength, 0.0, 1.0)));
+// Vanilla changes only the visible sky, not the time-of-day world exposure.
+// Use the SAME calibrated night/day response as Blue Water, without Blue
+// Water's atmospheric tint or moonlight. Previously the vanilla-only
+// sky-open heuristic preserved ~60% of baked daylight on half-open surfaces
+// at midnight, so switching from Blue Water brightened the map dramatically.
+// The optional authored-room protection still uses the sky openness estimate.
+fn vanilla_sky_gain(_normal: vec3<f32>, toward_sun: vec3<f32>, sky_open: f32,
+                    strength: f32, isolate: bool, calibration: vec4<f32>) -> vec3<f32> {
+    let calibrated = sky_gain_calibrated(vec3<f32>(0.03), vec3<f32>(1.0),
+        clamp(toward_sun.y, -1.0, 1.0), calibration);
+    let authored_share = select(1.0,
+        sky_transport_daylight_share(vec2<f32>(clamp(sky_open, 0.0, 1.0), 0.0)), isolate);
+    return mix(vec3<f32>(1.0), calibrated, clamp(strength * authored_share, 0.0, 1.0));
+}
+
+// Room protection uses a fixed sky-transport response, not the live moon's
+// visibility. Small but sustained indirect sky access can account for nearly
+// all the authored illumination in an outdoor shadow. Ignore the weakest
+// transport/noise, then smoothly reach full daylight dependence at 8% response
+// to the unit white sky. This is an estimated share, not source reconstruction.
+fn sky_transport_daylight_share(response: vec2<f32>) -> f32 {
+    return smoothstep(0.01, 0.08, max(response.x + response.y, 0.0));
 }
 
 // r_skyWorldGainMode calibration of the Blue Water world gain `full`.

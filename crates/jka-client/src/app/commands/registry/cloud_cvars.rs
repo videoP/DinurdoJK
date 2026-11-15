@@ -357,16 +357,16 @@ app_cvars! {
     }
     APP_R_BLUESKYCUBEAB {
         runtime: CvarDef::new("r_blueSkyCubeAB", "1", "0|1",
-            "Clear Blue Water sky A/B in Relighting Baked (r_relightMap 1): 0 original live atmosphere on BSP sky polygons, 1 cached five r_picmip-scaled faces (2048x2048 at picmip 0) + a 2x2 down face. Default 1 preserves existing Baked behavior. Native clouds or Blue Water native weather use the live fallback. Does NOT change r_skyWorldBakeAB, world lighting, CSM, or the sky environment used by ocean/models. Saved in video settings; benchmark with fixed time/camera and r_gpuTimings 1.",
+            "Clear Blue Water sky A/B in Environment Baked (r_environmentMode baked): 0 original live atmosphere on BSP sky polygons, 1 cached five r_picmip-scaled faces (2048x2048 at picmip 0) + a 2x2 down face. Default 1 preserves existing Baked behavior. Native clouds or Blue Water native weather use the live fallback. Does NOT change r_skyWorldBakeAB, world lighting, CSM, or the sky environment used by ocean/models. Saved in video settings; benchmark with fixed time/camera and r_gpuTimings 1.",
             CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Int(app.video.blue_sky_cube_ab as i32),
             |app, value| {
                 let CvarValue::Int(value) = value else { unreachable!() };
                 app.video.blue_sky_cube_ab = value as u8;
-                app.render_command(RenderCommand::SetBlueSkyCubeAB(value as u8));
+                app.render_command(RenderCommand::SetBlueSkyCubeAB(if app.video.environment_mode == 0 { value as u8 } else { 0 }));
                 app.mark_config_dirty();
                 app.publish_ui();
-                app.push_console_line(format!("^3BLUE SKY CUBE A/B:^7 {} ({}). Active with r_skyBackend 1, r_relightMap 1, r_fastsky 0, native clouds/weather off; other relighting modes retain their original sky path.", value,
+                app.push_console_line(format!("^3BLUE SKY CUBE A/B:^7 {} ({}). Active with r_skyBackend 1, r_environmentMode baked, r_fastsky 0, native clouds/weather off; Realtime stays live.", value,
                     if value == 0 { "A: live atmosphere" } else { "B: cached cube" }));
                 Ok(())
             }),

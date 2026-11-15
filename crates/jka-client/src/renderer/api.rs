@@ -920,6 +920,7 @@ pub struct PostEffects {
     /// 0 Off, 1 Baked, 2 Realtime. Sky display uses the same mode as relighting.
     pub relighting_mode: u8,
     pub sun_override: bool,
+    pub sky_sun_custom: bool,
     pub sun_yaw: f32,
     pub sun_pitch: f32,
     pub sun_intensity: f32,
@@ -936,7 +937,7 @@ pub struct PostEffects {
     pub baked_sun_cache: bool,
     pub lightmap_smoothing: u8,
     pub baked_sun_aa: u8,
-    /// Session diagnostics: lightmap signal view 0..8, receiver normals 0..2,
+    /// Session diagnostics: lightmap signal view 0..11, receiver normals 0..2,
     /// shadow-terminator ray origins.
     pub lightmap_signal: u8,
     pub sun_receiver_normals: u8,

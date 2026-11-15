@@ -11,6 +11,7 @@ pub use hud::layout::HudAnchor;
 pub use hud::movement::{FORCE_ICON_NAMES, FORCE_EXTENSION_ICON_NAMES, FORCE_POWER_INTERNAL_NAMES, FORCE_POWER_NAMES, FORCE_POWER_SIDES, FORCE_POWER_SORTED};
 #[allow(unused_imports)]
 pub use text::ProportionalGlyph;
+pub(crate) use text::UnicodeFallbackScope;
 mod chat;
 mod compose;
 mod studio_race;
@@ -66,7 +67,7 @@ pub(crate) fn append_native_hud_images(images: &mut Vec<String>, style: u8, jk2_
 pub(crate) use studio_race::leaderboard_bounds;
 mod ttf_font;
 pub(crate) use ttf_font::{
-    system_font_dirs, list_system_fonts, rasterize as rasterize_ttf_font, studio_default_system_fonts, STUDIO_FONT_CLASSIC,
+    system_font_dirs, list_system_fonts, rasterize as rasterize_ttf_font, rasterize_unicode_fallback, UnicodeFallbackFont, studio_default_system_fonts, STUDIO_FONT_CLASSIC,
     STUDIO_PACKAGED_FONTS,
 };
 pub(crate) use studio_race::draw_labels as draw_studio_labels;
@@ -292,10 +293,26 @@ pub enum ChatMode {
 }
 
 /// `cg_chat*` presentation settings for the DinurdoJK chat box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ChatFont {
+    Classic = 0,
+    Jura = 1,
+    Modern = 2,
+}
+
+impl ChatFont {
+    pub fn from_index(value: i32) -> Self {
+        match value { 1 => Self::Jura, 2 => Self::Modern, _ => Self::Classic }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChatSettings {
-    /// 0 = classic top bar; 1 = docked with modern font; 2 = docked with JKA font.
+    /// 0 = classic top bar; 1 = docked. 2 is retained for old saved configs.
     pub style: u8,
+    /// None migrates the font from an old combined style setting.
+    pub font_override: Option<ChatFont>,
     /// Messages shown at full strength while typing.
     pub history_lines: u8,
     /// Seconds a message stays on screen before it fades.
@@ -308,11 +325,18 @@ pub struct ChatSettings {
 
 impl ChatSettings {
     pub fn docked(&self) -> bool { self.style != 0 }
+    pub fn font(&self) -> ChatFont {
+        self.font_override.unwrap_or(if self.style == 1 { ChatFont::Modern } else { ChatFont::Classic })
+    }
+    pub fn set_style(&mut self, style: u8) {
+        self.font_override = Some(if style == 2 { ChatFont::Classic } else { self.font() });
+        self.style = u8::from(style != 0);
+    }
 }
 
 impl Default for ChatSettings {
     fn default() -> Self {
-        Self { style: 2, history_lines: 8, fade_time: 10.0, history_time: 120.0, mute_after_attack: 2.0 }
+        Self { style: 2, font_override: None, history_lines: 8, fade_time: 10.0, history_time: 120.0, mute_after_attack: 2.0 }
     }
 }
 

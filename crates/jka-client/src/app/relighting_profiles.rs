@@ -18,6 +18,9 @@ const MAX_PROFILES: usize = 256;
 // new cvar is added. Sky/cloud appearance uses its archived, live video cvars.
 const LIGHTING_CVARS: &[&str] = &[
     "r_relightMap",
+    "r_environmentMode",
+    "r_skySunCustom",
+    "r_sunTimeLocks",
     "r_relightTime",
     "r_relightMatchSystemTime",
     "r_sunYaw",
@@ -119,19 +122,20 @@ fn values_match(current: &Values, saved: &Values) -> bool {
         && saved
             .get("r_relightMatchSystemTime")
             .is_some_and(|v| v == "1");
+    // A clock update is not an edit only for axes still controlled by time.
+    // Absolute manual overrides must remain detectable as unsaved changes.
+    let locks = saved.get("r_sunTimeLocks")
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or(7);
     current.len() == saved.len()
         && saved.iter().all(|(name, value)| {
-            // Polling the clock changes these positions without being a user edit.
-            (clock
-                && matches!(
-                    name.as_str(),
-                    "r_sunYaw"
-                        | "r_sunPitch"
-                        | "r_blueSkyMoonElevation"
-                        | "r_blueSkyMoonAzimuth"
-                        | "r_blueSkyMoonCustom"
-                ))
-                || current.get(name) == Some(value)
+            (clock && match name.as_str() {
+                "r_sunYaw" => locks & VideoSettings::SUN_LOCK_YAW != 0,
+                "r_sunPitch" => locks & VideoSettings::SUN_LOCK_PITCH != 0,
+                "r_sunIntensity" => locks & VideoSettings::SUN_LOCK_INTENSITY != 0,
+                "r_blueSkyMoonElevation" | "r_blueSkyMoonAzimuth" | "r_blueSkyMoonCustom" => true,
+                _ => false,
+            }) || current.get(name) == Some(value)
         })
 }
 
@@ -308,7 +312,7 @@ impl App {
     /// and shadow choices. Clock matching goes last.
     fn set_relighting_values(&mut self, values: &Values) -> Result<(), String> {
         self.set_console_cvar("r_relightMatchSystemTime", "0")?;
-        for name in ["r_relightMap", "r_relightTime"] {
+        for name in ["r_relightMap", "r_environmentMode", "r_relightTime"] {
             if let Some(value) = values.get(name) {
                 self.set_console_cvar(name, value)?;
             }
@@ -316,13 +320,20 @@ impl App {
         for (name, value) in values {
             if !matches!(
                 name.as_str(),
-                "r_relightMap" | "r_relightTime" | "r_relightMatchSystemTime"
+                "r_relightMap" | "r_environmentMode" | "r_relightTime" | "r_relightMatchSystemTime"
+                    | "r_sunTimeLocks" | "r_skySunCustom"
             ) {
                 self.set_console_cvar(name, value)?;
             }
         }
-        if let Some(value) = values.get("r_relightMatchSystemTime") {
-            self.set_console_cvar("r_relightMatchSystemTime", value)?;
+        // Manual sun setters intentionally unlock their own axis. Reapply the
+        // saved time-lock mask afterward so absolute overrides and automatic
+        // axes both survive profile load. skySunCustom goes last because the
+        // time/lock setters enable the visual sun while editing.
+        for name in ["r_sunTimeLocks", "r_skySunCustom", "r_relightMatchSystemTime"] {
+            if let Some(value) = values.get(name) {
+                self.set_console_cvar(name, value)?;
+            }
         }
         Ok(())
     }

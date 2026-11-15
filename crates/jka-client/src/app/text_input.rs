@@ -63,18 +63,16 @@ impl App {
     pub(in crate::app) fn insert_console_text(&mut self, value: &str) -> bool {
         self.console_cursor = self.console_cursor.min(self.console_input.len());
         let before = self.console_input.len();
-        for ch in value
-            .chars()
-            .map(crate::cgame::unicode_input_char_to_jka_char)
-        {
+        let mut used = crate::cgame::unicode_input_wire_len(&self.console_input);
+        for ch in value.chars().map(crate::cgame::unicode_input_char_to_jka_char) {
             if ch.is_control() || matches!(ch, '`' | '~') {
                 continue;
             }
-            if crate::cgame::text_to_jka_bytes(&self.console_input).len() >= 160 {
-                break;
-            }
+            let len = if ch as u32 <= 0xff { 1 } else { ch.len_utf8() };
+            if used + len > 160 { break; }
             self.console_input.insert(self.console_cursor, ch);
             self.console_cursor += ch.len_utf8();
+            used += len;
         }
         self.console_input.len() != before
     }
@@ -332,6 +330,7 @@ impl App {
             match crate::clipboard::get_text() {
                 Ok(value) => {
                     let before = self.chat_input.len();
+                    let mut used = crate::cgame::unicode_input_wire_len(&self.chat_input);
                     for ch in value
                         .chars()
                         .map(crate::cgame::unicode_input_char_to_jka_char)
@@ -339,10 +338,10 @@ impl App {
                         if ch.is_control() {
                             continue;
                         }
-                        if crate::cgame::text_to_jka_bytes(&self.chat_input).len() >= 160 {
-                            break;
-                        }
+                        let len = if ch as u32 <= 0xff { 1 } else { ch.len_utf8() };
+                        if used + len > 160 { break; }
                         self.chat_input.push(ch);
+                        used += len;
                     }
                     if self.chat_input.len() != before {
                         self.chat_player_completion = None;
@@ -383,14 +382,16 @@ impl App {
                 }
                 if let Some(value) = &event.text {
                     let mut changed = false;
+                    let mut used = crate::cgame::unicode_input_wire_len(&self.chat_input);
                     for ch in value
                         .chars()
                         .map(crate::cgame::unicode_input_char_to_jka_char)
                     {
-                        if !ch.is_control()
-                            && crate::cgame::text_to_jka_bytes(&self.chat_input).len() < 160
+                        let len = if ch as u32 <= 0xff { 1 } else { ch.len_utf8() };
+                        if !ch.is_control() && used + len <= 160
                         {
                             self.chat_input.push(ch);
+                            used += len;
                             changed = true;
                         }
                     }

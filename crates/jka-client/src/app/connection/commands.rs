@@ -22,7 +22,8 @@ impl App {
             verb
         };
         if let Some(net) = self.net.as_mut() {
-            let bytes = crate::cgame::text_to_jka_bytes(text);
+            let bytes = crate::app::chat::forwarded_chat_command_bytes(text)
+                .unwrap_or_else(|| crate::cgame::text_to_jka_bytes(text));
             if let Err(error) = net.session_mut().add_reliable_command(&bytes, false) {
                 self.push_console_line(format!("^1{error}"));
             }
@@ -136,7 +137,8 @@ impl App {
         if !self.live_connected() {
             return Err("not connected to a live server".to_owned());
         }
-        let bytes = crate::cgame::text_to_jka_bytes(line.trim());
+        let bytes = crate::app::chat::forwarded_chat_command_bytes(line.trim())
+            .unwrap_or_else(|| crate::cgame::text_to_jka_bytes(line.trim()));
         let Some(net) = self.net.as_mut() else {
             return Err("network session disappeared while queuing command".to_owned());
         };

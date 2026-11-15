@@ -4,6 +4,7 @@ const SKY_AND_AUX_WGSL: &str = r#"
 @group(0) @binding(9) var sky_atlas:texture_2d<f32>;
 @group(0) @binding(10) var sky_atlas_sampler:sampler;
 @group(0) @binding(11) var<uniform> sky_environment:SkyEnvironment;
+@group(0) @binding(12) var sky_transport:texture_2d<f32>;
 fn sky_octahedral_decode(e:vec2<f32>)->vec3<f32> {
     var n=vec3(e.x,e.y,1.0-abs(e.x)-abs(e.y));
     let t=max(-n.z,0.0);
@@ -22,7 +23,8 @@ fn sky_world_gain(at:vec2<i32>)->vec3<f32> {
     let n=sky_octahedral_decode(e);
     let ambient_visibility=f32(packed&63u)/63.0;
     if parameters.sky.y>1.5 {
-        return vanilla_sky_gain(n,parameters.moon.xyz,ambient_visibility,parameters.sky.x);
+        return vanilla_sky_gain(n,parameters.moon.xyz,ambient_visibility,parameters.sky.x,
+            parameters.smoothing.w > 0.5,parameters.gain);
     }
     // Reuse the completed, edge-antialiased sun/moon bake at its native
     // resolution. Do not introduce a second shadow edge from the original
@@ -41,12 +43,18 @@ fn sky_world_gain(at:vec2<i32>)->vec3<f32> {
     let direct=color*intensity*incidence*direct_visibility;
     let now_y=select(direction.y,-1.0,moon_active);
     let full_gain=sky_gain_calibrated(clamp(ambient*0.5+direct*0.2,vec3(0.03),vec3(4.0)),vec3(1.0),now_y,parameters.gain);
-    // Existing lightmaps combine sky/direct GI with compiled point lights.
-    // Never darken a sealed room merely because its surface faces upward.
-    // This geometric weight is a conservative approximation of the DAYLIGHT
-    // share, not a claim to reconstruct individual q3map2 light sources.
-    let exposure=clamp(max(ambient_visibility,direct_visibility*incidence),0.0,1.0);
-    let weight=select(1.0,exposure,parameters.smoothing.w>0.5);
+    var weight=1.0;
+    if parameters.smoothing.w>0.5 {
+        // A shaded courtyard is still daylight-dependent. Never restore its
+        // daytime lightmap just because the current moon is behind a wall.
+        var response=vec2(ambient_visibility,0.0);
+        if parameters.smoothing.w>1.5 {
+            let uv=(vec2<f32>(at)+0.5)/vec2<f32>(textureDimensions(sky_normals));
+            let transported=sample_sky_transport(uv*vec2<f32>(textureDimensions(sky_transport))-0.5);
+            if all(transported>=vec2(0.0)) { response=transported; }
+        }
+        weight=sky_transport_daylight_share(response);
+    }
     return mix(vec3(1.0),full_gain,parameters.sky.x*weight);
 }
 "#;
@@ -75,10 +83,13 @@ fn baked_luminance(rgb:vec3<f32>)->f32 {{return dot(rgb,vec3(0.2126,0.7152,0.072
 {}
 {}
 fn source_luxel(at:vec2<i32>)->vec4<f32> {{
-    let texel=textureLoad(source,clamp(at,vec2(0),vec2<i32>(textureDimensions(source))-1),0);
+    let source_at=clamp(at,vec2(0),vec2<i32>(textureDimensions(source))-1);
+    let texel=textureLoad(source,source_at,0);
     var input:VertexOut; input.baked_sun_fit=parameters.fit;input.world_normal=vec3(0.0,1.0,0.0);
     var rgb=texel.rgb;
-    if parameters.fit.z==4.0 {{rgb=subtract_authored_baked_sun(rgb,texel.a,input);}}
+    if parameters.fit.z==4.0 {{
+        rgb=subtract_authored_baked_sun(rgb,texel.a,input);
+    }}
     return vec4(rgb,texel.a);
 }}
 
@@ -100,6 +111,29 @@ fn cubic_weight(d:f32, mode:f32)->f32 {{
 fn chart_at(at:vec2<i32>)->u32 {{
     if parameters.smoothing.z < 0.5 {{ return 0u; }}
     return textureLoad(charts,clamp(at,vec2(0),vec2<i32>(textureDimensions(charts))-1),0).r;
+}}
+// Original-resolution, chart-aware reconstruction shared by the actual gain
+// and diagnostic views. Never blend unrelated atlas islands or invalid luxels.
+fn sample_sky_transport(at:vec2<f32>)->vec2<f32> {{
+    let p=vec2<i32>(floor(at));
+    let f=fract(at);
+    let owner=chart_at(p+select(vec2(0),vec2(1),f>=vec2(0.5)));
+    let size=vec2<i32>(textureDimensions(sky_transport))-1;
+    var response=vec2(0.0);
+    var weights=0.0;
+    for (var y=0; y<2; y+=1) {{
+        for (var x=0; x<2; x+=1) {{
+            let tap=clamp(p+vec2(x,y),vec2(0),size);
+            if owner!=0u && chart_at(tap)!=owner {{ continue; }}
+            let value=textureLoad(sky_transport,tap,0).rg;
+            if any(value<vec2(0.0)) {{ continue; }}
+            let w=select(1.0-f.x,f.x,x==1)*select(1.0-f.y,f.y,y==1);
+            response+=value*w;
+            weights+=w;
+        }}
+    }}
+    if weights<1e-5 {{ return vec2(-1.0); }}
+    return response/weights;
 }}
 fn filtered_source(at:vec2<f32>)->vec4<f32> {{
     let p=vec2<i32>(floor(at));
@@ -153,6 +187,17 @@ fn lightmap_signal(which:u32,id:vec2<u32>,at:vec2<f32>,base:vec4<f32>,dims:vec2<
     if which==1u {{ return raw_bilinear(at).rgb; }}
     if which==2u {{ return baked_indirect_tone(base.rgb); }}
     if which==3u {{ return vec3(raw_bilinear(at).a); }}
+    if which>=9u {{
+        if parameters.smoothing.w<1.5 {{ return vec3(1.0,0.0,1.0); }}
+        let response=sample_sky_transport(at);
+        if any(response<vec2(0.0)) {{ return vec3(1.0,0.0,1.0); }}
+        var value=response.x;
+        if which==10u {{ value=response.y; }}
+        if which==11u {{ value=response.x+response.y; }}
+        // Same fixed display curve in all three views. This is white-sky
+        // response, not a recovered percentage of authored daylight.
+        return vec3(sqrt(clamp(value,0.0,1.0)));
+    }}
     // New-sun layers exist only once the static sun bake is composed.
     if parameters.sun.w<=0.0 {{ return vec3(1.0,0.0,1.0); }}
     let at_flux=vec2<i32>(id);

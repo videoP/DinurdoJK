@@ -75,27 +75,16 @@ fn console_plain_sized(
     out: &mut Vec<UiVertex>, value: &str, x: f32, y: f32,
     char_width: f32, char_height: f32, color: [f32; 4], width: u32, height: u32,
 ) {
-    for (index, byte) in value.bytes().enumerate() {
-        if byte != b' ' {
-            glyph_quad_sized(out, byte, x + index as f32 * char_width, y,
-                             char_width, char_height, color, width, height);
+    for (index, ch) in value.chars().enumerate() {
+        if ch != ' ' {
+            super::text::charset_glyph(out, ch, x + index as f32 * char_width, y,
+                char_width, char_height, color, width, height);
         }
     }
 }
 
 pub(in crate::ui) fn visible_text_len(value: &str) -> usize {
-    let bytes = crate::cgame::text_to_jka_bytes(value);
-    let mut index = 0usize;
-    let mut count = 0usize;
-    while index < bytes.len() {
-        if let Some((skip, _)) = crate::ui::color_escape(&bytes, index, 1.0) {
-            index += skip;
-        } else {
-            count += 1;
-            index += 1;
-        }
-    }
-    count
+    crate::ui::visible_jka_chars(value)
 }
 
 pub(in crate::ui) fn tail_chars(value: &str, max_chars: usize) -> String {
@@ -193,19 +182,10 @@ pub(in crate::ui) fn console_plain(
     height: u32,
 ) {
     let mut cursor_x = x;
-    for byte in value.bytes() {
-        if byte != b' ' {
-            glyph_quad_sized(
-                out,
-                byte,
-                cursor_x,
-                y,
-                CONSOLE_CHAR_WIDTH,
-                CONSOLE_CHAR_HEIGHT,
-                color,
-                width,
-                height,
-            );
+    for ch in value.chars() {
+        if ch != ' ' {
+            super::text::charset_glyph(out, ch, cursor_x, y,
+                CONSOLE_CHAR_WIDTH, CONSOLE_CHAR_HEIGHT, color, width, height);
         }
         cursor_x += CONSOLE_CHAR_WIDTH;
     }

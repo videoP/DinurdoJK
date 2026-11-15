@@ -409,7 +409,7 @@ impl Renderer {
             .filter(|world| !world.source_map)
             .and_then(|world| world.sun_bake.baked_direction());
         let has_authored_sun = authored_sun.is_some();
-        let old = authored_sun.unwrap_or_else(|| self.active_sun());
+        let old = authored_sun.unwrap_or_else(|| self.authored_sun());
         // Pending/unsupported reconstruction must preserve the authored image.
         let sun_bake_ready = self.world.as_ref().is_some_and(|world|
             world.sun_bake.ready && world.baked_sun_radiance.is_some());

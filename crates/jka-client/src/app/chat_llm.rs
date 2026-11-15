@@ -498,7 +498,9 @@ impl App {
                 } else {
                     // The docked chat box draws Cyrillic as well as Latin-1;
                     // a masked line in any other script is the bare mask.
-                    text::hud_text_wide(&body, self.chat_settings.docked()).unwrap_or_else(|| cl::MASK.to_owned())
+                    text::hud_text_wide(&body,
+                        self.chat_settings.docked() || self.chat_settings.font() != crate::ui::ChatFont::Classic)
+                        .unwrap_or_else(|| cl::MASK.to_owned())
                 };
                 self.chat_llm.history.set_filtered(id, if hidden { cl::HIDDEN_NOTE.to_owned() } else { body });
                 Censor::Censored { body: shown, hidden }

@@ -115,25 +115,33 @@ fn civil_from_days(days_since_unix_epoch: i64) -> (i64, i64, i64) {
 /// into the game's dependencies directory. The MSVC import is delay-loaded;
 /// runtime startup preloads the exact DLL path before the first Steam Audio call.
 fn copy_steam_audio_runtime_dll() -> Result<(), Box<dyn std::error::Error>> {
-    // OUT_DIR is target/<profile>/build/DinurdoJK-<hash>/out; the profile
-    // directory (where the .exe lands) is three levels up from there.
+    // OUT_DIR is target/<profile>/build/DinurdoJK-<hash>/out (classic Cargo
+    // layout) or target/<profile>/build/DinurdoJK/<hash>/out (newer Cargo
+    // build-dir layout). The profile directory, where the .exe lands, is the
+    // parent of that `build` directory in both.
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("missing OUT_DIR")?);
     let build_dir = out_dir
-        .parent()
-        .and_then(Path::parent)
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "build"))
         .ok_or("OUT_DIR has no build directory ancestor")?;
     let profile_dir = build_dir
         .parent()
         .ok_or("build directory has no profile directory ancestor")?;
 
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    // audionimbus-sys-<hash>/out (classic) or audionimbus-sys/<hash>/out (new).
+    let mut script_dirs = Vec::new();
     for entry in fs::read_dir(build_dir)?.filter_map(Result::ok) {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("audionimbus-sys-") {
-            continue;
+        if name.starts_with("audionimbus-sys-") {
+            script_dirs.push(entry.path());
+        } else if name == "audionimbus-sys" {
+            script_dirs.extend(fs::read_dir(entry.path())?.filter_map(Result::ok).map(|e| e.path()));
         }
-        let candidate = entry.path().join("out").join("lib").join("phonon.dll");
+    }
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for dir in script_dirs {
+        let candidate = dir.join("out").join("lib").join("phonon.dll");
         if !candidate.is_file() {
             continue;
         }

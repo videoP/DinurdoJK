@@ -3945,8 +3945,7 @@ impl Renderer {
                 let probe = self.ocean.as_ref().filter(|ocean|ocean.backend()!=0).and_then(|ocean| ocean.original_underwater_probe());
                 let first_atmosphere_render_started = menu_scene_trace.then(Instant::now);
                 atmosphere.render_image(&self.device, &self.queue, &mut encoder, probe,
-                    self.relighting_mode == 1 && native_sky_visible
-                        && self.blue_sky_cube_ab == 1);
+                    native_sky_visible && self.blue_sky_cube_ab == 1);
                 if let Some(started) = first_atmosphere_render_started {
                     rverbose!(2, "[MAP FIRST SCENE SKY] atmosphere render_image {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
                 }

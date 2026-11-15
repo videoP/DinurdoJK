@@ -361,7 +361,7 @@ pub(in crate::scene) fn prepare_internal(
         Some(job) => job.join()?,
         None => inline_hash.expect("map hash computed inline without a hash job"),
     };
-    let static_bsp_ao_cache = Some(static_bsp_ao_cache_info(root, game, name, map_hash));
+    let mut static_bsp_ao_cache = Some(static_bsp_ao_cache_info(root, game, name, map_hash));
     let steam_audio_bake_cache = options
         .steam_audio
         .then(|| crate::steam_audio::cache_info(root, game, name, map_hash));
@@ -536,6 +536,16 @@ pub(in crate::scene) fn prepare_internal(
         && !options.float_lightmap)
         .then(|| Atlas::new(&bsp.lightmaps));
     if let Some(atlas) = atlas.as_mut() {
+        let separated = atlas.separate_receivers(&[&mesh, &inline_mesh]);
+        if separated > 0 {
+            // AO caches final atlas pixels and otherwise keys only on the BSP.
+            // Give this receiver layout its own version namespace; an existing
+            // cache must not overwrite the copied charts with old atlas pixels.
+            if let Some(cache) = static_bsp_ao_cache.as_mut() {
+                cache.version |= 1 << 31;
+            }
+            println!("[LIGHTMAP ATLAS] separated {separated} aliased receiver charts; {}x{}; authored RGB preserved", atlas.width, atlas.height);
+        }
         if options.map_overbright_bits != options.overbright_bits {
             for pixel in atlas.rgba.chunks_exact_mut(4) {
                 let rgb = overbright_rgb(
@@ -1028,7 +1038,9 @@ pub(in crate::scene) fn prepare_internal(
                     .map(|i| vertex.lightmap_uv[i])
                     .unwrap_or([-1.0, -1.0]);
                 let lightmap_uv = match (&atlas, source_lightmap) {
-                    (Some(atlas), Some(page)) => atlas.uv(page, raw_lightmap_uv),
+                    (Some(atlas), Some(page)) => atlas.receiver_uv(
+                        page, raw_lightmap_uv, batch.surface, lightmap_slot.unwrap(),
+                    ),
                     (None, Some(_)) => raw_lightmap_uv,
                     _ => [-1.0, -1.0],
                 };

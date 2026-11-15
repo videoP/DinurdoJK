@@ -338,6 +338,8 @@ pub(super) enum VideoSection {
     Geometry,
     Lighting,
     Relighting,
+    EnvironmentLooks,
+    AdvancedEnvironment,
     Materials,
     Effects,
     PostProcessing,
@@ -356,19 +358,21 @@ pub(super) enum VideoSection {
 }
 
 impl VideoSection {
-    const RENDERING: [(Self, &'static str); 9] = [
+    const RENDERING: [(Self, &'static str); 8] = [
         (Self::Display, "Display & graphics"),
         (Self::Color, "Color & HDR"),
         (Self::Geometry, "Geometry"),
         (Self::Lighting, "Lighting"),
-        (Self::Relighting, "Relighting"),
         (Self::Materials, "Material rendering"),
         (Self::Effects, "Effects"),
         (Self::PostProcessing, "Post processing"),
         (Self::Physics, "Physics"),
     ];
-    const ENVIRONMENT: [(Self, &'static str); 7] = [
+    const ENVIRONMENT: [(Self, &'static str); 10] = [
         (Self::Sun, "Sky"),
+        (Self::Relighting, "Relighting"),
+        (Self::EnvironmentLooks, "Looks & profiles"),
+        (Self::AdvancedEnvironment, "Advanced environment"),
         (Self::Clouds, "Clouds"),
         (Self::Weather, "Weather"),
         (Self::Surface, "Surface"),

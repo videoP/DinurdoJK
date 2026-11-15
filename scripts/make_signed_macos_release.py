@@ -77,6 +77,7 @@ def create(binary: Path, phonon: Path, asset: Path, output: Path, tag: str, arch
     if phonon.name != 'libphonon.dylib':
         raise ValueError('Steam Audio dependency must be named libphonon.dylib')
     signer, verifier = key_pair()
+    jura_notice = read_safe(Path('release-licenses/Jura-OFL.txt'))
     payload = {
         INSTALLED_BINARY: read_safe(binary),
         PHONON: read_safe(phonon),
@@ -111,6 +112,7 @@ def create(binary: Path, phonon: Path, asset: Path, output: Path, tag: str, arch
         zip_bytes(zipfile_out, PHONON, payload[PHONON], 0o755)
         zip_bytes(zipfile_out, 'DinurdoJK/shared/dinurdo-assets.pk4', payload['DinurdoJK/shared/dinurdo-assets.pk4'], 0o644)
         zip_bytes(zipfile_out, 'Launch-DinurdoJK.command', launch, 0o755)
+        zip_bytes(zipfile_out, 'licenses/Jura-OFL.txt', jura_notice, 0o644)
     with zipfile.ZipFile(archive) as z:
         assert z.read(INSTALLED_BINARY) == payload[INSTALLED_BINARY]
         assert z.read(PHONON) == payload[PHONON]

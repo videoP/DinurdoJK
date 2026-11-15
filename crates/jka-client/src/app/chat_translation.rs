@@ -335,6 +335,10 @@ impl ChatMessage {
         &self.text
     }
 
+    pub(in crate::app) fn received_display_line(&self) -> String {
+        crate::cgame::received_chat_for_display(&self.text, self.body_start)
+    }
+
     fn prefix(&self) -> String {
         self.body_start.map_or_else(String::new, |start| self.text.chars().take(start).collect())
     }
@@ -363,7 +367,7 @@ impl ChatMessage {
                 let latin = text::hud_text(body);
                 format!("{}{}", self.prefix(), latin.as_deref().unwrap_or(crate::chat_llm::MASK))
             }
-            _ => self.text.clone(),
+            _ => self.received_display_line(),
         }
     }
 
@@ -498,6 +502,9 @@ pub(in crate::app) fn hud_chat(display: Display, record: &ChatRecord, wide: bool
         }
     };
     let original = (flags != 0).then(|| {
+        if record.text.chars().any(|ch| ch as u32 > 0xff) {
+            return record.text.clone();
+        }
         let decoded = text::decode(&crate::cgame::text_to_jka_bytes(&record.text), ct::Codepage::Auto);
         text::hud_text_wide(&decoded, true).filter(|_| wide).unwrap_or_else(|| record.text.clone())
     });
@@ -708,7 +715,8 @@ impl App {
             return;
         }
         let marker = marker(source.as_deref(), target);
-        let hud = text::hud_text_wide(&translated.text, self.chat_settings.docked());
+        let hud = text::hud_text_wide(&translated.text,
+            self.chat_settings.docked() || self.chat_settings.font() != crate::ui::ChatFont::Classic);
         message.show_original = display == Display::Original && ask == Ask::Auto;
         let show_original = message.show_original;
         let body_start = message.body_start;
@@ -1263,6 +1271,21 @@ mod tests {
 
     fn english() -> ct::Settings {
         ct::Settings { mode: Mode::Auto, target: "en".to_owned(), ..ct::Settings::default() }
+    }
+
+    #[test]
+    fn unicode_chat_console_refresh_keeps_wire_text_and_matches_display_suffix() {
+        let raw = crate::cgame::bytes_to_lossless_ascii("Ivan^7: ^2Привет".as_bytes());
+        let mut message = message(&raw, Some("Ivan^7: ^2".len()));
+        let shown = message.received_display_line();
+        message.set_console_shown(shown.clone());
+        let row = format!("12:00 {shown}");
+        assert_eq!(row.strip_suffix(message.console_shown.as_str()), Some("12:00 "));
+        assert_eq!(message.received_line(), raw);
+        message.censor = Censor::Pending { held: true };
+        assert_eq!(message.shown_line(), format!("Ivan^7: ^2{CENSOR_PENDING}"));
+        message.censor = Censor::None;
+        assert_eq!(message.shown_line(), "Ivan^7: ^2Привет");
     }
 
     #[test]

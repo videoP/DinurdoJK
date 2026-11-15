@@ -131,7 +131,7 @@ impl App {
         );
 
         theme::section(ui, "LAMP SHADOWS", "No master switch: inferred moving-object shadows follow the individual lamp-source toggles. Only CSM uses them; original map lightmaps remain intact.");
-        let lamp_shadow_mode = self.video.dynamic_shadows.is_csm();
+        let lamp_shadow_mode = self.video.effective_shadow_mode().is_csm();
         ui.add_enabled_ui(lamp_shadow_mode, |ui| {
             self.egui_toggle_row(ui, "Source: glow stages", "Use static shader glow emitters as shadow sources.", ui::VIDEO_ROW_BAKED_LOCAL_GLOW, self.video.baked_local_sources & 1 != 0);
             self.egui_toggle_row(ui, "Source: additive stages", "Infer lamps from additive stages; broad inference, disabled by default.", ui::VIDEO_ROW_BAKED_LOCAL_ADDITIVE, self.video.baked_local_sources & 2 != 0);
@@ -141,7 +141,7 @@ impl App {
             self.egui_toggle_row(ui, "Source: world flares", "Use compiled BSP flare locations as shadow-only lamp sources. Nearby compatible authored, shader and EFX lamps share one shadow cubemap (32-unit radius). This does not add direct map lighting or affect flare sprites.", ui::VIDEO_ROW_BAKED_LOCAL_FLARES, self.video.baked_local_sources & 32 != 0);
         });
         if !lamp_shadow_mode {
-            ui.small("Select Cascaded Shadow Maps to use these lamp shadows.");
+            ui.small("Cascaded Shadow Maps are required for these lamp shadows.");
         }
         const LAMP_SHADOW_AB: [(u8, &str, &str); 5] = [
             (0, "A: Cubes", "Original six-face cubemap generation and sampling (reference)."),

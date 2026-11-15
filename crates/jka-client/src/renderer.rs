@@ -1070,6 +1070,8 @@ struct Renderer {
     ui_bind_group: wgpu::BindGroup,
     ui_encoded_bind_group: wgpu::BindGroup,
     _ui_font: GpuImage,
+    _ui_jura_font: GpuImage,
+    ui_jura_metrics: Option<std::sync::Arc<ui::UnicodeFallbackFont>>,
     _ui_small_font: GpuImage,
     /// Clean TrueType UI font (binding 8) and its metrics.
     _ui_clean_font: GpuImage,
@@ -1269,6 +1271,7 @@ struct Renderer {
     contact_shadows_enabled: bool,
     relighting_mode: u8,
     sun_override: bool,
+    sky_sun_custom: bool,
     sun_yaw: f32,
     sun_pitch: f32,
     sun_intensity: f32,

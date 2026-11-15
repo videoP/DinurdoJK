@@ -26,6 +26,7 @@ struct VertexOut {
 @group(0) @binding(9) var ui_avatars: texture_2d<f32>;
 // Shader Remaps thumbnail slots; see renderer::set_remap_thumb.
 @group(0) @binding(10) var ui_remap_thumbs: texture_2d<f32>;
+@group(0) @binding(11) var ui_jura_fallback: texture_2d<f32>;
 
 // Same source controls both ordinary sRGB and encoded UNORM output.
 // In encoded mode the RGB sampled from the atlas is already encoded.
@@ -85,9 +86,14 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         glyph = textureSampleGrad(ui_clean_font, ui_font_sampler, input.uv, uv_dx, uv_dy);
     } else if input.textured < 9.5 {
         return compensate_ui(textureSampleLevel(ui_avatars, ui_font_sampler, input.uv, 0.0) * input.color);
-    } else {
+    } else if input.textured < 10.5 {
         // Shader Remaps thumbnail slot atlas; see ui::shader_remap.
         return compensate_ui(textureSampleLevel(ui_remap_thumbs, ui_font_sampler, input.uv, 0.0) * input.color);
+    } else {
+        glyph = textureSampleGrad(ui_jura_fallback, ui_font_sampler, input.uv, uv_dx, uv_dy);
+        if input.textured > 11.5 {
+            glyph.a = min(glyph.a * 2.0, 1.0);
+        }
     }
     return compensate_ui(vec4<f32>(input.color.rgb, input.color.a * glyph.a));
 }

@@ -12,8 +12,9 @@ enum Action {
 }
 
 impl App {
-    pub(super) fn egui_relighting_profiles(&mut self, ui: &mut egui::Ui) {
-        theme::row(ui, "Saved profiles", "Save relighting, sun/moon, sky and cloud settings together. Stored in DinurdoJK/light_profiles by map, shared across mods. Profiles only change when you save; other video settings remain independent.", theme::Reset::None, |_| {});
+    pub(super) fn egui_environment_looks(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "SAVED ENVIRONMENT LOOKS", "Save and restore sky, sun/moon, clouds and world relighting together, including the shared Baked/Realtime choice and individual sun time locks.");
+        theme::hint(ui, "Stored in DinurdoJK/light_profiles. Existing profiles and per-map auto-load defaults continue to work across mods; unrelated video settings are not changed.", theme::TEXT_DIM());
         if self.render_studio.graphics_gameplay.is_some() {
             theme::hint(ui, "Render Studio uses its own graphics profiles. Leave the workspace to manage gameplay relighting profiles.", theme::TEXT_DIM());
             return;
@@ -195,7 +196,7 @@ impl App {
         if !self.relighting_profiles.status.is_empty() {
             theme::hint(ui, &self.relighting_profiles.status, theme::TEXT_DIM());
         }
-        theme::hint(ui, "Saved profiles exclude temporary diagnostics and session-only experiments. Unsaved profile edits are replaced when you load another profile or leave the map.", theme::TEXT_DIM());
+        theme::hint(ui, "Environment looks exclude temporary diagnostics and session-only experiments. Unsaved edits are replaced when you load another look or leave the map.", theme::TEXT_DIM());
         ui.separator();
     }
 }

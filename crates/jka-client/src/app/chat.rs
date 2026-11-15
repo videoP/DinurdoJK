@@ -26,6 +26,7 @@ fn taystjk_chat_wire_text(message: &str) -> String {
 
 /// TaystJK `Message_Key`: the intended recipient is a stable client slot, not
 /// a player name, and `tell` is sent as a reliable client command.
+#[cfg(test)]
 fn taystjk_chat_command(mode: ChatMode, message: &str) -> String {
     let message = taystjk_chat_wire_text(message);
     match mode {
@@ -33,6 +34,61 @@ fn taystjk_chat_command(mode: ChatMode, message: &str) -> String {
         ChatMode::Team => format!("say_team \"{message}\""),
         ChatMode::Direct(client) => format!("tell {client} \"{message}\""),
     }
+}
+
+/// Chat is special: the protocol is a byte stream, not UTF-8 by definition.
+/// Keep legacy <=255 as one wire byte, encode genuinely Unicode codepoints as
+/// UTF-8, and truncate at a *character* boundary within Raven's 149-byte
+/// message buffer. Ordinary commands/cvars continue using JKA byte encoding.
+fn chat_command_bytes(mode: ChatMode, message: &str) -> Vec<u8> {
+    let sanitized = taystjk_chat_wire_text(message);
+    let mut bytes = match mode {
+        ChatMode::Global => b"say \"".to_vec(),
+        ChatMode::Team => b"say_team \"".to_vec(),
+        ChatMode::Direct(client) => format!("tell {client} \"").into_bytes(),
+    };
+    append_chat_body(&mut bytes, &sanitized);
+    bytes.push(b'"');
+    bytes
+}
+
+fn append_chat_body(bytes: &mut Vec<u8>, message: &str) {
+    const MAX_SAY_BYTES: usize = 149;
+    let mut used = 0;
+    let mut end = 0;
+    for (index, ch) in message.char_indices() {
+        let len = if ch as u32 <= 0xff { 1 } else { ch.len_utf8() };
+        if used + len > MAX_SAY_BYTES { break; }
+        used += len;
+        end = index + ch.len_utf8();
+    }
+    bytes.extend(crate::cgame::unicode_chat_wire_bytes(&message[..end]));
+}
+
+/// Match the server's ConcatArgs interpretation, then cap the message before
+/// encoding so server-side byte truncation cannot split a Unicode character.
+/// Recipient names stay in the legacy encoding, like other name lookups.
+pub(in crate::app) fn forwarded_chat_command_bytes(line: &str) -> Option<Vec<u8>> {
+    let args = jka_protocol::commands::tokenize(line.as_bytes());
+    let verb = std::str::from_utf8(args.first()?).ok()?;
+    let first_body = match verb.to_ascii_lowercase().as_str() {
+        "say" | "say_team" => 1,
+        "tell" => 2,
+        _ => return None,
+    };
+    if args.len() <= first_body { return None; }
+    let mut bytes = verb.as_bytes().to_vec();
+    if first_body == 2 {
+        bytes.extend_from_slice(b" \"");
+        bytes.extend(crate::cgame::text_to_jka_bytes(std::str::from_utf8(&args[1]).ok()?));
+        bytes.push(b'"');
+    }
+    bytes.extend_from_slice(b" \"");
+    let message = args[first_body..].iter()
+        .map(|arg| std::str::from_utf8(arg)).collect::<Result<Vec<_>, _>>().ok()?.join(" ");
+    append_chat_body(&mut bytes, &message);
+    bytes.push(b'"');
+    Some(bytes)
 }
 
 /// CG_LastAttacker/Con_MessageMode4_f. The attacker index comes from the
@@ -239,7 +295,14 @@ impl App {
             // edit field preserves leading/trailing spaces inside the quoted
             // say argument.
             // The server is the sole source of authoritative chat echoes.
-            self.forward_command_to_server(&taystjk_chat_command(self.chat_mode, &message));
+            // Only chat takes this Unicode-capable wire path. No global change
+            // to command, cvar, player-name or userinfo serialization.
+            let command = chat_command_bytes(self.chat_mode, &message);
+            if let Some(net) = self.net.as_mut() {
+                if let Err(error) = net.session_mut().add_reliable_command(&command, false) {
+                    self.push_console_line(format!("^1{error}"));
+                }
+            }
         }
         // Closing the chat overlay publishes the cleared input once.
         self.set_overlay(OverlayMode::None);
@@ -258,8 +321,35 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{taystjk_chat_command, taystjk_chat_wire_text, taystjk_last_attacker_slot};
+    use super::{taystjk_chat_command, chat_command_bytes, taystjk_chat_wire_text, taystjk_last_attacker_slot};
     use crate::ui::ChatMode;
+
+    #[test]
+    fn unicode_chat_forwarding_caps_console_and_explicit_commands() {
+        use super::forwarded_chat_command_bytes;
+        let body = format!("{}Ж", "a".repeat(148));
+        assert_eq!(forwarded_chat_command_bytes(&format!("say \"{body}\"")),
+            Some(format!("say \"{}\"", "a".repeat(148)).into_bytes()));
+        assert_eq!(forwarded_chat_command_bytes("tell \"a b\" Привет"),
+            Some("tell \"a b\" \"Привет\"".as_bytes().to_vec()));
+        assert_eq!(forwarded_chat_command_bytes("say_team \"你好\""),
+            Some("say_team \"你好\"".as_bytes().to_vec()));
+        assert!(forwarded_chat_command_bytes("name Жук").is_none());
+        assert!(forwarded_chat_command_bytes("tell 5").is_none());
+    }
+
+    #[test]
+    fn unicode_chat_bytes_preserve_jka_and_utf8_without_splitting() {
+        use crate::app::ChatMode;
+        assert_eq!(chat_command_bytes(ChatMode::Global, "hello"), b"say \"hello\"");
+        assert_eq!(chat_command_bytes(ChatMode::Global, "Привет"),
+            [b"say \"".as_slice(), "Привет".as_bytes(), b"\""].concat());
+        assert_eq!(chat_command_bytes(ChatMode::Global, "°"),
+            [b"say \"".as_slice(), &[0xB0], b"\""].concat());
+        let bytes = chat_command_bytes(ChatMode::Global, &"Ж".repeat(90));
+        assert_eq!(bytes.len(), b"say \"".len() + 148 + 1);
+        assert!(std::str::from_utf8(&bytes).is_ok());
+    }
 
     #[test]
     fn messagemode3_sends_tell_to_captured_slot() {

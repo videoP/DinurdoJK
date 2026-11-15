@@ -118,6 +118,7 @@ impl Renderer {
     /// frame readbacks therefore contain the same per-demo HUD pixels.
     fn submit_studio_source_hud(&mut self,hud:&crate::ui::UiSnapshot) {
         use crate::ui;
+        let _unicode_scope = ui::UnicodeFallbackScope::enter(self.ui_jura_metrics.clone());
         let (w,h)=(self.config.width.max(1),self.config.height.max(1));
         // The key-art atlas is lazily resident in ordinary gameplay. Studio
         // can be opened directly from the main menu, so initialize it here too.
@@ -139,7 +140,7 @@ impl Renderer {
             self.studio_race_font=Some((choice,None));
             if let Some(metrics)=metrics {
                 let image=crate::renderer::textures::upload_cached_texture(&self.device,&self.queue,&data);
-                let views=[&self._ui_font.view,&image.view,&self._ui_splash.view,&self._ui_keys.view,&self._ui_icons.view,&self._ui_team_icons.view,&self._ui_ext_images.view,&self._ui_clean_font.view,&self._ui_avatars.view,&self._ui_remap_thumbs.view];
+                let views=[&self._ui_font.view,&image.view,&self._ui_splash.view,&self._ui_keys.view,&self._ui_icons.view,&self._ui_team_icons.view,&self._ui_ext_images.view,&self._ui_clean_font.view,&self._ui_avatars.view,&self._ui_remap_thumbs.view,&self._ui_jura_font.view];
                 let mut entries=Vec::new();
                 for (index,view) in views.iter().enumerate() {
                     entries.push(wgpu::BindGroupEntry {binding:if index==0 {0}else{index as u32+1},resource:wgpu::BindingResource::TextureView(view)});

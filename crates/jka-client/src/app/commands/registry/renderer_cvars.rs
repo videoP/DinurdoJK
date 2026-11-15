@@ -39,6 +39,7 @@ app_cvars! {
                 if let Some(mode) = crate::ui::VideoSettings::parse_relighting_mode(value) {
                     settings.relighting_mode = mode;
                     settings.sun_override = mode != 0;
+                    if mode != 0 { settings.environment_mode = mode - 1; }
                 }
             }),
             archive: Some((56, |state| state.video.active_relighting_mode().to_string())),
@@ -52,6 +53,86 @@ app_cvars! {
                 Ok(())
             }
         }]
+    }
+
+    APP_R_ENVIRONMENTMODE {
+        runtime: CvarDef::new("r_environmentMode", "0", "0|1|baked|realtime",
+            "Shared sky and world rendering choice: 0 Baked (cached sky and relighting), 1 Realtime. Independent of r_relightMap enable/disable. Baked system time samples once per map load.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.environment_mode.to_string()),
+            |app, value| App::cvar_set_environmentmode(app, APP_R_ENVIRONMENTMODE.entry.name, &value.to_string())
+        ).with_text_setter(App::cvar_set_environmentmode, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                let mode = match value.trim().to_ascii_lowercase().as_str() {
+                    "0" | "baked" => Some(0), "1" | "realtime" => Some(1), _ => None,
+                };
+                if let Some(mode) = mode {
+                    settings.environment_mode = mode;
+                    if settings.sun_override { settings.relighting_mode = mode + 1; }
+                }
+            }),
+            archive: Some((57, |state| state.video.environment_mode.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_environmentmode(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = match value.trim().to_ascii_lowercase().as_str() {
+                    "0" | "baked" => 0, "1" | "realtime" => 1,
+                    _ => return Err(format!("{name}: expected baked (0) or realtime (1)")),
+                };
+                self.set_environment_mode(mode);
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_SKYSUNCUSTOM {
+        runtime: CvarDef::new("r_skySunCustom", "0", "0|1",
+            "Use edited sun angles, color and intensity for sky rendering even with world relighting off. Time-of-day edits enable this automatically.",
+            CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(i32::from(app.video.sky_sun_custom)),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.sky_sun_custom = value != 0;
+                app.sync_post_effects();
+                app.mark_config_dirty();
+                app.publish_ui();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.sky_sun_custom = parse_bool(value).unwrap_or(settings.sky_sun_custom);
+            }),
+            archive: Some((58, |state| bool_value(state.video.sky_sun_custom))),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
+    APP_R_SUNTIMELOCKS {
+        runtime: CvarDef::new("r_sunTimeLocks", "7", "0..7",
+            "Time-of-day automation bitmask for custom sun: yaw=1, pitch=2, intensity=4. Clear a bit to preserve an absolute manual override.",
+            CvarType::Int { min: 0, max: 7 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Int(app.video.sun_time_locks as i32),
+            |app, value| {
+                let CvarValue::Int(value) = value else { unreachable!() };
+                app.video.sun_time_locks = value as u8;
+                let hour = app.relight_clock_effective.unwrap_or(app.video.relight_time);
+                app.apply_relighting_celestial_time(hour);
+                app.sync_post_effects();
+                app.mark_config_dirty();
+                app.publish_ui();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(mask) = value.parse::<u8>() { settings.sun_time_locks = mask.min(7); }
+            }),
+            archive: Some((58, |state| state.video.sun_time_locks.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
     }
 
     APP_R_DEBUGWORLDVERTEXALPHAONE {
@@ -1961,7 +2042,7 @@ app_cvars! {
     }
 
     APP_R_DYNAMICSHADOWS {
-        runtime: CvarDef::new("r_dynamicShadows", "", "off|blob|entity|csm|csm_entities", "Shadow method; csm and csm_entities both select entity cascades. For static BSP sun casters additionally enable r_staticWorldCsm in Relighting.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_dynamicshadows(app)), |app, value| App::cvar_set_r_dynamicshadows(app, APP_R_DYNAMICSHADOWS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_dynamicshadows, None),
+        runtime: CvarDef::new("r_dynamicShadows", "", "off|blob|entity|csm|csm_entities", "Saved shadow method for ordinary rendering. Relight world temporarily enables entity CSM in Baked or full CSM in Realtime regardless of this preference; r_staticWorldCsm adds nearby world casters in Baked.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_dynamicshadows(app)), |app, value| App::cvar_set_r_dynamicshadows(app, APP_R_DYNAMICSHADOWS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_dynamicshadows, None),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, context| {
                     if let Some(mode) = DynamicShadowsMode::from_config(value) {
@@ -2360,13 +2441,16 @@ app_cvars! {
     }
 
     APP_R_LIGHTMAPSIGNAL {
-        runtime: CvarDef::new("r_lightmapSignal", "", "0..8", "Composed-lightmap diagnostic (use with r_lightmap 1): 0 off, 1 authored lightmap as compiled, 2 authored residual after old-sun removal + indirect tone, 3 authored-sun flux that was removed, 4 new sun incident flux, 5 new sun cosine (bake normal . sun), 6 new sun visibility (green lit, red shadowed, blue facing away), 7 lightmap charts + receiver triangle edges, 8 bake-normal change from smoothing (0..20 degrees) + triangle edges. 1-6 recompose only; 7/8 rebake. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.lightmap_signal.to_string()), |app, value| App::cvar_set_r_lightmapsignal(app, APP_R_LIGHTMAPSIGNAL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lightmapsignal, None),
+        runtime: CvarDef::new("r_lightmapSignal", "", "0..11", "Composed-lightmap diagnostic (use with r_lightmap 1): 0 off, 1 authored lightmap as compiled, 2 authored residual after old-sun removal + indirect tone, 3 authored-sun flux that was removed, 4 new sun incident flux, 5 new sun cosine (bake normal . sun), 6 new sun visibility (green lit, red shadowed, blue facing away), 7 lightmap charts + receiver triangle edges, 8 bake-normal change from smoothing (0..20 degrees) + triangle edges, 9 direct white-sky response, 10 bounced white-sky response, 11 total white-sky response. 9-11 require Protect authored room lighting, Blue Water, CSM and sky bake; grayscale sqrt display, magenta unavailable. Transport is a fixed-white-sky estimate, not authored daylight fraction. 7/8 rebake; other views recompose only. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.lightmap_signal.to_string()), |app, value| App::cvar_set_r_lightmapsignal(app, APP_R_LIGHTMAPSIGNAL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lightmapsignal, None),
         config: CvarBinding::NONE,
         implementations: [ impl App {
             fn cvar_set_r_lightmapsignal(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let mode = value.trim().parse::<u8>()
-                    .ok().filter(|mode| *mode <= 8)
-                    .ok_or_else(|| format!("{name}: expected 0..8"))?;
+                    .ok().filter(|mode| *mode <= 11)
+                    .ok_or_else(|| format!("{name}: expected 0..11"))?;
+                if mode >= 9 && (!self.video.sky_world_light_isolation || self.video.sky_backend != 1) {
+                    return Err(format!("{name}: sky transport views require Protect authored room lighting and Blue Water"));
+                }
                 if self.video.lightmap_signal != mode {
                     self.video.lightmap_signal = mode;
                     self.sync_post_effects();
@@ -2374,7 +2458,7 @@ app_cvars! {
                 self.console_status = format!("LIGHTMAP SIGNAL: {mode} ({})", [
                     "off", "authored as compiled", "authored residual", "authored sun removed",
                     "new sun flux", "new sun cosine", "new sun visibility", "charts + triangles",
-                    "normal smoothing",
+                    "normal smoothing", "direct white sky", "bounced white sky", "total white sky",
                 ][mode as usize]);
                 Ok(())
             }
@@ -2424,7 +2508,7 @@ app_cvars! {
     }
 
     APP_R_SKYWORLDGAINMODE {
-        runtime: CvarDef::new("r_skyWorldGainMode", "2", "0..2", "Blue Water sky-world gain calibration against the authored lightmap. 0 A: original absolute gain (can crush shadows by day). 1 B: daylight fades the gain to 1 (authored exposure) by sun elevation, vanilla-style. 2 C (default): ratio of the live time of day to the map's authored time, taken from q3map_sun or the shadow-detected sun; unknown sun keeps the gain neutral. Affects Baked and Realtime world, vertex-lit surfaces and models; dusk/night keep the Blue Water tint.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_skyWorldGainMode", "2", "0..2", "Sky-world gain calibration shared by Vanilla and Blue Water. 0 absolute response, 1 fade to authored daylight by sun elevation, 2 (default) day/night ratio against authored sun or daytime fallback. Blue Water adds atmospheric tint/moonlight; Vanilla has neither. Applies to baked lightmaps and vertex-lit surfaces.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.video.sky_world_gain_mode.to_string()),
             |app, value| App::cvar_set_r_skyworldgainmode(app, APP_R_SKYWORLDGAINMODE.entry.name, &value.to_string()))
             .with_text_setter(App::cvar_set_r_skyworldgainmode, None),
@@ -2458,7 +2542,7 @@ app_cvars! {
     }
 
     APP_R_SKYWORLDLIGHTISOLATION {
-        runtime: CvarDef::new("r_skyWorldLightIsolation", "0", "0|1", "Protect authored indoor/local lighting from Sky world gain using cached sky-visibility rays (0 legacy, 1 geometry-weighted). Baked: use r_skyWorldBakeAB 1. Realtime: route static BSP sky into the cached composition while retaining live CSM shadows. Approximate: original BSP lightmaps do not separate sky GI from every compiled point light.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_skyWorldLightIsolation", "0", "0|1", "Protect authored room lighting using cached direct and two-bounce sky transport (0 legacy, 1 transport-weighted). Outdoor shadows follow day/night lighting; sealed rooms retain their authored illumination. Baked: use r_skyWorldBakeAB 1. Realtime: route static BSP sky into the cached composition while retaining live CSM shadows. Approximate: original BSP lightmaps do not separate sky GI from every compiled point light.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(bool_value(app.video.sky_world_light_isolation)),
             |app, value| App::cvar_set_r_skyworldlightisolation(app, APP_R_SKYWORLDLIGHTISOLATION.entry.name, &value.to_string()))
             .with_text_setter(App::cvar_set_r_skyworldlightisolation, None),
@@ -2478,7 +2562,7 @@ app_cvars! {
                     self.mark_config_dirty();
                 }
                 self.console_status = if enabled {
-                    "SKY LIGHT ISOLATION: geometry-weighted sky, protected enclosed lighting. Requires Blue Water / CSM / baked receivers.".to_owned()
+                    "SKY LIGHT ISOLATION: transport-weighted day/night sky, protected enclosed lighting. Requires Blue Water / CSM / baked receivers.".to_owned()
                 } else {
                     "SKY LIGHT ISOLATION: legacy sky-world tint restored.".to_owned()
                 };
