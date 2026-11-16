@@ -5307,6 +5307,30 @@ app_cvars! {
         }]
     }
 
+    APP_R_LEGACYSCENEALIAS {
+        runtime: CvarDef::new(
+            "r_legacySceneAlias", "1", "0..1",
+            "Legacy model-blend scene alias A/B (session-only, live). 1: when r_legacyBlendTransfer 4 cannot draw into the swapchain (gamma/post, MSAA) but the scene target is 8-bit sRGB, additive/legacy model effects blend in display space through a UNORM view of that same scene target (lighting stays linear, no copies; MSAA adds a resolve scissored to the effects). 0: use the FP16 encode/decode transfer (r_legacyBlendBounds). FP16 scenes (HDR, glow, halation) always use the transfer.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app| CvarValue::String(u8::from(crate::renderer::legacy_scene_alias()).to_string()),
+            |app, value| App::cvar_set_r_legacyscenealias(app, APP_R_LEGACYSCENEALIAS.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_legacyscenealias, None),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_r_legacyscenealias(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let enabled = match value.trim() {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(format!("{name} expects 0 or 1")),
+                };
+                crate::renderer::set_legacy_scene_alias(enabled);
+                self.console_status = format!("LEGACY SCENE ALIAS: {}",
+                    if enabled { "display-space blend into the scene target" } else { "FP16 transfer" });
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_LEGACYBLENDBOUNDS {
         runtime: CvarDef::new(
             "r_legacyBlendBounds", "2", "0..2",

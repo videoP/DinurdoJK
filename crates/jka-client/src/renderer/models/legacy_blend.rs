@@ -698,6 +698,60 @@ impl DynamicModelRenderer {
         }
     }
 
+    /// Scene-alias MSAA only: the scissored linear resolve pipeline, built on
+    /// first use and rebuilt only when the scene format or sample count changes.
+    pub(in crate::renderer) fn ensure_legacy_scene_resolve(
+        &mut self, device: &wgpu::Device, format: wgpu::TextureFormat, samples: u32,
+    ) {
+        if self.legacy_scene_resolve.as_ref().is_some_and(|(f, s, _, _)| *f == format && *s == samples) {
+            return;
+        }
+        let mut image_entry = texture_entry(0);
+        image_entry.ty = wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2, multisampled: true,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("legacy model scene alias resolve"),
+            entries: &[image_entry],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("legacy model scene alias resolve"),
+            source: wgpu::ShaderSource::Wgsl(SCENE_RESOLVE.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("legacy model scene alias resolve"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("resolve"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: crate::pipeline_cache::get().as_ref(),
+        });
+        self.legacy_scene_resolve = Some((format, samples, layout, pipeline));
+    }
+
     pub(in crate::renderer) fn resize_legacy_blend(
         &mut self,
         device: &wgpu::Device,
@@ -739,7 +793,21 @@ impl DynamicModelRenderer {
             // Direct SDR route: no offscreen HDR texture, no scene sampling,
             // no fullscreen encode/decode and no forced post resolve. Only the
             // eligible geometry is redrawn into the encoded UNORM attachment.
-            let Some(view) = native_unorm_view else { return; };
+            // Scene alias: the same, into a UNORM view of the offscreen sRGB
+            // scene (MSAA) target rather than the swapchain image.
+            let scene_alias;
+            let view = if self.legacy_scene_alias {
+                let target = msaa.unwrap_or(scene);
+                scene_alias = target.texture().create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("legacy model scene display-space alias"),
+                    format: Some(target.texture().format().remove_srgb_suffix()),
+                    ..Default::default()
+                });
+                &scene_alias
+            } else {
+                let Some(view) = native_unorm_view else { return; };
+                view
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("legacy model direct display-space blend (UNORM alias)"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -762,6 +830,51 @@ impl DynamicModelRenderer {
                 ..Default::default()
             });
             self.draw_encoded_legacy_models(&mut pass, camera);
+            drop(pass);
+            // The alias pass never resolves (its attachment is the UNORM view).
+            // Keep the resolved scene equal to resolve(MSAA): only pixels the
+            // effects can touch changed, so a bounded rect resolves just those
+            // with the same linear box filter; otherwise one full resolve.
+            if let (true, Some(msaa_scene)) = (self.legacy_scene_alias, msaa) {
+                match (transfer_rect, self.legacy_scene_resolve.as_ref()) {
+                    (Some((x, y, w, h)), Some((_, _, layout, pipeline))) => {
+                        let source = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("legacy model scene alias resolve source"),
+                            layout,
+                            entries: &[wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(msaa_scene),
+                            }],
+                        });
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("legacy model scene alias bounded resolve"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: scene,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                            })],
+                            ..Default::default()
+                        });
+                        pass.set_scissor_rect(x, y, w, h);
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, &source, &[]);
+                        pass.draw(0..3, 0..1);
+                    }
+                    _ => {
+                        let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("legacy model scene alias resolve"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: msaa_scene,
+                                depth_slice: None,
+                                resolve_target: Some(scene),
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                            })],
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
             return;
         }
         let blend = self.legacy_blend.as_ref().unwrap();
@@ -888,6 +1001,26 @@ const TRANSFER_MSAA: &str = r#"
 @fragment fn decode(@builtin(position) p:vec4<f32>, @builtin(sample_index) sample:u32) -> @location(0) vec4<f32> {
     let c = textureLoad(image,vec2<i32>(p.xy),i32(sample));
     return vec4(legacy_effect_decode(c.rgb),c.a);
+}
+"#;
+
+// Scene-alias MSAA resolve: reading the sRGB MSAA view yields linear values,
+// so averaging and writing through the sRGB scene view matches the hardware
+// resolve of every other scene pass.
+const SCENE_RESOLVE: &str = r#"
+@group(0) @binding(0) var image: texture_multisampled_2d<f32>;
+@vertex fn vertex(@builtin(vertex_index) i:u32) -> @builtin(position) vec4<f32> {
+    let p = array<vec2<f32>,3>(vec2(-1.0,-1.0),vec2(3.0,-1.0),vec2(-1.0,3.0));
+    return vec4(p[i],0.0,1.0);
+}
+@fragment fn resolve(@builtin(position) p:vec4<f32>) -> @location(0) vec4<f32> {
+    let pixel = vec2<i32>(p.xy);
+    let count = textureNumSamples(image);
+    var sum = vec4<f32>(0.0);
+    for (var s = 0u; s < count; s = s + 1u) {
+        sum = sum + textureLoad(image, pixel, i32(s));
+    }
+    return sum / f32(count);
 }
 "#;
 

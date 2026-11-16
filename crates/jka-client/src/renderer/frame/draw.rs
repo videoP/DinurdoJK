@@ -600,6 +600,7 @@ impl Renderer {
         // swapchain image used through its sRGB view. Incompatible paths fall
         // back to the exact mode-0 transfer path.
         let requested_mode4 = self.dynamic_model_renderer.legacy_blend_mode == 4;
+        let mut legacy_scene_alias = false;
         if requested_mode4 {
             static FORCE_SRGB_SURFACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let force_srgb_surface = *FORCE_SRGB_SURFACE.get_or_init(||
@@ -616,8 +617,23 @@ impl Renderer {
                 && self.studio_world_viewport.is_none()
                 && !self.early_submit_frame(menu_backdrop_active)
                 && !self.present_copy_frame(menu_backdrop_active);
-            self.dynamic_model_renderer.legacy_blend_mode = if compatible { 4 } else { 0 };
+            // Not the swapchain, but an 8-bit sRGB scene target that the
+            // world already aliases as UNORM for its encoded stages (targets.rs
+            // declares the view format on the scene and MSAA textures). Post
+            // makes scene_output that target; MSAA aliases its MSAA texture.
+            let scene_format = self.gameplay_scene_format();
+            legacy_scene_alias = !compatible && crate::renderer::legacy_scene_alias()
+                && (plan.use_post || self.msaa_samples > 1)
+                && scene_format.is_srgb()
+                && self.dynamic_model_renderer.fx_sprite_surface_format == scene_format
+                && !glass_scene_possible && !self.smaa_enabled
+                && self.hdr_output.is_none()
+                && !menu_backdrop_active
+                && self.studio_world_viewport.is_none();
+            self.dynamic_model_renderer.legacy_blend_mode =
+                if compatible || legacy_scene_alias { 4 } else { 0 };
         }
+        self.dynamic_model_renderer.legacy_scene_alias = legacy_scene_alias;
         // Keep mode 0 as the unmodified, full-frame visual reference. When
         // requested mode 4 cannot use the SDR swapchain alias, only its
         // fallback may narrow the HDR/offscreen legacy transfers.
@@ -1751,7 +1767,9 @@ impl Renderer {
         // Direct SDR legacy shell pass uses a second *view*, not a second
         // texture. Under mode 4 eligibility the frame is acquired normally and
         // `surface_view` is the sRGB view of this same UNORM swapchain image.
-        let legacy_unorm_view = if self.dynamic_model_renderer.legacy_blend_mode == 4 {
+        let legacy_unorm_view = if self.dynamic_model_renderer.legacy_blend_mode == 4
+            && !self.dynamic_model_renderer.legacy_scene_alias
+        {
             frame.as_ref().map(|frame| self.surface_texture_unorm_view(frame))
         } else {
             None
@@ -8041,7 +8059,13 @@ impl Renderer {
         // 2 = 1 plus scissored shader resolves instead of the full-frame MSAA
         // hardware resolves.
         let legacy_bounds_mode = crate::renderer::legacy_blend_bounds();
-        let legacy_transfer_bound = if !legacy_mode4_fallback {
+        let scene_alias_msaa = self.dynamic_model_renderer.legacy_scene_alias
+            && self.dynamic_model_renderer.legacy_blend_mode == 4 && self.msaa_samples > 1;
+        let legacy_transfer_bound = if scene_alias_msaa {
+            // Scene alias: the rect only scissors its MSAA resolve.
+            crate::renderer::models::legacy_blend::bounded_legacy_transfer_rect(
+                dynamic_models, view_proj, render_width, render_height, true)
+        } else if !legacy_mode4_fallback {
             Err("not_mode4_fallback")
         } else if self.msaa_samples != 1 && legacy_bounds_mode == 0 {
             Err("msaa")
@@ -8059,6 +8083,13 @@ impl Renderer {
                 info.legacy_eligible_surfaces =
                     crate::renderer::models::legacy_blend::describe_eligible_surfaces(dynamic_models);
             }
+        }
+        if scene_alias_msaa && legacy_transfer_rect.is_some()
+            && self.dynamic_model_renderer.legacy_blend_active()
+        {
+            // The scene-alias gate requires this to equal the scene format.
+            let format = self.dynamic_model_renderer.fx_sprite_surface_format;
+            self.dynamic_model_renderer.ensure_legacy_scene_resolve(&self.device, format, self.msaa_samples);
         }
         self.dynamic_model_renderer.composite_legacy_blend(&self.device,&mut encoder,
             scene_output,self.targets.msaa_view.as_ref(),&self.targets.depth_view,&self.camera_bind_group,

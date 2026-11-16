@@ -427,6 +427,14 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     /// Frame-latched: 0 reference 16-bit, 1 encoded 8-bit, 2 direct+resolve,
     /// 3 direct without the legacy-forced scene resolve.
     pub(in crate::renderer) legacy_blend_mode: u8,
+    /// Frame-latched with `legacy_blend_mode == 4`: the encoded draws target a
+    /// UNORM view of the offscreen sRGB scene (or its MSAA) target instead of
+    /// the swapchain image.
+    pub(in crate::renderer) legacy_scene_alias: bool,
+    /// Lazily built scissored MSAA resolve for the scene-alias path:
+    /// (scene format, samples, layout, pipeline).
+    pub(in crate::renderer) legacy_scene_resolve:
+        Option<(wgpu::TextureFormat, u32, wgpu::BindGroupLayout, wgpu::RenderPipeline)>,
     /// Encoded pipelines are format-specific across 16-bit/8-bit transitions.
     pub(in crate::renderer) legacy_blend_pipeline_format: wgpu::TextureFormat,
     pub(in crate::renderer) legacy_blend: Option<super::legacy_blend::LegacyModelBlend>,

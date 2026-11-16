@@ -3698,6 +3698,12 @@ pub(in crate::renderer) fn render_thread_main(
             };
             let legacy_region = if !renderer.dynamic_model_renderer.legacy_blend_active() {
                 "none".to_owned()
+            } else if effective_blend_mode == 4 && renderer.dynamic_model_renderer.legacy_scene_alias {
+                match last_info.legacy_transfer_rect {
+                    Some((x, y, w, h)) => format!("scene_alias resolve=bounded({x},{y},{w},{h})"),
+                    None if renderer.msaa_samples > 1 => "scene_alias resolve=full".to_owned(),
+                    None => "scene_alias".to_owned(),
+                }
             } else if effective_blend_mode == 4 {
                 "direct".to_owned()
             } else if let Some((x, y, width, height)) = last_info.legacy_transfer_rect {

@@ -174,6 +174,20 @@ pub(crate) fn set_legacy_blend_mode(mode: u8) {
     LEGACY_BLEND_MODE.store(mode.min(4), std::sync::atomic::Ordering::Relaxed);
 }
 
+// Session-only A/B: legacy model effects blend in display (gamma) space by
+// drawing into a UNORM view of the 8-bit sRGB scene target itself (the world's
+// encoded-blend technique), instead of the FP16 encode/decode transfer.
+static LEGACY_SCENE_ALIAS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn legacy_scene_alias() -> bool {
+    LEGACY_SCENE_ALIAS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_legacy_scene_alias(enabled: bool) {
+    LEGACY_SCENE_ALIAS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 // Session-only A/B for HDR/offscreen legacy model transfers (see draw.rs):
 // 0 original, 1 bound MSAA + GPU-skinned shells, 2 = 1 + scissored resolves.
 static LEGACY_BLEND_BOUNDS: std::sync::atomic::AtomicU8 =

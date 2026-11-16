@@ -428,6 +428,8 @@ impl DynamicModelRenderer {
             planar_fx_rope_pipeline: None,
             planar_model_format: None,
             legacy_blend_mode: 0,
+            legacy_scene_alias: false,
+            legacy_scene_resolve: None,
             legacy_blend_pipeline_format: wgpu::TextureFormat::Rgba16Float,
             legacy_blend: None,
             legacy_model_pipelines: Default::default(),
