@@ -145,6 +145,9 @@ pub(in crate::app) struct GameSession {
     /// Last announced 3/2/1 value for the current Siege start countdown.
     pub(in crate::app) siege_last_countdown: i32,
     pub(in crate::app) presented_entities: Vec<PresentedEntity>,
+    /// TaystJK `cg_permanents`: EF_PERMANENT baselines survive independently
+    /// of the snapshot stream and are presented in live and demo sessions.
+    pub(in crate::app) permanent_entities: Vec<jka_protocol::gamestate::EntityState>,
     /// The predicted/followed player is intentionally absent from
     /// `presented_entities`; keep the synthesized entity for this frame so
     /// spatial audio can follow it through the final-camera respatialization.

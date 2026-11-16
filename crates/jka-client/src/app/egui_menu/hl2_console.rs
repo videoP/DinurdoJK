@@ -302,6 +302,8 @@ fn console_resize_grip(ctx: &egui::Context, window_rect: egui::Rect) -> Option<(
 
 impl App {
     pub(in crate::app) fn egui_hl2_console(&mut self, ctx: &egui::Context) {
+        self.chat_translation.request_console_font(&self.console_input, &self.base, self.game.as_deref());
+        self.chat_translation.request_console_font(&self.console_search_input, &self.base, self.game.as_deref());
         self.ensure_chat_translation_fonts(ctx);
         // Keep a small inset so even the resize edges remain reachable.
         let viewport = ctx.content_rect().shrink(5.0);
@@ -459,6 +461,7 @@ impl App {
                                     .filter(|&id| self.chat_translation.has_message(id));
                                 let translated = chat_id.and_then(|id| self.console_chat_translation_line(line, id));
                                 let display = translated.as_deref().unwrap_or(line);
+                                self.chat_translation.request_console_font(display, &self.base, self.game.as_deref());
                                 let job = console_line_job(display, kind);
                                 let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
                                 let (rect, _) = ui.allocate_exact_size(
@@ -635,36 +638,63 @@ impl App {
                         .show(ui, |ui| {
                             let (text_rect, response) = ui.allocate_exact_size(
                                 egui::vec2((field_width - 10.0).max(1.0), 17.0),
-                                egui::Sense::click(),
+                                egui::Sense::click_and_drag(),
                             );
                             let font = egui::FontId::monospace(12.5);
                             let color = egui::Color32::BLACK;
-                            let cursor = self.console_cursor.min(self.console_input.len());
-                            let cursor = if self.console_input.is_char_boundary(cursor) {
-                                cursor
-                            } else {
-                                self.console_input.len()
-                            };
                             let text_galley = ui.painter().layout_no_wrap(
                                 self.console_input.clone(), font.clone(), color,
                             );
-                            let prefix_galley = ui.painter().layout_no_wrap(
-                                self.console_input[..cursor].to_owned(), font, color,
-                            );
-                            let caret_offset = prefix_galley.size().x;
+                            let cursor = self.console_cursor.min(self.console_input.len());
+                            let caret_offset = ui.painter().layout_no_wrap(
+                                self.console_input[..cursor].to_owned(), font.clone(), color,
+                            ).size().x;
                             let visible_width = text_rect.width().max(1.0);
                             let scroll = (caret_offset - visible_width + 3.0).max(0.0);
                             let painter = ui.painter().with_clip_rect(text_rect);
                             let text_y = text_rect.center().y - text_galley.size().y * 0.5;
                             let input_origin = egui::pos2(text_rect.left() - scroll, text_y);
-                            if response.clicked() {
+                            let hit = |pointer: egui::Pos2| {
+                                text_galley.cursor_from_pos(pointer - input_origin).index.0
+                            };
+                            if response.drag_started() {
+                                if let Some(pointer) = ui.input(|i| i.pointer.press_origin()) {
+                                    let cursor = self.console_input_byte_at_char(hit(pointer));
+                                    self.begin_console_input_selection(cursor);
+                                }
+                            } else if response.clicked() || response.double_clicked() || response.triple_clicked() {
                                 if let Some(pointer) = response.interact_pointer_pos() {
-                                    let index = text_galley.cursor_from_pos(pointer - input_origin).index.0;
-                                    self.console_cursor = self.console_input.char_indices()
-                                        .nth(index).map_or(self.console_input.len(), |(byte, _)| byte);
+                                    let cursor = self.console_input_byte_at_char(hit(pointer));
+                                    self.begin_console_input_selection(cursor);
+                                    self.finish_console_input_selection();
                                 }
                             }
+                            if self.console_input_selecting {
+                                if ui.input(|i| i.pointer.primary_down()) {
+                                    if let Some(pointer) = ui.input(|i| i.pointer.interact_pos()) {
+                                        self.console_cursor = self.console_input_byte_at_char(hit(pointer));
+                                    }
+                                    ui.ctx().request_repaint();
+                                } else {
+                                    self.finish_console_input_selection();
+                                }
+                            }
+                            if let Some((start, end)) = self.console_input_selection_bounds() {
+                                let left = ui.painter().layout_no_wrap(
+                                    self.console_input[..start].to_owned(), font.clone(), color,
+                                ).size().x;
+                                let right = ui.painter().layout_no_wrap(
+                                    self.console_input[..end].to_owned(), font.clone(), color,
+                                ).size().x;
+                                painter.rect_filled(egui::Rect::from_min_max(
+                                    egui::pos2(input_origin.x + left, text_rect.top() + 1.0),
+                                    egui::pos2(input_origin.x + right, text_rect.bottom() - 1.0),
+                                ), egui::CornerRadius::ZERO, egui::Color32::from_rgb(120, 174, 211));
+                            }
                             painter.galley(input_origin, text_galley, color);
+                            let caret_offset = ui.painter().layout_no_wrap(
+                                self.console_input[..self.console_cursor].to_owned(), font, color,
+                            ).size().x;
                             let caret_x = (text_rect.left() + caret_offset - scroll)
                                 .clamp(text_rect.left(), text_rect.right());
                             painter.line_segment(
@@ -714,6 +744,8 @@ impl App {
         if let Some((popup, rows)) = prompt_rect.and_then(|prompt| {
             completion_popup_geometry(window_rect, prompt, viewport, suggestions.len(), hint)
         }) {
+            let selected = if self.console_suggest_picked { self.console_suggest_index } else { 0 };
+            let first = crate::ui::console_suggest_first_visible(suggestions.len(), rows, selected);
             egui::Area::new(egui::Id::new("dinurdo_hl2_console_suggestions"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(popup.min)
@@ -735,7 +767,8 @@ impl App {
                         );
                         row_top += COMPLETION_HINT_HEIGHT;
                     }
-                    for (idx, suggestion) in suggestions.iter().take(rows).enumerate() {
+                    for (local_row, suggestion) in suggestions.iter().skip(first).take(rows).enumerate() {
+                        let idx = first + local_row;
                         let row = egui::Rect::from_min_size(
                             egui::pos2(popup.left() + 6.0, row_top),
                             egui::vec2(row_width, COMPLETION_ROW_HEIGHT),
@@ -743,7 +776,7 @@ impl App {
                         let response = ui.interact(
                             row, ui.id().with(("hl2_completion", idx)), egui::Sense::click(),
                         );
-                        let selected = self.console_suggest_picked && self.console_suggest_index == idx;
+                        let selected = !hint && selected == idx;
                         if selected || response.hovered() {
                             painter.rect_filled(row, egui::CornerRadius::ZERO,
                                 if selected { egui::Color32::from_rgb(77, 101, 120) }

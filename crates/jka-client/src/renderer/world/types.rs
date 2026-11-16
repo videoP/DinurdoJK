@@ -739,6 +739,8 @@ pub(in crate::renderer) struct WorldGpu {
     pub(in crate::renderer) lightmaps: Vec<GpuImage>,
     pub(in crate::renderer) deluxemaps: Vec<GpuImage>,
     pub(in crate::renderer) lightmap_base_data: Arc<Vec<TextureData>>,
+    /// Only the main BSP's pages participate in static sun reconstruction.
+    pub(in crate::renderer) baked_sun_lightmap_count: usize,
     pub(in crate::renderer) static_ao_source: Option<StaticAoWorldSource>,
     pub(in crate::renderer) static_ao_source_to_gpu: Vec<u32>,
     pub(in crate::renderer) static_ao_gpu_vertices: Vec<GpuVertex>,

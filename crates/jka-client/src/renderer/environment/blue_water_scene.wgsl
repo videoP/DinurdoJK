@@ -31,6 +31,18 @@ struct CsmFrame {
 @group(3) @binding(1) var csm_sampler:sampler_comparison;
 @group(3) @binding(2) var<uniform> csm:CsmFrame;
 
+// Four bilinear depth comparisons soften cascade texel steps without another
+// shadow pass or texture. Keep this fullscreen path cheaper than the world's
+// nine-comparison Castano filter.
+fn filtered_csm_depth(uv:vec2<f32>, layer:i32, depth:f32)->f32 {
+ let step=vec2<f32>(0.5)/vec2<f32>(textureDimensions(csm_depth));
+ let a=textureSampleCompareLevel(csm_depth,csm_sampler,uv+vec2(-step.x,-step.y),layer,depth);
+ let b=textureSampleCompareLevel(csm_depth,csm_sampler,uv+vec2( step.x,-step.y),layer,depth);
+ let c=textureSampleCompareLevel(csm_depth,csm_sampler,uv+vec2(-step.x, step.y),layer,depth);
+ let d=textureSampleCompareLevel(csm_depth,csm_sampler,uv+vec2( step.x, step.y),layer,depth);
+ return (a+b+c+d)*0.25;
+}
+
 fn moon_csm_cascade(world:vec3<f32>, normal:vec3<f32>, index:i32)->f32 {
  let n=normalize(normal);
  let light=normalize(csm.light_direction_enabled.xyz);
@@ -41,12 +53,11 @@ fn moon_csm_cascade(world:vec3<f32>, normal:vec3<f32>, index:i32)->f32 {
  let ndc=clip.xyz/clip.w;
  if any(abs(ndc.xy)>vec2<f32>(1.)) || ndc.z<=0. || ndc.z>=1. {return 1.;}
  let uv=ndc.xy*vec2<f32>(0.5,-0.5)+vec2<f32>(0.5);
- // One hardware-filtered depth compare; this is only sampled for moonlit pixels.
- let static_visibility=textureSampleCompareLevel(csm_depth,csm_sampler,uv,index,ndc.z);
+ let static_visibility=filtered_csm_depth(uv,index,ndc.z);
  if csm.params.w<=1.5 {return static_visibility;}
  // Entity-caster CSM stores movers in slices 5..8. When static-world
  // casters are enabled, they remain in slices 0..3 as well.
- let moving_visibility=textureSampleCompareLevel(csm_depth,csm_sampler,uv,index+5,ndc.z);
+ let moving_visibility=filtered_csm_depth(uv,index+5,ndc.z);
  return min(static_visibility,moving_visibility);
 }
 fn moon_csm_visibility(world:vec3<f32>,normal:vec3<f32>)->f32 {
@@ -129,9 +140,9 @@ fn sky_normal_decode(e:vec2<f32>)->vec3<f32> {
  let mask_pixel=clamp(pixel,vec2<i32>(0),vec2<i32>(textureDimensions(world_mask))-1);
  let policy=textureLoad(world_mask,mask_pixel,0);
  let mask=policy.r;
- // Only the matching static world prepass can supply sky normals. Keep
- // geometric normals for shadow bias, models, movers and main-pass-only depth
- // writers. A foreground model replaces policy/depth but not this MRT slot.
+ // Only the matching static world prepass can supply smooth lighting/bias
+ // normals. Models, movers and main-pass-only depth writers retain geometric
+ // normals. A foreground model replaces policy/depth but not this MRT slot.
  var sky_normal=normal;
  if frame.eye.w>0.5 && abs(mask-0.125)>0.06 {
   let encoded=textureLoad(world_sky_normals,pixel,0).rg;
@@ -159,7 +170,7 @@ fn sky_normal_decode(e:vec2<f32>)->vec3<f32> {
   // Baked mode never runs this sky gain; its shadow filtering is unchanged.
   var moon_visibility=1.;
   if frame.options.w>0.5 && sky_incidence>0. {
-   moon_visibility=moon_csm_visibility(world,normal);
+   moon_visibility=moon_csm_visibility(world,sky_normal);
   }
   let direct=light_color*light_intensity*sky_incidence*shade*moon_visibility;
   // r_skyWorldGainMode (see sky_gain_calibrated): A original, B daylight fades to

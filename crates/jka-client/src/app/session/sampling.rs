@@ -96,16 +96,16 @@ impl GameSession {
         // Only origin, angles and velocity of this render copy are touched;
         // event, HUD, prediction and protocol state keep their original clock.
         let mut held_ms = 0.0;
-        if self.live && crate::cgame::remote_smoothing::mode() != 0 {
+        if self.live && matches!(crate::cgame::remote_smoothing::mode(), 1..=4) {
             self.remote_smoothing.apply_follow(&mut ps, std::time::Instant::now(), teleported);
         }
         // The ordinary snapshot playerState is interpolated above when nextSnap
         // exists. With no nextSnap, that interpolation holds the last origin
         // while the live camera's damping clock continues to advance. Keep
         // the missing-snapshot fix strictly in spectator follow, and only in
-        // legacy remote-smoothing mode: modes 1-4 already resample the followed
+        // legacy spectator path (modes 0 and 5): modes 1-4 resample the followed
         // player with their own visual clock/correction history.
-        if self.live && crate::cgame::remote_smoothing::mode() == 0 {
+        if self.live && matches!(crate::cgame::remote_smoothing::mode(), 0 | 5) {
             held_ms = self.spectator_follow_hold.apply(
                 &mut ps,
                 self.current_snapshot.as_ref(),
@@ -139,7 +139,7 @@ impl GameSession {
                     current, self.next_snapshot.as_ref(), presentation_time_ms)
                     + held_ms
             });
-            let clock = if self.live && crate::cgame::remote_smoothing::mode() != 0 {
+            let clock = if self.live && matches!(crate::cgame::remote_smoothing::mode(), 1..=4) {
                 self.remote_smoothing.follow_command_ms.or(snapshot_clock)
             } else {
                 snapshot_clock

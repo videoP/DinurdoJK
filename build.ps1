@@ -5,7 +5,7 @@ param(
     [switch]$Fetch,
     [switch]$Fast,
     [switch]$Faster,
-    [switch]$Dlss,
+    [switch]$NoDlss,
     [switch]$CacheAudit,
     # Copy ONLY DinurdoJK.exe (plus DinurdoJK.pdb when the build produced one) to
     # this folder instead of staging the game in target\release (no DLLs,
@@ -14,6 +14,7 @@ param(
     [Alias('OutDir')][string]$Output
 )
 $ErrorActionPreference = 'Stop'
+$dlssEnabled = -not $NoDlss
 # Measure the whole command, not just the Cargo subprocess.
 $buildWallClock = [System.Diagnostics.Stopwatch]::StartNew()
 $beforeCargoSeconds = $null
@@ -87,10 +88,11 @@ if ($toolchainBin -and (Test-Path -LiteralPath (Join-Path $toolchainBin 'rustc.e
 # land in target\release, Cargo's own folder for that profile).
 # -Output <folder>  Copy only DinurdoJK.exe (+ .pdb if built) there (any mode). Use
 #            -Output target\release to update the game folder after -Fast/-Faster.
-# -Dlss      Adds Cargo feature nvidia-dlss (NVIDIA DLAA, Vulkan only). Needs
-#            DLSS_SDK (NVIDIA DLSS SDK 310.9.1), VULKAN_SDK and libclang, and
-#            stages nvngx_dlss.dll beside the exe. Toggling it rebuilds only the
-#            game crate, but Cargo keeps a second copy of that crate's cache.
+# DLSS is included by default (DLAA and upscaling, Vulkan and DX12). Needs
+# DLSS_SDK (NVIDIA DLSS SDK 310.9.1), VULKAN_SDK and libclang.
+# -NoDlss    Omit DLSS support and its SDK requirements.
+# Toggling DLSS changes Cargo's feature fingerprint and retains another cache.
+# -Output copies no DLLs; keep nvngx_dlss.dll in DinurdoJK/dependencies/.
 if ($Fast -and $Faster) { throw 'Choose -Fast or -Faster, not both.' }
 if (($Fast -or $Faster) -and $Configuration -eq 'Debug') {
     throw 'For -Fast or -Faster, omit -Configuration Debug.'
@@ -109,11 +111,11 @@ if ($Fast) {
     $profileArguments = @()
 }
 $featureArguments = @()
-if ($Dlss) {
+if ($dlssEnabled) {
     foreach ($name in 'DLSS_SDK', 'VULKAN_SDK') {
         $value = [Environment]::GetEnvironmentVariable($name)
         if (-not $value -or -not (Test-Path -LiteralPath $value)) {
-            throw "-Dlss needs $name set to an existing directory (see crates\jka-client\DLAA_VULKAN.md)."
+            throw "DLSS is included by default and needs $name set to an existing directory. Set it up (see crates\jka-client\DLAA_VULKAN.md), or use -NoDlss to build without DLSS."
         }
     }
     $featureArguments = @('--features', 'nvidia-dlss')
@@ -315,8 +317,8 @@ try {
     $staleGraphicsLock = (-not $lockText) -or
         ($lockText -match '(?m)^name = "wgpu"\r?\nversion = "29\.') -or
         ($lockText -match '(?m)^name = "smaa"\r?\nversion = "0\.20\.0"')
-    # -Dlss needs dlss_wgpu/bindgen, which ordinary offline builds never download.
-    if ($Fetch -or $staleGraphicsLock -or $Dlss) {
+    # DLSS needs dlss_wgpu/bindgen, which builds without DLSS may not have downloaded.
+    if ($Fetch -or $staleGraphicsLock -or $dlssEnabled) {
         & $cargoPath fetch
         if ($LASTEXITCODE -ne 0) { throw 'Dependency download failed.' }
     }
@@ -398,11 +400,11 @@ try {
         Write-Host "`nBuilt ($buildMode): $executable"
         return
     }
-    if ($Dlss) {
+    if ($dlssEnabled) {
         # NGX loads the DLAA runtime from the executable's folder.
         Sync-IfDifferent -Source (Join-Path $env:DLSS_SDK 'lib\Windows_x86_64\rel\nvngx_dlss.dll') -Destination (Join-Path $runtimeDirectory 'nvngx_dlss.dll')
     }
-    $modeLabel = if ($Dlss) { "$buildMode+dlss" } else { $buildMode }
+    $modeLabel = if ($dlssEnabled) { "$buildMode+dlss" } else { $buildMode }
     Set-Content -LiteralPath "$executable.mode" -Value "$modeLabel $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -Encoding ascii
     Write-Host "`nBuilt ($buildMode): $executable"
     if ($Fast) { Write-Host '(-Fast: ThinLTO, codegen-units 16, incremental ON)' }

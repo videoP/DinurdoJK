@@ -49,7 +49,7 @@ impl ShaderComplexityTarget {
         let multisampled_view = multisampled.as_ref().map(|t| t.create_view(&Default::default()));
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("BSP heatmap diagnostic compositor"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../bsp_complexity.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", crate::material_flags::shader_constants(), include_str!("../../bsp_complexity.wgsl")).into()),
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("BSP heatmap cost texture layout"),

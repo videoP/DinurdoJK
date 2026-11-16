@@ -138,7 +138,8 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn blue_water_night(&self) -> bool {
-        self.sky_backend == 1 && self.active_sun().direction[1] >= 0.0
+        // Relighting owns the celestial key, independently of the sky display.
+        (self.sun_override || self.sky_backend == 1) && self.active_sun().direction[1] >= 0.0
     }
 
     /// The direct light used by BSP Relighting, static-sun composition, and
@@ -196,11 +197,10 @@ impl Renderer {
         })
     }
 
-    /// The sun the native river's Single Layer Water follows: Blue Water's
-    /// celestial light while that sky is on (as the Blue Water sea receives
-    /// it), otherwise the classic `active_sun()` the world is lit with.
+    /// Relit water shares the physical environment even when its dome is hidden.
+    /// Without relighting, preserve the selected sky's original water lighting.
     pub(in crate::renderer) fn river_scene_sun(&self) -> Option<crate::river_slw::SceneSun> {
-        if self.sky_backend == 1 {
+        if self.sun_override || self.sky_backend == 1 {
             if let Some(atmosphere) = &self.blue_water_sky {
                 let light = atmosphere.sky.light();
                 return crate::river_slw::SceneSun::blue_water(

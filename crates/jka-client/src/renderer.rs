@@ -232,6 +232,7 @@ mod live_river;
 mod models;
 mod neon_menu;
 mod overlay;
+mod unicode_fonts;
 mod ui_gamma;
 mod portal_depth;
 mod post;
@@ -371,7 +372,7 @@ use models::types::{
 };
 use overlay::{
     empty_ui_font_texture, load_ui_font_texture, load_ui_loading_texture,
-    load_studio_overlay_font, load_ui_clean_font, load_ui_proportional_font, load_ui_unknown_map_texture, PendingUiLevelshot,
+    load_studio_overlay_font, load_ui_clean_font, load_ui_unknown_map_texture, PendingUiLevelshot,
     ScreenFxTexture,
 };
 use post::bindings::{
@@ -1072,6 +1073,7 @@ struct Renderer {
     _ui_font: GpuImage,
     _ui_jura_font: GpuImage,
     ui_jura_metrics: Option<std::sync::Arc<ui::UnicodeFallbackFont>>,
+    ui_unicode_worker: unicode_fonts::UnicodeFontWorker,
     _ui_small_font: GpuImage,
     /// Clean TrueType UI font (binding 8) and its metrics.
     _ui_clean_font: GpuImage,
@@ -1106,6 +1108,11 @@ struct Renderer {
     ui_team_icon_key: Vec<String>,
     _ui_ext_images: GpuImage,
     ui_ext_image_key: Vec<String>,
+    /// Latest requested image names from the app. Unlike the committed key,
+    /// these may be waiting for an asynchronous atlas rebuild.
+    ui_ext_requested_images: Vec<String>,
+    /// Requested HUD chrome style; the visible style changes with its atlas.
+    ui_ext_requested_hud_style: u8,
     /// Persistent async loader; retains its parsed shader library across batches.
     ui_ext_image_loader: Option<overlay::UiExtImageLoader>,
     /// True while bind group binding 3 holds the unknown-map art rather than the
@@ -1119,6 +1126,7 @@ struct Renderer {
     ui_loading_image_key: Option<String>,
     ui_pending_levelshot: Option<PendingUiLevelshot>,
     ui_small_font_metrics: Option<ui::ProportionalFont>,
+    ui_enemy_info_font_metrics: Option<Arc<ui::ProportionalFont>>,
     _ui_font_sampler: wgpu::Sampler,
     frame_time_graph: FrameTimeGraph,
     /// Finished `gputilecost` heatmap; None until a probe completes.

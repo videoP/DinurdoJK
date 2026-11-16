@@ -51,6 +51,8 @@ impl PlayerPresenter {
                 // A reused body-queue slot starts a fresh life.
                 self.entities.insert(body_entity, body_runtime);
                 self.body_fade.remove(&body_entity);
+                self.disintegration_start.remove(&body_entity);
+                self.disintegration_smoke_last.remove(&body_entity);
                 if let Some(parts) = self.dismembered.get(&source_client).cloned() {
                     self.dismembered.insert(body_entity, parts);
                 } else {
@@ -101,6 +103,8 @@ impl PlayerPresenter {
                 self.ragdolls.remove_entity(entity);
                 self.body_queue_copies.remove(&entity);
                 self.body_fade.remove(&entity);
+                self.disintegration_start.remove(&entity);
+                self.disintegration_smoke_last.remove(&entity);
                 self.dismembered.remove(&entity);
                 self.dismember_source_snaps.remove(&entity);
                 self.detached_limb_visuals.remove(&entity);

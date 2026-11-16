@@ -457,7 +457,7 @@ app_cvars! {
     APP_CG_DRAWTEAMOVERLAYWEAPONS {
         runtime: CvarDef::new(
                 "cg_drawTeamOverlayWeapons",
-                "",
+                "1",
                 "0..1",
                 "Show teammate weapon icons in cg_drawTeamOverlay.",
                 CvarType::String,

@@ -305,13 +305,14 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
     output.uv = base_uv * draw.uv_xform.xy + draw.uv_xform.zw
         + vec2<f32>(base_uv.y * draw.uv_cross.x, base_uv.x * draw.uv_cross.y);
     // RB_CalcTurbulentTexCoords: per-vertex position, after scroll/environment.
-    if (draw.uv_cross.z != 0.0) {
+    if (draw.uv_cross.z != 0.0 && !is_disintegration(draw.color.a)) {
         let phase = vec2<f32>(model_position.x + model_position.z, model_position.y) / 1024.0
             + draw.uv_cross.w;
         output.uv += sin(phase * 6.28318530718) * draw.uv_cross.z;
     }
     if (draw.color.a <= -3.0) { output.uv = input.uv; }
-    output.predator_local = jka_to_render(model_position);
+    output.predator_local = select(jka_to_render(model_position),
+        draw.uv_cross.xyz, is_disintegration(draw.color.a));
     output.predator_grid = select(vec2<f32>(60.0, 65.0), draw.uv_cross.xy, draw.color.a <= -3.0);
     output.normal = render_normal;
     output.draw_index = draw_index;
@@ -342,7 +343,9 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
         );
         draw_color = vec4<f32>(draw.color.rgb * lighting, draw.color.a);
     }
-    draw_color.a = draw_color.a * specular_alpha(draw, world, world_normal);
+    if (!is_disintegration(draw.color.a)) {
+        draw_color.a = draw_color.a * specular_alpha(draw, world, world_normal);
+    }
     output.color = draw_color;
     output.world_position = render_position;
     return output;
@@ -638,6 +641,54 @@ fn fs_glass(input: VertexOut) -> @location(0) vec4<f32> {
         camera.camera_pos_time.w, tint, f0);
 }
 
+// TaystJK rd-vanilla/tr_shade_calc.cpp RB_CalcDisintegrateColors.
+// The two shader passes encode their elapsed 0..1500ms in vertex/draw alpha.
+// Their reserved ranges never overlap the existing cloak/force-refraction tags.
+fn is_disintegration(tag: f32) -> bool {
+    return (tag >= -22.01 && tag <= -20.99)
+        || (tag >= -20.01 && tag <= -18.99);
+}
+
+fn disintegration_threshold2(tag: f32) -> f32 {
+    let progress = select(tag + 22.0, tag + 20.0, tag > -20.5);
+    let radius = clamp(progress, 0.0, 1.0) * 1500.0 * 0.045;
+    return radius * radius;
+}
+
+fn disintegration_keep(tag: f32, world: vec3<f32>, hit: vec3<f32>) -> bool {
+    let diff = hit - world;
+    return dot(diff, diff) >= disintegration_threshold2(tag);
+}
+
+// RF_DISINTEGRATE1: surviving skinned body, progressively charred in the
+// original squared-distance bands (+60, +150, +180).
+fn disintegration_body_color(
+    color: vec4<f32>, tag: f32, world: vec3<f32>, hit: vec3<f32>,
+) -> vec4<f32> {
+    let diff = hit - world;
+    let d2 = dot(diff, diff);
+    let threshold2 = disintegration_threshold2(tag);
+    if (d2 < threshold2) { discard; }
+    var shade = 1.0;
+    if (d2 < threshold2 + 60.0) {
+        shade = 0.0;
+    } else if (d2 < threshold2 + 150.0) {
+        shade = 111.0 / 255.0;
+    } else if (d2 < threshold2 + 180.0) {
+        shade = 175.0 / 255.0;
+    }
+    return vec4<f32>(color.rgb * shade, 1.0);
+}
+
+// RF_DISINTEGRATE2: TaystJK's burn material is drawn wherever the expanding
+// disintegration front has not yet consumed the surface.
+fn disintegration_burn_color(
+    color: vec4<f32>, tag: f32, world: vec3<f32>, hit: vec3<f32>,
+) -> vec4<f32> {
+    if (!disintegration_keep(tag, world, hit)) { discard; }
+    return vec4<f32>(color.rgb, clamp(color.a, 0.0, 1.0));
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
@@ -651,6 +702,14 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
+    if (is_disintegration(input.color.a)) {
+        if (tex.a < 0.5) { discard; }
+        let lit = fogged(
+            model_wet_color_with_water(studio_light_color(shaded_color(input, tex), tex * vec4<f32>(input.color.rgb, 1.0), input.normal, input.world_position), input.normal, input.world_position, 0.0),
+            input.world_position, false);
+        return disintegration_body_color(lit, input.color.a,
+            input.world_position, input.predator_local);
+    }
     if tex.a < 0.5 {
         discard;
     }
@@ -664,6 +723,12 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_unlit(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
+    if (is_disintegration(input.color.a)) {
+        return disintegration_burn_color(
+            fogged(vec4<f32>(tex.rgb * input.color.rgb, tex.a),
+                input.world_position, false),
+            input.color.a, input.world_position, input.predator_local);
+    }
     return legacy_effect_output(fogged(legacy_effect_source(tex, input.color), input.world_position, false));
 }
 
@@ -682,6 +747,8 @@ struct PrepassVertexOut {
     @location(2) normal: vec3<f32>,
     // Thermal heat-source distance 0..1 (see heat_source_alpha), < 0 for none.
     @location(3) heat_alpha: f32,
+    @location(4) @interpolate(flat) disintegration_tag: f32,
+    @location(5) disintegration_hit: vec3<f32>,
 };
 
 struct PrepassOut {
@@ -768,6 +835,8 @@ fn prepass_vertex(input: VertexIn, draw_index: u32) -> PrepassVertexOut {
     output.world_position = render_position;
     output.normal = vec3<f32>(world_normal.x, world_normal.z, -world_normal.y);
     output.heat_alpha = heat_source_alpha(draw, model_position);
+    output.disintegration_tag = draw.color.a;
+    output.disintegration_hit = draw.uv_cross.xyz;
     return output;
 }
 
@@ -811,6 +880,8 @@ struct PrepassMotionVertexOut {
     // Unjittered clip positions now and last frame; divided per fragment.
     @location(4) current_clip: vec4<f32>,
     @location(5) previous_clip: vec4<f32>,
+    @location(6) @interpolate(flat) disintegration_tag: f32,
+    @location(7) disintegration_hit: vec3<f32>,
 };
 
 // DLSS motion prepass: object + skeletal motion from last frame's transform
@@ -840,6 +911,8 @@ fn vs_prepass_motion(input: VertexIn, @builtin(instance_index) draw_index: u32) 
     output.world_position = base.world_position;
     output.normal = base.normal;
     output.heat_alpha = base.heat_alpha;
+    output.disintegration_tag = base.disintegration_tag;
+    output.disintegration_hit = base.disintegration_hit;
     output.current_clip = camera.unjittered_view_proj * vec4<f32>(base.world_position, 1.0);
     output.previous_clip = camera.previous_unjittered_view_proj * vec4<f32>(previous_position, 1.0);
     return output;
@@ -858,6 +931,10 @@ fn fs_prepass_motion(input: PrepassMotionVertexOut) -> PrepassOut {
 
 @fragment
 fn fs_prepass_mask_motion(input: PrepassMotionVertexOut) -> PrepassOut {
+    if (is_disintegration(input.disintegration_tag)
+        && !disintegration_keep(input.disintegration_tag,
+            input.world_position, input.disintegration_hit)) { discard; }
+
     if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
         discard;
     }
@@ -868,6 +945,10 @@ fn fs_prepass_mask_motion(input: PrepassMotionVertexOut) -> PrepassOut {
 
 @fragment
 fn fs_prepass_mask(input: PrepassVertexOut) -> PrepassOut {
+    if (is_disintegration(input.disintegration_tag)
+        && !disintegration_keep(input.disintegration_tag,
+            input.world_position, input.disintegration_hit)) { discard; }
+
     if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
         discard;
     }
@@ -881,6 +962,10 @@ fn fs_rain_prepass(input: PrepassVertexOut) -> @location(0) f32 {
 
 @fragment
 fn fs_rain_prepass_mask(input: PrepassVertexOut) -> @location(0) f32 {
+    if (is_disintegration(input.disintegration_tag)
+        && !disintegration_keep(input.disintegration_tag,
+            input.world_position, input.disintegration_hit)) { discard; }
+
     if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
         discard;
     }
@@ -892,6 +977,10 @@ fn fs_rain_prepass_mask(input: PrepassVertexOut) -> @location(0) f32 {
 // surfaces need this discard. Same 0.5 cutoff as fs_prepass_mask.
 @fragment
 fn fs_shadow_mask(input: PrepassVertexOut) {
+    if (is_disintegration(input.disintegration_tag)
+        && !disintegration_keep(input.disintegration_tag,
+            input.world_position, input.disintegration_hit)) { discard; }
+
     if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
         discard;
     }

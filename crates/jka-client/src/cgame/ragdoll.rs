@@ -1832,6 +1832,21 @@ impl RagdollWorld {
         self.debug_candidates.remove(&source);
     }
 
+    /// TaystJK freezes the Ghoul2 body pose on EF_DISINTEGRATION. For a corpse
+    /// already owned by Rapier, freeze its existing articulated rigid bodies
+    /// rather than discarding the solved pose or changing multiplayer state.
+    pub(crate) fn freeze_for_disintegration(&mut self, entity: u16) {
+        let Some(instance) = self.instances.get(&entity) else { return; };
+        if instance.kind != RagdollKind::Corpse { return; }
+        for driven in &instance.driven {
+            if let Some(body) = self.bodies.get_mut(driven.body) {
+                if body.body_type() != RigidBodyType::Fixed {
+                    body.set_body_type(RigidBodyType::Fixed, true);
+                }
+            }
+        }
+    }
+
     /// Reliable `kg2` removes the Ghoul2 instance immediately; mirror that for
     /// any physics state bolted to the same presentation entity.
     pub(crate) fn remove_entity(&mut self, entity: u16) {

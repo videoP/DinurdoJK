@@ -34,7 +34,7 @@ struct SurfaceDeformationUniform {
 @group(1) @binding(26) var snowflow_field_1: texture_2d<f32>;
 @group(1) @binding(27) var snowflow_field_sampler: sampler;
 
-fn surface_material_id(material_word: u32) -> u32 { return (material_word >> 8u) & 31u; }
+fn surface_material_id(material_word: u32) -> u32 { return (material_word & MATERIAL_SURFACE_KIND_MASK) >> MATERIAL_SURFACE_KIND_SHIFT; }
 fn is_authored_snow(material_word: u32) -> bool { return surface_material_id(material_word) == MATERIAL_SNOW_WORD; }
 fn xz_inside_bounds(position: vec2<f32>, bounds: vec4<f32>) -> bool {
     return position.x >= bounds.x && position.y >= bounds.y && position.x <= bounds.z && position.y <= bounds.w;

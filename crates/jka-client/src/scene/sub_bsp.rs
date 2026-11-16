@@ -149,6 +149,10 @@ fn append_sub_bsp(map: &mut PreparedMap, mut child: PreparedMap) -> Result<(), S
 
     let texture_offset = map.textures.len();
     let lightmap_offset = map.lightmaps.len();
+    map.sub_bsp_boundary.get_or_insert(super::SubBspBoundary {
+        model: model_offset,
+        lightmap: lightmap_offset,
+    });
     let debug_offset = u32::try_from(map.material_debug.entries.len())
         .map_err(|_| "Material count exceeds u32")?;
     Arc::make_mut(&mut map.textures).append(Arc::make_mut(&mut child.textures));
@@ -275,6 +279,11 @@ fn remap_batch(
     batch.water_primary = false;
     batch.authored_ocean = None;
     batch.reflection_probe = None;
+    // Fused additive stages own their texture and lightmap indices too.
+    // They must receive the same import offsets as the primary stage.
+    for companion in &mut batch.additive_companions {
+        remap_batch(companion, vertex_offset, texture_offset, lightmap_offset, debug_offset)?;
+    }
     Ok(())
 }
 
@@ -303,6 +312,35 @@ mod tests {
         strings.insert(CS_BSP_MODELS + 2, b"maps/room.bsp\0".to_vec());
         assert!(server_bsp_names(&strings).is_err());
     }
+    #[test]
+    fn imported_fused_stage_resource_offsets_are_remapped() {
+        use crate::materials::{MaterialStage, StageTexture};
+        use jka_assets::shader::{AlphaGen, RgbGen, TcGen};
+        let stage = MaterialStage {
+            texture: StageTexture::Image(4), animation: None, enhancements: Default::default(),
+            blend: None, alpha_cutoff: 0.5, opacity: 1.0, color: [1.0; 3],
+            rgb_gen: RgbGen::Identity, alpha_gen: AlphaGen::Identity,
+            tc_gen: TcGen::Base, tc_mods: Vec::new(), depth_write: true,
+            depth_equal: false, depth_test_disabled: false, glow: false,
+        };
+        let material = super::super::SurfaceMaterial {
+            stages: vec![stage.clone()], ..Default::default()
+        };
+        let mut primary = super::super::material_batches::stage_batch(
+            &material, &stage, true, false, 0..3,
+            None, None, None, &[], [0; 4], [0.0; 4], false,
+        );
+        let mut companion = primary.clone();
+        companion.additive_companions.clear();
+        companion.lightmap = Some(2);
+        primary.additive_companions.push(companion);
+        remap_batch(&mut primary, 12, 7, 0, 0).unwrap();
+        assert_eq!(primary.additive_companions.len(), 1);
+        assert_eq!(primary.additive_companions[0].vertices, 12..15);
+        assert_eq!(primary.additive_companions[0].texture, Some(11));
+        assert_eq!(primary.additive_companions[0].lightmap, Some(7));
+    }
+
     #[test]
     fn misc_bsp_configstring_updates_include_completed_big_strings() {
         assert!(sub_bsp_configstring_command(b"cs 1613 \"maps/room.bsp\""));
@@ -490,6 +528,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(combined.sub_bsp_names, names);
+        let boundary = super::super::SubBspBoundary {
+            model: baseline.bsp_stats.as_ref().unwrap().inline_model_bounds.len() as u32,
+            lightmap: baseline.lightmaps.len(),
+        };
+        assert_eq!(combined.sub_bsp_boundary, Some(boundary));
+        assert_eq!(baseline.sub_bsp_boundary, None);
         assert_eq!(combined.vertices.len(), baseline.vertices.len());
         assert_eq!(combined.batches.len(), baseline.batches.len());
         assert_eq!(
@@ -593,6 +637,7 @@ mod tests {
             repeated.inline_vertices.len(),
             original_vertex_count
         );
+        assert_eq!(repeated.sub_bsp_boundary, Some(boundary));
         let mut solo = prepare_source_with_sub_bsps(
             &root,
             None,
@@ -604,6 +649,7 @@ mod tests {
         )
         .unwrap();
         assert!(solo.sub_bsp_names.is_empty());
+        assert_eq!(solo.sub_bsp_boundary, None);
         assert_eq!(
             solo.bsp_stats.as_ref().unwrap().inline_model_bounds.len(),
             9

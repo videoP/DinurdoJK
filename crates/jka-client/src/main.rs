@@ -69,6 +69,7 @@ mod logging;
 mod local_server;
 mod map_jobs;
 mod materials;
+mod material_flags;
 mod media_mp4;
 mod model_frame_log;
 mod net;

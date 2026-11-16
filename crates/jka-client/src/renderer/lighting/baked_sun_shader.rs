@@ -29,9 +29,15 @@ fn sky_world_gain(at:vec2<i32>)->vec3<f32> {
     // Reuse the completed, edge-antialiased sun/moon bake at its native
     // resolution. Do not introduce a second shadow edge from the original
     // lightmap grid or quantize this visibility into the packed sky normal.
-    let incident=max(textureLoad(sun_flux,at,0).r,0.0);
-    let cosine=max(textureLoad(sun_flux,at+vec2(0,i32(textureDimensions(sun_flux).y/2u)),0).r,0.0);
-    let direct_visibility=clamp(incident/max(cosine,1e-5),0.0,1.0);
+    // Realtime sky-only receivers have no directional sun-flux texture.
+    // The actual sun/moon is handled by live CSM; never manufacture cached
+    // direct sunlight from unrelated authored lightmap pixels.
+    var direct_visibility=0.0;
+    if parameters.sun.w>0.0 {
+        let incident=max(textureLoad(sun_flux,at,0).r,0.0);
+        let cosine=max(textureLoad(sun_flux,at+vec2(0,i32(textureDimensions(sun_flux).y/2u)),0).r,0.0);
+        direct_visibility=clamp(incident/max(cosine,1e-5),0.0,1.0);
+    }
     let ambient=env_irradiance(sky_atlas,sky_atlas_sampler,sky_environment,n)/3.14159265*ambient_visibility;
     // Exactly match blue_water_scene.wgsl and model_sky_light: at night,
     // sky_environment.light_* can still refer to the solar key.

@@ -1,3 +1,4 @@
+use crate::material_flags::*;
 use super::*;
 
 enum TestBinding {
@@ -178,7 +179,7 @@ fn test_groups(
 #[test]
 fn vertex_recipe_tracks_operations_not_values() {
     let mut a = MaterialUniform::default();
-    a.header = [0, 2, 134217728, 14 << 8];
+    a.header = [0, 2, MATERIAL_FLAG_RGB_WAVE, 14 << MATERIAL_SURFACE_KIND_SHIFT];
     a.mods[0] = [1.0, 1.0, 2.0, 0.0];
     a.mods[2] = [6.0, 1.0, 0.3, 0.0];
     a.mods[3] = [2.0, 3.0, 0.0, 0.0];
@@ -217,13 +218,13 @@ fn medium_plain_stages_drop_only_proven_unused_features() {
         static_bsp_ao: true,
         ..Default::default()
     };
-    let wall = MaterialFragmentKey::from_material([0, 0, 2, 0], 0.0);
+    let wall = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0], 0.0);
     let v = effective_stage_variant(medium, wall);
     assert!(basic(v));
     assert!(v.legacy_fog && v.static_bsp_ao);
     let mut lit = wall;
-    lit.flags |= 8;
-    lit.flags_w |= 2;
+    lit.flags |= MATERIAL_FLAG_NORMAL_MAP;
+    lit.flags_w |= MATERIAL_FLAG_DETAIL;
     let v = effective_stage_variant(medium, lit);
     assert!(v.pbr && v.pom && v.deluxe && v.detail_textures_enabled);
     let mut glass = wall;
@@ -242,8 +243,8 @@ fn shared_families_ignore_material_options_and_generated_keys_retain_operations(
         program_mode: WorldProgramMode::Shared,
         ..Default::default()
     };
-    let a = MaterialFragmentKey::from_material([0, 0, 2, 0], 0.0);
-    let b = MaterialFragmentKey::from_material([3, 0, 1 | 134217728, 0], 0.0);
+    let a = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0], 0.0);
+    let b = MaterialFragmentKey::from_material([3, 0, MATERIAL_FLAG_RGB_VERTEX | MATERIAL_FLAG_RGB_WAVE, 0], 0.0);
     assert_eq!(program_key(v, pipeline, a), program_key(v, pipeline, b));
     let v = WorldShaderVariantKey {
         program_mode: WorldProgramMode::Generated,
@@ -265,7 +266,7 @@ fn glass_primary_stages_keep_the_specialized_fs_main_program() {
     // Only fs_main shades promoted glass; minimal/shared/generated entries
     // would draw it as an opaque stage.
     let pipeline = super::super::pipelines::ocean_pipeline_key();
-    let glass = MaterialFragmentKey::from_material([0, 0, 2, 1 << 17], 0.0);
+    let glass = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, MATERIAL_FLAG_GLASS], 0.0);
     for mode in [WorldProgramMode::Shared, WorldProgramMode::Generated] {
         let v = WorldShaderVariantKey {
             material_specialization: true,
@@ -276,7 +277,7 @@ fn glass_primary_stages_keep_the_specialized_fs_main_program() {
         assert_eq!(key.program, StageProgram::Specialized);
         assert!(!uses_minimal_entry(key));
         // The glass bit only selects the program; it never splits PSOs.
-        assert_eq!(key.flags_w & (1 << 17), 0);
+        assert_eq!(key.flags_w & MATERIAL_FLAG_GLASS, 0);
     }
 }
 
@@ -284,9 +285,9 @@ fn glass_primary_stages_keep_the_specialized_fs_main_program() {
 fn foliage_material_flag_survives_world_program_specialization() {
     let mut pipeline = super::super::pipelines::ocean_pipeline_key();
     pipeline.class = crate::renderer::DrawClass::Mask;
-    let flag = crate::foliage::MATERIAL_FLAG;
-    let foliage = MaterialFragmentKey::from_material([0, 0, 1, flag], 0.5);
-    let ordinary = MaterialFragmentKey::from_material([0, 0, 1, 0], 0.5);
+    let flag = crate::material_flags::MATERIAL_FLAG_FOLIAGE_WIND;
+    let foliage = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_RGB_VERTEX, flag], 0.5);
+    let ordinary = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_RGB_VERTEX, 0], 0.5);
     for mode in [WorldProgramMode::Specialized, WorldProgramMode::Generated] {
         let variant = WorldShaderVariantKey {
             material_specialization: true, program_mode: mode, ..Default::default()
@@ -297,6 +298,35 @@ fn foliage_material_flag_survives_world_program_specialization() {
         assert_eq!(promoted.flags_w_mask & flag, flag);
         assert_eq!(still.flags_w & flag, 0);
         assert_eq!(still.flags_w_mask & flag, flag);
+    }
+}
+
+
+#[test]
+fn inline_baked_receiver_exclusion_cannot_promote_wind_in_any_program_mode() {
+    let pipeline = super::super::pipelines::ocean_pipeline_key();
+    for wind in [false, true] {
+        let word = MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION
+            | if wind { MATERIAL_FLAG_FOLIAGE_WIND } else { 0 };
+        let uniform = MaterialUniform { header: [0, 0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, word], ..Default::default() };
+        let raw = MaterialFragmentKey::from_uniform(&uniform);
+        for mode in [WorldProgramMode::Specialized, WorldProgramMode::Shared,
+            WorldProgramMode::Generated, WorldProgramMode::Hybrid] {
+            for baked_sun_relight in [false, true] {
+                let variant = WorldShaderVariantKey { material_specialization: true,
+                    program_mode: mode, baked_sun_relight, ..Default::default() };
+                let key = program_key(variant, pipeline, raw);
+                // This is the shader's material_flags_w() merge: bits omitted
+                // from specialization must remain readable from the uniform.
+                let bound = (word & !key.flags_w_mask) | (key.flags_w & key.flags_w_mask);
+                assert_eq!(bound & MATERIAL_FLAG_FOLIAGE_WIND != 0, wind);
+                assert_ne!(bound & MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION, 0);
+                let ordinary = MaterialFragmentKey::from_material(
+                    [0, 0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, word & !MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION], 0.0);
+                assert_eq!(key, program_key(variant, pipeline, ordinary),
+                    "receiver policy must not create another shader variant");
+            }
+        }
     }
 }
 
@@ -331,17 +361,17 @@ fn generated_stage_matrix_validates_and_specializes() {
     for variant in [minimal, low, medium, baked] {
         for flags in [
             0,
-            2,
-            1 | 1048576,
-            134217728 | 268435456,
-            2 | 8 | 16 | 32 | 128,
-            4096,
-            8388608,
-            131072 | 1,
+            MATERIAL_FLAG_IMPLICIT_LIGHTMAP,
+            MATERIAL_FLAG_RGB_VERTEX | MATERIAL_FLAG_ALPHA_VERTEX,
+            MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE,
+            MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_NORMAL_MAP | MATERIAL_FLAG_ROUGHNESS_MAP | MATERIAL_FLAG_HEIGHT_MAP | MATERIAL_FLAG_SPECULAR_MAP,
+            MATERIAL_FLAG_PLANAR_REFLECTION,
+            MATERIAL_FLAG_EXPLICIT_LIGHTMAP,
+            MATERIAL_FLAG_VERTEX_LIT | MATERIAL_FLAG_RGB_VERTEX,
         ] {
             for tc_gen in 0..4 {
                 let mut uniform = MaterialUniform::default();
-                uniform.header = [tc_gen, 4, flags, 2 | (14 << 8)];
+                uniform.header = [tc_gen, 4, flags, MATERIAL_FLAG_DETAIL | (14 << MATERIAL_SURFACE_KIND_SHIFT)];
                 uniform.params[0] = -0.5;
                 uniform.mods[0][0] = 1.0;
                 uniform.mods[2][0] = 3.0;
@@ -407,7 +437,7 @@ fn generated_plain_interface_omits_unused_varyings_and_tcmod_interpreter() {
     let key = program_key(
         variant,
         super::super::pipelines::ocean_pipeline_key(),
-        MaterialFragmentKey::from_material([0, 0, 2, 0], 0.0),
+        MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0], 0.0),
     );
     let source = generated_source(program_variant(variant, key), key);
     let interface = source
@@ -441,7 +471,7 @@ fn generated_wave_evaluation_is_vertex_only_and_flat() {
     let key = program_key(
         variant,
         super::super::pipelines::ocean_pipeline_key(),
-        MaterialFragmentKey::from_material([0, 0, 134217728 | 268435456, 0], 0.0),
+        MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE, 0], 0.0),
     );
     let source = generated_source(program_variant(variant, key), key);
     assert!(function_body(&source, "vs_generated").contains("vertex_wave_gens"));
@@ -456,7 +486,7 @@ fn program_cache_distinguishes_mode_interface_and_tcmod_sequence() {
     use super::super::pipelines::WorldPassPipelineIdentity;
     let mut pipeline = super::super::pipelines::ocean_pipeline_key();
     pipeline.class = crate::renderer::DrawClass::Opaque;
-    let m = MaterialFragmentKey::from_material([0, 0, 2, 0], 0.0);
+    let m = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0], 0.0);
     let v = WorldShaderVariantKey {
         material_specialization: true,
         ..Default::default()
@@ -623,26 +653,26 @@ fn world_program_modes_gpu_images_match() {
         });
         let modules = ProgramModules::default();
         for (flags, cutoff, tc_gen, func, profile, material_word) in [
-            (2, 0.0, 0, 0, 0, 0),
-            (1 | 1048576 | 2, 0.5, 0, 0, 0, 0),
-            (524288 | 2097152 | 2, -0.5, 1, 0, 0, 0),
-            (2 | 1073741824, 0.5, 2, 0, 0, 0),
-            (2 | 134217728 | 268435456, 0.0, 3, 0, 0, 0),
-            (2 | 134217728 | 268435456, 0.5, 0, 1, 0, 0),
-            (2 | 134217728 | 268435456, 0.0, 0, 2, 0, 0),
-            (2 | 134217728 | 268435456, 0.0, 0, 3, 0, 0),
-            (2 | 134217728 | 268435456, 0.0, 0, 4, 0, 0),
-            (2 | 134217728 | 268435456, 0.0, 0, 5, 0, 0),
-            (2, 0.0, 0, 0, 1, 0),
-            (2, 0.0, 0, 0, 2, 0),
-            (2, 0.0, 0, 0, 2, 2),
-            (2 | 8 | 16 | 32, 0.0, 0, 0, 2, 2),
-            (2 | 8 | 134217728, 0.5, 0, 1, 2, 2),
-            (2, 0.0, 0, 0, 2, 14 << 8),
-            (4096, 0.0, 3, 0, 2, 0),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0.0, 0, 0, 0, 0),
+            (MATERIAL_FLAG_RGB_VERTEX | MATERIAL_FLAG_ALPHA_VERTEX | MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0.5, 0, 0, 0, 0),
+            (MATERIAL_FLAG_RGB_ONE_MINUS_VERTEX | MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX | MATERIAL_FLAG_IMPLICIT_LIGHTMAP, -0.5, 1, 0, 0, 0),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_MASK_TEXTURE_ALPHA, 0.5, 2, 0, 0, 0),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE, 0.0, 3, 0, 0, 0),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE, 0.5, 0, 1, 0, 0),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE, 0.0, 0, 2, 0, 0),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE, 0.0, 0, 3, 0, 0),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE, 0.0, 0, 4, 0, 0),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE, 0.0, 0, 5, 0, 0),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0.0, 0, 0, 1, 0),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0.0, 0, 0, 2, 0),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0.0, 0, 0, 2, MATERIAL_FLAG_DETAIL),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_NORMAL_MAP | MATERIAL_FLAG_ROUGHNESS_MAP | MATERIAL_FLAG_HEIGHT_MAP, 0.0, 0, 0, 2, MATERIAL_FLAG_DETAIL),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_NORMAL_MAP | MATERIAL_FLAG_RGB_WAVE, 0.5, 0, 1, 2, MATERIAL_FLAG_DETAIL),
+            (MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0.0, 0, 0, 2, 14 << MATERIAL_SURFACE_KIND_SHIFT),
+            (MATERIAL_FLAG_PLANAR_REFLECTION, 0.0, 3, 0, 2, 0),
             // Explicit $lightmap stage: source alpha is forced opaque.
-            (8388608, 0.0, 1, 0, 0, 0),
-            (8388608 | 1048576, 0.0, 1, 0, 1, 0),
+            (MATERIAL_FLAG_EXPLICIT_LIGHTMAP, 0.0, 1, 0, 0, 0),
+            (MATERIAL_FLAG_EXPLICIT_LIGHTMAP | MATERIAL_FLAG_ALPHA_VERTEX, 0.0, 1, 0, 1, 0),
         ] {
             let mut material = MaterialUniform::default();
             material.header = [tc_gen, 3, flags, material_word];
@@ -929,7 +959,7 @@ fn trace_stage_eligibility_matches_program_selection() {
     // actually chooses a specialized fallback (or vice versa) for common cases.
     let mut pipeline = super::super::pipelines::ocean_pipeline_key();
     pipeline.class = crate::renderer::DrawClass::Opaque;
-    let plain = MaterialFragmentKey::from_material([0, 0, 2, 0], 0.0);
+    let plain = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0], 0.0);
     for mode in 2..=5 {
         let variant = WorldShaderVariantKey {
             material_specialization: true,
@@ -952,7 +982,7 @@ fn trace_stage_eligibility_matches_program_selection() {
         assert!(stage_rejection_reasons(variant, autosprite, plain, mode)
             .iter().any(|why| why.contains("autosprite2")));
         assert_eq!(program_key(variant, autosprite, plain).program, StageProgram::Specialized);
-        let glass = MaterialFragmentKey::from_material([0, 0, 2, 1 << 17], 0.0);
+        let glass = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, MATERIAL_FLAG_GLASS], 0.0);
         assert!(stage_rejection_reasons(variant, pipeline, glass, mode)
             .iter().any(|why| why.contains("glass")));
         assert_eq!(program_key(variant, pipeline, glass).program, StageProgram::Specialized);
@@ -962,7 +992,7 @@ fn trace_stage_eligibility_matches_program_selection() {
         program_mode: WorldProgramMode::Generated,
         ..Default::default()
     };
-    let special_tcgen = MaterialFragmentKey::from_material([7, 0, 2, 0], 0.0);
+    let special_tcgen = MaterialFragmentKey::from_material([7, 0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0], 0.0);
     assert!(stage_rejection_reasons(generated, pipeline, special_tcgen, 4)
         .iter().any(|why| why.contains("tcGen")));
     assert_eq!(program_key(generated, pipeline, special_tcgen).program, StageProgram::Specialized);
@@ -972,7 +1002,7 @@ fn trace_stage_eligibility_matches_program_selection() {
 fn hybrid_ocean_dry_stages_use_lean_programs() {
     let mut pipeline = super::super::pipelines::ocean_pipeline_key();
     pipeline.class = crate::renderer::DrawClass::Opaque;
-    let wall = MaterialFragmentKey::from_material([0, 0, 2, 0], 0.0);
+    let wall = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0], 0.0);
     let mode1 = WorldShaderVariantKey { material_specialization: true, ocean: true, ..Default::default() };
     assert_eq!(mode1.family(), WorldShaderFamily::Enhanced);
     let key = program_key(mode1, pipeline, wall);
@@ -1012,7 +1042,7 @@ fn baked_relight_specializes_only_lightmap_stages() {
     let key = program_key(variant, pipeline, texture);
     assert_eq!(key.program, StageProgram::GeneratedBasic);
     assert!(!program_variant(variant, key).baked_sun_relight);
-    for flags in [2, 8388608, 131072 | 1] {
+    for flags in [MATERIAL_FLAG_IMPLICIT_LIGHTMAP, MATERIAL_FLAG_EXPLICIT_LIGHTMAP, MATERIAL_FLAG_VERTEX_LIT | MATERIAL_FLAG_RGB_VERTEX] {
         let lit = MaterialFragmentKey::from_material([0, 0, flags, 0], 0.0);
         let key = program_key(variant, pipeline, lit);
         assert_eq!(key.program, StageProgram::GeneratedEnhanced, "flags {flags}");
@@ -1024,11 +1054,11 @@ fn baked_relight_specializes_only_lightmap_stages() {
         assert!(source.contains("@interpolate(flat) baked_sun_fit"));
     }
     // Vertex colour alone (no vertex-lit flag) is not baked lighting.
-    let vertex_color = MaterialFragmentKey::from_material([0, 0, 1, 0], 0.0);
+    let vertex_color = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_RGB_VERTEX, 0], 0.0);
     assert!(!program_variant(variant, program_key(variant, pipeline, vertex_color)).baked_sun_relight);
     // Mode 3 keeps lightmapped relight specialized; plain stages stay shared.
     let shared = WorldShaderVariantKey { program_mode: WorldProgramMode::Shared, ..variant };
-    let lightmapped = MaterialFragmentKey::from_material([0, 0, 2, 0], 0.0);
+    let lightmapped = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, 0], 0.0);
     assert_eq!(program_key(shared, pipeline, lightmapped).program, StageProgram::Specialized);
     assert!(stage_rejection_reasons(shared, pipeline, lightmapped, 3).iter().any(|why| why.contains("baked")));
     assert_eq!(program_key(shared, pipeline, texture).program, StageProgram::SharedBasic);
@@ -1050,11 +1080,11 @@ fn hybrid_mode_five_selects_work_not_material_names() {
 
     // Ordinary texture, baked lightmap and vertex-color stages all use a
     // compact *specialized* entry: alpha and material constants remain fixed.
-    for flags in [0, 2, 1, 131072 | 1, 8388608] {
+    for flags in [0, MATERIAL_FLAG_IMPLICIT_LIGHTMAP, MATERIAL_FLAG_RGB_VERTEX, MATERIAL_FLAG_VERTEX_LIT | MATERIAL_FLAG_RGB_VERTEX, MATERIAL_FLAG_EXPLICIT_LIGHTMAP] {
         let key = MaterialFragmentKey::from_material([0, 0, flags, 0], 0.0);
         assert_eq!(program_key(variant, pipeline, key).program, StageProgram::Minimal);
     }
-    let cutout = MaterialFragmentKey::from_material([0, 0, 1, 0], 0.4);
+    let cutout = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_RGB_VERTEX, 0], 0.4);
     let mut masked = pipeline;
     masked.class = crate::renderer::DrawClass::Mask;
     let key = program_key(variant, masked, cutout);
@@ -1070,18 +1100,18 @@ fn hybrid_mode_five_selects_work_not_material_names() {
     let mut scroll = MaterialFragmentKey::from_material([0, 0, 0, 0], 0.0);
     scroll.vertex_recipe.tc_mods = [1, 0, 0, 0];
     assert_eq!(program_key(variant, pipeline, scroll).program, StageProgram::GeneratedBasic);
-    let wave = MaterialFragmentKey::from_material([0, 0, 134217728, 0], 0.0);
+    let wave = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_RGB_WAVE, 0], 0.0);
     assert_eq!(program_key(variant, pipeline, wave).program, StageProgram::GeneratedBasic);
 
     // Enhanced equations remain live where they actually affect the material.
     let pbr = WorldShaderVariantKey { pbr: true, ..variant };
-    let pbr_stage = MaterialFragmentKey::from_material([0, 0, 8, 0], 0.0);
+    let pbr_stage = MaterialFragmentKey::from_material([0, 0, MATERIAL_FLAG_NORMAL_MAP, 0], 0.0);
     assert_eq!(program_key(pbr, pipeline, pbr_stage).program, StageProgram::GeneratedEnhanced);
     let plain = MaterialFragmentKey::from_material([0, 0, 0, 0], 0.0);
     assert_eq!(program_key(pbr, pipeline, plain).program, StageProgram::Specialized);
 
     // Never reinterpret unsupported authored effects as a plain shader.
-    let glass = MaterialFragmentKey::from_material([0, 0, 0, 1 << 17], 0.0);
+    let glass = MaterialFragmentKey::from_material([0, 0, 0, MATERIAL_FLAG_GLASS], 0.0);
     assert_eq!(program_key(variant, pipeline, glass).program, StageProgram::Specialized);
     let special_tc = MaterialFragmentKey::from_material([5, 0, 0, 0], 0.0);
     assert_eq!(program_key(variant, pipeline, special_tc).program, StageProgram::Specialized);
@@ -1099,7 +1129,7 @@ fn hybrid_generated_wgsl_source_is_shared_without_merging_pipeline_constants() {
         ..Default::default()
     };
     let mut a = MaterialFragmentKey::from_material([2, 0, 0, 0], 0.0);
-    let mut b = MaterialFragmentKey::from_material([2, 0, 33554432, 0], 0.0);
+    let mut b = MaterialFragmentKey::from_material([2, 0, MATERIAL_FLAG_OPAQUE_STAGE, 0], 0.0);
     a.vertex_recipe.tc_mods[0] = 1;
     b.vertex_recipe.tc_mods[0] = 1;
     let ka = program_key(variant, pipeline, a);

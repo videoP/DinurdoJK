@@ -307,6 +307,10 @@ static void install_prediction_entities(const jka_player *p) {
         memset(ps, 0, sizeof(*ps));
         cent->currentState.number = ent->number;
         cent->currentState.eType = ent->entity_type;
+        /* TaystJK's PM_CheckJump distinguishes brush contact using s.solid.
+         * Preserve the wire value instead of classifying every traced mover
+         * as a non-brush entity (which permits invalid wallruns). */
+        cent->currentState.solid = ent->solid;
         cent->currentState.bolt1 = ent->bolt1;
         if (ent->entity_type != ET_PLAYER && ent->entity_type != ET_NPC) continue;
         VectorCopy(ent->origin, ps->origin);

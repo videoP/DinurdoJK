@@ -169,7 +169,7 @@ impl App {
         } else {
             1
         };
-        theme::row(ui, "Sky mode", "Fastsky uses r_fastsky 1. Vanilla draws authored BSP sky stages. Blue Water adds its atmosphere; Star Nest replaces BSP sky faces with the fractal renderer. These modes are exclusive in the UI; clouds are chosen separately.", theme::Reset::None, |ui| {
+        theme::row(ui, "Sky mode", "Fastsky uses r_fastsky 1. Vanilla draws authored BSP sky stages. Blue Water adds its atmosphere; Star Nest replaces BSP sky faces with the fractal renderer. These modes are exclusive in the UI; clouds are chosen separately. Relighting and shadows are preserved when the sky mode changes.", theme::Reset::None, |ui| {
             for (mode, name) in [(0, "Fastsky"), (1, "Vanilla"), (2, "Blue Water"), (3, "Star Nest")] {
                 if theme::chip(ui, name, sky_mode == mode).clicked() && (sky_mode != mode || (mode == 0 && self.video.fast_sky != 1)) {
                     // The fastsky cvar also sends a specialized render-thread command.
@@ -331,7 +331,7 @@ impl App {
         });
 
         // ------------------------------------------- moon and atmosphere --
-        if self.video.sky_backend == 1 {
+        if self.video.sun_override || self.video.sky_backend == 1 {
             self.egui_native_moon(ui);
             self.egui_native_atmosphere(ui);
         }

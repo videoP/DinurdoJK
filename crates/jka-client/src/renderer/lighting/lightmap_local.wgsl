@@ -14,8 +14,8 @@ fn composed_lightmap_receiver(input: VertexOut) -> bool {
     return (lighting_settings.baked_sun_debug_mode.z & 3u) != 0u && lightmapped_shadow_receiver(input);
 }
 fn lightmapped_shadow_receiver(input: VertexOut) -> bool {
-    return (material_flags_w() & 262144u) == 0u && input.shell_kind == 0u
-        && ((material_flags() & (2u | 8388608u | 16777216u)) != 0u || material_tc_gen() == 1u);
+    return (material_flags_w() & MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION) == 0u && input.shell_kind == 0u
+        && ((material_flags() & (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_EXPLICIT_LIGHTMAP | MATERIAL_FLAG_HAS_LIGHTMAP)) != 0u || material_tc_gen() == 1u);
 }
 fn baked_local_receiver(input: VertexOut) -> bool {
     return (lighting_settings.baked_sun_debug_mode.z & 2u) != 0u && composed_lightmap_receiver(input);
@@ -66,7 +66,7 @@ fn remove_inferred_blocked(color: vec3<f32>, blocked: f32) -> vec3<f32> {
     return color*(1.0-fraction);
 }
 fn shade_original_lamp_shadows(lightmap: vec3<f32>, input: VertexOut) -> vec3<f32> {
-    let vertex_lit = input.shell_kind == 0u && (material_flags() & 131073u) == 131073u;
+    let vertex_lit = input.shell_kind == 0u && (material_flags() & (MATERIAL_FLAG_VERTEX_LIT | MATERIAL_FLAG_RGB_VERTEX)) == (MATERIAL_FLAG_VERTEX_LIT | MATERIAL_FLAG_RGB_VERTEX);
     if !lightmapped_shadow_receiver(input) && !vertex_lit {return lightmap;}
     let ids=vec2<u32>(lighting_settings.baked_indirect_curve.zw);
     // A/B=4: before doing expensive per-light attribution or any PCF,

@@ -1425,6 +1425,7 @@ pub enum RenderCommand {
     SetCombatUi {
         zoom_scope: Option<ui::UiZoomScope>,
         rocket_lock: Option<ui::UiRocketLock>,
+        hack_progress: Option<ui::UiHackProgress>,
     },
     /// The renderer-drawn main page; `None` when it is not showing.
     SetNeonMenu(Option<crate::neon_menu::MenuFrame>),

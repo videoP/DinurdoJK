@@ -388,22 +388,20 @@ impl App {
                     self.touch_baked_sun_debug();
                 }
             });
-            theme::section(ui, "SKY ILLUMINATION", "Sky illumination uses cached lightmaps in Baked. Realtime uses live Blue Water lighting or a cached vanilla sun-elevation approximation with live CSM shadows.");
-            theme::row(ui, "Protect authored room lighting", "A/B: OFF uses the original sky multiplier (including indoors). ON estimates daylight dependence from direct sky access and two diffuse bounces: enclosed rooms retain local illumination while outdoor shadows follow the current sky. Newly simulated map lights are added after sky tint. With Blue Water Realtime, static BSP surfaces use the cached sky bake instead of the fullscreen multiplier; live CSM remains. This is an approximation, not complete indirect-light separation. Blue Water uses sky transport; Vanilla uses precomputed sky openness. Relighting automatically enables CSM; the sky bake must remain enabled.", theme::Reset::None, |ui| {
+            theme::section(ui, "SKY ILLUMINATION", "Sky illumination uses cached lightmaps in Baked and live lighting in Realtime. All sky display modes share the same illumination and CSM shadows.");
+            theme::row(ui, "Protect authored room lighting", "A/B: OFF uses the original sky multiplier (including indoors). ON estimates daylight dependence from direct sky access and two diffuse bounces: enclosed rooms retain local illumination while outdoor shadows follow the current sky. Newly simulated map lights are added after sky tint. With Realtime room protection, static BSP surfaces use the cached sky bake instead of the fullscreen multiplier; live CSM remains. This is an approximation, not complete indirect-light separation. All sky display modes share the same transport. Relighting automatically enables CSM; the sky bake must remain enabled.", theme::Reset::None, |ui| {
                 if let Some(enabled) = theme::switch(ui, self.video.sky_world_light_isolation) {
                     let _ = self.set_console_cvar("r_skyWorldLightIsolation", if enabled { "1" } else { "0" });
                 }
             });
             if self.video.sky_world_light_isolation {
-                if self.video.sky_backend == 1 {
-                    if let Some(mode) = segmented_row(
-                        ui, "Sky transport preview",
-                        "Diagnostic white-sky response on static BSP lightmaps: Direct shows sky access; Bounced follows two diffuse reflections; Total combines them. Brighter means more sky response, not the fraction of authored daylight. Uses a fixed 60% reflectance and no artificial lights. The smoothed transport drives room protection; weak response is preserved and sustained sky access follows day/night lighting. Requires CSM and the sky bake. Magenta means unavailable. Use r_lightmap 1 to hide textures; r_lightmap 0 restores them.",
-                        theme::Reset::None, self.video.lightmap_signal,
-                        &[(0, "Off"), (9, "Direct"), (10, "Bounced"), (11, "Total")],
-                    ) {
-                        let _ = self.set_console_cvar("r_lightmapSignal", &mode.to_string());
-                    }
+                if let Some(mode) = segmented_row(
+                    ui, "Sky transport preview",
+                    "Diagnostic white-sky response on static BSP lightmaps: Direct shows sky access; Bounced follows two diffuse reflections; Total combines them. Brighter means more sky response, not the fraction of authored daylight. Uses a fixed 60% reflectance and no artificial lights. The smoothed transport drives room protection; weak response is preserved and sustained sky access follows day/night lighting. Requires CSM and the sky bake. Magenta means unavailable. Use r_lightmap 1 to hide textures; r_lightmap 0 restores them.",
+                    theme::Reset::None, self.video.lightmap_signal,
+                    &[(0, "Off"), (9, "Direct"), (10, "Bounced"), (11, "Total")],
+                ) {
+                    let _ = self.set_console_cvar("r_lightmapSignal", &mode.to_string());
                 }
                 if baked_mode && (!self.video.baked_sun_cache || self.video.sky_world_bake_ab == 0) {
                     theme::hint(ui, "Baked mode needs B: Sky bake and the baked sun cache enabled for room protection.", theme::TEXT_DIM());
@@ -411,11 +409,11 @@ impl App {
                     theme::hint(ui, "Realtime world sky is cached and recomposed when the sky changes (up to once/second); realtime caster shadows are still live. No full-screen sky multiplier.", theme::TEXT_DIM());
                 }
             }
-            if let Some(mode) = segmented_row(ui, "Sky gain calibration", "Shared day/night calibration for Vanilla and Blue Water map illumination. A: absolute gain. B: daylight approaches authored exposure. C: compare the current time of day to the map's authored sunlight (or the assumed daytime reference when missing). Blue Water additionally contributes atmospheric tint and optional moonlight; Vanilla does not.", theme::Reset::None,
+            if let Some(mode) = segmented_row(ui, "Sky gain calibration", "Shared day/night calibration for Vanilla and Blue Water map illumination. A: absolute gain. B: daylight approaches authored exposure. C: compare the current time of day to the map's authored sunlight (or the assumed daytime reference when missing). Atmospheric tint and moonlight are shared across sky display modes.", theme::Reset::None,
                 self.video.sky_world_gain_mode, &[(0, "A: Original"), (1, "B: Daylight"), (2, "C: Map time")]) {
                 let _ = self.set_console_cvar("r_skyWorldGainMode", &mode.to_string());
             }
-            theme::row(ui, "Sky world lighting", "World brightness adjustment: 0% off, 100% full. Vanilla uses sun elevation and traced sky openness; Blue Water uses atmospheric irradiance. Baked updates cached lighting, Realtime uses live Blue Water lighting or vanilla cached gain with live CSM.", theme::Reset::None, |ui| {
+            theme::row(ui, "Sky world lighting", "World brightness adjustment: 0% off, 100% full. All sky display modes share atmospheric irradiance and celestial shadows. Baked updates cached lighting; Realtime uses live lighting with live CSM, or cached sky gain with room protection.", theme::Reset::None, |ui| {
                 let mut strength = self.video.sky_world_lighting_strength;
                 let readout = format!("{:.0}%", strength * 100.0);
                 if theme::slider_default(ui, &mut strength, 0.0..=1.0, &readout, defaults.sky_world_lighting_strength) {

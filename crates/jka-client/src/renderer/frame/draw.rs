@@ -173,7 +173,8 @@ impl Renderer {
         let collision_world_only = crate::renderer::collision_world_only() && self.world.is_some();
         // Stable frame-level admission; never borrow the whole renderer again
         // while atmosphere or render targets are held mutably below.
-        let native_sky_visible = self.native_sky_surface_visible();
+        let native_sky_visible = self.native_sky_surface_visible()
+            && self.blue_water_sky.as_ref().is_some_and(|sky| sky.can_display_sky());
         let competitive_no_world = self.competitive_ab == 10
             || competitive_mask & (probe::WORLD_DRAW | probe::WORLD_PREP_AND_DRAW) != 0;
         // A/B bit 0 disables optional split encoder finishing while preserving
@@ -1597,7 +1598,7 @@ impl Renderer {
         self.dynamic_model_renderer.entity_sun_relight = self.entity_sun_relight();
         self.sync_entity_cloud_shadow_sun();
         self.dynamic_model_renderer.retire_sky_world(&self.queue,
-            self.sun_override && self.sky_backend == 1 && self.blue_water_sky.is_some()
+            self.sun_override && self.blue_water_sky.is_some()
                 && self.sky_world_lighting_strength > 0.0);
         let ray_traced_shadows = self.hardware_rt_active();
         // Mirrors the draw_phase calls below: the RT receivers (which add these
@@ -3641,7 +3642,7 @@ impl Renderer {
         // Moving models share one live sky gain in Baked and Realtime. The
         // fullscreen sky pass skips those pixels to avoid a second application.
         let sky_world_baked = false;
-        let model_sky_world = self.sun_override && self.sky_backend == 1 && self.sky_world_lighting_strength > 0.0;
+        let model_sky_world = self.sun_override && self.sky_world_lighting_strength > 0.0;
         // r_skyWorldGainMode calibration; also needs &self, so read before any field borrow below.
         let sky_gain = self.sky_gain_calibration();
         let blue_water_moon_csm_active = shadow_matrices.is_some()
@@ -3880,7 +3881,7 @@ impl Renderer {
                 // would borrow all of self while SMAA holds smaa_target mutably.
                 // The sky's selected key light may be the moon instead.
                 let ocean_sky_gains = crate::ocean::night_sky_reflection_gains(
-                    ocean_sun.direction[1], self.sky_backend == 1,
+                    ocean_sun.direction[1], self.sun_override || self.sky_backend == 1,
                     self.blue_water_environment.night_sky);
                 if let Some(ocean) = self.ocean.as_mut().filter(|gpu| gpu.backend() != 0) {
                     // Share Godot's *exact* PVS tile admission with the native
@@ -3917,8 +3918,8 @@ impl Renderer {
                             && self.ocean_settings.hybrid_waterline_debug == 3,
                         &pvs, self.ocean_extension_mask, sky_faces,
                         &self.ocean_optics.water_distance, self.camera_water_surface,
-                        self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1).map(|sky| sky.sky.environment()),
-                        self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1).map(|sky| sky.sky.light()),
+                        self.blue_water_sky.as_ref().filter(|_| self.sun_override || self.sky_backend == 1).map(|sky| sky.sky.environment()),
+                        self.blue_water_sky.as_ref().filter(|_| self.sun_override || self.sky_backend == 1).map(|sky| sky.sky.light()),
                         ocean_sky_gains,
                         self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1).map(|sky| &sky.aerial),
                         self.blue_water_sky.as_ref().filter(|_| self.cloud_backend == 1 && self.clouds_enabled && self.cloud_shadows_enabled).map(|sky| sky.clouds.shadow()), optical_volumes.as_ref().expect("active water volumes"),
@@ -5868,7 +5869,7 @@ impl Renderer {
                         &self.shadow_resources.receiver_buffer))
                 } else { None };
                 if blue_sky_scene_active {
-                    if let Some(atmosphere) = self.blue_water_sky.as_mut().filter(|_| self.sky_backend == 1
+                    if let Some(atmosphere) = self.blue_water_sky.as_mut().filter(|_| self.sky_backend == 1 || model_sky_world
                         || self.blue_water_environment.world_lighting > 0.0
                         || (self.cloud_backend == 1 && self.clouds_enabled)
                         || self.blue_water_environment.weather_backend == 1) {
@@ -6952,7 +6953,7 @@ impl Renderer {
                     depth_stencil_attachment:Some(wgpu::RenderPassDepthStencilAttachment {view:&self.targets.depth_view,depth_ops:Some(wgpu::Operations {load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}),stencil_ops:None}),..Default::default()
                 });
                 tile_cost::scissor(&mut pass, self.targets._scene_texture.width(), self.targets._scene_texture.height());
-                let environment = self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1)
+                let environment = self.blue_water_sky.as_ref().filter(|_| self.sun_override || self.sky_backend == 1)
                     .map(|atmosphere| &atmosphere.sky.environment().bind_group);
                 if copyable {
                     for river in &self.live_rivers {

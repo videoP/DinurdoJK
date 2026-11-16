@@ -31,6 +31,7 @@ pub(in crate::renderer) struct CameraUniform {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(in crate::renderer) struct MaterialUniform {
+    // x: tcGen, y: tcMod count; z/w: separate namespaces in material_flags.rs.
     pub(in crate::renderer) header: [u32; 4],
     pub(in crate::renderer) vector_s: [f32; 4],
     pub(in crate::renderer) vector_t: [f32; 4],

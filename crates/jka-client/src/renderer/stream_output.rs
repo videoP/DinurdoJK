@@ -420,7 +420,8 @@ impl StreamOutput {
         }
         let resources = self.resources.as_ref()?;
 
-        let _unicode_scope = ui::UnicodeFallbackScope::enter(renderer.ui_jura_metrics.clone());
+        let _unicode_scope = ui::UnicodeFallbackScope::enter_with_requests(renderer.ui_jura_metrics.clone(),
+            Some(renderer.ui_unicode_worker.requests.clone()));
         let mut snapshot = renderer.ui_state.clone();
         crate::streamer::strip_local_only(&mut snapshot);
         redact_stream_snapshot(&mut snapshot, self.settings);

@@ -359,6 +359,60 @@ pub enum EntityPresentationKind {
     Unknown,
 }
 
+// TaystJK cl_cgame.cpp CL_GetDefaultState / cg_main.c CG_TransitionPermanent:
+// only baselines carrying EF_PERMANENT become persistent cgame entities.
+const EF_PERMANENT: i32 = 1 << 7;
+
+/// Cache permanent gamestate entities once per CGame lifetime. Baselines are
+/// otherwise only delta-compression seeds, not a renderable entity list.
+pub(crate) fn permanent_entities_from_baselines(
+    baselines: &BTreeMap<u16, EntityState>,
+) -> Vec<EntityState> {
+    baselines
+        .values()
+        .filter(|state| state.field_i32("eFlags").unwrap_or(0) & EF_PERMANENT != 0)
+        .cloned()
+        .collect()
+}
+
+/// CG_AddPacketEntities adds `cg_permanents` after packet entities. Permanent
+/// ET_MOVERS such as jaPRO misc_bsp holders are intentionally absent from all
+/// snapshot entity lists, but still need their baseline model and transform
+/// every frame. Run after prediction/remote smoothing: these are visual-only
+/// entities, not additional authoritative network snapshots.
+pub(crate) fn append_permanent_entities(
+    presented: &mut Vec<PresentedEntity>,
+    permanents: &[EntityState],
+    time: i32,
+) {
+    for state in permanents {
+        // Prefer a newer snapshot state if a server ever transmits this id.
+        if presented.iter().any(|entity| entity.number == state.number) {
+            continue;
+        }
+        let Some(origin) = evaluate_entity_trajectory(state, "pos", time) else {
+            continue;
+        };
+        let Some(angles) = evaluate_entity_trajectory(state, "apos", time) else {
+            continue;
+        };
+        if !origin.iter().chain(&angles).all(|value| value.is_finite()) {
+            continue;
+        }
+        let entity_type = state.field_i32("eType").unwrap_or(0);
+        if entity_type >= ET_EVENTS {
+            continue;
+        }
+        presented.push(PresentedEntity {
+            number: state.number,
+            entity_type,
+            origin,
+            angles,
+            state: state.clone(),
+        });
+    }
+}
+
 impl PresentedEntity {
     pub fn presentation_kind(&self) -> EntityPresentationKind {
         match self.entity_type {
@@ -2466,6 +2520,15 @@ impl ClientGameState {
     /// on integer JKA server time, while visual interpolation may sample between
     /// integer milliseconds (important when rendering demos at very high FPS).
     pub fn present_entities_at(&mut self, time_ms: f64) -> Result<Vec<PresentedEntity>, String> {
+        self.present_entities_at_with_smoothing(time_ms, false)
+    }
+
+    /// TaystJK's cg_smoothClients=1 is a CGame trajectory choice, not a
+    /// buffered history resampler. Only the live mode-5 caller sets this bit:
+    /// demo playback retains its existing presentation unchanged.
+    pub fn present_entities_at_with_smoothing(
+        &mut self, time_ms: f64, tayst_smooth_clients: bool,
+    ) -> Result<Vec<PresentedEntity>, String> {
         let current = self
             .current_snapshot
             .as_ref()
@@ -2482,6 +2545,13 @@ impl ClientGameState {
         };
 
         let frame_interpolation = self.frame_interpolation;
+        // TaystJK CG_CalcEntityLerpPositions suppresses smoothClients when
+        // IsRacemode && movement style is not MV_COOP_JKA. Use the same
+        // authoritative playerState stats, and never apply to other mods.
+        let race_forces_interpolation = tayst_smooth_clients && self.is_japro()
+            && current.player_state.stats[crate::japro_cg::STAT_RACEMODE] != 0
+            && current.player_state.stats[crate::japro_cg::STAT_MOVEMENTSTYLE]
+                != crate::japro_cg::MV_COOP_JKA;
         let mut presented = Vec::with_capacity(current.entities.len());
         for state in &current.entities {
             // OpenJK skips the local player entity here because predictedPlayerEntity is added
@@ -2491,7 +2561,15 @@ impl ClientGameState {
                 continue;
             }
             let cent = self.entity_mut(state.number)?;
-            calc_entity_lerp_positions(cent, time_ms, frame_interpolation, current.server_time, next.as_ref().map(|s| s.server_time))?;
+            // Exact TaystJK mover correction is needed only in the trajectory
+            // fallback branch. Supply the offset without changing prediction or
+            // any authored packet entity state.
+            let mover_offset = if tayst_smooth_clients && field_i32(state, "eType") == ET_PLAYER {
+                tayst_mover_delta(&current, state, time_ms)
+            } else { [0.0; 3] };
+            calc_entity_lerp_positions(cent, time_ms, frame_interpolation,
+                current.server_time, next.as_ref().map(|s| s.server_time),
+                tayst_smooth_clients, race_forces_interpolation, mover_offset)?;
             let current_state = cent.current_state.clone().unwrap_or_else(|| state.clone());
             let entity_type = field_i32(&current_state, "eType");
             // As in CG_AddCEntity, event-only entities have already served their transition/event
@@ -3490,12 +3568,31 @@ fn check_entity_event(
     })
 }
 
+/// Port of CG_AdjustPositionForMover's positional delta for the TaystJK
+/// trajectory fallback. No per-frame heap, no edits to gameplay snapshots.
+fn tayst_mover_delta(snapshot: &Snapshot, player: &EntityState, time_ms: f64) -> [f32; 3] {
+    let ground = field_i32(player, "groundEntityNum");
+    if ground <= 0 { return [0.0; 3]; }
+    let Some(mover) = snapshot.entities.iter().find(|entity|
+        i32::from(entity.number) == ground && field_i32(entity, "eType") == ET_MOVER)
+    else { return [0.0; 3]; };
+    let movement = trajectory(mover, "pos");
+    match (evaluate_trajectory_at(movement, f64::from(snapshot.server_time)),
+        evaluate_trajectory_at(movement, time_ms)) {
+        (Ok(before), Ok(after)) => std::array::from_fn(|axis| after[axis] - before[axis]),
+        _ => [0.0; 3],
+    }
+}
+
 fn calc_entity_lerp_positions(
     cent: &mut CEntity,
     time_ms: f64,
     frame_interpolation: f32,
     current_server_time: i32,
     next_server_time: Option<i32>,
+    tayst_smooth_clients: bool,
+    race_forces_interpolation: bool,
+    mover_offset: [f32; 3],
 ) -> Result<(), String> {
     let current = cent
         .current_state
@@ -3503,6 +3600,34 @@ fn calc_entity_lerp_positions(
         .ok_or_else(|| "CG_CalcEntityLerpPositions without currentState".to_owned())?;
     let current_pos = trajectory(current, "pos");
     let current_apos = trajectory(current, "apos");
+    let number = i32::from(current.number);
+    let entity_type = field_i32(current, "eType");
+    let is_remote_client = number < 32;
+
+    // TaystJK CG_CalcEntityLerpPositions: race players (except MV_COOP_JKA)
+    // force TR_INTERPOLATE on both snapshot positions even with smoothClients 1.
+    // The override is visual only; do not mutate authoritative EntityState.
+    if tayst_smooth_clients && race_forces_interpolation && is_remote_client {
+        if cent.interpolate {
+            let next = cent.next_state.as_ref()
+                .ok_or_else(|| "interpolating race client without nextState".to_owned())?;
+            let next_time = next_server_time
+                .ok_or_else(|| "interpolating race client without next snapshot".to_owned())?;
+            let next_pos = trajectory(next, "pos");
+            let current_angles = evaluate_trajectory_at(current_apos, f64::from(current_server_time))?;
+            let next_angles = evaluate_trajectory_at(trajectory(next, "apos"), f64::from(next_time))?;
+            for axis in 0..3 {
+                cent.lerp_origin[axis] = current_pos.base[axis]
+                    + frame_interpolation * (next_pos.base[axis] - current_pos.base[axis]);
+                cent.lerp_angles[axis] = lerp_angle(current_angles[axis], next_angles[axis], frame_interpolation);
+            }
+        } else {
+            cent.lerp_origin = current_pos.base; // BG_EvaluateTrajectory(TR_INTERPOLATE)
+            cent.lerp_angles = evaluate_trajectory_at(current_apos, time_ms)?;
+            for axis in 0..3 { cent.lerp_origin[axis] += mover_offset[axis]; }
+        }
+        return Ok(());
+    }
 
     if cent.interpolate && current_pos.kind == TR_INTERPOLATE {
         interpolate_entity_position(
@@ -3514,15 +3639,11 @@ fn calc_entity_lerp_positions(
         return Ok(());
     }
 
-    let number = i32::from(current.number);
-    let entity_type = field_i32(current, "eType");
-    let is_remote_client = number < 32;
-
     // OpenJK's stock cg_smoothClients default is 0. In that mode
     // CG_CalcEntityLerpPositions forcibly treats remote clients and NPCs as
     // TR_INTERPOLATE before the normal trajectory branches. This prevents
     // extrapolating player positions when a newer snapshot exists.
-    if cent.interpolate && (is_remote_client || entity_type == ET_NPC) {
+    if !tayst_smooth_clients && cent.interpolate && (is_remote_client || entity_type == ET_NPC) {
         interpolate_entity_position(
             cent,
             frame_interpolation,
@@ -3548,6 +3669,10 @@ fn calc_entity_lerp_positions(
 
     cent.lerp_origin = evaluate_trajectory_at(current_pos, time_ms)?;
     cent.lerp_angles = evaluate_trajectory_at(current_apos, time_ms)?;
+    if tayst_smooth_clients && is_remote_client {
+        // TaystJK CG_AdjustPositionForMover only on fallback evaluation.
+        for axis in 0..3 { cent.lerp_origin[axis] += mover_offset[axis]; }
+    }
     Ok(())
 }
 
@@ -4009,6 +4134,51 @@ fn entity_vec3(entity: &EntityState, prefix: &str) -> Option<[f32; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remote_entity(kind: i32, x: f32, velocity: f32) -> EntityState {
+        let mut state = EntityState { number: 2, fields: [0; ENTITY_FIELDS.len()] };
+        set_entity_i32(&mut state, "eType", ET_PLAYER);
+        set_entity_i32(&mut state, "pos.trType", kind);
+        set_entity_vec3(&mut state, "pos.trBase", [x, 0.0, 0.0]);
+        set_entity_vec3(&mut state, "pos.trDelta", [velocity, 0.0, 0.0]);
+        set_entity_i32(&mut state, "pos.trTime", 100);
+        set_entity_i32(&mut state, "pos.trDuration", 100);
+        state
+    }
+
+    #[test]
+    fn tayst_mode_interpolates_linear_stop_without_extra_buffer() {
+        let mut cent = CEntity { current_state: Some(remote_entity(TR_LINEAR_STOP, 0.0, 100.0)),
+            next_state: Some(remote_entity(TR_LINEAR_STOP, 20.0, 100.0)),
+            interpolate: true, ..CEntity::default() };
+        calc_entity_lerp_positions(&mut cent, 112.5, 0.25, 100, Some(150),
+            true, false, [0.0; 3]).unwrap();
+        // TaystJK samples trajectory endpoints at snapshot time, then lerps.
+        assert!((cent.lerp_origin[0] - 6.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn tayst_mode_extrapolates_native_linear_stop_when_no_next_snapshot() {
+        let mut cent = CEntity { current_state: Some(remote_entity(TR_LINEAR_STOP, 0.0, 100.0)),
+            ..CEntity::default() };
+        calc_entity_lerp_positions(&mut cent, 175.0, 0.0, 100, None,
+            true, false, [0.0; 3]).unwrap();
+        assert!((cent.lerp_origin[0] - 7.5).abs() < 0.001);
+        // TR_LINEAR_STOP is bounded at 200ms; no invented 35ms cap.
+        calc_entity_lerp_positions(&mut cent, 300.0, 0.0, 100, None,
+            true, false, [0.0; 3]).unwrap();
+        assert!((cent.lerp_origin[0] - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn tayst_mode_race_forces_interpolate_except_coop() {
+        let mut cent = CEntity { current_state: Some(remote_entity(TR_LINEAR_STOP, 0.0, 100.0)),
+            next_state: Some(remote_entity(TR_LINEAR_STOP, 20.0, 100.0)),
+            interpolate: true, ..CEntity::default() };
+        calc_entity_lerp_positions(&mut cent, 112.5, 0.25, 100, Some(150),
+            true, true, [0.0; 3]).unwrap();
+        assert!((cent.lerp_origin[0] - 5.0).abs() < 0.001);
+    }
 
     #[test]
     fn unicode_chat_display_preserves_names_and_decodes_only_the_body() {
@@ -5439,5 +5609,47 @@ mod breath_weather_port_tests {
             "wind", "constantwind ( 0 800 0 )", "gustingwind"] {
             assert!(breath_weather_command_enables_cold(command), "{command}");
         }
+    }
+}
+
+#[cfg(test)]
+mod permanent_baseline_tests {
+    use super::*;
+
+    fn baseline(number: u16, flags: i32, origin: [f32; 3]) -> EntityState {
+        let mut state = EntityState {
+            number,
+            fields: [0; ENTITY_FIELDS.len()],
+        };
+        let mut set = |field: &str, bits: u32| {
+            let index = ENTITY_FIELDS.iter().position(|(name, _)| *name == field).unwrap();
+            state.fields[index] = bits;
+        };
+        set("eType", ET_MOVER as u32);
+        set("eFlags", flags as u32);
+        set("solid", 0x00ff_ffff);
+        set("modelindex", 9);
+        for (axis, value) in origin.into_iter().enumerate() {
+            set(&format!("pos.trBase[{axis}]"), value.to_bits());
+        }
+        state
+    }
+
+    #[test]
+    fn misc_bsp_permanent_baseline_renders_without_snapshot_entity() {
+        let permanent = baseline(41, EF_PERMANENT, [20_000.0, -20_000.0, -20_000.0]);
+        let ordinary = baseline(42, 0, [10.0, 20.0, 30.0]);
+        let baselines = BTreeMap::from([(41, permanent), (42, ordinary)]);
+        let saved = permanent_entities_from_baselines(&baselines);
+        assert_eq!(saved.len(), 1);
+        let mut presented = Vec::new(); // The real demo has no entity 41 in any snapshot.
+        append_permanent_entities(&mut presented, &saved, 251_500);
+        assert_eq!(presented.len(), 1);
+        assert_eq!(presented[0].number, 41);
+        assert_eq!(presented[0].origin, [20_000.0, -20_000.0, -20_000.0]);
+        assert_eq!(presented[0].state.field_i32("modelindex"), Some(9));
+        // Subsequent frame / an explicit network update cannot duplicate it.
+        append_permanent_entities(&mut presented, &saved, 251_750);
+        assert_eq!(presented.len(), 1);
     }
 }

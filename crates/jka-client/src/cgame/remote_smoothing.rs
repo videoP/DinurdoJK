@@ -6,6 +6,8 @@
 //! yet transitioned by CGame) to supply actual past states for visual sampling.
 //! ET: Legacy's cl_interpolation motivated a snapshot history; jaMME's demo
 //! command-history smoother needs extended demo records not present on live servers.
+//! Mode 5 is native TaystJK cg_smoothClients 1, implemented directly in
+//! CGame trajectory presentation (not through this history ring).
 //! Mode 4 is an *experiment* using live playerState commandTime gaps to
 //! shape interpolation tangents (with fallback), NOT an exact jaMME port.
 use std::collections::VecDeque;
@@ -31,7 +33,7 @@ static EXTRAP_MAX_MS: AtomicU32 = AtomicU32::new(35);
 static DEBUG: AtomicU8 = AtomicU8::new(0);
 
 pub(crate) fn mode() -> u8 { MODE.load(Ordering::Relaxed) }
-pub(crate) fn set_mode(value: u8) { MODE.store(value.min(4), Ordering::Relaxed); }
+pub(crate) fn set_mode(value: u8) { MODE.store(value.min(5), Ordering::Relaxed); }
 pub(crate) fn buffer_ms() -> u32 { BUFFER_MS.load(Ordering::Relaxed) }
 pub(crate) fn set_buffer_ms(value: u32) { BUFFER_MS.store(value.min(100), Ordering::Relaxed); }
 pub(crate) fn buffer_auto() -> bool { BUFFER_AUTO.load(Ordering::Relaxed) != 0 }
@@ -288,7 +290,7 @@ fn hermite(a: &Pose, b: &Pose, fraction: f32, dt: f32) -> [f32; 3] {
 impl RemoteSmoothing {
     fn sync_mode(&mut self, selected: u8) {
         if self.last_mode == selected { return; }
-        if selected == 0 { self.frames = VecDeque::new(); }
+        if selected == 0 || selected == 5 { self.frames = VecDeque::new(); }
         else { self.frames.clear(); }
         self.clock = VisualClock::default();
         self.continuity.fill(VisualContinuity::default());
@@ -317,7 +319,7 @@ impl RemoteSmoothing {
     /// eventually transitions to it. This preserves real arrival jitter.
     pub(crate) fn receive(&mut self, snapshot: &Snapshot, now: Instant) {
         self.sync_mode(mode());
-        if self.last_mode == 0 || snapshot.snap_flags & (1 << 1) != 0 { return; }
+        if self.last_mode == 0 || self.last_mode == 5 || snapshot.snap_flags & (1 << 1) != 0 { return; }
         if self.frames.back().is_some_and(|last| last.message >= snapshot.message_num) { return; }
         if let Some((previous_wall, previous_server)) = self.last_receive {
             let wall_ms = now.saturating_duration_since(previous_wall).as_secs_f64() * 1000.0;
@@ -377,7 +379,7 @@ impl RemoteSmoothing {
     pub(crate) fn prime(&mut self, current: Option<&Snapshot>, next: Option<&Snapshot>,
                         queue: &VecDeque<Snapshot>) {
         self.sync_mode(mode());
-        if self.last_mode == 0 || !self.frames.is_empty() { return; }
+        if self.last_mode == 0 || self.last_mode == 5 || !self.frames.is_empty() { return; }
         if let Some(snapshot) = current { self.insert_snapshot(snapshot); }
         if let Some(snapshot) = next { self.insert_snapshot(snapshot); }
         for snapshot in queue { self.insert_snapshot(snapshot); }
@@ -734,6 +736,9 @@ impl RemoteSmoothing {
     }
 
     pub(crate) fn summary(&self) -> String {
+        if mode() == 5 {
+            return "[REMOTE SMOOTH] mode=5 TaystJK cg_smoothClients 1: native live CGame trajectory interpolation/evaluation; no added buffer, extrapolation cap, or history samples (the mode 1-4 counters do not apply).".into();
+        }
         let c = &self.counters;
         let total = c.interpolated + c.extrapolated + c.held;
         let rate = |count| if total == 0 { 0.0 } else { count as f64 * 100.0 / total as f64 };
@@ -754,6 +759,7 @@ impl RemoteSmoothing {
         self.last_report = Some(now);
         crate::logging::write_console_line(crate::logging::ConsoleLineKind::Normal,
             format_args!("{}", self.summary()));
+        if mode() == 5 { return; } // Native CGame path has no historical per-client counters.
         if debug() >= 2 {
             for (id, pose) in self.continuity.iter().enumerate().filter(|(_, p)| p.source != Source::None) {
                 crate::logging::write_console_line(crate::logging::ConsoleLineKind::Normal,

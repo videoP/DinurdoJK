@@ -73,7 +73,7 @@ pub(crate) fn with_model_weather(base: &str) -> String {
 {}
 {WEATHER_SURFACE_WGSL}
 {MODEL_WEATHER_WGSL}
-{}", crate::foliage::SHADER, include_str!("legacy_model_blend.wgsl"))
+{}", crate::foliage::shader(), include_str!("legacy_model_blend.wgsl"))
 }
 
 /// `base` plus the shared weather maths and forward weather shading for the world

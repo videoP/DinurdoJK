@@ -72,9 +72,6 @@ struct Material {
 const CLASSIC_FULLBRIGHT: u32 = 1u;
 const CLASSIC_VERTEX_LIGHT: u32 = 2u;
 const CLASSIC_LIGHTMAP_ONLY: u32 = 4u;
-const MATERIAL_EXPLICIT_LIGHTMAP: u32 = 8388608u;
-const MATERIAL_HAS_LIGHTMAP: u32 = 16777216u;
-const MATERIAL_OPAQUE_STAGE: u32 = 33554432u;
 
 struct VertexIn {
     @location(0) position: vec3<f32>,
@@ -155,11 +152,11 @@ fn shader_stage_time() -> f32 {
 fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
     var out = color;
     let time = shader_stage_time();
-    if ((material.header.z & 134217728u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u) {
         let g = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, time), 0.0, 1.0);
         out = vec4<f32>(vec3<f32>(g), out.a);
     }
-    if ((material.header.z & 268435456u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_ALPHA_WAVE) != 0u) {
         out.a = clamp(wave_value(material.wave_funcs.y, material.wave_alpha, time), 0.0, 1.0);
     }
     return out;
@@ -282,7 +279,7 @@ fn fast_world_vertex(input: VertexIn, instance_index: u32) -> VertexOut {
     output.uv = generated_uv(input);
     output.lightmap_uv = input.lightmap_uv;
     output.color = input.color;
-    if ((material.header.w & 524288u) != 0u) {
+    if ((material.header.w & MATERIAL_FLAG_BAKED_ADDITIVE) != 0u) {
         output.color = baked_additive_vertex_gain(input.color, input.lightmap_uv.x);
     }
     // Keep the known-fast fragment path free of the camera bind group.
@@ -405,7 +402,6 @@ fn moved_shader_input(original: VertexIn) -> VertexIn {
 // Shared authored RGB modulation. Display-space PSOs encode each source and
 // blend against the encoded destination, as TaystJK's UNORM framebuffer does.
 // Other redraws retain their existing linear output and authored blend factors.
-const MATERIAL_LEGACY_ADDITIVE_SRGB: u32 = 536870912u;
 // Enabled only by the display-space BSP PSOs (SDR alias or float transfer).
 override LEGACY_WORLD_ENCODED_BLEND: bool = false;
 // JK2MV legacy LDR lightmap modulation, specialized at map/protocol transition.
@@ -435,8 +431,8 @@ fn encoded_world_output(color: vec4<f32>) -> vec4<f32> {
     return color;
 }
 fn legacy_rgb_output(color: vec4<f32>) -> vec4<f32> {
-    if ((material.header.z & MATERIAL_LEGACY_ADDITIVE_SRGB) != 0u) {
-        let has_wave = (material.header.z & 134217728u) != 0u;
+    if ((material.header.z & MATERIAL_FLAG_LEGACY_SRGB) != 0u) {
+        let has_wave = (material.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u;
         var wave = 1.0;
         if (has_wave) {
             wave = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, shader_stage_time()), 0.0, 1.0);
@@ -610,30 +606,30 @@ fn additive_vertex_output(base: VertexOut, count: u32) -> AdditiveVertexOut {
 
 fn additive_stage_tint(m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
     var color = m.color;
-    if ((m.header.z & 1u) != 0u) {
+    if ((m.header.z & MATERIAL_FLAG_RGB_VERTEX) != 0u) {
         color = vec4<f32>(color.rgb * vertex_color.rgb, color.a);
-    } else if ((m.header.z & 524288u) != 0u) {
+    } else if ((m.header.z & MATERIAL_FLAG_RGB_ONE_MINUS_VERTEX) != 0u) {
         color = vec4<f32>(color.rgb * (vec3<f32>(1.0) - vertex_color.rgb), color.a);
     }
-    if ((m.header.z & 1048576u) != 0u) {
+    if ((m.header.z & MATERIAL_FLAG_ALPHA_VERTEX) != 0u) {
         color.a *= vertex_color.a;
-    } else if ((m.header.z & 2097152u) != 0u) {
+    } else if ((m.header.z & MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX) != 0u) {
         color.a *= (1.0 - vertex_color.a);
     }
-    if ((m.header.z & 134217728u) != 0u) {
+    if ((m.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u) {
         let wave = clamp(wave_value(m.wave_funcs.x, m.wave_rgb, additive_time(m)), 0.0, 1.0);
         color = vec4<f32>(vec3<f32>(wave), color.a);
     }
-    if ((m.header.z & 268435456u) != 0u) {
+    if ((m.header.z & MATERIAL_FLAG_ALPHA_WAVE) != 0u) {
         color.a = clamp(wave_value(m.wave_funcs.y, m.wave_alpha, additive_time(m)), 0.0, 1.0);
     }
-    if ((m.header.w & 524288u) != 0u) { color = vec4<f32>(color.rgb * vertex_color.rgb, color.a); }
+    if ((m.header.w & MATERIAL_FLAG_BAKED_ADDITIVE) != 0u) { color = vec4<f32>(color.rgb * vertex_color.rgb, color.a); }
     return color;
 }
 fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
     var sample = texel * additive_stage_tint(m, vertex_color);
-    if ((m.header.z & MATERIAL_LEGACY_ADDITIVE_SRGB) != 0u) {
-        let has_wave = (m.header.z & 134217728u) != 0u;
+    if ((m.header.z & MATERIAL_FLAG_LEGACY_SRGB) != 0u) {
+        let has_wave = (m.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u;
         var wave = 1.0;
         if (has_wave) {
             wave = clamp(wave_value(m.wave_funcs.x, m.wave_rgb, additive_time(m)), 0.0, 1.0);
@@ -648,7 +644,7 @@ fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f3
     // source blend retains its original factor: GL_ONE contributes raw color
     // and alpha; GL_SRC_ALPHA weights both by source alpha. The per-stage
     // uniform bit works for mixed chains without an additional PSO variant.
-    let weight = select(sample.a, 1.0, (m.header.w & (1u << 21u)) != 0u);
+    let weight = select(sample.a, 1.0, (m.header.w & MATERIAL_FLAG_ADDITIVE_ONE) != 0u);
     return vec4<f32>(sample.rgb * weight, sample.a * weight);
 }
 fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f32> {
@@ -659,14 +655,14 @@ fn additive_fused_contributions(input: AdditiveVertexOut, count: u32) -> vec4<f3
     // Three-stage fusion previously recomputed the inverse twice; no sampling,
     // stage ordering, blending or shader permutation changes.
     let uv1 = input.additive_uv1;
-    if ((additive_stage1.header.w & 65536u) != 0u) {
+    if ((additive_stage1.header.w & MATERIAL_FLAG_ADDITIVE_CLAMP) != 0u) {
         total += additive_weighted_sample(textureSample(sky_rt, additive_clamp_sampler, uv1), additive_stage1, input.color);
     } else {
         total += additive_weighted_sample(textureSample(sky_rt, additive_repeat_sampler, uv1), additive_stage1, input.color);
     }
     if (count >= 3u) {
         let uv2 = input.additive_uv2;
-        if ((additive_stage2.header.w & 65536u) != 0u) {
+        if ((additive_stage2.header.w & MATERIAL_FLAG_ADDITIVE_CLAMP) != 0u) {
             total += additive_weighted_sample(textureSample(sky_bk, additive_clamp_sampler, uv2), additive_stage2, input.color);
         } else {
             total += additive_weighted_sample(textureSample(sky_bk, additive_repeat_sampler, uv2), additive_stage2, input.color);
@@ -701,14 +697,14 @@ fn competitive_one_stage_lit(input: VertexOut, classic: u32) -> vec4<f32> {
     if (!fullbright) {
         if (vertex_lit) {
             light = select(input.color.rgb, vec3<f32>(1.0), debug_lightmap);
-        } else if ((flags & (2u | MATERIAL_HAS_LIGHTMAP)) != 0u && input.lightmap_uv.x >= 0.0) {
+        } else if ((flags & (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_HAS_LIGHTMAP)) != 0u && input.lightmap_uv.x >= 0.0) {
             light = textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv).rgb;
-        } else if ((flags & 131072u) != 0u) {
+        } else if ((flags & MATERIAL_FLAG_VERTEX_LIT) != 0u) {
             light = input.color.rgb;
         }
     }
     if (debug_lightmap) { return vec4<f32>(light, alpha); }
-    return vec4<f32>(texel.rgb * select(light, vec3<f32>(1.0), (flags & MATERIAL_EXPLICIT_LIGHTMAP) != 0u), alpha);
+    return vec4<f32>(texel.rgb * select(light, vec3<f32>(1.0), (flags & MATERIAL_FLAG_EXPLICIT_LIGHTMAP) != 0u), alpha);
 }
 
 @fragment fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
@@ -722,7 +718,7 @@ fn competitive_one_stage_lit(input: VertexOut, classic: u32) -> vec4<f32> {
     )) {
         discard;
     }
-    if ((material.header.w & (1u << 17u)) != 0u) {
+    if ((material.header.w & MATERIAL_FLAG_GLASS) != 0u) {
         let to_eye = normalize(camera.camera_pos_time.xyz - input.world_position);
         let facing = abs(dot(normalize(input.world_normal), to_eye));
         let f0 = clamp(material.ocean_color.a, 0.02, 0.18);
@@ -732,26 +728,26 @@ fn competitive_one_stage_lit(input: VertexOut, classic: u32) -> vec4<f32> {
     let classic_fullbright = (classic_flags & CLASSIC_FULLBRIGHT) != 0u;
     let classic_vertex_light = (classic_flags & CLASSIC_VERTEX_LIGHT) != 0u;
     let classic_lightmap_only = (classic_flags & CLASSIC_LIGHTMAP_ONLY) != 0u;
-    let explicit_lightmap_stage = (material.header.z & MATERIAL_EXPLICIT_LIGHTMAP) != 0u;
-    let has_lightmap = (material.header.z & MATERIAL_HAS_LIGHTMAP) != 0u;
-    let opaque_stage = (material.header.z & MATERIAL_OPAQUE_STAGE) != 0u;
+    let explicit_lightmap_stage = (material.header.z & MATERIAL_FLAG_EXPLICIT_LIGHTMAP) != 0u;
+    let has_lightmap = (material.header.z & MATERIAL_FLAG_HAS_LIGHTMAP) != 0u;
+    let opaque_stage = (material.header.z & MATERIAL_FLAG_OPAQUE_STAGE) != 0u;
 
     var stage_color = material.color;
-    if ((material.header.z & 1u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_RGB_VERTEX) != 0u) {
         stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a);
-    } else if ((material.header.z & 524288u) != 0u) {
+    } else if ((material.header.z & MATERIAL_FLAG_RGB_ONE_MINUS_VERTEX) != 0u) {
         stage_color = vec4<f32>(
             stage_color.rgb * (vec3<f32>(1.0) - input.color.rgb),
             stage_color.a,
         );
     }
-    if ((material.header.z & 1048576u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_ALPHA_VERTEX) != 0u) {
         stage_color.a = stage_color.a * input.color.a;
-    } else if ((material.header.z & 2097152u) != 0u) {
+    } else if ((material.header.z & MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX) != 0u) {
         stage_color.a = stage_color.a * (1.0 - input.color.a);
     }
     stage_color = apply_wave_gens(stage_color);
-    if ((material.header.w & 524288u) != 0u) { stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a); }
+    if ((material.header.w & MATERIAL_FLAG_BAKED_ADDITIVE) != 0u) { stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a); }
 
     var source_sample = textureSample(base_texture, base_sampler, input.uv);
 
@@ -765,7 +761,7 @@ fn competitive_one_stage_lit(input: VertexOut, classic: u32) -> vec4<f32> {
 
     if (classic_lightmap_only && has_lightmap
         && !explicit_lightmap_stage
-        && (material.header.z & 2u) == 0u) {
+        && (material.header.z & MATERIAL_FLAG_IMPLICIT_LIGHTMAP) == 0u) {
         if (opaque_stage) {
             source_sample = vec4<f32>(1.0);
             stage_color = vec4<f32>(1.0);
@@ -780,7 +776,7 @@ fn competitive_one_stage_lit(input: VertexOut, classic: u32) -> vec4<f32> {
     // test the source texture's alpha while retaining the vertex alpha for
     // the actual stage output and for all sibling shaders.
     let mask_alpha = select(base.a, source_sample.a * material.color.a,
-        (material.header.z & 1073741824u) != 0u);
+        (material.header.z & MATERIAL_FLAG_MASK_TEXTURE_ALPHA) != 0u);
     if ((material.params.x > 0.0 && mask_alpha < material.params.x || material.params.x < 0.0 && mask_alpha >= -material.params.x)) {
         discard;
     }
@@ -788,7 +784,7 @@ fn competitive_one_stage_lit(input: VertexOut, classic: u32) -> vec4<f32> {
     // Only the synthesized implicit material uses a single-pass
     // base-texture × lightmap path. Explicit JKA shader scripts render their
     // `$lightmap` as its own ordered blend stage instead.
-    if ((material.header.z & 2u) != 0u && input.lightmap_uv.x >= 0.0) {
+    if ((material.header.z & MATERIAL_FLAG_IMPLICIT_LIGHTMAP) != 0u && input.lightmap_uv.x >= 0.0) {
         var lightmap_color = textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv).rgb;
         if (classic_fullbright) {
             lightmap_color = vec3<f32>(1.0);
@@ -802,13 +798,13 @@ fn competitive_one_stage_lit(input: VertexOut, classic: u32) -> vec4<f32> {
         }
     }
 
-    if (classic_lightmap_only && (material.header.z & 131072u) != 0u && !has_lightmap) {
+    if (classic_lightmap_only && (material.header.z & MATERIAL_FLAG_VERTEX_LIT) != 0u && !has_lightmap) {
         base = vec4<f32>(select(input.color.rgb, vec3<f32>(1.0), classic_vertex_light), base.a);
     }
 
     // Cached static BSP AO only modulates the normal baked-light contribution.
     if (classic_flags == 0u
-        && (material.header.x == 1u || (material.header.z & 2u) != 0u || (material.header.z & 131072u) != 0u)) {
+        && (material.header.x == 1u || (material.header.z & MATERIAL_FLAG_IMPLICIT_LIGHTMAP) != 0u || (material.header.z & MATERIAL_FLAG_VERTEX_LIT) != 0u)) {
         let static_ao = clamp(input.sky_dir_ao.w, 0.0, 1.0);
         base = vec4<f32>(base.rgb * static_ao, base.a);
     }
@@ -854,18 +850,18 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
     }
     let uv = apply_tc_mods(sky_cloud_uv(d, material.params.z), vec3<f32>(0.0));
     var stage_color = material.color;
-    if ((material.header.z & 1u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_RGB_VERTEX) != 0u) {
         stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a);
-    } else if ((material.header.z & 524288u) != 0u) {
+    } else if ((material.header.z & MATERIAL_FLAG_RGB_ONE_MINUS_VERTEX) != 0u) {
         stage_color = vec4<f32>(stage_color.rgb * (vec3<f32>(1.0) - input.color.rgb), stage_color.a);
     }
-    if ((material.header.z & 1048576u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_ALPHA_VERTEX) != 0u) {
         stage_color.a = stage_color.a * input.color.a;
-    } else if ((material.header.z & 2097152u) != 0u) {
+    } else if ((material.header.z & MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX) != 0u) {
         stage_color.a = stage_color.a * (1.0 - input.color.a);
     }
     stage_color = apply_wave_gens(stage_color);
-    if ((material.header.w & 524288u) != 0u) { stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a); }
+    if ((material.header.w & MATERIAL_FLAG_BAKED_ADDITIVE) != 0u) { stage_color = vec4<f32>(stage_color.rgb * input.color.rgb, stage_color.a); }
     let base = textureSample(base_texture, base_sampler, uv) * stage_color;
     if ((material.params.x > 0.0 && base.a < material.params.x || material.params.x < 0.0 && base.a >= -material.params.x)) {
         discard;
@@ -887,7 +883,7 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
         // A cloud-layer stage of the sky shader (tcGen sky cloud).
         return sky_cloud_color(input, d);
     }
-    if ((material.header.w & 1u) == 0u) {
+    if ((material.header.w & MATERIAL_FLAG_SKYBOX) == 0u) {
         // skyParms "-" has no outerbox. OpenJK draws no skybox here, so leave
         // the scene clear color visible (global-fog color when the BSP has one).
         discard;

@@ -1321,35 +1321,26 @@ impl VideoSettings {
             self.sky_world_lighting_strength.clamp(0.0, 1.0)
         } else { 0.0 };
         if self.active_relighting_mode() == 2 {
-            if self.sky_backend == 1 {
-                // Preserve the newer isolation path: trace sky receivers into
-                // cached lighting instead of fullscreen tinting enclosed rooms.
-                let traced_sky = self.sky_world_light_isolation && self.effective_shadow_mode().is_csm();
-                if traced_sky {
-                    effective.blue_water_environment.world_lighting = 0.0;
-                    effective.baked_sun_cache = true;
-                    effective.sky_world_bake_ab = 1;
-                } else {
-                    effective.blue_water_environment.world_lighting = effective.sky_world_lighting_strength;
-                    // Baked-sun removal (slider/Auto/Contour) must work in
-                    // Realtime exactly as in Baked, so the saved sun-cache
-                    // setting is kept. Only the baked *sky* gain is disabled:
-                    // the fullscreen pass already supplies it.
-                    effective.sky_world_bake_ab = 0;
-                }
-                // Daytime sky gain is 1 (authored exposure), so the sun comes
-                // from the explicit-sun path exactly as in vanilla Realtime;
-                // the atmosphere gain only takes over toward dusk/night.
-                effective.sun_lighting = true;
-                effective.entity_sun_lighting = true;
-            } else {
-                // Vanilla Realtime keeps the change-triggered BSP compositor
-                // while live CSM handles world shadows; no Blue Water atlas.
+            // Preserve the newer isolation path: trace sky receivers into
+            // cached lighting instead of fullscreen tinting enclosed rooms.
+            let traced_sky = self.sky_world_light_isolation && self.effective_shadow_mode().is_csm();
+            if traced_sky {
+                effective.blue_water_environment.world_lighting = 0.0;
                 effective.baked_sun_cache = true;
                 effective.sky_world_bake_ab = 1;
-                effective.sun_lighting = true;
-                effective.entity_sun_lighting = true;
+            } else {
+                effective.blue_water_environment.world_lighting = effective.sky_world_lighting_strength;
+                // Baked-sun removal (slider/Auto/Contour) must work in
+                // Realtime exactly as in Baked, so the saved sun-cache
+                // setting is kept. Only the baked *sky* gain is disabled:
+                // the fullscreen pass already supplies it.
+                effective.sky_world_bake_ab = 0;
             }
+            // Sky display does not select the lighting delivery. The sun
+            // comes from the shared explicit-sun path;
+            // the atmosphere gain only takes over toward dusk/night.
+            effective.sun_lighting = true;
+            effective.entity_sun_lighting = true;
         }
         if !self.sun_override {
             effective.baked_sun_cache = false;
@@ -1409,26 +1400,36 @@ mod relighting_tests {
     }
 
     #[test]
-    fn vanilla_realtime_uses_cached_world_light_without_blue_water_atmosphere() {
-        let mut video = VideoSettings::default();
-        video.sun_override = true;
-        video.relighting_mode = 2;
-        video.sky_backend = 0;
-        video.blue_water_environment.world_lighting = 1.0;
-        video.baked_sun_cache = false;
-        video.sky_world_bake_ab = 0;
-        let vanilla = video.effective_relighting();
-        assert_eq!(vanilla.blue_water_environment.world_lighting, 0.0);
-        assert!(vanilla.baked_sun_cache);
-        assert_eq!(vanilla.sky_world_bake_ab, 1);
-        assert!(vanilla.sun_lighting);
-        assert!(vanilla.entity_sun_lighting);
-
-        video.sky_backend = 1;
-        let blue_water = video.effective_relighting();
-        assert!(!blue_water.baked_sun_cache);
-        assert_eq!(blue_water.sky_world_bake_ab, 0);
-        assert!(blue_water.blue_water_environment.world_lighting > 0.0);
+    fn sky_display_preserves_baked_and_realtime_lighting() {
+        for mode in [1, 2] {
+            for isolation in [false, true] {
+                for cache in [false, true] {
+                    let mut video = VideoSettings::default();
+                    video.sun_override = true;
+                    video.relighting_mode = mode;
+                    video.sky_world_light_isolation = isolation;
+                    video.baked_sun_cache = cache;
+                    video.sky_backend = 1;
+                    let reference = video.effective_relighting();
+                    let shadows = video.effective_shadow_mode();
+                    for backend in [0, 1] {
+                        for fast_sky in [0, 1, 7] {
+                            video.sky_backend = backend;
+                            video.fast_sky = fast_sky;
+                            let actual = video.effective_relighting();
+                            assert_eq!(actual.blue_water_environment.world_lighting,
+                                reference.blue_water_environment.world_lighting);
+                            assert_eq!(actual.baked_sun_cache, reference.baked_sun_cache);
+                            assert_eq!(actual.sky_world_bake_ab, reference.sky_world_bake_ab);
+                            assert_eq!(actual.sky_world_lighting_strength, reference.sky_world_lighting_strength);
+                            assert_eq!(actual.sun_lighting, reference.sun_lighting);
+                            assert_eq!(actual.entity_sun_lighting, reference.entity_sun_lighting);
+                            assert_eq!(video.effective_shadow_mode(), shadows);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -330,6 +330,12 @@ impl App {
         if leaving_console {
             self.console_input.clear();
             self.console_cursor = 0;
+            self.console_suggest_origin = None;
+            self.console_suggest_picked = false;
+            self.clear_console_input_selection();
+            self.console_input_last_click = None;
+            self.console_input_click_count = 0;
+            self.console_input_focused = true;
             self.console_history_index = None;
         }
         if overlay != OverlayMode::Console {

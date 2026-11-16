@@ -307,8 +307,20 @@ impl Renderer {
         ui_state.extension_shader_flags.clone_from(&self.ui_state.extension_shader_flags);
         ui_state.extension_image_dimensions.clone_from(&self.ui_state.extension_image_dimensions);
         ui_state.extension_image_uvs.clone_from(&self.ui_state.extension_image_uvs);
+        // The app requests an atlas, but cannot publish new indices before its
+        // GPU texture and UVs are ready. Keep the drawable names paired with
+        // the committed atlas until sync_ui_extension_images() installs both.
+        self.ui_ext_requested_images = std::mem::take(&mut ui_state.extension_images);
+        ui_state.extension_images.clone_from(&self.ui_ext_image_key);
+        // Keep the previous HUD chrome visible while the replacement atlas is
+        // being decoded; switching to native must not show an empty HUD.
+        self.ui_ext_requested_hud_style = ui_state.video.hud_style;
+        if self.ui_ext_requested_images != self.ui_ext_image_key {
+            ui_state.video.hud_style = self.ui_state.video.hud_style;
+        }
         // Likewise the clean font: loaded once by the renderer, never by the app.
         ui_state.clean_font.clone_from(&self.ui_clean_font_metrics);
+        ui_state.enemy_info_font.clone_from(&self.ui_enemy_info_font_metrics);
         ui_state.avatar_atlas.clone_from(&self.ui_avatar_atlas);
         ui_state.shader_compile_progress = self.ui_state.shader_compile_progress;
         ui_state.shader_compile_stage = self.ui_state.shader_compile_stage.clone();
@@ -330,16 +342,21 @@ impl Renderer {
         &mut self,
         zoom_scope: Option<ui::UiZoomScope>,
         rocket_lock: Option<ui::UiRocketLock>,
+        hack_progress: Option<ui::UiHackProgress>,
     ) {
-        // The static crosshair is cached in the transient HUD buffer, whereas
-        // zoomMode changes arrive through this lightweight per-tick command.
-        // Rebuild that buffer on scope entry/exit only, not on every zoom frame.
+        // The crosshair sits in the cached transient HUD for fixed crosshairs
+        // and in the late-latched tail for projected ones. Zoom only changes
+        // static crosshair visibility on entry/exit; the use timer changes the
+        // *bar geometry* every game tick while hacking is active.
         let zoom_was_active = self.ui_state.zoom_scope.is_some();
+        let hack_was_active = self.ui_state.hack_progress.is_some();
         self.ui_state.zoom_scope = zoom_scope;
         self.ui_state.rocket_lock = rocket_lock;
+        self.ui_state.hack_progress = hack_progress;
         self.load_ui_icons_if_needed();
-        if zoom_was_active != self.ui_state.zoom_scope.is_some()
-            && self.ui_state.crosshair.scope_mode != 1
+        if (zoom_was_active != self.ui_state.zoom_scope.is_some()
+                && self.ui_state.crosshair.scope_mode != 1)
+            || hack_was_active || hack_progress.is_some()
         {
             self.rebuild_transient_ui();
         }
@@ -368,13 +385,13 @@ impl Renderer {
         }
         if self.ui_state.extension_hud == widgets
             && self.ui_state.native_hidden == hidden
-            && self.ui_state.extension_images == images
+            && self.ui_ext_requested_images == images
         {
             return;
         }
         self.ui_state.extension_hud = widgets;
         self.ui_state.native_hidden = hidden;
-        self.ui_state.extension_images = images;
+        self.ui_ext_requested_images = images;
         self.sync_ui_extension_images();
         // HUD extensions may be the *only* consumers of the native icon atlas.
         // A stock selector need not be visible for native weapon/item/Force art.
@@ -516,6 +533,7 @@ impl Renderer {
                     matches!(command, crate::extensions::HudCommand::NativeIcon { .. })))
             || self.ui_state.zoom_scope.is_some()
             || self.ui_state.rocket_lock.is_some()
+            || self.ui_state.hack_progress.is_some()
             // cg_specHud broadcast cards draw weapon icons from the atlas.
             || self.ui_state.spectator_broadcast.as_ref().is_some_and(|broadcast|
                 broadcast.players.iter().any(|player| player.weapon.is_some()))
@@ -647,14 +665,10 @@ impl Renderer {
             || !ui::gameplay_hud_visible(&self.ui_state, w, h)
             || self.ui_state.enemy_info.is_none()
         { return; }
-        let sy = h as f32 / 480.0;
-        let sx = sy; // widthRatioCoef * width/640 == height/480
-        let rows = usize::from(self.ui_state.video.draw_fps != 0)
-            + usize::from(self.ui_state.game_timer.is_some());
-        let x0 = w as f32 - 45.0 * sx;
-        let y0 = (17.0 + rows as f32 * 22.0) * sy;
-        let x1 = x0 + 40.0 * sx;
-        let y1 = y0 + 40.0 * sy;
+        let icon = ui::enemy_info_icon_rect(self.ui_state.video.draw_fps,
+            self.ui_state.game_timer.is_some(), w, h);
+        let (x0, y0) = (icon.x, icon.y);
+        let (x1, y1) = (x0 + icon.width, y0 + icon.height);
         let seconds = self.frame_time();
         let make_vertex = |x: f32, y: f32, uv: [f32; 2], color: [f32; 4], cut: f32| UiVertex {
             position: [x / w as f32 * 2.0 - 1.0, 1.0 - y / h as f32 * 2.0],
@@ -847,6 +861,7 @@ impl Renderer {
         {
             self.ui_ext_image_loader = None;
             self.ui_ext_image_key.clear();
+            self.ui_state.extension_images.clear();
             self.ui_state.extension_shader_flags.clear();
             self.ui_state.extension_image_dimensions.clear();
             self.ui_state.extension_image_uvs.clear();
@@ -857,7 +872,7 @@ impl Renderer {
             self.rebuild_ui_bind_group();
             rverbose!(1, "UI extension images: reset on JK2/JKA asset namespace switch");
         }
-        let wanted = self.ui_state.extension_images.clone();
+        let wanted = self.ui_ext_requested_images.clone();
         if wanted.is_empty() {
             self.ui_ext_image_loader = None;
             if !self.ui_ext_image_key.is_empty() {
@@ -865,11 +880,14 @@ impl Renderer {
                     &self.device, &self.queue, &blank_ui_extension_atlas(),
                 );
                 self.ui_ext_image_key.clear();
+                self.ui_state.extension_images.clear();
                 self.ui_state.extension_shader_flags.clear();
                 self.ui_state.extension_image_dimensions.clear();
                 self.ui_state.extension_image_uvs.clear();
                 self.ui_icon_shader_materials.retain(|&key, _| key < ui::ICON_NAMES.len());
                 self.rebuild_ui_bind_group();
+                self.ui_state.video.hud_style = self.ui_ext_requested_hud_style;
+                self.rebuild_dynamic_ui();
             }
             return;
         }
@@ -880,8 +898,9 @@ impl Renderer {
                 self.base.clone(), self.detail_texture_game.clone(), jk2_version,
             ));
         }
-        // The previous image atlas remains valid until the new complete
-        // pack is ready. Never upload half an atlas with obsolete UVs.
+        // Keep drawing only the *committed* image names against the previous
+        // atlas. New names/indices must not sample old slots while the worker
+        // prepares their matching texture, UVs and authored shader materials.
         let completed = self.ui_ext_image_loader.as_mut().and_then(|loader| {
             match loader.results.try_recv() {
                 Ok(batch) => { loader.pending = false; Some(batch) }
@@ -908,6 +927,10 @@ impl Renderer {
                     self.ui_icon_shader_materials.insert(index, stages);
                 }
                 self.ui_ext_image_key = batch.wanted;
+                // Publish names only after the atlas, UVs and shader flags have
+                // all been installed; the next HUD rebuild sees one generation.
+                self.ui_state.extension_images.clone_from(&self.ui_ext_image_key);
+                self.ui_state.video.hud_style = self.ui_ext_requested_hud_style;
                 self.rebuild_ui_bind_group();
                 self.rebuild_dynamic_ui();
                 rverbose!(1, "UI extension images: {} native-size artwork entries, packed {}x{}, upload {:.2} ms",
@@ -2194,7 +2217,8 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn rebuild_retained_ui(&mut self) {
-        let _unicode_scope = ui::UnicodeFallbackScope::enter(self.ui_jura_metrics.clone());
+        let _unicode_scope = ui::UnicodeFallbackScope::enter_with_requests(
+            self.ui_jura_metrics.clone(), Some(self.ui_unicode_worker.requests.clone()));
         let trace_started = self.ui_trace.then(Instant::now);
         if self.ui_state.video.skip_ui {
             self.ui_vertex_count = 0;
@@ -2233,7 +2257,8 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn rebuild_dynamic_ui(&mut self) {
-        let _unicode_scope = ui::UnicodeFallbackScope::enter(self.ui_jura_metrics.clone());
+        let _unicode_scope = ui::UnicodeFallbackScope::enter_with_requests(
+            self.ui_jura_metrics.clone(), Some(self.ui_unicode_worker.requests.clone()));
         let trace_started = self.ui_trace.then(Instant::now);
         self.ui_dynamic_vertices.clear();
         self.ui_dynamic_stable_vertex_count = 0;
@@ -2292,7 +2317,8 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn rebuild_movement_ui(&mut self) {
-        let _unicode_scope = ui::UnicodeFallbackScope::enter(self.ui_jura_metrics.clone());
+        let _unicode_scope = ui::UnicodeFallbackScope::enter_with_requests(
+            self.ui_jura_metrics.clone(), Some(self.ui_unicode_worker.requests.clone()));
         let trace_started = self.ui_trace.then(Instant::now);
         if self.ui_state.video.skip_ui {
             self.ui_dynamic_vertex_count = 0;
@@ -2340,7 +2366,8 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn rebuild_transient_ui(&mut self) {
-        let _unicode_scope = ui::UnicodeFallbackScope::enter(self.ui_jura_metrics.clone());
+        let _unicode_scope = ui::UnicodeFallbackScope::enter_with_requests(
+            self.ui_jura_metrics.clone(), Some(self.ui_unicode_worker.requests.clone()));
         let trace_started = self.ui_trace.then(Instant::now);
         self.ui_transient_vertices.clear();
         if self.ui_state.video.skip_ui {
@@ -2387,7 +2414,8 @@ impl Renderer {
         view_proj: Mat4,
         dynamic_crosshair_world: Option<[f32; 3]>,
     ) {
-        let _unicode_scope = ui::UnicodeFallbackScope::enter(self.ui_jura_metrics.clone());
+        let _unicode_scope = ui::UnicodeFallbackScope::enter_with_requests(
+            self.ui_jura_metrics.clone(), Some(self.ui_unicode_worker.requests.clone()));
         self.ui_transient_vertices
             .truncate(self.ui_transient_stable_vertex_count);
         if self.ui_state.video.skip_ui {
@@ -3382,10 +3410,55 @@ pub(in crate::renderer) fn empty_ui_font_texture(label: &str) -> TextureData {
     }
 }
 
+/// Keep OCR and TaystJK's arialnb in one immutable coverage texture, without
+/// adding a texture binding or changing the font used by other HUD elements.
+pub(in crate::renderer) fn load_ui_hud_fonts(
+    base: &Path, game: Option<&Path>,
+) -> (TextureData, Option<ui::ProportionalFont>, Option<ui::ProportionalFont>) {
+    let (mut texture, mut ocr) = load_ui_proportional_font(base, game, "ocr_a");
+    let (arial_texture, arial) = load_ui_proportional_font_origin(base, game, "arialnb", true);
+    let Some(mut arial) = arial.filter(|_| arial_texture.width > 1) else {
+        return (texture, ocr, None);
+    };
+    let width = texture.width.max(arial_texture.width);
+    let height = texture.height + arial_texture.height;
+    let mut pixels = vec![0u8; width as usize * height as usize * 4];
+    for (source, top) in [(&texture, 0), (&arial_texture, texture.height)] {
+        let row_bytes = source.width as usize * 4;
+        for y in 0..source.height as usize {
+            let dest = ((top as usize + y) * width as usize) * 4;
+            pixels[dest..dest + row_bytes]
+                .copy_from_slice(&source.rgba[y * row_bytes..(y + 1) * row_bytes]);
+        }
+    }
+    let remap = |font: &mut ui::ProportionalFont, source: &TextureData, top: u32| {
+        for glyph in &mut font.glyphs {
+            glyph.s *= source.width as f32 / width as f32;
+            glyph.s2 *= source.width as f32 / width as f32;
+            glyph.t = (glyph.t * source.height as f32 + top as f32) / height as f32;
+            glyph.t2 = (glyph.t2 * source.height as f32 + top as f32) / height as f32;
+        }
+    };
+    if let Some(ocr) = &mut ocr { remap(ocr, &texture, 0); }
+    remap(&mut arial, &arial_texture, texture.height);
+    texture.label = "JKA OCR / arialnb HUD font atlas".into();
+    texture.width = width;
+    texture.height = height;
+    texture.rgba = pixels.into();
+    texture.mip_level_count = 1;
+    (texture, ocr, Some(arial))
+}
+
 pub(in crate::renderer) fn load_ui_proportional_font(
     base: &Path,
     game: Option<&Path>,
     name: &str,
+) -> (TextureData, Option<ui::ProportionalFont>) {
+    load_ui_proportional_font_origin(base, game, name, false)
+}
+
+fn load_ui_proportional_font_origin(
+    base: &Path, game: Option<&Path>, name: &str, top_origin: bool,
 ) -> (TextureData, Option<ui::ProportionalFont>) {
     let mut assets = match AssetSearchPath::open_game(base, game) {
         Ok(assets) => assets,
@@ -3402,7 +3475,21 @@ pub(in crate::renderer) fn load_ui_proportional_font(
     let metrics_path = format!("fonts/{name}.fontdat");
     let metrics = match assets.read(&metrics_path, 64 * 1024) {
         Ok(Some(asset)) => match ui::parse_fontdat(&asset.bytes) {
-            Ok(font) => {
+            Ok(mut font) => {
+                if top_origin {
+                    // RE_Font_DrawString adds height - (descender >> 1) to
+                    // CG_Text_Paint's y. parse_fontdat validated this header.
+                    let offset = 256 * 28 + 3 * 2;
+                    let raw_height = i16::from_le_bytes([asset.bytes[offset - 4], asset.bytes[offset - 3]]);
+                    let descender = if raw_height == 0 {
+                        // Same legacy-header fallback as RE_RegisterFont.
+                        (f32::from(font.point_size) / 10.0 + 2.0).round() as i16
+                    } else {
+                        i16::from_le_bytes([asset.bytes[offset], asset.bytes[offset + 1]])
+                    };
+                    let baseline = i32::from(font.height) - i32::from(descender >> 1);
+                    for glyph in &mut font.glyphs { glyph.baseline -= baseline; }
+                }
                 if crate::logging::renderer_verbose_enabled(2) {
                     crate::logging::write_line_with_path(
                         crate::logging::Level::Info,
@@ -3475,47 +3562,6 @@ pub(in crate::renderer) fn load_ui_clean_font(
         }
     }
     (empty_ui_font_texture("JKA missing clean UI font"), None)
-}
-
-/// Built-in Unicode fallback companion. This is deliberately not a replacement
-/// for `ocr_a` or any other JKA font. Missing file disables fallback cleanly.
-/// The shipped Jura-Bold.ttf belongs in GameData/DinurdoJK/fonts/.
-pub(in crate::renderer) fn load_ui_jura_fallback(
-    base: &Path, game: Option<&Path>,
-) -> (TextureData, Option<ui::UnicodeFallbackFont>) {
-    const MAX_BYTES: usize = 16 * 1024 * 1024;
-    let root = base.parent().unwrap_or(base);
-    let bundled = root.join("DinurdoJK").join("fonts").join("Jura-Bold.ttf");
-    let bytes = (|| {
-        use std::io::Read;
-        let file = std::fs::File::open(&bundled).ok()?;
-        if file.metadata().ok()?.len() > MAX_BYTES as u64 { return None; }
-        let mut bytes = Vec::new();
-        file.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes).ok()?;
-        (bytes.len() <= MAX_BYTES).then_some(bytes)
-    })().or_else(|| {
-        let mut assets = AssetSearchPath::open_game(base, game).ok()?;
-        Some(assets.read("fonts/Jura-Bold.ttf", MAX_BYTES).ok()??.bytes)
-    });
-    let Some(bytes) = bytes else {
-        eprintln!("Unicode fallback disabled: put Jura-Bold.ttf in {}", bundled.display());
-        return (empty_ui_font_texture("Jura Unicode fallback unavailable"), None);
-    };
-    match ui::rasterize_unicode_fallback(&bytes) {
-        Ok(fallback) => (
-            TextureData {
-                label: "Jura Unicode missing-glyph atlas".to_owned(),
-                source: None, width: fallback.width, height: fallback.height,
-                rgba: fallback.rgba.into(), rgba16f: None,
-                mip_level_count: fallback.mip_level_count, clamp: true, srgb: false,
-            },
-            Some(fallback.font),
-        ),
-        Err(error) => {
-            eprintln!("Unicode fallback Jura-Bold.ttf: {error}");
-            (empty_ui_font_texture("Jura Unicode fallback error"), None)
-        }
-    }
 }
 
 /// Studio overlay font for `choice`: `ui::STUDIO_FONT_CLASSIC` is JKA's

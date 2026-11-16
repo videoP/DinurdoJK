@@ -152,7 +152,7 @@ fn encode_sky_depth(z: f32) -> f32 {
     output.position = shadow.view_proj * vec4<f32>(input.position, 1.0);
     output.uv = generated_uv(input);
     output.alpha_multiplier = material.color.a;
-    if ((material.header.z & 1u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_RGB_VERTEX) != 0u) {
         output.alpha_multiplier *= input.color.a;
     }
     return output;

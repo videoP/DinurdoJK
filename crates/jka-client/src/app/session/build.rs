@@ -296,7 +296,7 @@ impl App {
             session.live_snapshots.pop_front();
         }
         session.snapshots = session.snapshots.saturating_add(1);
-        if crate::cgame::remote_smoothing::mode() != 0 {
+        if matches!(crate::cgame::remote_smoothing::mode(), 1..=4) {
             session.remote_smoothing.receive(&snapshot, Instant::now());
         }
         session.live_snapshots.push_back(snapshot);

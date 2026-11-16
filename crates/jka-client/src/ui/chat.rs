@@ -365,6 +365,26 @@ pub(in crate::ui) fn build_chat_input(
         w,
         h,
     );
+    if ui.chat_input_selected && !ui.chat_input.is_empty() {
+        // Selection belongs to the message, not the SAY/TEAM/TELL prompt or
+        // trailing cursor marker. Both classic and proportional chat use this.
+        for (index, line) in wrapped.split('\n').enumerate() {
+            let text = line.strip_suffix('_').unwrap_or(line);
+            let prefix_chars = if index == 0 { prompt.chars().count() + 1 } else { 0 };
+            let byte = text.char_indices().nth(prefix_chars)
+                .map_or(text.len(), |(at, _)| at);
+            let selected = &text[byte..];
+            if selected.is_empty() { continue; }
+            let (offset, selection_width) = if let Some(txt) = &selected_font {
+                (txt.width(&text[..byte], big_char), txt.width(selected, big_char))
+            } else {
+                (text[..byte].chars().count() as f32 * big_char,
+                 selected.chars().count() as f32 * big_char)
+            };
+            rect(out, x + padding_x + offset, y + padding_y + index as f32 * big_char,
+                selection_width, big_char, [0.18, 0.42, 0.65, 0.80], w, h);
+        }
+    }
     if let Some(txt) = selected_font {
         let mut baseline = y + padding_y + (big_char + txt.cap(big_char)) * 0.5;
         for line in wrapped.split('\n') {

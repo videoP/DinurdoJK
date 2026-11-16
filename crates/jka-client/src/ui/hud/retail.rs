@@ -5,7 +5,7 @@
 //! coordinates from retail `ui/hud.menu`. No Rhai calls, menus or scripting.
 //! Textures come from the mounted retail `gfx/hud` and `gfx/2d/numbers` art.
 use crate::ui::{
-    hud_element_rect, textured_rect_with_source, text, HudElementId, HudRectContext,
+    glyph_quad_sized, hud_element_rect, textured_rect_with_source, HudElementId, HudRectContext,
     HudState, UiSnapshot, UiVertex,
 };
 use super::extensions::{
@@ -60,6 +60,8 @@ const AMMO_COLOR: [f32; 4] = [1.0, 0.658, 0.062, 1.0];
 const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
 const WHITE: [f32; 4] = [1.0; 4];
 const BACKGROUND: &str = "gfx/hud/hudleft";
+const AMMO_NUMBER_X: f32 = -83.0;
+const AMMO_NUMBER_Y: f32 = 98.0;
 
 /// Called on all native UI-image registration paths (full snapshots, async
 /// extension updates, HUD-editor moves). Original extension slots stay first.
@@ -141,25 +143,31 @@ impl Painter<'_> {
         }
     }
 
+    fn number_start_x(x: f32, chars: usize) -> f32 {
+        x + 2.0 + 6.0 * (3 - chars.min(3)) as f32
+    }
+
     fn number(&mut self, value: i32, x: f32, y: f32, color: [f32; 4]) {
-        let value = value.clamp(-99, 999);
-        let text = value.to_string();
-        let mut x = x + 2.0 + 6.0 * (3 - text.len()) as f32;
-        for ch in text.chars() {
+        let text = value.clamp(-99, 999).to_string();
+        let start_x = Self::number_start_x(x, text.len());
+        for (i, ch) in text.chars().enumerate() {
             let name = if ch == '-' { NUMBERS[10] } else {
                 NUMBERS[ch.to_digit(10).unwrap_or(0) as usize]
             };
-            let local_x = self.local_x(x);
-            self.image(name, local_x, y, 6.0, 12.0, color);
-            x += 7.0;
+            self.image(name, self.local_x(start_x + 7.0 * i as f32), y, 6.0, 12.0, color);
         }
     }
 
     fn dashes(&mut self) {
-        let scale = 2.0 * self.unit / 2.25;
-        let x = self.origin[0] + self.local_x(-75.0) * self.unit;
-        let y = self.origin[1] + (12.0 + 87.0) * self.unit;
-        text(self.out, "--", x, y, scale, AMMO_COLOR, self.screen[0], self.screen[1]);
+        // Match the two numeric cells exactly, using the same proportional
+        // font path TaystJK uses for its infinite-ammo label.
+        let start_x = Self::number_start_x(AMMO_NUMBER_X, 2);
+        for i in 0..2 {
+            let x = self.origin[0] + self.local_x(start_x + 7.0 * i as f32) * self.unit;
+            let y = self.origin[1] + (12.0 + AMMO_NUMBER_Y) * self.unit;
+            glyph_quad_sized(self.out, b'-', x, y, 6.0 * self.unit, 12.0 * self.unit,
+                AMMO_COLOR, self.screen[0], self.screen[1]);
+        }
     }
 }
 
@@ -203,15 +211,18 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: u32, h: 
                 if hud.force_flash { RED } else { FORCE_COLOR });
         }
         if hud.weapon == 0 { return; }
-        if (1..=3).contains(&hud.weapon) {
-            painter.dashes();
-            if hud.weapon == 3 && (1..=3).contains(&hud.saber_style) {
+        if hud.weapon == 3 {
+            // TaystJK/OpenJK CG_DrawHUD selects CG_DrawSaberStyle instead of
+            // CG_DrawAmmo for WP_SABER; the saber never gets "--".
+            if (1..=3).contains(&hud.saber_style) {
                 painter.piece(STYLES[(hud.saber_style - 1) as usize], WHITE);
             }
+        } else if hud.weapon == 1 || hud.weapon == 2 {
+            painter.dashes();
         } else if let Some(ammo) = hud.ammo {
             let maximum = AMMO_MAX.get(hud.ammo_index).copied().unwrap_or(0);
             painter.tics(&AMMO, ammo, maximum / 4, tint, false);
-            painter.number(ammo, -83.0, 98.0,
+            painter.number(ammo, AMMO_NUMBER_X, AMMO_NUMBER_Y,
                 if ammo > 0 { AMMO_COLOR } else { RED });
         }
     }
@@ -231,6 +242,77 @@ mod tests {
         assert_eq!(images.first().unwrap(), "gfx/custom/a");
         append_retail_hud_images(&mut images, 1);
         assert_eq!(images.len(), 32);
+    }
+
+    #[test]
+    fn infinite_ammo_uses_the_same_cells_as_a_two_digit_ammo_count() {
+        let images = {
+            let mut images = Vec::new();
+            append_retail_hud_images(&mut images, 1);
+            images
+        };
+        let draw = |dash: bool| {
+            let mut vertices = Vec::new();
+            let mut painter = Painter {
+                out: &mut vertices, images: &images, shader_flags: &[], uvs: &[],
+                screen: [1280, 720], origin: [1056.0, 504.0], unit: 1.5,
+                right: true,
+            };
+            if dash { painter.dashes(); }
+            else { painter.number(88, AMMO_NUMBER_X, AMMO_NUMBER_Y, AMMO_COLOR); }
+            vertices
+        };
+        let numbers = draw(false);
+        let dashes = draw(true);
+        assert_eq!(numbers.len(), 12);
+        assert_eq!(dashes.len(), 12);
+        assert!(numbers.iter().all(|v| v.textured == EXT_IMAGE_TEXTURE_SOURCE));
+        assert!(dashes.iter().all(|v| v.textured == 1.0));
+        for index in 0..12 {
+            assert_eq!(numbers[index].position, dashes[index].position);
+        }
+    }
+
+    #[test]
+    fn saber_uses_style_instead_of_infinite_ammo() {
+        let mut ui = UiSnapshot::default();
+        ui.hud = Some(HudState { weapon: 3, saber_style: 1, ..Default::default() });
+        append_retail_hud_images(&mut ui.extension_images, 1);
+        let mut vertices = Vec::new();
+        build(&mut vertices, &ui, 1280, 720);
+        assert!(!vertices.iter().any(|v| v.textured == 1.0));
+    }
+
+    #[test]
+    fn native_hud_waits_for_committed_image_names_not_previous_atlas_slots() {
+        let mut ui = UiSnapshot::default();
+        ui.video.hud_style = 1;
+        ui.hud = Some(HudState {
+            health: 82, max_health: 100, armor: 63,
+            ammo: Some(29), ammo_index: 3, weapon: 4,
+            force_power: Some(70), ..Default::default()
+        });
+        // A previous HUD generation used the first two slots for team flags.
+        ui.extension_images = vec![
+            "gfx/hud/mpi_rflag".into(), "gfx/hud/mpi_bflag".into(),
+        ];
+        ui.extension_image_uvs = vec![
+            ([0.0, 0.0], [0.5, 1.0]),
+            ([0.5, 0.0], [1.0, 1.0]),
+        ];
+        let mut requested = ui.extension_images.clone();
+        append_retail_hud_images(&mut requested, 1);
+        // Until the renderer commits the requested names AND new atlas/UVs,
+        // native painter must not interpret slot zero as gfx/hud/hudleft.
+        let mut vertices = Vec::new();
+        build(&mut vertices, &ui, 1920, 1080);
+        assert!(!vertices.iter().any(|v| v.textured == EXT_IMAGE_TEXTURE_SOURCE));
+
+        ui.extension_image_uvs = vec![([0.0, 0.0], [1.0, 1.0]); requested.len()];
+        ui.extension_images = requested;
+        vertices.clear();
+        build(&mut vertices, &ui, 1920, 1080);
+        assert!(vertices.iter().any(|v| v.textured == EXT_IMAGE_TEXTURE_SOURCE));
     }
 
     #[test]

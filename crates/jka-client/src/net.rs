@@ -1388,9 +1388,12 @@ impl LiveInput {
         const WP_STUN_BATON: i32 = 1;
         const WP_MELEE: i32 = 2;
         const WP_SABER: i32 = 3;
+        const WP_BRYAR_PISTOL: i32 = 4; // JKA blaster pistol (DL-44)
+        const WP_BLASTER: i32 = 5;
         const WP_THERMAL: i32 = 12;
         const WP_DET_PACK: i32 = 14;
-        const LAST_USEABLE_WEAPON: i32 = 16;
+        const WP_BRYAR_OLD: i32 = 16; // JK2-era Bryar, still a separate JKA weapon
+        const LAST_USEABLE_WEAPON: i32 = WP_BRYAR_OLD;
         if ps.field_i32("pm_flags").unwrap_or(0) & 4096 != 0 || ps.field_i32("emplacedIndex").unwrap_or(0) != 0 {
             return false;
         }
@@ -1409,6 +1412,32 @@ impl LiveInput {
             num += 2;
         } else {
             num = if ps.stats[4] & (1 << WP_SABER) != 0 { WP_SABER } else { WP_MELEE };
+        }
+        // TaystJK CG_Weapon_f: the second numbered slot is shared by the
+        // JKA DL-44 (WP_BRYAR_PISTOL) and the original Bryar (WP_BRYAR_OLD).
+        // Ownership is authoritative; do not substitute the old Bryar's
+        // model/icon for a player who actually has weapon 4.
+        let owned = ps.stats[4];
+        if num == WP_BRYAR_PISTOL {
+            if owned & ((1 << WP_BRYAR_PISTOL) | (1 << WP_BRYAR_OLD)) == 0 {
+                if owned & (1 << WP_MELEE) != 0 {
+                    num = WP_MELEE;
+                } else if owned & (1 << WP_STUN_BATON) != 0 {
+                    num = WP_STUN_BATON;
+                }
+            } else if owned & (1 << WP_BRYAR_OLD) != 0 {
+                let equipped = ps.field_i32("weapon").unwrap_or(0);
+                if equipped == WP_BRYAR_PISTOL || owned & (1 << WP_BRYAR_PISTOL) == 0 {
+                    num = WP_BRYAR_OLD;
+                } else if equipped == WP_BRYAR_OLD {
+                    num = WP_BRYAR_PISTOL;
+                }
+            }
+        } else if num == WP_BLASTER && owned & (1 << WP_BLASTER) == 0
+            && owned & (1 << WP_STUN_BATON) != 0
+        {
+            // TaystJK's E-11 slot falls back to the stun baton.
+            num = WP_STUN_BATON;
         }
         if num > LAST_USEABLE_WEAPON + 1 {
             return false;
@@ -1784,8 +1813,14 @@ fn prediction_solid_entities(
             *slot = Some(entity);
         }
     }
+    // Track all selected-snapshot IDs (including non-solids). An explicit
+    // server update takes precedence over an older permanent baseline.
+    let mut snapshot_ids = [false; MAX_GENTITIES];
     let mut solids = Vec::with_capacity(solid_snapshot.entities.len());
     for next in &solid_snapshot.entities {
+        if let Some(slot) = snapshot_ids.get_mut(usize::from(next.number)) {
+            *slot = true;
+        }
         let displayed = current.get(usize::from(next.number)).copied().flatten();
         // CG_BuildSolidList tests currentState.eType, but nextState.solid.
         let current_type = displayed.map_or_else(|| next.field_i32("eType").unwrap_or(0), |e| e.entity_type);
@@ -1806,6 +1841,42 @@ fn prediction_solid_entities(
         // predicted movement traces, not in point-contents or visual queries.
         // Use currentState, just like TaystJK CG_ClipMoveToEntities.
         solid.skip_movement = skip_portable_shield_movement(current_type, state);
+        solids.push(solid);
+    }
+
+    // TaystJK cg_predict.c CG_BuildSolidList also registers nearby
+    // cg_permanents outside the snapshot loop (5500-unit distance cull;
+    // ET_TERRAIN bypasses that cull). These are EF_PERMANENT baselines,
+    // notably jaPRO's misc_bsp ET_MOVER, not arbitrary missing snapshot
+    // entities. Keep the selected snapshot authoritative for duplicate IDs.
+    const EF_PERMANENT: i32 = 1 << 7;
+    const PERMANENT_COLLISION_RANGE_SQ: f32 = 5_500.0 * 5_500.0;
+    let player_origin = [
+        solid_snapshot.player_state.field_f32("origin[0]").unwrap_or(0.0),
+        solid_snapshot.player_state.field_f32("origin[1]").unwrap_or(0.0),
+        solid_snapshot.player_state.field_f32("origin[2]").unwrap_or(0.0),
+    ];
+    for entity in presented {
+        let id = usize::from(entity.number);
+        if id >= MAX_GENTITIES || snapshot_ids[id]
+            || entity.state.field_i32("eFlags").unwrap_or(0) & EF_PERMANENT == 0
+            || prediction_trigger(entity.entity_type)
+            || entity.state.field_i32("solid").unwrap_or(0) == 0
+        {
+            continue;
+        }
+        let distance_sq: f32 = entity.origin.iter().zip(player_origin)
+            .map(|(&component, player)| (component - player).powi(2))
+            .sum();
+        if entity.entity_type != jka_protocol::entity_type::ET_TERRAIN
+            && distance_sq > PERMANENT_COLLISION_RANGE_SQ
+        {
+            continue;
+        }
+        let mut solid = solid_entity_from_state(
+            &entity.state, entity.origin, entity.angles, physics_time,
+        );
+        solid.skip_movement = skip_portable_shield_movement(entity.entity_type, &entity.state);
         solids.push(solid);
     }
     solids
@@ -2530,6 +2601,7 @@ impl Predictor {
                 jka_movement::PredictionEntity {
                     number: i32::from(state.number), entity_type,
                     model_index: int("modelindex"), bolt1: int("bolt1"),
+                    solid: int("solid"),
                     trajectory_type: int("pos.trType"),
                     origin: [float("pos.trBase[0]"), float("pos.trBase[1]"), float("pos.trBase[2]")],
                     velocity: [float("pos.trDelta[0]"), float("pos.trDelta[1]"), float("pos.trDelta[2]")],
@@ -3340,6 +3412,48 @@ mod tests {
         changed.state.fields[field("modelindex")] = 3;
         let current = prediction_solid_entities(&snapshot, &[changed, other], 500);
         assert!(!current[0].skip_movement);
+    }
+
+    #[test]
+    fn permanent_misc_bsp_collides_without_snapshot_entity() {
+        use jka_protocol::gamestate::ENTITY_FIELDS;
+        let field = |name: &str| ENTITY_FIELDS.iter().position(|(n, _)| *n == name).unwrap();
+        let mut mover = mover_entity(41, ET_MOVER, [20_000.0, -20_000.0, -20_000.0], [0.0; 3]);
+        mover.state.fields[field("eFlags")] = 1 << 7; // EF_PERMANENT
+        mover.state.fields[field("solid")] = 0x00ff_ffff; // SOLID_BMODEL
+        mover.state.fields[field("modelindex")] = 9; // mp/duel7 in mp/ffa3
+        let mut snapshot = Snapshot {
+            server_time: 500, message_num: 5, delta_num: 4, snap_flags: 0,
+            ping: 0, server_command_num: 0, area_mask: [0; 32],
+            player_state: PlayerState::default(), vehicle_player_state: None,
+            entities: Vec::new(), // The two recorded jaPRO demos both omit 41.
+        };
+        for (axis, value) in [20_585.0f32, -19_811.0, -19_846.0].into_iter().enumerate() {
+            snapshot.player_state.set_field_bits(&format!("origin[{axis}]"), value.to_bits());
+        }
+        let near = prediction_solid_entities(&snapshot, &[mover.clone()], 500);
+        assert_eq!(near.len(), 1, "permanent BSP must enter predicted movement traces");
+        assert_eq!(near[0].number, 41);
+        let EntityClip::InlineModel { index, origin, .. } = near[0].clip else {
+            panic!("misc_bsp must retain its inline collision model");
+        };
+        assert_eq!(index, 9);
+        assert_eq!(origin, [20_000.0, -20_000.0, -20_000.0]);
+
+        // The cull exists in TaystJK, so arbitrary distant permanent entities
+        // must not enter local movement traces.
+        snapshot.player_state.set_field_bits("origin[0]", 0.0f32.to_bits());
+        snapshot.player_state.set_field_bits("origin[1]", 0.0f32.to_bits());
+        snapshot.player_state.set_field_bits("origin[2]", 0.0f32.to_bits());
+        assert!(prediction_solid_entities(&snapshot, &[mover.clone()], 500).is_empty());
+
+        // A snapshot state overrides the baseline, even when it clears solid.
+        snapshot.entities.push(mover.state.clone());
+        snapshot.entities[0].fields[field("solid")] = 0;
+        snapshot.player_state.set_field_bits("origin[0]", 20_000.0f32.to_bits());
+        snapshot.player_state.set_field_bits("origin[1]", (-20_000.0f32).to_bits());
+        snapshot.player_state.set_field_bits("origin[2]", (-20_000.0f32).to_bits());
+        assert!(prediction_solid_entities(&snapshot, &[mover], 500).is_empty());
     }
 
     #[test]
@@ -4258,6 +4372,47 @@ mod tests {
         assert_eq!(input.weapon_select, 3, "slot 1 selects the saber when not already wielded");
         input.cycle_weapon(&ps, true);
         assert_eq!(input.weapon_select, 4);
+    }
+
+    #[test]
+    fn jka_pistol_slot_switches_between_dl44_and_old_bryar_like_taystjk() {
+        let mut ps = PlayerState::default();
+        ps.stats[4] = (1 << 3) | (1 << 4) | (1 << 16);
+        ps.ammo[2] = 100; // both pistols use AMMO_BLASTER
+        let mut input = LiveInput::default();
+
+        ps.set_field_bits("weapon", 3); // entering pistol slot from saber
+        input.select_weapon_slot(&ps, "2");
+        assert_eq!(input.weapon_select, 4, "both owned: default to the JKA DL-44");
+
+        ps.set_field_bits("weapon", 4);
+        input.select_weapon_slot(&ps, "2");
+        assert_eq!(input.weapon_select, 16, "equipped DL-44 toggles to old Bryar");
+
+        ps.set_field_bits("weapon", 16);
+        input.select_weapon_slot(&ps, "2");
+        assert_eq!(input.weapon_select, 4, "equipped old Bryar toggles back to DL-44");
+
+        ps.stats[4] &= !(1 << 16);
+        ps.set_field_bits("weapon", 3);
+        input.select_weapon_slot(&ps, "2");
+        assert_eq!(input.weapon_select, 4, "old Bryar absent: never select its ID");
+
+        ps.stats[4] = (1 << 3) | (1 << 16);
+        input.select_weapon_slot(&ps, "2");
+        assert_eq!(input.weapon_select, 16, "only old Bryar owned: use it");
+    }
+
+    #[test]
+    fn pistol_slot_without_either_pistol_uses_taystjk_melee_fallback() {
+        let mut ps = PlayerState::default();
+        ps.stats[4] = 1 << 2; // melee, but no pistol
+        let mut input = LiveInput::default();
+        input.select_weapon_slot(&ps, "2");
+        assert_eq!(input.weapon_select, 2);
+        ps.stats[4] = 1 << 1; // stun baton, but no pistol or melee
+        input.select_weapon_slot(&ps, "2");
+        assert_eq!(input.weapon_select, 1);
     }
 
     #[test]

@@ -19,6 +19,7 @@
 //! Run `cargo test -p DinurdoJK --release shader_audit -- --nocapture` for the
 //! full report.
 
+use crate::material_flags::*;
 use super::{compose_world_shader, WorldShaderVariantKey};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use wgpu::naga::{
@@ -999,7 +1000,7 @@ fn material_fragment_key_narrows_only_compiled_out_bits() {
     assert_eq!(minimal.flags_mask & (pbr_normal_map | planar), 0);
     assert_eq!(minimal.flags & (pbr_normal_map | planar), 0);
     assert_eq!(minimal.flags_w_mask & (2 | 4), 0);
-    assert_eq!(minimal.flags & 2, 2);
+    assert_eq!(minimal.flags & MATERIAL_FLAG_IMPLICIT_LIGHTMAP, MATERIAL_FLAG_IMPLICIT_LIGHTMAP);
     assert_eq!(minimal.alpha_func, 2);
     let mut pbr = minimal_key();
     pbr.pbr = true;

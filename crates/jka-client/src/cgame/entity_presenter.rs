@@ -2400,19 +2400,19 @@ impl EntityPresenter {
         settings: crate::camera::ViewWeaponSettings,
         world_fov: f32,
     ) -> Result<(Vec<DynamicModelSurface>, Option<[f32; 3]>), String> {
-        const WP_NONE: i32 = 0;
         const WP_STUN_BATON: i32 = 1;
         const WP_DISRUPTOR: i32 = 6;
         const WP_REPEATER: i32 = 8;
         const WP_FLECHETTE: i32 = 10;
         const WP_ROCKET_LAUNCHER: i32 = 11;
         const WP_CONCUSSION: i32 = 15;
-        const WP_EMPLACED_GUN: i32 = 17;
 
-        // EternalJK CG_AddViewWeapon forwards saber/melee through the same
-        // first-person viewModel path as the other weapons.
-        // CG_AddPlayerWeapon only special-cases the emplaced gun here.
-        if settings.draw_gun == 0 || matches!(weapon_num, WP_NONE | WP_EMPLACED_GUN) {
+        // The stock bg_itemlist gives WP_MELEE the stun baton's view_model,
+        // even though CG_CopyG2WeaponInstance explicitly removes its held
+        // weapon model. Do not draw that borrowed baton MD3 when unarmed in
+        // FPLS. This only suppresses the separate first-person MD3; Ghoul2
+        // body/saber presentation remains owned by PlayerPresenter.
+        if !should_render_view_weapon_md3(weapon_num, settings.draw_gun) {
             return Ok((Vec::new(), None));
         }
 
@@ -3976,9 +3976,33 @@ fn facing_axis(axis: [[f32; 3]; 3], origin: [f32; 3], eye: [f32; 3], locked: boo
     [x.map(|c| c * s[0]), y.map(|c| c * s[1]), z.map(|c| c * s[2])]
 }
 
+/// The unarmed (WP_MELEE) first-person slot must not be drawn using the
+/// stock stun-baton MD3 shared by the two bg_itemlist entries. A real stun
+/// baton (WP_STUN_BATON) still has its view model and three authored barrels.
+#[inline]
+fn should_render_view_weapon_md3(weapon: i32, draw_gun: u8) -> bool {
+    const WP_NONE: i32 = 0;
+    const WP_MELEE: i32 = 2;
+    const WP_EMPLACED_GUN: i32 = 17;
+    draw_gun != 0 && !matches!(weapon, WP_NONE | WP_MELEE | WP_EMPLACED_GUN)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unarmed_fpls_does_not_submit_stun_baton_view_model() {
+        // Both IT_WEAPON entries share baton.md3; the weapon ID, not the
+        // model pathname, distinguishes unarmed fists from a real baton.
+        assert!(!should_render_view_weapon_md3(2, 1)); // WP_MELEE
+        assert!(should_render_view_weapon_md3(1, 1)); // WP_STUN_BATON
+        assert!(should_render_view_weapon_md3(3, 1)); // WP_SABER
+        assert!(should_render_view_weapon_md3(5, 1)); // WP_BLASTER
+        assert!(!should_render_view_weapon_md3(0, 1)); // WP_NONE
+        assert!(!should_render_view_weapon_md3(17, 1)); // WP_EMPLACED_GUN
+        assert!(!should_render_view_weapon_md3(1, 0)); // cg_drawGun 0
+    }
 
     #[test]
     fn auxiliary_shield_sphere_and_seeker_visibility_tracks_cg_player() {

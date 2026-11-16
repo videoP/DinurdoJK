@@ -127,6 +127,8 @@ impl PlayerPresenter {
         self.preview_source_jiggles.clear();
         self.team_power.clear();
         self.body_fade.clear();
+        self.disintegration_start.clear();
+        self.disintegration_smoke_last.clear();
         self.mind_trick_fades.clear();
         self.cloak_states.clear();
         self.force_refractions.clear();
@@ -338,6 +340,8 @@ impl PlayerPresenter {
             cosmetic_mismatch_logged: None,
             team_power: HashMap::new(),
             body_fade: HashMap::new(),
+            disintegration_start: HashMap::new(),
+            disintegration_smoke_last: HashMap::new(),
             gore_limit: 0,
             gore: Vec::new(),
             pending_gore: Vec::new(),

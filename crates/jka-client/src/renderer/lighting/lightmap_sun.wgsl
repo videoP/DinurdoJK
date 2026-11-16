@@ -4,8 +4,8 @@ override ENABLE_CSM_COVERAGE: bool = false;
 // composed sunlight; only the moving-caster footprint needs a live comparison.
 fn static_sun_lightmap_receiver(input: VertexOut) -> bool {
     return (lighting_settings.baked_sun_debug_mode.z & 1u) != 0u
-        && (material_flags_w() & 262144u) == 0u && input.shell_kind == 0u
-        && ((material_flags() & (2u | 8388608u | 16777216u)) != 0u || material_tc_gen() == 1u);
+        && (material_flags_w() & MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION) == 0u && input.shell_kind == 0u
+        && ((material_flags() & (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_EXPLICIT_LIGHTMAP | MATERIAL_FLAG_HAS_LIGHTMAP)) != 0u || material_tc_gen() == 1u);
 }
 
 fn sample_dynamic_cascade(world_position: vec3<f32>, normal: vec3<f32>, cascade: i32) -> f32 {

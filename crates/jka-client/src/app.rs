@@ -863,6 +863,12 @@ pub struct App {
     console_input: String,
     /// UTF-8 byte offset of the editable console caret inside `console_input`.
     console_cursor: usize,
+    /// UTF-8 anchor; the caret is the other end of an input-field selection.
+    console_input_selection_anchor: Option<usize>,
+    console_input_selecting: bool,
+    console_input_focused: bool,
+    console_input_last_click: Option<(Instant, usize)>,
+    console_input_click_count: u8,
     console_status: String,
     console_lines: VecDeque<String>,
     /// Explicit semantic presentation class for each console row. Kept parallel
@@ -913,6 +919,9 @@ pub struct App {
     /// (otherwise row 0 is the implicit Tab target).
     console_suggest_index: usize,
     console_suggest_picked: bool,
+    /// Original typed query while console arrow navigation previews completion
+    /// candidates in the edit field. Keeps the popup from filtering itself.
+    console_suggest_origin: Option<(String, usize)>,
     /// Esc / history browsing hides the popup until the next edit so Up/Down
     /// keep meaning "history" and Esc can still close the console.
     console_suggest_hidden: bool,
@@ -1017,6 +1026,8 @@ pub struct App {
     console_search_index: Option<usize>,
     chat_mode: ChatMode,
     chat_input: String,
+    /// Ctrl+A selects the entire chat edit field; shared by Classic and Docked.
+    chat_input_selected: bool,
     chat_player_completion: Option<ChatPlayerCompletionCycle>,
     chat_lines: VecDeque<ChatRecord>,
     /// `cg_chatTranslate*`: received messages, pending and finished translations.

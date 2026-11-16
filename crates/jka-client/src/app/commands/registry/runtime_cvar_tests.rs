@@ -760,20 +760,23 @@ fn relighting_master_preserves_edits_and_round_trips_through_canonical_cvar() {
     let event_loop = winit::event_loop::EventLoop::<crate::runtime::UserEvent>::with_user_event()
         .with_any_thread(true).build().unwrap();
     let fixture = Fixture::new();
-    let path = fixture.0.join("DinurdoJK.cfg");
+    let base = fixture.0.join("base");
+    fs::create_dir_all(&base).unwrap();
+    let path = base.join("DinurdoJK.cfg");
     fs::write(&path, "").unwrap();
-    let mut app = App::new(fixture.0.clone(), None, crate::scene::MapSource::Bsp("mp/ffa3".into()),
+    let mut app = App::new(base, None, crate::scene::MapSource::Bsp("mp/ffa3".into()),
         false, event_loop.create_proxy()).unwrap();
     assert!(!app.video.sun_override);
     app.map_authored_sun = Some(crate::scene::DirectionalSun::from_q3_angles([1.0, 0.5, 0.25], 650.0, 42.0, 30.0));
     app.set_console_cvar("r_relightMap", "1").unwrap();
-    assert_eq!(app.console_cvar_value("r_cascadedShadows").as_deref(), Some("1"));
-    assert_eq!(app.video.dynamic_shadows, crate::ui::DynamicShadowsMode::CascadedShadowMapsEntities);
+    assert_eq!(app.console_cvar_value("r_cascadedShadows").as_deref(), Some("0"));
+    assert_eq!(app.video.dynamic_shadows, crate::ui::DynamicShadowsMode::Off);
+    assert!(app.video.effective_shadow_mode().is_csm());
     assert!((app.video.sun_yaw - 42.0).abs() < 0.001);
     assert!((app.video.sun_pitch - 30.0).abs() < 0.001);
     assert_eq!(app.video.sun_intensity, 650.0);
     app.set_console_cvar("r_relightMap", "0").unwrap();
-    assert_eq!(app.console_cvar_value("r_cascadedShadows").as_deref(), Some("1"));
+    assert_eq!(app.console_cvar_value("r_cascadedShadows").as_deref(), Some("0"));
     for (name, value) in [("r_sunYaw", "123"), ("r_skyWorldLightIsolation", "1"), ("r_sunLighting", "1"), ("r_bakedSunRemoval", "0.75"), ("r_bakedSunRemovalAuto", "1"), ("r_bakedLocalLights", "1"), ("r_bakedLocalGlow", "1")] {
         app.set_console_cvar(name, value).unwrap();
     }
@@ -781,7 +784,16 @@ fn relighting_master_preserves_edits_and_round_trips_through_canonical_cvar() {
     app.set_console_cvar("r_relightMap", "1").unwrap();
     assert_eq!(app.video.sun_yaw, 123.0);
     assert!(app.video.effective_relighting().sun_lighting);
+    for backend in ["0", "1"] {
+        app.set_console_cvar("r_skyBackend", backend).unwrap();
+        app.set_console_cvar("r_fastsky", "1").unwrap();
+        app.set_console_cvar("r_lightmapSignal", "11").unwrap();
+        assert_eq!(app.video.lightmap_signal, 11);
+    }
+    app.set_console_cvar("r_lightmapSignal", "0").unwrap();
+    app.set_console_cvar("r_fastsky", "0").unwrap();
     app.set_console_cvar("r_relightMap", "0").unwrap();
+    assert!(app.set_console_cvar("r_lightmapSignal", "11").is_err());
     let off = app.video.effective_relighting();
     assert!(!off.sun_lighting && off.added_map_light_sources() == 0);
     assert_eq!(off.baked_sun_removal, 0.0);

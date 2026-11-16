@@ -18,6 +18,16 @@ struct AtmosphereConfig {
     picmip: u32,
 }
 
+impl AtmosphereConfig {
+    fn same_lighting_resources(self, requested: Self) -> bool {
+        Self { aerial: requested.aerial, ..self } == requested
+    }
+
+    fn supports(self, requested: Self) -> bool {
+        self.same_lighting_resources(requested) && (self.aerial || !requested.aerial)
+    }
+}
+
 /// A view-space aerial volume may be reused only for identical sky inputs
 /// and an identical (including TAA jitter) camera. When the view is stationary
 /// and sky time advances, cap reuse to one 60 Hz interval so moving celestial
@@ -58,7 +68,8 @@ impl crate::renderer::Renderer {
     pub(in crate::renderer) fn ensure_native_atmosphere(&mut self, camera: &Camera) {
         use crate::pipeline_jobs::{hash_config, PipelineJobKey};
         let sky_visible = self.native_sky_surface_visible();
-        let requested = sky_visible || self.blue_water_environment.world_lighting > 0.0
+        let relighting_environment = self.sun_override && self.sky_world_lighting_strength > 0.0;
+        let requested = sky_visible || relighting_environment || self.blue_water_environment.world_lighting > 0.0
             || self.blue_water_environment.weather_backend == 1
             || (self.cloud_backend == 1 && self.clouds_enabled)
             // Water may still need the environment map when Shitter hides the
@@ -81,10 +92,11 @@ impl crate::renderer::Renderer {
             aerial: sky_visible,
             picmip: self.picmip.min(16),
         };
-        if self.blue_water_sky.as_ref().is_some_and(|sky| sky.config == config) {
+        // Hiding the dome does not retire its lighting tables or rebuild them
+        // without aerial support. Showing it again can reuse the same resource.
+        if self.blue_water_sky.as_ref().is_some_and(|sky| sky.config.supports(config)) {
             return;
         }
-        let was_active = self.blue_water_sky.take().is_some();
         let key = PipelineJobKey::new("native-atmosphere", 0, hash_config(&config));
         if let Some(atmosphere) = self.pipeline_jobs.take_ready::<AtmosphereRenderer>(key) {
             self.blue_water_sky = Some(atmosphere);
@@ -95,6 +107,11 @@ impl crate::renderer::Renderer {
             rverbose!(1, "[ENVIRONMENT READY] atmosphere activated at frame boundary {config:?}");
             return;
         }
+        // A lighting-only atmosphere remains usable while its visible-sky
+        // pipelines are prepared. Format/size/cloud changes still retire it.
+        let keep_lighting = self.blue_water_sky.as_ref()
+            .is_some_and(|sky| sky.config.same_lighting_resources(config));
+        let was_active = !keep_lighting && self.blue_water_sky.take().is_some();
         if was_active {
             self.history_valid = false;
             self.rebuild_frame_plan();
@@ -180,6 +197,10 @@ pub(in crate::renderer) struct AtmosphereRenderer {
     frame_host_vp: glam::Mat4,
 }
 impl AtmosphereRenderer {
+    pub(in crate::renderer) fn can_display_sky(&self) -> bool {
+        self.config.aerial
+    }
+
     fn build(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -1811,7 +1832,32 @@ mod native_tests {
 
 #[cfg(test)]
 mod native_sky_visibility_tests {
-    use super::native_sky_surface_visible;
+    use super::{AtmosphereConfig, native_sky_surface_visible};
+
+    #[test]
+    fn hiding_and_restoring_sky_reuses_lighting_resources() {
+        let visible = AtmosphereConfig {
+            target: (2560, 1440, 1, wgpu::TextureFormat::Bgra8UnormSrgb),
+            quality: 2, cloud_quality: 4, clouds: false, weather: false,
+            aerial: true, picmip: 3,
+        };
+        let hidden = AtmosphereConfig { aerial: false, ..visible };
+        assert!(visible.supports(hidden), "vanilla/fastsky must retain the completed environment");
+        assert!(visible.supports(visible), "restoring the dome must not rebuild lighting");
+        assert!(hidden.same_lighting_resources(visible), "keep lighting during visible-sky preparation");
+        assert!(!hidden.supports(visible), "a lighting-only resource still needs display pipelines");
+        for incompatible in [
+            AtmosphereConfig { target: (1280, 720, 1, visible.target.3), ..hidden },
+            AtmosphereConfig { target: (2560, 1440, 4, visible.target.3), ..hidden },
+            AtmosphereConfig { quality: 1, ..hidden },
+            AtmosphereConfig { clouds: true, ..hidden },
+            AtmosphereConfig { weather: true, ..hidden },
+            AtmosphereConfig { picmip: 0, ..hidden },
+        ] {
+            assert!(!visible.supports(incompatible));
+            assert!(!visible.same_lighting_resources(incompatible));
+        }
+    }
 
     #[test]
     fn flat_world_and_fastsky_never_display_the_physical_dome() {

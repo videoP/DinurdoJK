@@ -31,7 +31,7 @@ fn foliage_noise_position(position: vec3<f32>, wind: vec4<f32>, variation: f32) 
 // Compiled world geometry has no per-model pivot: continuous world-space noise
 // preserves shared vertices and material-stage alignment without guessed UV roots.
 fn foliage_wind_position(position: vec3<f32>, material_word: u32, wind: vec4<f32>) -> vec3<f32> {
-    if ((material_word & 262144u) == 0u) { return position; }
+    if ((material_word & MATERIAL_FLAG_FOLIAGE_WIND) == 0u) { return position; }
     return foliage_noise_position(position, wind, 0.0);
 }
 

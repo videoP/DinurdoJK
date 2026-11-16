@@ -476,7 +476,7 @@ impl super::Renderer {
             self.targets._scene_texture.width(),
             self.targets._scene_texture.height(),
         ];
-        let blue_water_ambient = self.sky_backend == 1 && self.blue_water_sky.is_some();
+        let blue_water_ambient = (self.sun_override || self.sky_backend == 1) && self.blue_water_sky.is_some();
         let foam = water.has_foam_detail();
         {
             let sun = self.river_scene_sun();
@@ -559,7 +559,7 @@ impl super::Renderer {
         // Sample listener submersion from the solved and displaced river
         // height in one 1x1 GPU pass, no synchronous map or render stall.
         if let Some(water) = &mut self.river_surface {
-            let environment = self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1)
+            let environment = self.blue_water_sky.as_ref().filter(|_| self.sun_override || self.sky_backend == 1)
                 .map(|atmosphere| &atmosphere.sky.environment().bind_group);
             water.encode_audio_probe(
                 &self.device, &self.queue, encoder,

@@ -270,10 +270,20 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         draw_color = vec4<f32>(draw.color.rgb * lighting, draw.color.a);
     }
 
-    draw_color.a = draw_color.a * specular_alpha(draw, world, world_normal);
+    // The RT Shadows compute-skinning path also serves normal MD3 raster
+    // draws. Preserve the temporary disintegration marker and hit position,
+    // instead of overwriting the alpha with specular strength / heat metadata.
+    // Matches the direct ghoul2_skin.wgsl vertex path without changing ABI.
+    let disintegrating = (draw.color.a >= -22.01 && draw.color.a <= -20.99)
+        || (draw.color.a >= -20.01 && draw.color.a <= -18.99);
+    if (!disintegrating) {
+        draw_color.a = draw_color.a * specular_alpha(draw, world, world_normal);
+    }
     let original_uv = vec2<f32>(input.position_uv_x.w, input.normal_uv_y.w);
-    let uv = original_uv * draw.uv_xform.xy + draw.uv_xform.zw
-        + vec2<f32>(original_uv.y * draw.uv_cross.x, original_uv.x * draw.uv_cross.y);
+    let uv = select(
+        original_uv * draw.uv_xform.xy + draw.uv_xform.zw
+            + vec2<f32>(original_uv.y * draw.uv_cross.x, original_uv.x * draw.uv_cross.y),
+        original_uv, disintegrating);
     var wetness = 0.0;
     if (draw.water_base.w > 0.5) {
         let band = clamp((render_position.y - draw.water_base.x) * 0.125, 0.0, 7.0);
@@ -286,5 +296,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let heat_alpha = heat_source_alpha(draw, model_position);
     let thermal = select(0.0, 0.01 + 0.48 * (1.0 - heat_alpha), heat_alpha >= 0.0);
-    write_vertex(draw.params.z + vertex_index, render_position, render_normal, uv, draw_color, wetness, draw.axis0.w, thermal);
+    // MD3 uses depth_hack / water_wetness / foliage_wind as a transient
+    // 3-float carrier for the hit origin only on disintegration surfaces.
+    write_vertex(draw.params.z + vertex_index, render_position, render_normal, uv,
+        draw_color, select(wetness, draw.uv_cross.y, disintegrating),
+        select(draw.axis0.w, draw.uv_cross.z, disintegrating),
+        select(thermal, draw.uv_cross.x, disintegrating));
 }

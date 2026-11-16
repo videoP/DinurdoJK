@@ -317,8 +317,11 @@ pub const COMBAT_ICON_NAMES: [&str; 12] = [
 // Maintain the old atlas indices for crosshair/force icons, so existing HUD
 // paths don't change; NA cells use the corresponding qpath + "_na" at load time.
 pub(crate) const ICON_RAGE_RECOVERY: usize = ICON_COMBAT_BASE + COMBAT_ICON_NAMES.len();
-pub const ICON_NAMES: [&str; ICON_RAGE_RECOVERY + 1] = {
-    let mut names = [""; ICON_RAGE_RECOVERY + 1];
+// TaystJK CG_Init: cgs.media.hackerIconShader = R_RegisterShaderNoMip("gfx/mp/c_icon_tech").
+// Append after the existing icons: their atlas indices must not change.
+pub(in crate::ui) const ICON_HACK_TECH: usize = ICON_RAGE_RECOVERY + 1;
+pub const ICON_NAMES: [&str; ICON_HACK_TECH + 1] = {
+    let mut names = [""; ICON_HACK_TECH + 1];
     names[0] = "gfx/2d/lag";
     names[1] = "gfx/2d/net";
     let mut i = 0;
@@ -350,6 +353,7 @@ pub const ICON_NAMES: [&str; ICON_RAGE_RECOVERY + 1] = {
         i += 1;
     }
     names[ICON_RAGE_RECOVERY] = "gfx/mp/f_icon_ragerec";
+    names[ICON_HACK_TECH] = "gfx/mp/c_icon_tech";
     names
 };
 

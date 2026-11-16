@@ -32,6 +32,28 @@ pub(in crate::app) struct ConsoleWrappedRow {
     pub end_col: usize,
 }
 
+/// One word definition for log double-click and command-line double-click.
+/// Coordinates are Unicode scalar indices, not UTF-8 byte offsets.
+pub(in crate::app) fn console_word_range(input: &str, column: usize) -> Option<(usize, usize)> {
+    let chars: Vec<char> = input.chars().collect();
+    if chars.is_empty() { return None; }
+    let index = column.min(chars.len() - 1);
+    if chars[index].is_whitespace() { return None; }
+    let word_char = |ch: char| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\' | ':' | '@');
+    let is_word = word_char(chars[index]);
+    let same_class = |ch: char| !ch.is_whitespace() && word_char(ch) == is_word;
+    let mut start = index;
+    while start > 0 && same_class(chars[start - 1]) { start -= 1; }
+    let mut end = index + 1;
+    while end < chars.len() && same_class(chars[end]) { end += 1; }
+    Some((start, end))
+}
+
+/// Reuse the log's 450 ms / adjacent-character multi-click policy for the prompt.
+pub(in crate::app) fn console_next_click_count(continues: bool, previous: u8) -> u8 {
+    if continues && previous < 3 { previous + 1 } else { 1 }
+}
+
 #[derive(Debug, Default)]
 pub(in crate::app) struct ConsoleReflow {
     pub columns: usize,
@@ -849,30 +871,7 @@ impl App {
     ) -> Option<(ConsolePoint, ConsolePoint)> {
         let raw = self.console_selection_line(point.line)?;
         let plain = self.console_strip_colors(&raw);
-        let chars: Vec<char> = plain.chars().collect();
-        if chars.is_empty() {
-            return None;
-        }
-
-        let index = point.col.min(chars.len().saturating_sub(1));
-        if chars[index].is_whitespace() {
-            return None;
-        }
-
-        fn word_char(ch: char) -> bool {
-            ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | '\\' | ':' | '@')
-        }
-
-        let class_is_word = word_char(chars[index]);
-        let same_class = |ch: char| !ch.is_whitespace() && word_char(ch) == class_is_word;
-        let mut start = index;
-        while start > 0 && same_class(chars[start - 1]) {
-            start -= 1;
-        }
-        let mut end = index + 1;
-        while end < chars.len() && same_class(chars[end]) {
-            end += 1;
-        }
+        let (start, end) = console_word_range(&plain, point.col)?;
         Some((
             ConsolePoint {
                 line: point.line,
@@ -904,6 +903,10 @@ impl App {
     }
 
     pub(in crate::app) fn begin_console_selection(&mut self, point: ConsolePoint) {
+        self.console_input_focused = false;
+        self.clear_console_input_selection();
+        self.console_input_last_click = None;
+        self.console_input_click_count = 0;
         const MULTI_CLICK_WINDOW: Duration = Duration::from_millis(450);
         let now = Instant::now();
         let continues = self
@@ -913,11 +916,7 @@ impl App {
                     && last_point.line == point.line
                     && last_point.col.abs_diff(point.col) <= 1
             });
-        self.console_click_count = if continues && self.console_click_count < 3 {
-            self.console_click_count + 1
-        } else {
-            1
-        };
+        self.console_click_count = console_next_click_count(continues, self.console_click_count);
         self.console_last_click = Some((now, point));
 
         match self.console_click_count {
@@ -970,6 +969,10 @@ impl App {
     }
 
     pub(in crate::app) fn select_all_console(&mut self) {
+        self.console_input_focused = false;
+        self.clear_console_input_selection();
+        self.console_input_last_click = None;
+        self.console_input_click_count = 0;
         let Some(last_line) = self.console_lines.len().checked_sub(1) else {
             self.console_selection_anchor = None;
             self.console_selection_focus = None;
@@ -1166,7 +1169,18 @@ impl App {
 
 #[cfg(test)]
 mod reflow_tests {
-    use super::{console_colored_fragment, ConsolePoint, ConsoleReflow};
+    use super::{console_colored_fragment, console_next_click_count, console_word_range, ConsolePoint, ConsoleReflow};
+
+    #[test]
+    fn console_words_use_the_same_boundaries_for_log_and_prompt() {
+        assert_eq!(console_word_range("say /map mp/ffa3 now", 12), Some((9, 16)));
+        assert_eq!(console_word_range("hello 世界", 7), Some((6, 8)));
+        assert_eq!(console_word_range("one two", 3), None);
+        assert_eq!(console_word_range("", 0), None);
+        assert_eq!(console_next_click_count(false, 2), 1);
+        assert_eq!(console_next_click_count(true, 1), 2);
+        assert_eq!(console_next_click_count(true, 2), 3);
+    }
 
     #[test]
     fn reflow_preserves_source_columns_and_prefers_whole_words() {

@@ -71,6 +71,8 @@ pub(in crate::cgame::player_presenter) const G2_MODELPART_LLEG: i32 = 15;
 pub(in crate::cgame::player_presenter) const G2_MODELPART_RLEG: i32 = 16;
 
 pub(in crate::cgame::player_presenter) const EF_NODRAW: i32 = 1 << 8;
+/// Server-directed corpse destruction, not the ordinary EV_BODYFADE.
+pub(in crate::cgame::player_presenter) const EF_DISINTEGRATION: i32 = 1 << 26;
 
 pub(in crate::cgame::player_presenter) const EF_DEAD: i32 = 1 << 1;
 

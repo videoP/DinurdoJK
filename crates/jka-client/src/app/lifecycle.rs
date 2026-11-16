@@ -245,11 +245,15 @@ impl ApplicationHandler<UserEvent> for App {
                 // preserving any partially typed line in the graphical console.
                 let pending_input = std::mem::replace(&mut self.console_input, command);
                 let pending_cursor = std::mem::replace(&mut self.console_cursor, 0);
+                let pending_selection = self.console_input_selection_anchor;
+                let pending_focus = self.console_input_focused;
                 self.console_cursor = self.console_input.len();
                 let pending_history_index = self.console_history_index;
                 self.execute_console();
                 self.console_input = pending_input;
                 self.console_cursor = pending_cursor.min(self.console_input.len());
+                self.console_input_selection_anchor = pending_selection;
+                self.console_input_focused = pending_focus;
                 self.console_history_index = pending_history_index;
                 self.publish_ui();
             }
@@ -2764,7 +2768,12 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.demo_speed_dragging {
                     self.update_demo_speed_slider(position.x);
                 }
-                if self.overlay == OverlayMode::Console && self.console_selecting {
+                if self.overlay == OverlayMode::Console && !self.console_hl2 && self.console_input_selecting {
+                    let width = self.window.as_ref().map_or(0, |window| window.inner_size().width);
+                    let col = ui::console_input_x_to_column(width, self.console_scale, position.x);
+                    self.console_cursor = self.console_input_byte_at_visible_column(col);
+                    self.publish_ui();
+                } else if self.overlay == OverlayMode::Console && !self.console_hl2 && self.console_selecting {
                     let size = self
                         .window
                         .as_ref()
@@ -2900,13 +2909,19 @@ impl ApplicationHandler<UserEvent> for App {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
                 ..
-            } if self.overlay == OverlayMode::Console => {
+            } if self.overlay == OverlayMode::Console && !self.console_hl2 => {
                 let size = self
                     .window
                     .as_ref()
                     .map(|window| window.inner_size())
                     .unwrap_or_default();
-                if self.click_classic_console_translate_checkbox(
+                if let Some(col) = ui::console_input_hit(
+                    size.width, size.height, self.console_size, self.console_scale,
+                    self.cursor_position.0, self.cursor_position.1,
+                ) {
+                    let cursor = self.console_input_byte_at_visible_column(col);
+                    self.begin_console_input_selection(cursor);
+                } else if self.click_classic_console_translate_checkbox(
                     size.width, size.height, self.cursor_position.0, self.cursor_position.1,
                 ) {
                     self.console_selecting = false;
@@ -2946,8 +2961,9 @@ impl ApplicationHandler<UserEvent> for App {
                 state: ElementState::Released,
                 button: MouseButton::Left,
                 ..
-            } if self.overlay == OverlayMode::Console => {
+            } if self.overlay == OverlayMode::Console && !self.console_hl2 => {
                 self.finish_console_selection();
+                self.finish_console_input_selection();
                 self.publish_ui();
             }
             WindowEvent::MouseInput {

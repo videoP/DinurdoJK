@@ -395,6 +395,7 @@ impl GameSession {
         self.siege_respawn_time = 0;
         self.siege_last_countdown = 0;
         self.presented_entities.clear();
+        self.permanent_entities.clear();
         self.event_presenter.clear();
         self.reward_active = None;
         self.reward_queue.clear();
@@ -520,6 +521,11 @@ impl GameSession {
         self.weapon_fx.reset_for_seek(target);
         self.weapon_fx.begin_frame(target);
         self.presented_entities = self.client_game.present_entities_at(f64::from(target))?;
+        crate::cgame::append_permanent_entities(
+            &mut self.presented_entities,
+            &self.permanent_entities,
+            target,
+        );
         let sample = self
             .update_presented_player_state(f64::from(target), target, true, None, None)
             .ok_or_else(|| "DEMO SEEK TARGET HAS NO CAMERA PLAYERSTATE".to_owned())?;

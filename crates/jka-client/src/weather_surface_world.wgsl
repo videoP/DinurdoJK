@@ -12,7 +12,7 @@ override ENABLE_WEATHER_SURFACE: bool = true;
 // How much a material's own gloss shows through a wet film. Grass, snow, foliage
 // and cloth stay matte, earth stays soft, metal, glass, stone and plastic shine.
 fn weather_material_gloss_response() -> f32 {
-    let material_kind = (material.header.w >> 8u) & 31u;
+    let material_kind = (material.header.w & MATERIAL_SURFACE_KIND_MASK) >> MATERIAL_SURFACE_KIND_SHIFT;
     if (material_kind == 5u || material_kind == 6u || material_kind == 14u
         || material_kind == 19u || material_kind == 20u || material_kind == 21u
         || material_kind == 22u || material_kind == 27u) { return 0.28; }
@@ -93,7 +93,7 @@ fn weather_surface_response(input: VertexOut) -> WeatherSurfaceResponse {
     result.runoff_tilt = 0.0;
     result.water_normal = vec3<f32>(0.0, 1.0, 0.0);
     if (!ENABLE_WEATHER_SURFACE
-        || (material.header.z & 4u) == 0u
+        || (material.header.z & MATERIAL_FLAG_DYNAMIC_RECEIVER) == 0u
         || (weather_surface.amount_distance.x <= 0.001 && weather_surface.puddle.x <= 0.001)) {
         return result;
     }
@@ -243,7 +243,7 @@ fn weather_surface_response(input: VertexOut) -> WeatherSurfaceResponse {
 // top and barely change colour at all. This is deliberately not the inverse of the
 // gloss response above: wet concrete both darkens a lot and turns glossy.
 fn weather_material_porosity() -> f32 {
-    let material_kind = (material.header.w >> 8u) & 31u;
+    let material_kind = (material.header.w & MATERIAL_SURFACE_KIND_MASK) >> MATERIAL_SURFACE_KIND_SHIFT;
     // Sealed: metal, glass, marble, ice, bulletproof glass, rubber, plastic, tiles,
     // shatterglass, armour, screens.
     if (material_kind == 3u || material_kind == 4u || material_kind == 10u
@@ -507,7 +507,7 @@ fn weather_surface_debug(input: VertexOut, weather: WeatherSurfaceResponse, mode
         return vec3<f32>(
             weather_material_porosity(),
             weather_material_gloss_response(),
-            select(0.0, 1.0, (material.header.z & 4u) != 0u)
+            select(0.0, 1.0, (material.header.z & MATERIAL_FLAG_DYNAMIC_RECEIVER) != 0u)
         );
     }
     if (mode == 7u) {

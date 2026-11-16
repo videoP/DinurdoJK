@@ -15,29 +15,29 @@ CvarDef::new("r_lampShadowDebug", "0", "0|1|2", "Session-only: 0 off, 1 single d
     }));
     Ok(())
 }),
-CvarDef::new("cg_remoteSmoothing", "0", "0..4", "Live remote players AND spectator-follow POV: 0 original; 1 buffered linear/hold; 2 buffered linear + bounded extrapolation; 3 Hermite + extrapolation; 4 jaMME-inspired commandTime-aware Hermite (fallback linear). Visual-only, session-only.", CvarType::Int { min: 0, max: 4 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::mode() as i32), |app, value| {
+CvarDef::new("cg_remoteSmoothing", "0", "0..5", "Live remote visuals: 0 original; 1 buffered linear/hold; 2 buffered linear + bounded extrapolation; 3 Hermite + extrapolation; 4 jaMME-inspired commandTime-aware Hermite; 5 TaystJK cg_smoothClients 1 (native trajectory logic, no added buffer). Modes 1-4 also resample spectator follow; mode 5 keeps the legacy spectator-follow clock. Session-only.", CvarType::Int { min: 0, max: 5 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::mode() as i32), |app, value| {
     let CvarValue::Int(mode) = value else { unreachable!() };
     crate::cgame::remote_smoothing::set_mode(mode as u8);
     if let Some(session) = app.game_session.as_mut() { session.remote_smoothing.sync_from_cvar(); }
-    app.push_console_line(format!("^3cg_remoteSmoothing:^7 mode {mode} (0=original, 1=buffer+hold, 2=buffer+extrap, 3=buffer+Hermite+extrap, 4=jaMME-inspired commandTime tangents). Includes live spectator follow; recorded demos unchanged."));
+    app.push_console_line(format!("^3cg_remoteSmoothing:^7 mode {mode} (0=original, 1=buffer+hold, 2=buffer+extrap, 3=buffer+Hermite+extrap, 4=jaMME-inspired, 5=TaystJK cg_smoothClients 1: native trajectory rules, no visual buffer). Modes 1-4 resample spectator follow; demos unchanged."));
     Ok(())
 }),
-CvarDef::new("cg_remoteBufferMs", "50", "0..100", "Extra visual-only snapshot interpolation delay (ms), 0 for low latency; used when cg_remoteBufferAuto=0. Session only.", CvarType::Int { min: 0, max: 100 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::buffer_ms() as i32), |_app, value| {
+CvarDef::new("cg_remoteBufferMs", "50", "0..100", "Extra visual-only snapshot interpolation delay (ms) for modes 1-4; 0 for low latency; used when cg_remoteBufferAuto=0. Ignored in mode 5. Session only.", CvarType::Int { min: 0, max: 100 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::buffer_ms() as i32), |_app, value| {
     let CvarValue::Int(ms) = value else { unreachable!() };
     crate::cgame::remote_smoothing::set_buffer_ms(ms as u32);
     Ok(())
 }),
-CvarDef::new("cg_remoteBufferAuto", "0", "0|1", "0 fixed cg_remoteBufferMs; 1 adaptive visual buffer from server snapshot cadence and arrival jitter (up to 100 ms). Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::cgame::remote_smoothing::buffer_auto()), |_app, value| {
+CvarDef::new("cg_remoteBufferAuto", "0", "0|1", "0 fixed cg_remoteBufferMs; 1 adaptive visual buffer for modes 1-4 from server snapshot cadence and arrival jitter (up to 100 ms). Ignored in mode 5. Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::cgame::remote_smoothing::buffer_auto()), |_app, value| {
     let CvarValue::Bool(enabled) = value else { unreachable!() };
     crate::cgame::remote_smoothing::set_buffer_auto(enabled);
     Ok(())
 }),
-CvarDef::new("cg_remoteExtrapMaxMs", "35", "0..100", "Maximum visual-only extrapolation beyond the latest remote snapshot for smoothing modes 2/3/4. 0 disables extrapolation. Session only.", CvarType::Int { min: 0, max: 100 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::extrap_max_ms() as i32), |_app, value| {
+CvarDef::new("cg_remoteExtrapMaxMs", "35", "0..100", "Maximum visual-only extrapolation beyond the latest remote snapshot for smoothing modes 2/3/4 (not mode 5). 0 disables extrapolation. Session only.", CvarType::Int { min: 0, max: 100 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::extrap_max_ms() as i32), |_app, value| {
     let CvarValue::Int(ms) = value else { unreachable!() };
     crate::cgame::remote_smoothing::set_extrap_max_ms(ms as u32);
     Ok(())
 }),
-CvarDef::new("cg_remoteSmoothDebug", "0", "0..2", "0 off; 1 one-second smoothing/underrun/correction summary; 2 also logs per remote player. No render overhead/readbacks. Session only.", CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::debug() as i32), |_app, value| {
+CvarDef::new("cg_remoteSmoothDebug", "0", "0..2", "0 off; 1 one-second smoothing/underrun/correction summary; 2 also logs per remote player (modes 1-4 only). Mode 5 reports native path, without history counters. No render overhead/readbacks. Session only.", CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::cgame::remote_smoothing::debug() as i32), |_app, value| {
     let CvarValue::Int(level) = value else { unreachable!() };
     crate::cgame::remote_smoothing::set_debug(level as u8);
     Ok(())
@@ -55,7 +55,7 @@ CvarDef::new("cg_footstepDebug", "0", "0..3", "JK2 footstep pipeline diagnostics
     crate::cgame::footsteps::set_debug_level(level as u8);
     Ok(())
 }),
-CvarDef::new("cg_remoteSmoothStats", "0", "0|1", "Write 1 to print an immediate remote visual history/jitter/underrun report to the in-game console. Read-back remains 0 (one-shot command cvar).", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(false), |app, value| {
+CvarDef::new("cg_remoteSmoothStats", "0", "0|1", "Write 1 to print an immediate remote visual history/jitter/underrun report (modes 1-4), or the native mode-5 status, to the in-game console. Read-back remains 0 (one-shot command cvar).", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(false), |app, value| {
     let CvarValue::Bool(print) = value else { unreachable!() };
     if print {
         if let Some(session) = app.game_session.as_ref() {

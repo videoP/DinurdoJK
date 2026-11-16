@@ -206,6 +206,13 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, small_font:
     let baseline = text_b[1] + (text_b[3] + txt.cap(px)) * 0.5;
     let reserve = 40.0 * s;
     let shown = tail_to_fit(&txt, &ui.chat_input, px, text_b[2] - reserve);
+    if ui.chat_input_selected && !shown.is_empty() {
+        // Only the visible part of a Ctrl+A selection is drawn in this
+        // horizontally scrolling field; the complete message remains selected.
+        rect(out, text_b[0], baseline - txt.cap(px) - 2.0 * s,
+            txt.width(&shown, px), txt.cap(px) + 5.0 * s,
+            pal::fade([0.18, 0.42, 0.65, 0.80], open), w, h);
+    }
     if shown.is_empty() {
         // Clear of the caret, which rests at the start of the empty field.
         txt.draw(out, "Type a message", text_b[0] + 8.0 * s, baseline, px, pal::fade(pal::TEXT_FAINT(), 0.8 * open));

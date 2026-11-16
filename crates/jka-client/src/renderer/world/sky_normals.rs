@@ -70,7 +70,7 @@ mod tests {
 
     #[test]
     fn realtime_sky_normal_shaders_validate() {
-        let source = include_str!("../../depth_prepass.wgsl");
+        let source = crate::material_flags::depth_shader();
         let depth = wgpu::naga::front::wgsl::parse_str(source)
             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(source)));
         wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(),
@@ -109,7 +109,7 @@ fn target(device: &wgpu::Device, size: (u32, u32)) -> (wgpu::Texture, wgpu::Text
 
 impl Renderer {
     pub(in crate::renderer) fn realtime_sky_normals_active(&self) -> bool {
-        self.sky_backend == 1 && self.blue_water_environment.world_lighting > 0.0
+        self.blue_water_environment.world_lighting > 0.0
             && self.blue_sky_diag & 8 == 0 && self.thermal_vision == 0 && self.world.is_some()
     }
 
@@ -136,7 +136,7 @@ impl Renderer {
         if self.realtime_sky_normals.is_none() {
             let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("realtime sky normal prepass"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../../depth_prepass.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(crate::material_flags::depth_shader().into()),
             });
             let layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("realtime sky normal prepass"),

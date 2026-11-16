@@ -186,7 +186,7 @@ fn vs_mask(input: VertexIn) -> MaskVertexOut {
     out.uv = generated_uv(input);
     out.world_position = input.position;
     out.alpha_multiplier = material.color.a;
-    if ((material.header.z & 1u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_RGB_VERTEX) != 0u) {
         out.alpha_multiplier *= input.color.a;
     }
     return out;
@@ -212,7 +212,7 @@ struct SkyFragmentOut {
 @vertex fn vs_sky_mask(input: SkyVertexIn) -> SkyMaskVertexOut {
     let authored = VertexIn(input.position, input.uv, input.lightmap_uv, input.normal, input.color);
     var alpha = material.color.a;
-    if ((material.header.z & 1u) != 0u) { alpha *= input.color.a; }
+    if ((material.header.z & MATERIAL_FLAG_RGB_VERTEX) != 0u) { alpha *= input.color.a; }
     return SkyMaskVertexOut(camera.view_proj * vec4(input.position, 1.0),
         generated_uv(authored), alpha, input.position, input.sky_normal);
 }
@@ -256,11 +256,11 @@ fn material_matches_planar_plane(selected_plane: vec4<f32>) -> bool {
 }
 
 fn active_planar_for_surface(world_position: vec3<f32>) -> bool {
-    let planar_candidate = (material.header.z & (4096u | 8192u)) != 0u;
+    let planar_candidate = (material.header.z & (MATERIAL_FLAG_PLANAR_REFLECTION | MATERIAL_FLAG_PLANAR_ENVIRONMENT)) != 0u;
     if (!planar_candidate || planar_reflection.viewport.z <= 0.5) {
         return false;
     }
-    let promoted_environment = (material.header.z & 8192u) != 0u;
+    let promoted_environment = (material.header.z & MATERIAL_FLAG_PLANAR_ENVIRONMENT) != 0u;
     let active_count = min(u32(planar_reflection.viewport.z + 0.5), 4u);
     for (var slot = 0u; slot < 4u; slot = slot + 1u) {
         if (slot >= active_count) {
@@ -286,16 +286,16 @@ fn reflection_policy(world_position: vec3<f32>) -> vec4<f32> {
     // R >= 0.5 stays "SSR eligible". The quarter steps additionally mark
     // lightmapped world (0.25 / 0.75): the Blue Water sky world-light pass skips
     // those pixels when the composed lightmap already carries that light.
-    let lightmapped = (material.header.z & (2u | 8388608u | 16777216u)) != 0u || material.header.x == 1u;
+    let lightmapped = (material.header.z & (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_EXPLICIT_LIGHTMAP | MATERIAL_FLAG_HAS_LIGHTMAP)) != 0u || material.header.x == 1u;
     let ssr_eligible = select(select(0.0, 0.25, lightmapped), select(1.0, 0.75, lightmapped),
-        (material.header.z & 4194304u) != 0u);
+        (material.header.z & MATERIAL_FLAG_SSR) != 0u);
     let active_planar = select(0.0, 1.0, active_planar_for_surface(world_position));
     // Alpha is an Rgba8Unorm channel. Pack two exact bits into its four
     // representable thirds: bit 0 = reflection probe, bit 1 = BSP global fog.
     // This avoids allocating another full-resolution policy target merely to
     // reproduce OpenJK's legacy framebuffer-space global fog pass.
-    let probe_bit = select(0u, 1u, (material.header.z & 2048u) != 0u);
-    let global_fog_bit = select(0u, 2u, (material.header.z & 67108864u) != 0u);
+    let probe_bit = select(0u, 1u, (material.header.z & MATERIAL_FLAG_REFLECTION_PROBE) != 0u);
+    let global_fog_bit = select(0u, 2u, (material.header.z & MATERIAL_FLAG_GLOBAL_FOG) != 0u);
     let packed_policy = f32(probe_bit | global_fog_bit) / 3.0;
     return vec4<f32>(
         ssr_eligible,
@@ -326,7 +326,7 @@ fn radial_depth(world_position: vec3<f32>) -> f32 {
 // Only the thermal-specific prepass PSOs call this classifier.  The regular
 // prepass retains roughness in policy.b for SSR and does no thermal work.
 fn thermal_world_material() -> f32 {
-    let kind = (material.header.w >> 8u) & 31u;
+    let kind = (material.header.w & MATERIAL_SURFACE_KIND_MASK) >> MATERIAL_SURFACE_KIND_SHIFT;
     var heat = 0.15; // unknown concrete/stone
     switch (kind) {
         case 1u, 2u: { heat = 0.24; }  // wood
@@ -343,10 +343,10 @@ fn thermal_world_material() -> f32 {
         case 27u: { heat = 0.18; }    // carpet
         default: {}
     }
-    if ((material.header.w & (1u << 17u)) != 0u) {
+    if ((material.header.w & MATERIAL_FLAG_GLASS) != 0u) {
         heat = 0.065; // JKA glass material override
     }
-    if ((material.header.z & 65536u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_WATER_PRIMARY) != 0u) {
         heat = 0.055; // promoted JKA water stage
     }
     // An additive or glow stage does NOT heat its entire parent material:
@@ -356,15 +356,15 @@ fn thermal_world_material() -> f32 {
     // per pixel in thermal_glow_heat (post.wgsl). Giving the base draw a heat
     // floor here would falsely heat the entire surface.
     // q3map_surfacelight is an explicit authored whole-surface emitter.
-    if ((material.header.w & (1u << 5u)) != 0u) {
+    if ((material.header.w & MATERIAL_FLAG_THERMAL_SURFACELIGHT) != 0u) {
         heat = max(heat, 0.76);
     }
     // Authored surfaceparm lava and compiled CONTENTS_LAVA take priority over
     // generic water, glass and material hints, including emissive stage flags.
-    if ((material.header.w & (1u << 3u)) != 0u) { return 0.80; }
+    if ((material.header.w & MATERIAL_FLAG_THERMAL_LAVA) != 0u) { return 0.80; }
     // BSP shader emission and stage glow are explicit hints; only the
     // active-only depth variant reads them. This is not a true heat source.
-    if ((material.header.z & 256u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_EMISSIVE_MAP) != 0u) {
         heat = max(heat, 0.72);
     }
     return heat;
@@ -376,7 +376,7 @@ fn thermal_world_material() -> f32 {
 // material data; RGB alone cannot recover it. The NIR-only prepass writes B
 // into the existing policy attachment, so no extra full-screen target exists.
 fn nir_world_reflectance() -> f32 {
-    let kind = (material.header.w >> 8u) & 31u;
+    let kind = (material.header.w & MATERIAL_SURFACE_KIND_MASK) >> MATERIAL_SURFACE_KIND_SHIFT;
     var reflectance = 0.47;  // unknown masonry/concrete
     switch (kind) {
         case 1u, 2u: { reflectance = 0.52; }  // wood
@@ -391,8 +391,8 @@ fn nir_world_reflectance() -> f32 {
         case 27u: { reflectance = 0.24; } // carpet
         default: {}
     }
-    if ((material.header.w & (1u << 17u)) != 0u) { reflectance = 0.10; }
-    if ((material.header.z & 65536u) != 0u) { reflectance = 0.055; } // water
+    if ((material.header.w & MATERIAL_FLAG_GLASS) != 0u) { reflectance = 0.10; }
+    if ((material.header.z & MATERIAL_FLAG_WATER_PRIMARY) != 0u) { reflectance = 0.055; } // water
     // Unlike LWIR, emissive/glow/lava *do not* imply strong reflected NIR.
     return reflectance;
 }

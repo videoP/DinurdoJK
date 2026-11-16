@@ -8,11 +8,19 @@
 - Keep durable repository rules here. Add a nested `AGENTS.md` only for rules specific to that subtree, and read applicable nested files before editing there. A file under `Development Docs/Patch20` does not govern sibling source trees under `crates/`.
 - Keep task findings, measurements, and investigation order in audit documents, not in permanent instructions. See [RUST_AUDIT.md](<Development Docs/RUST_AUDIT.md>) for the November 11, 2026 handoff review; recheck findings against current code before acting on them.
 
+## Standing preference: minimal verification and concise work
+
+- Default to source inspection, reasoning, and direct edits. The user has explicitly rejected excessive testing, repeated compilation, and token-heavy verification loops (2026-11-16).
+- Do not routinely run tests, GPU checks, capture matrices, benchmarks, or builds.
+- When a brief compile-error check is useful, use `.\build.ps1 -Faster` with the existing `target/faster` cache. Batch edits first; repeat only to resolve a compile error or after a material correction.
+- Run `-Fast`, release builds, tests, Clippy, or runtime capture/benchmark sessions only when the user explicitly requests them. Do not ask for these routinely; finish the authorized edits and state briefly what was not run.
+- Keep investigation, progress updates, and delivery concise. Prefer a direct logical fix over expanding the verification scope.
+
 ## Build artifact policy
 
-- Use `.\build.ps1 -Fast -Output C:\Games\JK` for routine builds in this checkout so the executable is updated in the user's game folder. Use `--profile fast` for direct Cargo builds, checks, tests, and Clippy. The build cache remains `target/fast`; `-Output` copies the runnable executable without creating another build cache.
+- Use `.\build.ps1 -Faster` only when a brief compile-error check is needed. If the user explicitly requests a Fast build and game-folder update, use `.\build.ps1 -Fast -Output C:\Games\JK`. Explicitly requested direct Cargo tests or Clippy use `--profile fast` and the matching existing compiler flags. `-Output` copies the executable without creating another build cache.
 - Do not create feature-, task-, review-, benchmark-, or session-specific target directories. Do not override `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`, or `--target-dir` to isolate work.
-- Keep both `target/fast` and `target/release`. Use full release builds for shipping or final performance measurements when needed. Do not use debug or additional custom profiles unless the user explicitly requests them.
+- Keep existing `target/fast`, `target/faster`, and `target/release` outputs. Use full release builds only when explicitly requested for shipping or final performance measurements. Do not use debug or additional custom profiles unless the user explicitly requests them.
 - Reuse the existing build cache. If another build holds Cargo's lock, wait or coordinate rather than creating another target directory. Worktrees must reuse the main checkout's target directory instead of creating another build cache.
 - Do not copy build trees or binaries into new backup or baseline directories. Disk space is a user constraint.
 - Do not delete existing target contents as part of routine work; cleanup requires an explicit user request.
@@ -20,11 +28,11 @@
 ## Standing memory: prevent incremental-cache growth
 
 - Disk space is a hard user constraint. Reuse existing incremental-cache configurations as well as the shared target directory. Do not create another configuration merely for an agent, task, check, or test run.
-- Keep the toolchain, fast profile, target, feature set, and compiler flags consistent with `build.ps1 -Fast`. Direct Cargo tests must use the same compiler flags as the build script. Do not switch between its path-remapping flags and no flags, or repeatedly append duplicate flags: Cargo treats changed configurations as separate caches.
+- Keep the toolchain, profile, target, feature set, and compiler flags consistent with the selected standard build-script mode. Explicitly requested direct Cargo tests must use the same compiler flags as `build.ps1 -Fast`. Do not switch between its path-remapping flags and no flags, or repeatedly append duplicate flags: Cargo treats changed configurations as separate caches.
 - Cargo legitimately keeps separate game and test artifacts. Reuse those existing entries; do not attempt to force incompatible artifacts into one internal folder or introduce extra profiles to isolate work.
 - Check available disk space before substantial compilation. Inspect existing cache configurations and running Cargo processes before assuming a fresh build is necessary. If expected headroom is insufficient, stop compilation and explain the space requirement instead of repeatedly filling the drive.
-- Batch source changes before building. Reuse an already-built test executable when its sources are unchanged. Do not run successive build/check/test/Clippy variants for routine verification when the existing build and focused tests suffice.
-- Rebuild again only for a material source change, a failure, or an unresolved validation concern. Keep final verification to the necessary game build and focused test run using the existing configuration.
+- Batch source changes before any permitted compile check. If tests are explicitly requested, reuse an already-built test executable when its sources are unchanged. Do not run successive build/check/test/Clippy variants for routine verification.
+- A failure or validation concern does not authorize broader verification. Follow the minimal-verification preference above; do not automatically finish with a Fast build and test run.
 - The user only ever runs `build.ps1 -Fast` and `-Faster`. Every other Cargo configuration in `target/fast` comes from agents, and each one mints a new incremental hash folder (`target/fast/incremental/<crate>-<hash>`, 3-12 GB for the game crate) that rustc never deletes. The hash covers the dependency graph, features, profile, target kind (bin, test, check), and `-C metadata`-relevant flags. So:
   - Build and test only the game package (`-p DinurdoJK`) with the default features. Do not use `--workspace`, `--all-targets`, `--all-features`, `--no-default-features`, or extra `--features` for routine work: they change feature unification and re-hash shared dependencies such as wgpu.
   - Do not run `cargo check` or `cargo clippy` in place of a build. Each is a separate configuration with its own cache. Run Clippy only when the task asks for it.
@@ -48,12 +56,12 @@
 - Preserve multiplayer frame time, input latency, and the minimal renderer path. Keep lazy pipeline specialization and existing prewarming policy; avoid unnecessary shader variants or eager compilation.
 - Visibility and feature toggles do not necessarily stop simulation, interactions, environment updates, or resource preparation. Trace every consumer before gating work.
 - Preserve authored material stages, tcMods, shader time, tint, glow, animation, winding, lighting, and PVS behavior when sharing or caching geometry. Retain diagnostic and inspector traceability.
-- Use existing diagnostics first. Benchmark the affected scenario with the same map, camera/demo, settings, backend, build profile, and warm-up. Compare CPU/GPU time as relevant and frame-time distributions, not FPS alone. State what was not measured.
+- Use existing diagnostics first. When benchmarks are explicitly requested, use the same map, camera/demo, settings, backend, build profile, and warm-up. Compare CPU/GPU time as relevant and frame-time distributions, not FPS alone. State what was not measured.
 
 ## Verification and delivery
 
-- Documentation-only and read-only audit tasks do not require compilation. For source changes, use the necessary focused verification under the build/cache policy above; honor explicit task-specific no-build requests and report unrun checks.
-- Keep each cleanup small enough to review and validate independently. Prefer existing focused tests; add regression coverage for meaningful behavior or ownership risks rather than tests that only mirror the implementation. Do not run successive build/check/test/Clippy variants without a reason.
+- Documentation-only and read-only audit tasks do not require compilation. Source edits also do not automatically require a build or tests. Follow the minimal-verification preference above and report unrun checks briefly.
+- Keep each cleanup small enough to review independently. When testing is explicitly requested, prefer existing focused tests and meaningful regression coverage rather than tests that mirror the implementation. Do not expand into unrelated test failures.
 - Update all callers and test fixtures, including ignored tests, when changing signatures, struct fields, or ownership types. A test-name filter selects what runs; it does not avoid compiling the rest of the unit-test target.
 - In this checkout, edit files directly when the task calls for changes. Produce incremental patches or ZIPs when requested or when working from an archive without checkout access; packaging is not a default requirement.
 - Report the problem, changed files, preserved behavior, verification actually performed, and unresolved risks. An allocation removed in source is not automatically a demonstrated frame-time improvement.

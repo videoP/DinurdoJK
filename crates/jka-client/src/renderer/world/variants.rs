@@ -1,4 +1,5 @@
 //! World variants.
+use crate::material_flags::*;
 use crate::renderer::Hash;
 use super::programs::{StageProgram, VertexRecipe, WorldProgramMode};
 
@@ -81,37 +82,14 @@ pub(in crate::renderer) struct WorldShaderVariantKey {
 
 // MaterialUniform header.z bits that are never read by the world WGSL (CPU,
 // depth-prepass or RT only). Fixing them would only split pipelines.
-const MATERIAL_FLAGS_UNREAD: u32 = 8192 | 4194304 | 67108864 | 65536;
-const MATERIAL_FLAGS_PBR: u32 =
-    8 | 16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 262144;
-const MATERIAL_FLAGS_PLANAR: u32 = 4096 | 16384 | 32768;
-const MATERIAL_FLAG_IMPLICIT_LIGHTMAP: u32 = 2;
-const MATERIAL_FLAG_DYNAMIC_RECEIVER: u32 = 4;
-const MATERIAL_FLAG_VERTEX_LIT: u32 = 131072;
-const MATERIAL_FLAGS_VERTEX_COLOR: u32 = 1 | 524288 | 1048576 | 2097152;
-const MATERIAL_FLAG_EXPLICIT_LIGHTMAP: u32 = 8388608;
-const MATERIAL_FLAG_HAS_LIGHTMAP: u32 = 16777216;
-const MATERIAL_FLAG_OPAQUE_STAGE: u32 = 33554432;
-const MATERIAL_FLAGS_WAVES: u32 = 134217728 | 268435456;
-const MATERIAL_FLAG_LEGACY_SRGB: u32 = 536870912;
-const MATERIAL_FLAG_MASK_TEXTURE_ALPHA: u32 = 1073741824;
+const MATERIAL_FLAGS_UNREAD: u32 = MATERIAL_FLAG_PLANAR_ENVIRONMENT | MATERIAL_FLAG_SSR | MATERIAL_FLAG_GLOBAL_FOG | MATERIAL_FLAG_WATER_PRIMARY;
+const MATERIAL_FLAGS_PBR: u32 = MATERIAL_FLAG_NORMAL_MAP | MATERIAL_FLAG_ROUGHNESS_MAP | MATERIAL_FLAG_HEIGHT_MAP | MATERIAL_FLAG_METALLIC_MAP | MATERIAL_FLAG_SPECULAR_MAP | MATERIAL_FLAG_EMISSIVE_MAP | MATERIAL_FLAG_PACKED_RMO | MATERIAL_FLAG_HEIGHT_FROM_ALPHA | MATERIAL_FLAG_REFLECTION_PROBE | MATERIAL_FLAG_RMO_SPECULAR_ALPHA;
+const MATERIAL_FLAGS_PLANAR: u32 = MATERIAL_FLAG_PLANAR_REFLECTION | MATERIAL_FLAG_PLANAR_DEBUG | MATERIAL_FLAG_BLENDED_ENVIRONMENT;
+const MATERIAL_FLAGS_VERTEX_COLOR: u32 = MATERIAL_FLAG_RGB_VERTEX | MATERIAL_FLAG_RGB_ONE_MINUS_VERTEX | MATERIAL_FLAG_ALPHA_VERTEX | MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX;
+const MATERIAL_FLAGS_WAVES: u32 = MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE;
 /// MATERIAL_KEY_TC_GEN value that leaves tcGen read from the uniform.
 const MATERIAL_TC_GEN_DYNAMIC: u32 = u32::MAX;
-const MATERIAL_FLAGS_W_DETAIL: u32 = 2;
-const MATERIAL_FLAGS_W_PLANAR: u32 = 4 | (1 << 6) | (1 << 7);
-const MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP: u32 = 65536;
-/// Promoted glass primary stage. Only `fs_main` / `fs_main_legacy_fog` shade it,
-/// so it is carried in the raw key for program selection; `for_variant` drops it.
-pub(in crate::renderer) const MATERIAL_FLAGS_W_GLASS: u32 = 1 << 17;
-/// Cached sun-visibility gain on static non-lightmapped additive BSP stages.
-pub(in crate::renderer) const MATERIAL_FLAGS_W_BAKED_ADDITIVE: u32 = 1 << 19;
-/// Prepared post-lightmap environmental overlay; uses composed sky gain only.
-/// Keep separate from foliage wind (bit 18) and baked additive gain (bit 19).
-pub(in crate::renderer) const MATERIAL_FLAGS_W_SKY_OVERLAY: u32 = 1 << 20;
-/// Alpha-blended `rgbGen identityLighting` stage over a q3map_nolightmap (vertex-lit)
-/// surface. Authored, it repaints the lit base at full brightness, so relighting
-/// scales it by the base's relit/authored vertex-light ratio (never above 1).
-pub(in crate::renderer) const MATERIAL_FLAGS_W_VERTEX_OVERLAY: u32 = 1 << 22;
+const MATERIAL_FLAGS_W_PLANAR: u32 = MATERIAL_FLAG_AUTHORED_ENVIRONMENT | MATERIAL_FLAG_PLANAR_SRC_ALPHA | MATERIAL_FLAG_PLANAR_ONE_MINUS_SRC_ALPHA;
 
 /// TaystJK-style per-material fragment specialization (r_fragmentShaderMode 1).
 ///
@@ -143,8 +121,8 @@ impl MaterialFragmentKey {
         Self {
             flags: header[2] & !MATERIAL_FLAGS_UNREAD,
             flags_mask: !MATERIAL_FLAGS_UNREAD,
-            flags_w: header[3] & (MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS | MATERIAL_FLAGS_W_SKY_OVERLAY | MATERIAL_FLAGS_W_VERTEX_OVERLAY | MATERIAL_FLAGS_W_BAKED_ADDITIVE | crate::foliage::MATERIAL_FLAG),
-            flags_w_mask: MATERIAL_FLAGS_W_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAGS_W_GLASS | MATERIAL_FLAGS_W_SKY_OVERLAY | MATERIAL_FLAGS_W_VERTEX_OVERLAY | MATERIAL_FLAGS_W_BAKED_ADDITIVE | crate::foliage::MATERIAL_FLAG,
+            flags_w: header[3] & (MATERIAL_FLAG_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAG_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAG_GLASS | MATERIAL_FLAG_SKY_OVERLAY | MATERIAL_FLAG_VERTEX_OVERLAY | MATERIAL_FLAG_BAKED_ADDITIVE | MATERIAL_FLAG_FOLIAGE_WIND),
+            flags_w_mask: MATERIAL_FLAG_DETAIL | MATERIAL_FLAGS_W_PLANAR | MATERIAL_FLAG_DLIGHT_IN_LIGHTMAP | MATERIAL_FLAG_GLASS | MATERIAL_FLAG_SKY_OVERLAY | MATERIAL_FLAG_VERTEX_OVERLAY | MATERIAL_FLAG_BAKED_ADDITIVE | MATERIAL_FLAG_FOLIAGE_WIND,
             tc_gen: header[0],
             alpha_func: if alpha_cutoff > 0.0 {
                 2
@@ -204,7 +182,7 @@ impl MaterialFragmentKey {
             | MATERIAL_FLAGS_VERTEX_COLOR
             | MATERIAL_FLAGS_WAVES
             | MATERIAL_FLAG_LEGACY_SRGB;
-        let mut keep_w = crate::foliage::MATERIAL_FLAG | MATERIAL_FLAGS_W_BAKED_ADDITIVE;
+        let mut keep_w = MATERIAL_FLAG_FOLIAGE_WIND | MATERIAL_FLAG_BAKED_ADDITIVE;
         let mut fix_tc_gen = false;
         if alpha_test {
             keep |= MATERIAL_FLAG_MASK_TEXTURE_ALPHA;
@@ -218,7 +196,7 @@ impl MaterialFragmentKey {
             fix_tc_gen = true;
         }
         if variant.baked_sun_relight {
-            keep_w |= MATERIAL_FLAGS_W_SKY_OVERLAY | MATERIAL_FLAGS_W_VERTEX_OVERLAY;
+            keep_w |= MATERIAL_FLAG_SKY_OVERLAY | MATERIAL_FLAG_VERTEX_OVERLAY;
         }
         if variant.classic_render_flags || variant.baked_sun_relight {
             keep |= MATERIAL_FLAG_EXPLICIT_LIGHTMAP
@@ -247,10 +225,10 @@ impl MaterialFragmentKey {
             keep |= MATERIAL_FLAG_DYNAMIC_RECEIVER;
         }
         if variant.detail_textures_enabled {
-            keep_w |= MATERIAL_FLAGS_W_DETAIL;
+            keep_w |= MATERIAL_FLAG_DETAIL;
         }
         if variant.legacy_dlights {
-            keep_w |= MATERIAL_FLAGS_W_DLIGHT_IN_LIGHTMAP;
+            keep_w |= MATERIAL_FLAG_DLIGHT_IN_LIGHTMAP;
         }
         (keep, keep_w, fix_tc_gen)
     }
@@ -598,10 +576,10 @@ mod baked_sky_flag_tests {
 
     #[test]
     fn overlay_relighting_is_not_foliage_wind() {
-        let overlay = MATERIAL_FLAGS_W_SKY_OVERLAY;
-        let foliage = crate::foliage::MATERIAL_FLAG;
+        let overlay = MATERIAL_FLAG_SKY_OVERLAY;
+        let foliage = MATERIAL_FLAG_FOLIAGE_WIND;
         assert_eq!(overlay & foliage, 0, "sky overlay must never enable foliage wind");
-        assert_eq!(overlay & MATERIAL_FLAGS_W_BAKED_ADDITIVE, 0,
+        assert_eq!(overlay & MATERIAL_FLAG_BAKED_ADDITIVE, 0,
             "sky overlay must never enable baked additive gain");
         let material = MaterialFragmentKey::from_material([0, 0, 0, overlay], 0.0);
         assert_eq!(material.flags_w & overlay, overlay);

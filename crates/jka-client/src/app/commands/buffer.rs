@@ -346,6 +346,7 @@ impl App {
         self.console_scroll = 0;
         let command = std::mem::take(&mut self.console_input);
         self.console_cursor = 0;
+        self.clear_console_input_selection();
         self.console_suggest_reset();
         let command = command.trim().to_owned();
         if command.is_empty() {

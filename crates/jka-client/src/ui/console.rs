@@ -40,6 +40,25 @@ fn console_input_y(w: u32, h: u32, size: ConsoleSize, scale: f32) -> f32 {
     console_panel_height(h, size) - char_height - 18.0
 }
 
+/// Classic prompt hitbox. Return a *display* column; App maps it back to a
+/// UTF-8 cursor offset. While dragging, only x matters (y may leave the bar).
+pub fn console_input_hit(
+    w: u32, h: u32, size: ConsoleSize, scale: f32, x: f64, y: f64,
+) -> Option<usize> {
+    let input_y = console_input_y(w, h, size, scale);
+    let (char_width, char_height) = console_char_metrics(w, scale);
+    let text_x = 30.0 + char_width;
+    if x < (text_x - 6.0) as f64 || x > w as f64 - 8.0
+        || y < (input_y - 8.0) as f64 || y >= (input_y + char_height) as f64
+    { return None; }
+    Some(console_input_x_to_column(w, scale, x))
+}
+
+pub fn console_input_x_to_column(w: u32, scale: f32, x: f64) -> usize {
+    let (char_width, _) = console_char_metrics(w, scale);
+    ((x - (30.0 + char_width) as f64) / char_width as f64).max(0.0).round() as usize
+}
+
 pub fn console_visible_line_capacity(w: u32, h: u32, size: ConsoleSize, scale: f32) -> usize {
     let input_y = console_input_y(w, h, size, scale);
     let (_, line_step) = console_char_metrics(w, scale);
@@ -320,6 +339,15 @@ pub fn console_suggest_detail_line_count(w: u32, h: u32, description: &str) -> u
     natural.min(fit.max(1))
 }
 
+/// Keep the selected completion in view; shared by Classic and HL2 popups.
+pub fn console_suggest_first_visible(count: usize, visible: usize, selected: usize) -> usize {
+    if visible == 0 || count <= visible {
+        0
+    } else {
+        selected.min(count - 1).saturating_sub(visible / 2).min(count - visible)
+    }
+}
+
 pub fn console_suggest_geometry(
     w: u32,
     h: u32,
@@ -346,11 +374,7 @@ pub fn console_suggest_geometry(
     } else {
         (input_y - 10.0 - total_h).max(4.0)
     };
-    let first = if count <= visible {
-        0
-    } else {
-        selected.saturating_sub(visible / 2).min(count - visible)
-    };
+    let first = console_suggest_first_visible(count, visible, selected);
     ConsoleSuggestGeometry {
         x: 12.0,
         y,
@@ -858,6 +882,19 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
     } else {
         ui.console_input.len()
     };
+    if let Some((start, end)) = ui.console_input_selection {
+        let start = start.min(ui.console_input.len());
+        let end = end.min(ui.console_input.len());
+        if start < end && ui.console_input.is_char_boundary(start) && ui.console_input.is_char_boundary(end) {
+            let left = text_x + visible_text_len(&ui.console_input[..start]) as f32 * char_width;
+            let right = text_x + visible_text_len(&ui.console_input[..end]) as f32 * char_width;
+            let clipped_right = right.min(w as f32 - 8.0);
+            if clipped_right > left {
+                rect(out, left, input_y - 1.0, clipped_right - left, line_step + 2.0,
+                    with_alpha(CON_CYAN(), 0.36), w, h);
+            }
+        }
+    }
     if ui.console_input.is_empty() {
         console_plain_sized(
             out, "type a command or cvar", text_x + 6.0, input_y,
@@ -1254,6 +1291,17 @@ pub(in crate::ui) fn build_console_suggestions(
 #[cfg(test)]
 mod con_scale_tests {
     use super::*;
+
+    #[test]
+    fn suggestion_scroll_tracks_selection_and_wraps_across_visible_rows() {
+        assert_eq!(console_suggest_first_visible(24, 5, 0), 0);
+        assert_eq!(console_suggest_first_visible(24, 5, 2), 0);
+        assert_eq!(console_suggest_first_visible(24, 5, 5), 3);
+        assert_eq!(console_suggest_first_visible(24, 5, 23), 19);
+        assert_eq!(console_suggest_first_visible(24, 5, 0), 0);
+        assert_eq!(console_suggest_first_visible(3, 5, 2), 0);
+        assert_eq!(console_suggest_first_visible(24, 0, 23), 0);
+    }
 
     #[test]
     fn console_scale_changes_rows_and_hit_columns_together() {

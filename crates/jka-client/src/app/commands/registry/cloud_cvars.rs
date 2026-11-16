@@ -284,7 +284,7 @@ app_cvars! {
     }
     // One saved strength, routed to the bake or live pass by the relighting mode.
     APP_R_BLUESKYWORLDLIGHTING {
-        runtime:CvarDef::new("r_blueSkyWorldLighting","1","0..1","World day/night sky lighting strength (Blue Water or vanilla): 0 off, 1 full. Baked composes the adjustment into cached lighting; Realtime uses Blue Water live shading or vanilla change-triggered lightmaps and CSM shadows.",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+        runtime:CvarDef::new("r_blueSkyWorldLighting","1","0..1","World day/night sky lighting strength: 0 off, 1 full. Baked composes the adjustment into cached lighting; Realtime uses live sky shading and CSM shadows. Lighting is independent of the visible sky and r_fastsky.",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
             |app:&App|CvarValue::String(app.video.sky_world_lighting_strength.to_string()),|app,value|App::cvar_set_bluesky_world_lighting(app,APP_R_BLUESKYWORLDLIGHTING.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_world_lighting,None),
         config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.sky_world_lighting_strength=v.clamp(0.0,1.0);}}}),archive:Some((27324,|state|state.video.sky_world_lighting_strength.to_string())),..CvarBinding::NONE},
         implementations:[impl App {fn cvar_set_bluesky_world_lighting(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.sky_world_lighting_strength=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0);app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
@@ -381,7 +381,7 @@ app_cvars! {
     }
     APP_R_SKYBACKEND {
         runtime: CvarDef::new("r_skyBackend", "0", "0|1",
-            "0 authored JKA sky; 1 original Blue Water atmosphere, celestial bodies and environment lighting. Fastsky and Star Nest remain separate archived compatibility cvars.",
+            "0 authored JKA sky; 1 Blue Water atmosphere and celestial bodies. Relighting uses the same lighting and shadows for both displays. Fastsky and Star Nest remain separate archived compatibility cvars.",
             CvarType::Int { min: 0, max: 1 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Int(app.video.sky_backend as i32),
             |app, value| {

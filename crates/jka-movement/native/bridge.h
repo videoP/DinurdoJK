@@ -126,6 +126,8 @@ typedef struct jka_prediction_entity_s {
     /* BSP map classname classification, not inferred from trajectory.
        0 = unknown; 1 = func_train; 2 = race pass-through door/plat. */
     int32_t mover_class;
+    /* entityState_t.solid, e.g. SOLID_BMODEL for inline brush models. */
+    int32_t solid;
 } jka_prediction_entity;
 
 /* Read-only OpenJK presentation queries used by the Rust CGame renderer. */

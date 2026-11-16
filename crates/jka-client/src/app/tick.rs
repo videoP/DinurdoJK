@@ -347,11 +347,13 @@ impl App {
             // state. No command at all when idle, except the one transition
             // that clears previously active artwork.
             let (zoom_scope, rocket_lock) = self.combat_overlay_state();
-            let active = zoom_scope.is_some() || rocket_lock.is_some();
+            let hack_progress = self.hack_progress_ui();
+            let active = zoom_scope.is_some() || rocket_lock.is_some() || hack_progress.is_some();
             if active || self.combat_ui_was_active {
                 self.render_command(RenderCommand::SetCombatUi {
                     zoom_scope,
                     rocket_lock,
+                    hack_progress,
                 });
             }
             self.combat_ui_was_active = active;
@@ -383,6 +385,7 @@ impl App {
             self.render_command(RenderCommand::SetCombatUi {
                 zoom_scope: None,
                 rocket_lock: None,
+                hack_progress: None,
             });
             self.combat_ui_was_active = false;
         }

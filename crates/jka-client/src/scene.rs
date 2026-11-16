@@ -864,6 +864,14 @@ pub struct InlineModelGeometry {
     pub batches: Range<usize>,
 }
 
+/// First server-imported model handle and lightmap page. Everything before
+/// this boundary belongs to the main BSP and its authored lighting context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubBspBoundary {
+    pub model: u32,
+    pub lightmap: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BspMapStats {
     /// OpenJK `cgs.inlineModelMidpoints`, indexed by inline model number
@@ -1697,6 +1705,7 @@ pub struct PreparedMap {
     pub shader_origins: Arc<BTreeMap<String, materials::ShaderDefinitionOrigin>>,
     /// Server CS_BSP_MODELS assets, in the order used for collision/render handles.
     pub sub_bsp_names: Vec<String>,
+    pub sub_bsp_boundary: Option<SubBspBoundary>,
     pub authored_oceans: Vec<crate::ocean::authoring::AuthoredOcean>,
     /// jaPRO sailing markers (ocean/shore/current) in entity-lump order, loaded
     /// into the jaPRO prediction backend when this map is installed.

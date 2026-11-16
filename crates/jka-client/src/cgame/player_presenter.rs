@@ -13,6 +13,7 @@ mod bodies;
 mod cloth;
 mod cloak;
 mod cosmetics;
+mod disintegration;
 mod diagnostics;
 mod effects;
 mod events;
@@ -41,7 +42,7 @@ use assets::loading::{
     environment_uv, specular_alpha, stage_uv_affine, wave_value, ModelLoadShared, ModelResolution, StageFrame,
 };
 use assets::types::{
-    fpls_mode3_surface_hidden, Ghoul2GpuMeshSource, PlayerModelAsset, PlayerSurfaceAsset,
+    fpls_mode1_surface_hidden, Ghoul2GpuMeshSource, PlayerModelAsset, PlayerSurfaceAsset,
     ResolvedMaterial, ResolvedStage, SaberModelAsset, SurfaceOverlay,
 };
 #[cfg(test)]
@@ -90,7 +91,7 @@ use view::{
     ghoul2_entity_radius, ghoul2_lod_for_view, ghoul2_model_scale, ghoul2_render_origin,
     ghoul2_render_transform, BLOB_SHADOW_DISTANCE, BLOB_SHADOW_DROID_RADIUS, BLOB_SHADOW_MAXS,
     BLOB_SHADOW_MINS, BLOB_SHADOW_RADIUS, CLASS_REMOTE, CLASS_SEEKER, EF2_SHIP_DEATH, EF_DEAD,
-    EF_NODRAW, EF_RAG, EF_TELEPORT_BIT, G2_MODELPART_HEAD, G2_MODELPART_LARM, G2_MODELPART_LLEG,
+    EF_DISINTEGRATION, EF_NODRAW, EF_RAG, EF_TELEPORT_BIT, G2_MODELPART_HEAD, G2_MODELPART_LARM, G2_MODELPART_LLEG,
     G2_MODELPART_RARM, G2_MODELPART_RHAND, G2_MODELPART_RLEG, G2_MODELPART_WAIST, G2_MODEL_PART,
     MASK_PLAYERSOLID, MAX_GLA_BYTES, MAX_GLM_BYTES, MAX_SKIN_BYTES, PW_CLOAKED,
     WP_BRYAR_PISTOL, WP_SABER,
@@ -332,6 +333,9 @@ pub struct PlayerPresenter {
     /// `cent->bodyFadeTime` start per corpse (EV_BODYFADE): the body turns
     /// transparent and is gone after about 3.2 s.
     body_fade: HashMap<u16, i32>,
+    /// TaystJK centity dustTrailTime, scoped to the current entity life.
+    disintegration_start: HashMap<u16, i32>,
+    disintegration_smoke_last: HashMap<u16, i32>,
     /// `cg_ghoul2Marks`: burn marks kept per model (0 disables them).
     gore_limit: usize,
     gore: Vec<super::player_gore::Gore>,

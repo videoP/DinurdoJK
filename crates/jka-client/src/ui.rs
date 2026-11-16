@@ -67,7 +67,8 @@ pub(crate) fn append_native_hud_images(images: &mut Vec<String>, style: u8, jk2_
 pub(crate) use studio_race::leaderboard_bounds;
 mod ttf_font;
 pub(crate) use ttf_font::{
-    system_font_dirs, list_system_fonts, rasterize as rasterize_ttf_font, rasterize_unicode_fallback, UnicodeFallbackFont, studio_default_system_fonts, STUDIO_FONT_CLASSIC,
+    system_font_dirs, list_system_fonts, rasterize as rasterize_ttf_font, UnicodeFallbackFont,
+    UnicodeGlyphBitmap, rasterize_unicode_glyph, studio_default_system_fonts, STUDIO_FONT_CLASSIC,
     STUDIO_PACKAGED_FONTS,
 };
 pub(crate) use studio_race::draw_labels as draw_studio_labels;
@@ -115,7 +116,9 @@ pub use compose::{
 };
 use console::{build_console, rect_gradient, with_alpha, CONSOLE_CHAR_HEIGHT, CONSOLE_CHAR_WIDTH};
 pub use console::{
-    console_help_hit, console_suggest_chip_hit, console_suggest_detail_line_count,
+    console_help_hit, console_input_hit, console_input_x_to_column,
+    console_suggest_chip_hit, console_suggest_detail_line_count,
+    console_suggest_first_visible,
     console_suggest_hit, console_text_hit, console_visible_line_capacity, console_wrap_columns,
 };
 use demo::build_demo_timeline;
@@ -137,7 +140,7 @@ pub(crate) use hud::extensions::{EXT_IMAGE_TEXTURE_SOURCE, EXT_IMAGE_SHADER_SOUR
 pub use hud::layout::{
     hud_element_rect, HudElementId, HudElementLayout, HudLayout, HudRect, HudRectContext,
 };
-pub(crate) use hud::layout::{apply_hud_layout, hud_stock_rect, snap_hud_neighbor_size, snap_hud_rect_position, snap_hud_scale_to_grid, snap_hud_dimensions_scale};
+pub(crate) use hud::layout::{apply_hud_layout, enemy_info_icon_rect, hud_stock_rect, snap_hud_neighbor_size, snap_hud_rect_position, snap_hud_scale_to_grid, snap_hud_dimensions_scale};
 pub(crate) use hud::movement::visible_jka_chars;
 use hud::movement::{
     build_lagometer, build_movement_keys, build_race_timer, build_speedometer, build_strafe_helper,
@@ -1004,7 +1007,7 @@ impl Default for TeamOverlaySettings {
             mode: 0,
             x: 640,
             y: 0,
-            weapons: false,
+            weapons: true,
             scale: 1.0,
             max_hp: 150.0,
             force: true,
@@ -1773,6 +1776,15 @@ pub struct UiSiegeHud {
     pub stat_viewer: Option<UiSiegeStatViewer>,
 }
 
+/// Server-owned use-button hacking timer. Both values are transmitted in
+/// JKA playerState; only `time` advances on the client between snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UiHackProgress {
+    pub end_time: i32,
+    pub base_time: i32,
+    pub time: i32,
+}
+
 #[derive(Debug, Clone)]
 pub struct UiSnapshot {
     /// Active multiplayer protocol controls which game the Native HUD recreates.
@@ -1792,6 +1804,8 @@ pub struct UiSnapshot {
     pub console_input: String,
     /// UTF-8 byte offset of the editable caret in `console_input`.
     pub console_cursor: usize,
+    /// Selected UTF-8 byte range in the editable command prompt, if any.
+    pub console_input_selection: Option<(usize, usize)>,
     pub console_status: String,
     pub console_lines: Vec<String>,
     pub console_line_kinds: Vec<crate::logging::ConsoleLineKind>,
@@ -1830,6 +1844,7 @@ pub struct UiSnapshot {
     pub console_help_hover: bool,
     pub chat_mode: ChatMode,
     pub chat_input: String,
+    pub chat_input_selected: bool,
     pub chat_lines: Vec<UiChatLine>,
     pub chat_settings: ChatSettings,
     pub chat_anim: UiChatAnim,
@@ -1900,6 +1915,8 @@ pub struct UiSnapshot {
     pub(crate) zoom_scope: Option<UiZoomScope>,
     /// TaystJK CG_DrawRocketLocking (server-authoritative rocketLockIndex).
     pub(crate) rocket_lock: Option<UiRocketLock>,
+    /// TaystJK CG_DrawHaqrBar: use-button hackingTime/hackingBaseTime.
+    pub(crate) hack_progress: Option<UiHackProgress>,
     /// Render-thread-owned UV coordinates for native-resolution icons. Kept
     /// across incoming app snapshots; empty until the atlas is lazily loaded.
     pub(crate) icon_atlas_uvs: Vec<([f32; 2], [f32; 2])>,
@@ -1909,6 +1926,8 @@ pub struct UiSnapshot {
     /// Render-thread-owned clean TrueType font (texture binding 8), kept
     /// across app snapshots like `icon_atlas_uvs`.
     pub(crate) clean_font: Option<std::sync::Arc<ProportionalFont>>,
+    /// TaystJK FONT_SMALL2, packed into the shared proportional-font texture.
+    pub(crate) enemy_info_font: Option<std::sync::Arc<ProportionalFont>>,
     /// Render-thread-owned avatar atlas (texture binding 9).
     pub(crate) avatar_atlas: Option<std::sync::Arc<AvatarAtlas>>,
     pub movement_keys: MovementKeysSettings,
@@ -1955,6 +1974,7 @@ impl Default for UiSnapshot {
             mode: OverlayMode::None,
             console_input: String::new(),
             console_cursor: 0,
+            console_input_selection: None,
             console_status: String::new(),
             console_lines: Vec::new(),
             console_line_kinds: Vec::new(),
@@ -1984,6 +2004,7 @@ impl Default for UiSnapshot {
             console_help_hover: false,
             chat_mode: ChatMode::Global,
             chat_input: String::new(),
+            chat_input_selected: false,
             chat_lines: Vec::new(),
             chat_settings: ChatSettings::default(),
             chat_anim: UiChatAnim::default(),
@@ -2029,9 +2050,11 @@ impl Default for UiSnapshot {
             inventory_select: None,
             zoom_scope: None,
             rocket_lock: None,
+            hack_progress: None,
             icon_atlas_uvs: Vec::new(),
             icon_shader_flags: Vec::new(),
             clean_font: None,
+            enemy_info_font: None,
             avatar_atlas: None,
             movement_keys: MovementKeysSettings::default(),
             strafe_helper: StrafeHelperSettings::default(),

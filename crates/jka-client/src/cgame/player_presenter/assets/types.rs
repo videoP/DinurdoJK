@@ -132,9 +132,11 @@ pub(in crate::cgame::player_presenter) struct PlayerSurfaceAsset {
     pub(in crate::cgame::player_presenter) source_material: Option<SourceMaterialParams>,
 }
 
-pub(in crate::cgame::player_presenter) const FPLS_MODE3_OFF_SURFACES: &[&str] = &[
-    // EternalJK CG_ForceFPLSPlayerModel: every FPLS mode removes the head
-    // variants and the TIE-pilot hoses so first person never sits inside them.
+// TaystJK CG_ForceFPLSPlayerModel with cg_fpls 1: hide the head and the
+// TIE-pilot face hoses, but keep the posed body (including hands/arms).
+// Modes 2 and 3 additionally hide hips/torso; using their rules for our
+// boolean cg_fpls accidentally made both arms disappear with their parents.
+const FPLS_MODE1_OFF_SURFACES: &[&str] = &[
     "head_eyes_mouth",
     "heada_eyes_mouth",
     "head",
@@ -145,30 +147,20 @@ pub(in crate::cgame::player_presenter) const FPLS_MODE3_OFF_SURFACES: &[&str] = 
     "headb_eyes_mouth",
     "torso_l_hose",
     "torso_r_hose",
-    // EternalJK modes 2/3 additionally turn these exact surfaces off; its
-    // source describes that state as "removes everything but the saber hilt".
-    // Dinurdo's cg_fpls is boolean, so enabled maps to mode 3: no player body,
-    // normal first-person camera, held saber hilt/blades retained.
-    "hips",
-    "hipsa",
-    "torso",
-    "torsoa",
 ];
 
-pub(in crate::cgame::player_presenter) fn fpls_mode3_surface_hidden(
+pub(in crate::cgame::player_presenter) fn fpls_mode1_surface_hidden(
     glm: &GlmModel,
     surface_index: usize,
 ) -> bool {
-    // EternalJK passes TURN_OFF (G2SURFACEFLAG_NODESCENDANTS), so disabling
-    // hips/torso also suppresses every child surface below those roots. Walk
-    // the GLM parent chain to reproduce Ghoul2's hierarchy semantics rather
-    // than merely hiding the four surfaces whose names were passed to G2API.
+    // Ghoul2 TURN_OFF uses G2SURFACEFLAG_NODESCENDANTS, so exclude children
+    // of a hidden head or hose even if the skin names the child differently.
     let mut index = surface_index;
     for _ in 0..=glm.hierarchy.len() {
         let Some(surface) = glm.hierarchy.get(index) else {
             return false;
         };
-        if FPLS_MODE3_OFF_SURFACES
+        if FPLS_MODE1_OFF_SURFACES
             .iter()
             .any(|hidden| surface.name.eq_ignore_ascii_case(hidden))
         {
@@ -183,6 +175,50 @@ pub(in crate::cgame::player_presenter) fn fpls_mode3_surface_hidden(
         index = parent;
     }
     false
+}
+
+#[cfg(test)]
+mod fpls_tests {
+    use super::*;
+    use jka_assets::ghoul2::GlmSurfaceHierarchy;
+
+    #[test]
+    fn fpls_mode1_keeps_arms_and_hands_but_hides_head_descendants() {
+        // Model hierarchy: hips -> torso -> arms/hands, head/face and hoses.
+        // When torso was TURN_OFF (our old mode-3 mapping), the arm surfaces
+        // inherited that state and vanished; TaystJK mode 1 keeps them.
+        let nodes = [
+            ("hips", -1),
+            ("Torso", 0),
+            ("r_arm", 1),
+            ("r_hand", 2),
+            ("head", 1),
+            ("face_variant", 4),
+            ("torso_l_hose", 1),
+            ("hose_detail", 6),
+            ("l_arm", 1),
+            ("l_hand", 8),
+        ];
+        let glm = GlmModel {
+            name: "fpls-test".into(),
+            anim_name: "*default".into(),
+            num_bones: 0,
+            hierarchy: nodes.iter().map(|(name, parent)| GlmSurfaceHierarchy {
+                name: (*name).into(),
+                flags: 0,
+                shader: String::new(),
+                parent_index: *parent,
+                children: Vec::new(),
+            }).collect(),
+            lods: Vec::new(),
+        };
+        for visible in [0, 1, 2, 3, 8, 9] {
+            assert!(!fpls_mode1_surface_hidden(&glm, visible), "surface {visible} should remain");
+        }
+        for hidden in [4, 5, 6, 7] {
+            assert!(fpls_mode1_surface_hidden(&glm, hidden), "surface {hidden} should be hidden");
+        }
+    }
 }
 
 pub(in crate::cgame::player_presenter) struct PlayerModelAsset {

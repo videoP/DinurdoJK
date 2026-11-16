@@ -16,7 +16,7 @@ use crate::renderer::{
     create_targets, create_texture_sampler, create_ui_pipeline, cube_texture_entry,
     depth_array_texture_entry, depth_cube_array_texture_entry, depth_texture_entry,
     empty_ui_font_texture, encode_screenshot_job, env_flag, load_texture_asset_or_missing,
-    load_ui_font_texture, load_ui_loading_texture, load_ui_proportional_font, load_ui_clean_font,
+    load_ui_font_texture, load_ui_loading_texture, load_ui_clean_font,
     load_ui_unknown_map_texture, mpsc, no_vsync_mode, nonfiltering_sampler_entry,
     sampler_entry, sampler_entry_stages, storage_buffer_entry, supported_msaa,
     texture_2d_array_entry, texture_3d_entry, texture_3d_entry_stages, texture_entry,
@@ -861,7 +861,7 @@ impl Renderer {
             &device,
             wgpu::ShaderModuleDescriptor {
                 label: Some("JKA cascaded-shadow caster shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shadow.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(crate::material_flags::shadow_shader().into()),
             },
         );
         let shadow_pipeline_layout =
@@ -1300,13 +1300,21 @@ impl Renderer {
         init_mark!("detail/wireframe/UI pipelines");
         let ui_font_data = load_ui_font_texture(base, game);
         let ui_font = upload_cached_texture(&device, &queue, &ui_font_data);
-        let (ui_small_font_data, ui_small_font_metrics) =
-            load_ui_proportional_font(base, game, "ocr_a");
+        let (ui_small_font_data, ui_small_font_metrics, ui_enemy_info_font_metrics) =
+            super::overlay::load_ui_hud_fonts(base, game);
         let ui_small_font = upload_cached_texture(&device, &queue, &ui_small_font_data);
         let (ui_clean_font_data, ui_clean_font_metrics) = load_ui_clean_font(base, game);
         let ui_clean_font = upload_cached_texture(&device, &queue, &ui_clean_font_data);
-        let (ui_jura_data, ui_jura_metrics) = super::overlay::load_ui_jura_fallback(base, game);
-        let ui_jura_font = upload_cached_texture(&device, &queue, &ui_jura_data);
+        // The fallback slot is a transparent 1x1 until the first non-JKA
+        // character is seen. No Jura/Noto file or atlas is opened at startup.
+        let ui_jura_font = upload_cached_texture(&device, &queue,
+            &empty_ui_font_texture("lazy Unicode fallback (not loaded)"));
+        let ui_jura_metrics = Some(ui::UnicodeFallbackFont {
+            glyphs: std::collections::HashMap::new(),
+            cap_heights: std::collections::HashMap::new(),
+            failed: std::collections::HashSet::new(), height: 64, cap_height: 42.0,
+        });
+        let ui_unicode_worker = super::unicode_fonts::UnicodeFontWorker::new(base, game);
         // Filled in the background the first time a scoreboard is shown.
         let ui_avatars = upload_cached_texture(&device, &queue, &empty_ui_font_texture("JKA UI avatar atlas (not loaded)"));
         let ui_remap_thumbs = upload_cached_texture(&device, &queue, &empty_ui_font_texture("Shader Remaps thumbnails (not loaded)"));
@@ -2138,7 +2146,7 @@ impl Renderer {
             &device,
             wgpu::ShaderModuleDescriptor {
                 label: Some("JKA AO depth prepass shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../depth_prepass.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(crate::material_flags::depth_shader().into()),
             },
         );
         let depth_prepass_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2591,6 +2599,7 @@ impl Renderer {
             _ui_font: ui_font,
             _ui_jura_font: ui_jura_font,
             ui_jura_metrics: ui_jura_metrics.map(std::sync::Arc::new),
+            ui_unicode_worker,
             _ui_small_font: ui_small_font,
             _ui_clean_font: ui_clean_font,
             ui_clean_font_metrics: ui_clean_font_metrics.map(std::sync::Arc::new),
@@ -2612,6 +2621,8 @@ impl Renderer {
             ui_team_icon_key: Vec::new(),
             _ui_ext_images: ui_ext_images,
             ui_ext_image_key: Vec::new(),
+            ui_ext_requested_images: Vec::new(),
+            ui_ext_requested_hud_style: 0,
             ui_ext_image_loader: None,
             ui_binding_is_unknown_map: false,
             _ui_unknown_map: ui_unknown_map,
@@ -2620,6 +2631,7 @@ impl Renderer {
             ui_loading_image_key: None,
             ui_pending_levelshot: None,
             ui_small_font_metrics,
+            ui_enemy_info_font_metrics: ui_enemy_info_font_metrics.map(Arc::new),
             _ui_font_sampler: ui_font_sampler,
             frame_time_graph: FrameTimeGraph::default(),
             tile_cost_overlay: None,

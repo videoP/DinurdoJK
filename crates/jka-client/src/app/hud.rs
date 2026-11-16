@@ -226,6 +226,7 @@ impl App {
         // cg.predictedPlayerState, or the demo/follow equivalent. Never rely on
         // a local key bind: these values are also supplied in DM26 playback.
         let (zoom_scope, rocket_lock) = self.combat_overlay_state();
+        let hack_progress = self.hack_progress_ui();
 
         let mut snapshot = UiSnapshot {
             jk2_mode: self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2(),
@@ -241,6 +242,7 @@ impl App {
             setup_selected: self.setup_selected,
             console_input: self.console_input.clone(),
             console_cursor: self.console_cursor,
+            console_input_selection: self.console_input_selection_bounds(),
             console_status: self.console_status.clone(),
             console_lines,
             console_line_kinds,
@@ -270,6 +272,7 @@ impl App {
             console_help_hover: self.console_help_hover && self.overlay == OverlayMode::Console,
             chat_mode: self.chat_mode,
             chat_input: self.chat_input.clone(),
+            chat_input_selected: self.chat_input_selected,
             chat_settings: self.chat_settings,
             chat_anim: self.chat_anim_ui(Instant::now()),
             chat_lines,
@@ -330,10 +333,12 @@ impl App {
             inventory_select,
             zoom_scope,
             rocket_lock,
+            hack_progress,
             icon_atlas_uvs: Vec::new(),
             icon_shader_flags: Vec::new(),
             extension_shader_flags: Vec::new(),
             clean_font: None,
+            enemy_info_font: None,
             avatar_atlas: None,
             movement_keys: self.movement_keys_hud,
             strafe_helper: if in_studio {
@@ -1338,6 +1343,24 @@ impl App {
             saber_active_style: 0,
             force_flash: false,
             ..Default::default()
+        })
+    }
+
+    /// CG_DrawCrosshair only shows the hacking indicator while the server's
+    /// predicted playerState carries an active hackingTime. The remaining time
+    /// is evaluated against the same cgame clock used for the snapshot.
+    pub(in crate::app) fn hack_progress_ui(&self) -> Option<ui::UiHackProgress> {
+        if self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2() {
+            return None;
+        }
+        let time = self.game_session.as_ref()?.cgame_time;
+        let ps = self.current_player_state()?;
+        let end_time = ps.field_i32("hackingTime").unwrap_or(0);
+        let base_time = ps.field_i32("hackingBaseTime").unwrap_or(0);
+        (end_time != 0 && base_time > 0).then_some(ui::UiHackProgress {
+            end_time,
+            base_time,
+            time,
         })
     }
 

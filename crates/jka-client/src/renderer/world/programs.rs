@@ -1,4 +1,5 @@
 //! Stage program policies. Classification happens during compilation, never per pixel.
+use crate::material_flags::*;
 use crate::renderer::{
     MaterialFragmentKey, MaterialUniform, PipelineKey, WorldShaderFamily, WorldShaderVariantKey,
 };
@@ -50,7 +51,7 @@ pub(in crate::renderer) struct VertexRecipe {
 impl VertexRecipe {
     pub fn from_uniform(material: &MaterialUniform) -> Self {
         let mut recipe = Self {
-            surface_material: ((material.header[3] >> 8) & 31) as u8,
+            surface_material: ((material.header[3] & MATERIAL_SURFACE_KIND_MASK) >> MATERIAL_SURFACE_KIND_SHIFT) as u8,
             ..Self::default()
         };
         for i in 0..(material.header[1] as usize).min(4) {
@@ -59,10 +60,10 @@ impl VertexRecipe {
                 recipe.stretch_funcs[i] = (material.mods[i * 2 + 1][1] + 0.5) as u8;
             }
         }
-        if material.header[2] & 134217728 != 0 {
+        if material.header[2] & MATERIAL_FLAG_RGB_WAVE != 0 {
             recipe.wave_funcs[0] = material.wave_funcs[0] as u8;
         }
-        if material.header[2] & 268435456 != 0 {
+        if material.header[2] & MATERIAL_FLAG_ALPHA_WAVE != 0 {
             recipe.wave_funcs[1] = material.wave_funcs[1] as u8;
         }
         recipe
@@ -106,8 +107,8 @@ pub(in crate::renderer) fn dry_variant(v: WorldShaderVariantKey) -> Option<World
 /// `$lightmap` stage, the implicit lightmap multiply, or a vertex-lit stage
 /// using vertex colour. Everything else compiles ENABLE_BAKED_SUN_RELIGHT out.
 fn baked_relight_live(m: MaterialFragmentKey) -> bool {
-    m.flags & (2 | 8388608) != 0 || (m.flags & 131072 != 0 && m.flags & 1 != 0)
-        || (m.flags_w & (super::variants::MATERIAL_FLAGS_W_SKY_OVERLAY | super::variants::MATERIAL_FLAGS_W_VERTEX_OVERLAY)) != 0
+    m.flags & (MATERIAL_FLAG_IMPLICIT_LIGHTMAP | MATERIAL_FLAG_EXPLICIT_LIGHTMAP) != 0 || (m.flags & MATERIAL_FLAG_VERTEX_LIT != 0 && m.flags & MATERIAL_FLAG_RGB_VERTEX != 0)
+        || (m.flags_w & (MATERIAL_FLAG_SKY_OVERLAY | MATERIAL_FLAG_VERTEX_OVERLAY)) != 0
 }
 
 /// Exact material-side eliminations in the main base pass. Reflection/fog/dlight
@@ -117,7 +118,7 @@ pub(in crate::renderer) fn effective_stage_variant(
     m: MaterialFragmentKey,
 ) -> WorldShaderVariantKey {
     v = v.base_pass_key();
-    if m.flags & (8 | 16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 | 262144) == 0 {
+    if m.flags & (MATERIAL_FLAG_NORMAL_MAP | MATERIAL_FLAG_ROUGHNESS_MAP | MATERIAL_FLAG_HEIGHT_MAP | MATERIAL_FLAG_METALLIC_MAP | MATERIAL_FLAG_SPECULAR_MAP | MATERIAL_FLAG_EMISSIVE_MAP | MATERIAL_FLAG_PACKED_RMO | MATERIAL_FLAG_HEIGHT_FROM_ALPHA | MATERIAL_FLAG_REFLECTION_PROBE | MATERIAL_FLAG_RMO_SPECULAR_ALPHA) == 0 {
         v.pbr = false;
         v.pom = false;
         v.deluxe = false;
@@ -129,10 +130,10 @@ pub(in crate::renderer) fn effective_stage_variant(
         v.pbr_companion_sampler = false;
         v.pbr_vertex_lightgrid = false;
     }
-    if m.flags_w & 2 == 0 {
+    if m.flags_w & MATERIAL_FLAG_DETAIL == 0 {
         v.detail_textures_enabled = false;
     }
-    if m.flags & 4096 == 0 && m.tc_gen != 3 {
+    if m.flags & MATERIAL_FLAG_PLANAR_REFLECTION == 0 && m.tc_gen != 3 {
         v.planar_reflections = false;
     }
     if m.vertex_recipe.surface_material != 14 {
@@ -171,7 +172,7 @@ fn hybrid_program(
     // and expensive live material effects. Numeric parameters remain uniforms.
     let structural = m.tc_gen == 2 || m.tc_gen == 3
         || m.vertex_recipe.tc_mods.iter().any(|&op| op != 0)
-        || m.flags & (134217728 | 268435456) != 0;
+        || m.flags & (MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE) != 0;
     let enhanced = !basic(effective_stage_variant(v, m));
     if structural || enhanced {
         if enhanced {
@@ -210,11 +211,11 @@ pub(in crate::renderer) fn program_key(
     let alpha = p.class != crate::renderer::DrawClass::Opaque;
     // Glass shading exists only in fs_main; the minimal, shared and generated
     // entries would draw it as an opaque stage.
-    let glass = m.flags_w & super::variants::MATERIAL_FLAGS_W_GLASS != 0;
+    let glass = m.flags_w & MATERIAL_FLAG_GLASS != 0;
     // These static additive stages use the authored vertex RGB to recover a
     // baked sky gain in the vertex shader. Generated/shared entries can
     // remove vertex colours when rgbGen is Const/Wave, so keep fs_main.
-    let baked_additive = m.flags_w & super::variants::MATERIAL_FLAGS_W_BAKED_ADDITIVE != 0;
+    let baked_additive = m.flags_w & MATERIAL_FLAG_BAKED_ADDITIVE != 0;
     let ordinary = !(p.auto_sprite || p.auto_sprite2 || p.deform_move) && !p.legacy_srgb_three_stage && m.tc_gen <= 3 && !glass;
     // A uniform-driven shared relight measured 4-13% slower than mode-1
     // specialization (RTX 3060, costadelsol/ffa3): keep it specialized in mode 3.
@@ -371,10 +372,10 @@ pub(in crate::renderer) fn stage_rejection_reasons(
     if p.legacy_srgb_three_stage {
         reasons.push("authored three-stage legacy sRGB composite");
     }
-    if m.flags_w & super::variants::MATERIAL_FLAGS_W_GLASS != 0 {
+    if m.flags_w & MATERIAL_FLAG_GLASS != 0 {
         reasons.push("glass stage requires fs_main");
     }
-    if m.flags_w & super::variants::MATERIAL_FLAGS_W_BAKED_ADDITIVE != 0 {
+    if m.flags_w & MATERIAL_FLAG_BAKED_ADDITIVE != 0 {
         reasons.push("baked additive sky requires specialized fs_main");
     }
     if mode >= 3 && m.tc_gen > 3 {
@@ -415,7 +416,7 @@ pub(in crate::renderer) fn map_eligibility_counts(
             else if (p.auto_sprite || p.auto_sprite2) { 6 }
             else if p.legacy_srgb_three_stage { 7 }
             else if mode >= 3 && m.tc_gen > 3 { 8 }
-            else if m.flags_w & super::variants::MATERIAL_FLAGS_W_GLASS != 0 { 9 }
+            else if m.flags_w & MATERIAL_FLAG_GLASS != 0 { 9 }
             else { 10 };
         counts[category] += 1;
     }
@@ -456,7 +457,7 @@ pub(in crate::renderer) fn fallback_reason(
         "authored three-stage RGB composite"
     } else if m.tc_gen > 3 {
         "special texture-coordinate generator"
-    } else if m.flags_w & super::variants::MATERIAL_FLAGS_W_GLASS != 0 {
+    } else if m.flags_w & MATERIAL_FLAG_GLASS != 0 {
         "glass primary stage"
     } else if v.program_mode == WorldProgramMode::Shared && v.baked_sun_relight && baked_relight_live(m) {
         "baked relight on a lightmapped stage (mode 3)"
@@ -602,10 +603,10 @@ pub(in crate::renderer) fn generated_source(
         );
 
     let enhanced = m.program == StageProgram::GeneratedEnhanced;
-    let has_wave = m.flags & (134217728 | 268435456) != 0;
-    let needs_color = (m.flags & (1 | 524288) != 0 && m.flags & 134217728 == 0)
-        || (m.flags & (1048576 | 2097152) != 0 && m.flags & 268435456 == 0);
-    let needs_lm = enhanced || m.flags & 2 != 0;
+    let has_wave = m.flags & (MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE) != 0;
+    let needs_color = (m.flags & (MATERIAL_FLAG_RGB_VERTEX | MATERIAL_FLAG_RGB_ONE_MINUS_VERTEX) != 0 && m.flags & MATERIAL_FLAG_RGB_WAVE == 0)
+        || (m.flags & (MATERIAL_FLAG_ALPHA_VERTEX | MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX) != 0 && m.flags & MATERIAL_FLAG_ALPHA_WAVE == 0);
+    let needs_lm = enhanced || m.flags & MATERIAL_FLAG_IMPLICIT_LIGHTMAP != 0;
     let needs_position = enhanced || v.legacy_fog || v.jump_shade;
     let mut fields = vec![("uv", "vec2<f32>")];
     if needs_lm {
@@ -654,7 +655,7 @@ pub(in crate::renderer) fn generated_source(
         // Keep the exact wave evaluator, including remap/clamp time, in the VS.
         // A flat varying carries its per-stage result to the existing FS helper.
         source = source.replacen("fn apply_wave_gens(", "fn vertex_wave_gens(", 1);
-        source.push_str("\nvar<private> generated_wave_color: vec4<f32>;\nfn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {\nvar out = color;\nif ((material_flags() & 134217728u) != 0u) { out = vec4<f32>(generated_wave_color.rgb, out.a); }\nif ((material_flags() & 268435456u) != 0u) { out.a = generated_wave_color.a; }\nreturn out;\n}\n");
+        source.push_str("\nvar<private> generated_wave_color: vec4<f32>;\nfn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {\nvar out = color;\nif ((material_flags() & MATERIAL_FLAG_RGB_WAVE) != 0u) { out = vec4<f32>(generated_wave_color.rgb, out.a); }\nif ((material_flags() & MATERIAL_FLAG_ALPHA_WAVE) != 0u) { out.a = generated_wave_color.a; }\nreturn out;\n}\n");
     }
     let mut generated = String::from(
         "\nstruct GeneratedVertexOut {\n@builtin(position) @invariant clip_position: vec4<f32>,\n",
@@ -772,10 +773,10 @@ impl GeneratedShape {
             program: material.program,
             tc_gen: material.tc_gen,
             vertex_recipe: material.vertex_recipe,
-            wave: flags & (134217728 | 268435456) != 0,
-            vertex_color: (flags & (1 | 524288) != 0 && flags & 134217728 == 0)
-                || (flags & (1048576 | 2097152) != 0 && flags & 268435456 == 0),
-            lightmap_uv: enhanced || flags & 2 != 0,
+            wave: flags & (MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE) != 0,
+            vertex_color: (flags & (MATERIAL_FLAG_RGB_VERTEX | MATERIAL_FLAG_RGB_ONE_MINUS_VERTEX) != 0 && flags & MATERIAL_FLAG_RGB_WAVE == 0)
+                || (flags & (MATERIAL_FLAG_ALPHA_VERTEX | MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX) != 0 && flags & MATERIAL_FLAG_ALPHA_WAVE == 0),
+            lightmap_uv: enhanced || flags & MATERIAL_FLAG_IMPLICIT_LIGHTMAP != 0,
         }
     }
 }

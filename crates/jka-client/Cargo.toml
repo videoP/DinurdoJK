@@ -72,7 +72,7 @@ default = ["local-llm"]
 # chatQRD. Building it needs CMake and libclang; `--no-default-features`
 # builds the client without it and those features report that it is missing.
 local-llm = ["jka-llm/llama"]
-# Opt-in: `build.ps1 -Fast -Dlss` (see DLAA_VULKAN.md).
+# Included by build.ps1 by default; opt out with -NoDlss (see DLAA_VULKAN.md).
 nvidia-dlss = ["dep:dlss_wgpu", "dep:uuid"]
 
 [dev-dependencies]

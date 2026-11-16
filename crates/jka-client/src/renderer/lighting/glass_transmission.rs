@@ -4,6 +4,7 @@
 //! `trans` or for alpha-shadow foliage. Unmarked glass is accepted only when
 //! both the texture name and the draw semantics corroborate it.
 
+use crate::material_flags::*;
 use crate::renderer::{BlendMode, DrawBatch, DrawClass};
 use std::sync::OnceLock;
 use std::collections::HashMap;
@@ -174,9 +175,9 @@ fn sampled_throughput(source: &RtAlphaMaskSource, vertex: &crate::renderer::RtAl
         _ => {}
     }
     let sampled = sample_texture(source, uv);
-    let vertex_alpha = if material.header[2] & 1048576 != 0 {
+    let vertex_alpha = if material.header[2] & MATERIAL_FLAG_ALPHA_VERTEX != 0 {
         vertex.lightmap_alpha[2]
-    } else if material.header[2] & 2097152 != 0 {
+    } else if material.header[2] & MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX != 0 {
         1.0 - vertex.lightmap_alpha[2]
     } else { 1.0 };
     let alpha = (sampled[3] * material.color[3] * vertex_alpha).clamp(0.0, 1.0);

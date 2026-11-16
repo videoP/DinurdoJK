@@ -731,7 +731,7 @@ impl App {
                     // Record *arrival* time for the experimental remote visual
                     // buffer, not the later CGame transition time. Mode 0 does no
                     // snapshot copies, timing updates, or allocator work here.
-                    if crate::cgame::remote_smoothing::mode() != 0 {
+                    if matches!(crate::cgame::remote_smoothing::mode(), 1..=4) {
                         session.remote_smoothing.receive(&snapshot, Instant::now());
                     }
                     session.live_snapshots.push_back(snapshot);
@@ -1191,6 +1191,13 @@ impl App {
         session
             .client_game
             .reset_gamestate(&configstrings, command_sequence);
+        // CL_GetDefaultState / CG_TransitionPermanent: the live session's
+        // decoder lives in NetSession, not GameSession's demo decoder.
+        session.permanent_entities = self.net.as_ref().map_or_else(Vec::new, |net| {
+            crate::cgame::permanent_entities_from_baselines(
+                &net.session().decoder().baselines,
+            )
+        });
         while let Some(command) = self.pending_live_server_commands.pop_front() {
             session.client_game.queue_server_command(command);
         }

@@ -674,6 +674,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         shader_library: Arc::new(library),
         shader_origins: Arc::new(library_debug.origins.clone()),
         sub_bsp_names: Vec::new(),
+        sub_bsp_boundary: None,
         authored_oceans: Vec::new(),
         sailing_spawns: Vec::new(),
         water_brush_bounds,

@@ -2115,6 +2115,7 @@ pub(in crate::scene) fn prepare_internal(
         shader_library: Arc::new(library),
         shader_origins: Arc::new(library_debug.origins.clone()),
         sub_bsp_names: Vec::new(),
+        sub_bsp_boundary: None,
         debug_volumes,
         authored_oceans,
         sailing_spawns: crate::ocean::authoring::sailing_spawns(&bsp),

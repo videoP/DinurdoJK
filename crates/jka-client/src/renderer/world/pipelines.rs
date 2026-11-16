@@ -1,4 +1,5 @@
 //! World pipelines.
+use crate::material_flags::*;
 use crate::renderer::reflections::planar::PLANAR_COLOR_FORMAT;
 use crate::renderer::{
     camera_depth_compare, create_cull_debug_pipeline, create_ssr_visibility_resources,
@@ -184,7 +185,10 @@ impl Renderer {
                 // a JK2-only copy on the lazy companion worker; JKA reuses the
                 // original fast module and incurs no new shader cost.
                 let jk2_shader = jk2_legacy_color.then(|| {
-                    let source = include_str!("../../bsp_fast.wgsl").replace(
+                    let source = format!("{}\n{}\n{}",
+                        include_str!("../../bsp_fast.wgsl"),
+                        crate::foliage::surface_shader(),
+                        include_str!("../../sky_fractal.wgsl")).replace(
                         "override JK2_LEGACY_COLOR: bool = false;",
                         "override JK2_LEGACY_COLOR: bool = true;",
                     );
@@ -490,28 +494,28 @@ pub(in crate::renderer) fn material_uniform(
     // separate rgbGen/alphaGen state. Bit 0 remains the legacy "RGB from
     // vertex color" flag so existing shader paths keep their compact layout.
     if matches!(source.rgb_gen, RgbGen::Vertex | RgbGen::ExactVertex) {
-        out.header[2] |= 1;
+        out.header[2] |= MATERIAL_FLAG_RGB_VERTEX;
     } else if matches!(source.rgb_gen, RgbGen::OneMinusVertex) {
-        out.header[2] |= 524288;
+        out.header[2] |= MATERIAL_FLAG_RGB_ONE_MINUS_VERTEX;
     }
 
     // ParseStage already resolved the implicit vertex-alpha rule, including
     // an explicit `alphaGen identity` before or after `rgbGen vertex`.
     let alpha_from_vertex = matches!(source.alpha_gen, AlphaGen::Vertex);
     if alpha_from_vertex {
-        out.header[2] |= 1048576;
+        out.header[2] |= MATERIAL_FLAG_ALPHA_VERTEX;
     } else if matches!(source.alpha_gen, AlphaGen::OneMinusVertex) {
-        out.header[2] |= 2097152;
+        out.header[2] |= MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX;
     }
 
     // Waveform generators replace the stage's RGB / alpha in the shader.
     if let RgbGen::Wave(wave) = source.rgb_gen {
-        out.header[2] |= 134217728;
+        out.header[2] |= MATERIAL_FLAG_RGB_WAVE;
         out.wave_rgb = [wave.base, wave.amplitude, wave.phase, wave.frequency];
         out.wave_funcs[0] = wave.func.id();
     }
     if let AlphaGen::Wave(wave) = source.alpha_gen {
-        out.header[2] |= 268435456;
+        out.header[2] |= MATERIAL_FLAG_ALPHA_WAVE;
         out.wave_alpha = [wave.base, wave.amplitude, wave.phase, wave.frequency];
         out.wave_funcs[1] = wave.func.id();
     }
@@ -529,28 +533,28 @@ pub(in crate::renderer) fn material_uniform(
         out.wave_funcs[2] = w.func.id();
     }
     if source.modulate_lightmap {
-        out.header[2] |= 2;
+        out.header[2] |= MATERIAL_FLAG_IMPLICIT_LIGHTMAP;
     }
     // Only the additional BSP lightstyle pass: shader skips runtime relighting,
     // local dynamic lights and material overlays already drawn in style 0.
     if source.lightstyle_slot != 0 {
-        out.header[2] |= 2147483648u32;
+        out.header[2] |= MATERIAL_FLAG_EXTRA_STATIC_LIGHTSTYLE;
     }
     if source.texture_is_lightmap {
-        out.header[2] |= 8388608;
+        out.header[2] |= MATERIAL_FLAG_EXPLICIT_LIGHTMAP;
     }
     if source.lightmap.is_some() {
-        out.header[2] |= 16777216;
+        out.header[2] |= MATERIAL_FLAG_HAS_LIGHTMAP;
     }
     if matches!(source.pipeline.blend, BlendMode::Opaque) {
-        out.header[2] |= 33554432;
+        out.header[2] |= MATERIAL_FLAG_OPAQUE_STAGE;
     }
     // Fused additive stage source factor: keep GL_ONE GL_ONE distinct from
     // GL_SRC_ALPHA GL_ONE without adding a native PSO permutation. This bit is
     // read only by fs_additive_fused2/3, never by regular material shaders.
     // Header.w bit 21 is intentionally outside MaterialFragmentKey's masks.
     if source.pipeline.blend == BlendMode::Custom(BlendFactor::One, BlendFactor::One) {
-        out.header[3] |= 1 << 21;
+        out.header[3] |= MATERIAL_FLAG_ADDITIVE_ONE;
     }
     // One legacy RGB policy for the original fused overlay and the additive
     // source approximation. The exact fusion uses its existing opaque shader
@@ -559,19 +563,19 @@ pub(in crate::renderer) fn material_uniform(
     if matches!(source.legacy_rgb_compositing(),
         scene::LegacyRgbCompositing::EncodedAdditiveSource)
     {
-        out.header[2] |= 536870912; // MATERIAL_LEGACY_ADDITIVE_SRGB
+        out.header[2] |= MATERIAL_FLAG_LEGACY_SRGB;
     }
     // Depth prepass packs this into the reflection-policy attachment so the
     // final Legacy 1 display-space fog affects exactly the BSP surfaces that
     // participate in the compiled/recovered global fog (q3map_nofog stays out).
     if source.fog_is_global && source.fog[3] > 0.001 && source.global_fog_post_eligible {
-        out.header[2] |= 67108864;
+        out.header[2] |= MATERIAL_FLAG_GLOBAL_FOG;
     }
     // This draw is an environmental overlay over an authored $lightmap. The
     // baked sky gain is stored alongside static sun aux when the sky bake is
     // active. Decode it only on these prepared stages (including fused ones).
     if source.baked_sky_overlay {
-        out.header[3] |= super::variants::MATERIAL_FLAGS_W_SKY_OVERLAY;
+        out.header[3] |= MATERIAL_FLAG_SKY_OVERLAY;
     }
     // Authored full-brightness overlay (rgbGen identityLighting, alpha blend) over a
     // vertex-lit base: relighting scales it with the base. Other blends stay exact.
@@ -579,41 +583,41 @@ pub(in crate::renderer) fn material_uniform(
         && matches!(source.rgb_gen, RgbGen::IdentityLighting)
         && matches!(source.pipeline.blend, BlendMode::Custom(BlendFactor::SrcAlpha, BlendFactor::OneMinusSrcAlpha))
     {
-        out.header[3] |= super::variants::MATERIAL_FLAGS_W_VERTEX_OVERLAY;
+        out.header[3] |= MATERIAL_FLAG_VERTEX_OVERLAY;
     }
     // Dedicated cached-AO receiver bit for q3map LIGHTMAP_BY_VERTEX stages.
     // Restrict it to the stage that actually consumes BSP vertex RGB so
     // emissive/additive sibling stages do not get incorrectly darkened.
     if source.vertex_lit && source.rgb_gen.uses_vertex_color() {
-        out.header[2] |= 131072;
+        out.header[2] |= MATERIAL_FLAG_VERTEX_LIT;
     }
     let pbr_eligible = source.pbr_eligible();
     if pbr_eligible && source.normal_texture.is_some() {
-        out.header[2] |= 8;
+        out.header[2] |= MATERIAL_FLAG_NORMAL_MAP;
     }
     if pbr_eligible && source.roughness_texture.is_some() {
-        out.header[2] |= 16;
+        out.header[2] |= MATERIAL_FLAG_ROUGHNESS_MAP;
     }
     if pbr_eligible && source.height_texture.is_some() {
-        out.header[2] |= 32;
+        out.header[2] |= MATERIAL_FLAG_HEIGHT_MAP;
     }
     if pbr_eligible && source.metallic_texture.is_some() {
-        out.header[2] |= 64;
+        out.header[2] |= MATERIAL_FLAG_METALLIC_MAP;
     }
     if pbr_eligible && source.specular_texture.is_some() {
-        out.header[2] |= 128;
+        out.header[2] |= MATERIAL_FLAG_SPECULAR_MAP;
     }
     if pbr_eligible && source.emissive_texture.is_some() {
-        out.header[2] |= 256;
+        out.header[2] |= MATERIAL_FLAG_EMISSIVE_MAP;
     }
     if pbr_eligible && source.rmo_packed {
-        out.header[2] |= 512;
+        out.header[2] |= MATERIAL_FLAG_PACKED_RMO;
     }
     if pbr_eligible && source.rmo_specular_alpha {
-        out.header[2] |= 262144;
+        out.header[2] |= MATERIAL_FLAG_RMO_SPECULAR_ALPHA;
     }
     if pbr_eligible && source.height_from_alpha {
-        out.header[2] |= 1024;
+        out.header[2] |= MATERIAL_FLAG_HEIGHT_FROM_ALPHA;
     }
     if source.water && source.authored_ocean.is_none() {
         out.ocean_waves = [1.0, source.water_amplitude, 0.0, 0.0];
@@ -621,7 +625,7 @@ pub(in crate::renderer) fn material_uniform(
     if source.water_primary {
         // Enhanced-water promotion: the authored first stage becomes the single
         // GodotOceanWaves surface pass while sibling authored stages are skipped.
-        out.header[2] |= 65536;
+        out.header[2] |= MATERIAL_FLAG_WATER_PRIMARY;
     }
     for (i, modifier) in source.tc_mods.iter().take(4).enumerate() {
         let a = i * 2;
@@ -656,30 +660,30 @@ pub(in crate::renderer) fn material_uniform(
         && source.pipeline.class != DrawClass::Sky
         && source.pipeline.blend == BlendMode::Opaque
     {
-        out.header[2] |= 4;
+        out.header[2] |= MATERIAL_FLAG_DYNAMIC_RECEIVER;
     }
     if source.skybox.is_some() {
-        out.header[3] |= 1;
+        out.header[3] |= MATERIAL_FLAG_SKYBOX;
     }
     if source.dlight_in_lightmap_stage {
-        out.header[3] |= 1 << 16;
+        out.header[3] |= MATERIAL_FLAG_DLIGHT_IN_LIGHTMAP;
     }
     if detail_texture_eligible {
-        out.header[3] |= 2;
+        out.header[3] |= MATERIAL_FLAG_DETAIL;
     }
-    out.header[3] |= u32::from(source.surface_material & 31) << 8;
+    out.header[3] |= (u32::from(source.surface_material) << MATERIAL_SURFACE_KIND_SHIFT) & MATERIAL_SURFACE_KIND_MASK;
     // Thermal-specific classifier reads these low unused header.w bits only
     // when the lazy thermal prepass is active. Regular shaders ignore them.
-    if source.thermal_lava { out.header[3] |= 1 << 3; }
+    if source.thermal_lava { out.header[3] |= MATERIAL_FLAG_THERMAL_LAVA; }
     // Stage-level glow/additive emission is resolved by the authored thermal
     // capture at individual texels, not in the opaque depth prepass. Only an
     // explicit q3map_surfacelight has whole-surface heat (level 3).
-    if source.thermal_emission == 3 { out.header[3] |= 1 << 5; }
+    if source.thermal_emission == 3 { out.header[3] |= MATERIAL_FLAG_THERMAL_SURFACELIGHT; }
     if source.foliage_wind {
-        out.header[3] |= crate::foliage::MATERIAL_FLAG;
+        out.header[3] |= MATERIAL_FLAG_FOLIAGE_WIND;
     }
     if source.glass_primary {
-        out.header[3] |= 1 << 17;
+        out.header[3] |= MATERIAL_FLAG_GLASS;
         out.ocean_color = [source.glass_tint[0], source.glass_tint[1], source.glass_tint[2], source.glass_reflectance];
     }
     out.color = source.color;
@@ -697,7 +701,7 @@ pub(in crate::renderer) fn material_uniform(
     // The map loader can recover the specific GE128/127 depth-seed boundary
     // without changing the shader script or globally forcing BSP vertex alpha.
     if source.alpha_test_texture_only {
-        out.header[2] |= 1073741824; // MATERIAL_MASK_TEXTURE_ALPHA_ONLY
+        out.header[2] |= MATERIAL_FLAG_MASK_TEXTURE_ALPHA;
     }
     // Opaque world pipelines are compiled with ENABLE_ALPHA_TEST off.
     debug_assert!(
@@ -748,36 +752,36 @@ pub(in crate::renderer) fn material_uniform(
         || source.roughness_override.is_some()
         || source.specular_reflectance.is_some();
     if pbr_eligible && has_pbr_companion && source.reflection_probe.is_some() {
-        out.header[2] |= 2048;
+        out.header[2] |= MATERIAL_FLAG_REFLECTION_PROBE;
         out.reflection_probe = source.reflection_probe_position_radius;
     }
     if (source.reflection_cache_flags & scene::REFLECTION_CACHE_SSR) != 0 {
-        out.header[2] |= 4194304;
+        out.header[2] |= MATERIAL_FLAG_SSR;
     }
-    // header.w bit 2 is free. header.z bit 23 already marks explicit lightmaps.
+    // Preserve the authored environment composite in its own header.w flag.
     // This authored-material guard requires no new bindings or pipeline variants.
     if source.authored_environment_composite {
-        out.header[3] |= 1 << 2;
+        out.header[3] |= MATERIAL_FLAG_AUTHORED_ENVIRONMENT;
     }
     if source.planar_reflection {
         // Portal stages are foreground shaders over the reflected secondary
         // view, NOT replacement textures. Identify the exact legacy blend so
         // the reflection background can be composited before WGPU blending.
         match source.pipeline.blend {
-            BlendMode::Custom(BlendFactor::One, BlendFactor::SrcAlpha) => out.header[3] |= 1 << 6,
-            BlendMode::Custom(BlendFactor::One, BlendFactor::OneMinusSrcAlpha) => out.header[3] |= 1 << 7,
+            BlendMode::Custom(BlendFactor::One, BlendFactor::SrcAlpha) => out.header[3] |= MATERIAL_FLAG_PLANAR_SRC_ALPHA,
+            BlendMode::Custom(BlendFactor::One, BlendFactor::OneMinusSrcAlpha) => out.header[3] |= MATERIAL_FLAG_PLANAR_ONE_MINUS_SRC_ALPHA,
             _ => {}
         }
-        out.header[2] |= 4096;
+        out.header[2] |= MATERIAL_FLAG_PLANAR_REFLECTION;
         out.planar_plane = source.planar_plane;
     } else if source.planar_environment_candidate {
-        out.header[2] |= 8192;
+        out.header[2] |= MATERIAL_FLAG_PLANAR_ENVIRONMENT;
         // A blended tcGen-environment stage is not a mirror replacement in the
         // material sense: its legacy environment texture also authored the
         // strength/tint of the reflection contribution. Preserve that response
         // when substituting the live planar scene.
         if source.pipeline.blend != BlendMode::Opaque {
-            out.header[2] |= 32768;
+            out.header[2] |= MATERIAL_FLAG_BLENDED_ENVIRONMENT;
         }
         out.planar_plane = source.planar_plane;
     }
@@ -790,7 +794,7 @@ pub(in crate::renderer) fn material_uniform(
         // Debug-only bit. assign_planar_reflection_planes propagates the
         // resolved plane to sibling stages so diagnostics cannot be hidden by
         // a later alpha/lightmap pass of the same material.
-        out.header[2] |= 16384;
+        out.header[2] |= MATERIAL_FLAG_PLANAR_DEBUG;
         out.planar_plane = source.planar_plane;
     }
     out
@@ -1728,7 +1732,7 @@ pub(in crate::renderer) fn create_shader_complexity_pipelines(
     // worker job. Normal BSP modules never see these declarations.
     let complexity_fragment = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("BSP shader complexity (diagnostics only)"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("../../bsp_complexity.wgsl").into()),
+        source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", crate::material_flags::shader_constants(), include_str!("../../bsp_complexity.wgsl")).into()),
     });
     let jobs = keys.to_vec();
     let pipelines = compile_pipeline_jobs("bsp-shader-complexity", jobs.clone(), |&key| {

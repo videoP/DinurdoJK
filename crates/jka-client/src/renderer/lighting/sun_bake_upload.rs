@@ -99,7 +99,7 @@ impl MaskUpload {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("install completed baked sun masks"),
         });
-        let output = images
+        let mut output: Vec<_> = images
             .iter()
             .zip(bases)
             .zip(masks)
@@ -182,6 +182,9 @@ impl MaskUpload {
                 GpuImage::new(texture, view)
             })
             .collect();
+        // Imported BSP lightmaps retain their own alpha/RGB and bindings.
+        // A main-map mask must never truncate the aggregate page table.
+        output.extend_from_slice(&images[output.len()..]);
         queue.submit([encoder.finish()]);
         output
     }

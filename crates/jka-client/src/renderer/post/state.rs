@@ -143,7 +143,7 @@ impl Renderer {
             self.pipeline_jobs.request(key, if masked { "NIR masked world prepass" } else { "NIR world prepass" }, move || {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("JKA lazy near-IR world classifier"),
-                    source: wgpu::ShaderSource::Wgsl(include_str!("../../depth_prepass.wgsl").into()),
+                    source: wgpu::ShaderSource::Wgsl(crate::material_flags::depth_shader().into()),
                 });
                 let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("JKA lazy NIR world prepass layout"),
@@ -217,7 +217,7 @@ impl Renderer {
             self.pipeline_jobs.request(key, if masked { "thermal masked world prepass" } else { "thermal world prepass" }, move || {
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("JKA lazy thermal world classifier"),
-                    source: wgpu::ShaderSource::Wgsl(include_str!("../../depth_prepass.wgsl").into()),
+                    source: wgpu::ShaderSource::Wgsl(crate::material_flags::depth_shader().into()),
                 });
                 let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("JKA lazy thermal world prepass layout"),

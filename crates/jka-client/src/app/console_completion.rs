@@ -52,6 +52,32 @@ fn common_map_prefix(names: &[&str]) -> String {
     first[..len].to_owned()
 }
 
+/// Navigation wraps within the current filtered result set, in either console style.
+fn stepped_suggestion_index(index: usize, picked: bool, delta: i32, count: usize) -> usize {
+    debug_assert!(count > 0);
+    let current = if picked { index.min(count - 1) } else { 0 };
+    (current as i32 + delta).rem_euclid(count as i32) as usize
+}
+
+/// Preview a completion without accepting it or changing the search query.
+/// This replaces only the token under the original caret, preserving args.
+fn preview_console_input(input: &str, cursor: usize, name: &str) -> Option<(String, usize)> {
+    let (start, end, command) = if let Some(ctx) = arguments::context(input, cursor) {
+        (ctx.start, ctx.end, false)
+    } else {
+        let (start, end) = App::console_first_token_span(input)?;
+        (start, end, true)
+    };
+    let prefix = if command && (input[start..end].starts_with('/') || input[start..end].starts_with('\\')) {
+        &input[start..start + 1]
+    } else {
+        ""
+    };
+    let mut preview = input.to_owned();
+    preview.replace_range(start..end, &format!("{prefix}{name}"));
+    Some((preview, start + prefix.len() + name.len()))
+}
+
 impl App {
     pub(in crate::app) fn format_console_entry(&self, entry: &crate::console::Entry) -> String {
         match entry.kind {
@@ -101,6 +127,7 @@ impl App {
         let Some((start, end)) = Self::console_first_token_span(&self.console_input) else {
             return;
         };
+        self.clear_console_input_selection();
         self.console_input.replace_range(start..end, replacement);
         if append_space && self.console_input.len() == start + replacement.len() {
             self.console_input.push(' ');
@@ -344,6 +371,7 @@ impl App {
     }
 
     fn replace_console_argument(&mut self, start: usize, end: usize, name: &str) {
+        self.clear_console_input_selection();
         self.console_input.replace_range(start..end, name);
         self.console_cursor = start + name.len();
         self.console_history_index = None;
@@ -434,15 +462,20 @@ impl App {
         if !self.console_suggest || self.overlay != OverlayMode::Console || self.console_search_open {
             return None;
         }
-        if let Some(Context { source, start, end }) = self.argument_context() {
+        // During arrow-key preview, rank candidates against the *typed*
+        // query, not the completed candidate currently shown in the field.
+        let (query, cursor) = self.console_suggest_origin.as_ref()
+            .map_or((self.console_input.as_str(), self.console_cursor),
+                    |(input, cursor)| (input.as_str(), *cursor));
+        if let Some(Context { source, start, end }) = arguments::context(query, cursor) {
             if self.console_suggest_hidden { return None; }
-            let (hits, total) = self.console_argument_hits(source, &self.console_input[start..end], 24);
+            let (hits, total) = self.console_argument_hits(source, &query[start..end], 24);
             return (!hits.is_empty()).then_some((hits, total, false));
         }
-        let (start, end) = Self::console_first_token_span(&self.console_input)?;
-        let token = &self.console_input[start..end];
+        let (start, end) = Self::console_first_token_span(query)?;
+        let token = &query[start..end];
         let connected = self.console_scope();
-        if self.console_cursor > end {
+        if cursor > end {
             let entry = crate::console::find_command(token, connected)?;
             let hit = crate::console::Suggestion {
                 entry,
@@ -531,6 +564,7 @@ impl App {
     pub(in crate::app) fn console_suggest_reset(&mut self) {
         self.console_suggest_index = 0;
         self.console_suggest_picked = false;
+        self.console_suggest_origin = None;
         self.console_suggest_hidden = false;
         *self.console_arg_suggest_cache.borrow_mut() = None;
         self.ensure_console_argument_catalog();
@@ -546,6 +580,7 @@ impl App {
         let Some((start, end)) = Self::console_first_token_span(&self.console_input) else {
             return;
         };
+        self.clear_console_input_selection();
         let had_space = self.console_input[end..].starts_with(char::is_whitespace);
         self.console_input.replace_range(start..end, name);
         let mut cursor = start + name.len();
@@ -608,6 +643,7 @@ impl App {
                 }
                 if let Some(common) = crate::console::common_prefix(&token, self.console_scope()) {
                     if common.len() > token.len() {
+                        self.clear_console_input_selection();
                         self.console_input.replace_range(start..end, &common);
                         self.console_cursor = start + common.len();
                         self.console_suggest_reset();
@@ -650,14 +686,21 @@ impl App {
         let Some((hits, _, false)) = self.console_suggest_state() else {
             return;
         };
-        let current = if self.console_suggest_picked {
-            self.console_suggest_index
-        } else {
-            0
-        };
-        self.console_suggest_index =
-            (current as i32 + delta).rem_euclid(hits.len() as i32) as usize;
+        self.console_suggest_index = stepped_suggestion_index(
+            self.console_suggest_index, self.console_suggest_picked, delta, hits.len(),
+        );
         self.console_suggest_picked = true;
+        // Preview the highlighted completion in *both* console styles,
+        // preserving the original query so later arrow presses keep the list stable.
+        let (input, cursor) = self.console_suggest_origin.get_or_insert_with(||
+            (self.console_input.clone(), self.console_cursor));
+        let Some((preview, caret)) = preview_console_input(
+            input, *cursor, hits[self.console_suggest_index].name(),
+        ) else { return; };
+        self.console_input = preview;
+        self.console_cursor = caret;
+        self.clear_console_input_selection();
+        self.console_history_index = None;
     }
 
     /// Left click on the popup or the header switch. Returns whether it was consumed.
@@ -730,6 +773,8 @@ impl App {
             (index, _) => index,
         };
         self.console_history_index = next;
+        self.clear_console_input_selection();
+        self.focus_console_input();
         self.console_input = next
             .map(|index| self.console_history[index].clone())
             .unwrap_or_default();
@@ -755,7 +800,29 @@ impl App {
 
 #[cfg(test)]
 mod map_completion_tests {
-    use super::{common_map_prefix, App};
+    use super::{common_map_prefix, preview_console_input, stepped_suggestion_index, App};
+
+    #[test]
+    fn suggestion_arrows_wrap_from_first_to_last_and_back() {
+        assert_eq!(stepped_suggestion_index(0, false, -1, 24), 23);
+        assert_eq!(stepped_suggestion_index(23, true, 1, 24), 0);
+        assert_eq!(stepped_suggestion_index(0, false, 1, 24), 1);
+        assert_eq!(stepped_suggestion_index(0, true, -1, 1), 0);
+    }
+
+    #[test]
+    fn console_arrow_preview_keeps_command_arguments_and_utf8() {
+        assert_eq!(preview_console_input("co arg", 2, "connect"),
+            Some(("connect arg".to_owned(), 7)));
+        assert_eq!(preview_console_input("co", 2, "connect"),
+            Some(("connect".to_owned(), 7)));
+        assert_eq!(preview_console_input("co", 2, "condump"),
+            Some(("condump".to_owned(), 7)));
+        assert_eq!(preview_console_input("/map mp/ff", 10, "mp/ffa3"),
+            Some(("/map mp/ffa3".to_owned(), 12)));
+        assert_eq!(preview_console_input("/say Привет", 4, "say_team"),
+            Some(("/say_team Привет".to_owned(), 9)));
+    }
 
     #[test]
     fn console_only_completes_the_map_argument() {

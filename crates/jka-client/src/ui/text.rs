@@ -16,30 +16,66 @@ thread_local! {
 thread_local! {
     static UNICODE_FALLBACK: std::cell::RefCell<Option<std::sync::Arc<super::UnicodeFallbackFont>>> =
         const { std::cell::RefCell::new(None) };
+    // Each renderer owns its queue. Standalone UI tests do not register one.
+    static UNICODE_REQUESTS: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<char>>>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) struct UnicodeFallbackScope(Option<std::sync::Arc<super::UnicodeFallbackFont>>);
+pub(crate) struct UnicodeFallbackScope {
+    previous_font: Option<std::sync::Arc<super::UnicodeFallbackFont>>,
+    previous_requests: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<char>>>>,
+}
 
 impl UnicodeFallbackScope {
+    #[cfg(test)]
     pub(crate) fn enter(font: Option<std::sync::Arc<super::UnicodeFallbackFont>>) -> Self {
-        Self(UNICODE_FALLBACK.with(|cell| cell.replace(font)))
+        Self::enter_with_requests(font, None)
+    }
+
+    pub(crate) fn enter_with_requests(
+        font: Option<std::sync::Arc<super::UnicodeFallbackFont>>,
+        requests: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<char>>>>,
+    ) -> Self {
+        Self {
+            previous_font: UNICODE_FALLBACK.with(|cell| cell.replace(font)),
+            previous_requests: UNICODE_REQUESTS.with(|cell| cell.replace(requests)),
+        }
     }
 }
 
 impl Drop for UnicodeFallbackScope {
     fn drop(&mut self) {
-        UNICODE_FALLBACK.with(|cell| { cell.replace(self.0.take()); });
+        UNICODE_FALLBACK.with(|cell| { cell.replace(self.previous_font.take()); });
+        UNICODE_REQUESTS.with(|cell| { cell.replace(self.previous_requests.take()); });
     }
 }
 
-/// The only lookup performed for non-JKA Unicode: the glyph has already been
-/// rasterized and packed at initialization. No font searches in the hot path.
+/// Only missing glyphs enter the slow path. The caller never opens fonts,
+/// rasterizes, allocates GPU resources, or waits for the font worker.
 fn jura_glyph(ch: char) -> Option<(ProportionalGlyph, i16, f32)> {
-    UNICODE_FALLBACK.with(|cell| {
+    let ready = UNICODE_FALLBACK.with(|cell| {
         let borrowed = cell.borrow();
         let font = borrowed.as_ref()?;
-        Some((*font.glyphs.get(&ch)?, font.height, font.cap_height))
-    })
+        if font.failed.contains(&ch) { return Some(None); }
+        Some(Some((*font.glyphs.get(&ch)?, font.height,
+            font.cap_heights.get(&ch).copied().unwrap_or(font.cap_height))))
+    });
+    let ready = match ready {
+        Some(None) => return None,
+        Some(Some(ready)) => Some(ready),
+        None => None,
+    };
+    if ready.is_none() {
+        UNICODE_REQUESTS.with(|cell| {
+            if let Some(queue) = cell.borrow().as_ref() {
+                if let Ok(mut pending) = queue.lock() {
+                    // A hostile message cannot grow the work queue indefinitely.
+                    if pending.len() < 256 { pending.insert(ch); }
+                }
+            }
+        });
+    }
+    ready
 }
 
 const JURA_GLYPH_SOURCE: f32 = 11.0;
@@ -49,7 +85,12 @@ const JURA_FIXED_GLYPH_SOURCE: f32 = 12.0;
 /// and atlas. For everything else, use Jura only when it actually contains it.
 fn proportional_glyph(font: &ProportionalFont, ch: char) -> (ProportionalGlyph, f32, f32) {
     if let Ok(byte) = u8::try_from(ch as u32) {
-        return (font.glyphs[byte as usize], 1.0, 2.0);
+        let stock = font.glyphs[byte as usize];
+        if stock.horiz_advance > 0 || stock.width > 0 || ch.is_whitespace() || ch.is_control() {
+            return (stock, 1.0, 2.0);
+        }
+        // A blank fontdat entry is genuinely missing, even if the codepoint
+        // fits in one byte. Preserve every actually authored JKA glyph.
     }
     if let Some((glyph, jura_height, _)) = jura_glyph(ch) {
         return (glyph, f32::from(font.height) / f32::from(jura_height.max(1)), JURA_GLYPH_SOURCE);
@@ -292,6 +333,9 @@ pub fn parse_fontdat(bytes: &[u8]) -> Result<ProportionalFont, String> {
     let _ascender = read_i16(bytes, &mut offset);
     let _descender = read_i16(bytes, &mut offset);
     let _korean_hack = read_i16(bytes, &mut offset);
+    // Retail arialnb leaves height/ascender/descender zero. OpenJK/TaystJK
+    // use point size as height for these legacy fontdat headers.
+    let height = if height == 0 { point_size } else { height };
     if point_size <= 0 || height <= 0 {
         return Err(format!(
             "fontdat has invalid dimensions point_size={point_size} height={height}"
@@ -996,7 +1040,11 @@ impl<'a> UiText<'a> {
             super::ChatFont::Modern => Self::new(ui, legacy, w, h),
             super::ChatFont::Jura => {
                 let mut text = Self::legacy_with_wide(ui, legacy, w, h);
-                text.jura = UNICODE_FALLBACK.with(|cell| cell.borrow().is_some());
+                // Keep legacy chat visible while Jura is being loaded, or
+                // indefinitely when no suitable fallback font is installed.
+                let ready_h = jura_glyph('H').is_some();
+                let ready_question = jura_glyph('?').is_some();
+                text.jura = ready_h && ready_question;
                 text
             }
         }
@@ -1056,6 +1104,12 @@ impl<'a> UiText<'a> {
                 }
                 continue;
             }
+            if (ch as u32) > 255 && font.wide_glyph(ch).is_none() {
+                if let Some((glyph, height, _)) = jura_glyph(ch) {
+                    width += f32::from(glyph.horiz_advance.max(0)) * px / f32::from(height.max(1));
+                    continue;
+                }
+            }
             width += f32::from(font.glyph_for(ch).horiz_advance.max(0)) * scale;
         }
         width
@@ -1081,25 +1135,31 @@ impl<'a> UiText<'a> {
                     }
                     continue;
                 }
-                let glyph = font.glyph_for(ch);
+                let fallback = ((ch as u32) > 255 && font.wide_glyph(ch).is_none())
+                    .then(|| jura_glyph(ch)).flatten();
+                let (glyph, glyph_scale, source) = if let Some((glyph, height, _)) = fallback {
+                    (glyph, px / f32::from(height.max(1)), JURA_GLYPH_SOURCE)
+                } else {
+                    (font.glyph_for(ch), scale, CLEAN_FONT_SOURCE)
+                };
                 if glyph.width > 0 && glyph.height > 0 && ch != ' ' {
                     let offset = if pass { shadow } else { 0.0 };
                     let tint = if pass { [0.0, 0.0, 0.0, color[3] * 0.55] } else { active };
                     textured_rect_with_source(
                         out,
-                        cursor + f32::from(glyph.horiz_offset) * scale + offset,
-                        baseline - glyph.baseline as f32 * scale + offset,
-                        f32::from(glyph.width) * scale,
-                        f32::from(glyph.height) * scale,
+                        cursor + f32::from(glyph.horiz_offset) * glyph_scale + offset,
+                        baseline - glyph.baseline as f32 * glyph_scale + offset,
+                        f32::from(glyph.width) * glyph_scale,
+                        f32::from(glyph.height) * glyph_scale,
                         [glyph.s, glyph.t],
                         [glyph.s2, glyph.t2],
                         tint,
-                        CLEAN_FONT_SOURCE,
+                        source,
                         w,
                         h,
                     );
                 }
-                cursor += f32::from(glyph.horiz_advance.max(0)) * scale;
+                cursor += f32::from(glyph.horiz_advance.max(0)) * glyph_scale;
             }
         }
     }
@@ -1204,6 +1264,17 @@ mod widescreen_font_tests {
     use super::*;
 
     #[test]
+    fn legacy_arialnb_fontdat_uses_point_size_for_zero_height() {
+        let mut bytes = vec![0u8; 256 * 28 + 10];
+        bytes[256 * 28..256 * 28 + 2].copy_from_slice(&14i16.to_le_bytes());
+        let font = parse_fontdat(&bytes).unwrap();
+        assert_eq!(font.height, 14);
+        assert_eq!(font.point_size, 14);
+        bytes[256 * 28 + 2..256 * 28 + 4].copy_from_slice(&(-1i16).to_le_bytes());
+        assert!(parse_fontdat(&bytes).is_err());
+    }
+
+    #[test]
     fn jura_console_glyph_height_does_not_shrink_with_wide_letters() {
         let mut glyphs = std::collections::HashMap::new();
         for (ch, width) in [('Ж', 40), ('І', 8)] {
@@ -1213,7 +1284,7 @@ mod widescreen_font_tests {
             });
         }
         let _scope = UnicodeFallbackScope::enter(Some(std::sync::Arc::new(
-            super::super::UnicodeFallbackFont { glyphs, height: 32, cap_height: 16.0 },
+            super::super::UnicodeFallbackFont { glyphs, cap_heights: std::collections::HashMap::new(), failed: std::collections::HashSet::new(), height: 32, cap_height: 16.0 },
         )));
         let mut out = Vec::new();
         fixed_charset_text(&mut out, "ЖІ", 10.0, 20.0, 8.0, 16.0,
@@ -1243,7 +1314,7 @@ mod widescreen_font_tests {
             1.0, [1.0; 4], true, 1920, 1080);
         let glyphs = value.chars().map(|ch| (ch, ProportionalGlyph::default())).collect();
         let _loaded = UnicodeFallbackScope::enter(Some(std::sync::Arc::new(
-            super::super::UnicodeFallbackFont { glyphs, height: 64, cap_height: 40.0 },
+            super::super::UnicodeFallbackFont { glyphs, cap_heights: std::collections::HashMap::new(), failed: std::collections::HashSet::new(), height: 64, cap_height: 40.0 },
         )));
         let mut after = Vec::new();
         proportional_text_uniform(&mut after, &value, &legacy, 10.0, 24.0,
@@ -1262,7 +1333,7 @@ mod widescreen_font_tests {
         let _empty = UnicodeFallbackScope::enter(None);
         {
             let _loaded = UnicodeFallbackScope::enter(Some(std::sync::Arc::new(
-                super::super::UnicodeFallbackFont { glyphs, height: 24, cap_height: 18.0 },
+                super::super::UnicodeFallbackFont { glyphs, cap_heights: std::collections::HashMap::new(), failed: std::collections::HashSet::new(), height: 24, cap_height: 18.0 },
             )));
             assert_eq!(proportional_text_width("^1AЖ", &legacy, 1.0), 27.0);
             assert_eq!(wrap_proportional_text("A ЖA", &legacy, 1.0, 27.0), "A\nЖA\n");
@@ -1284,6 +1355,26 @@ mod widescreen_font_tests {
     }
 
     #[test]
+    fn lazy_glyph_requests_skip_stock_text_and_cache_failed_unicode() {
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let failed_font = std::sync::Arc::new(super::super::UnicodeFallbackFont {
+            glyphs: std::collections::HashMap::new(),
+            cap_heights: std::collections::HashMap::new(),
+            failed: std::collections::HashSet::from(['\u{1F642}']),
+            height: 64, cap_height: 42.0,
+        });
+        let _scope = UnicodeFallbackScope::enter_with_requests(Some(failed_font), Some(queue.clone()));
+        let stock = test_font();
+        let _ = proportional_glyph(&stock, 'A');
+        assert!(queue.lock().unwrap().is_empty(), "stock ASCII never queues a font");
+        let _ = proportional_glyph(&stock, '你');
+        let _ = proportional_glyph(&stock, '你');
+        assert_eq!(queue.lock().unwrap().len(), 1, "duplicate requests are deduplicated");
+        let _ = proportional_glyph(&stock, '\u{1F642}');
+        assert_eq!(queue.lock().unwrap().len(), 1, "known missing font never retries");
+    }
+
+    #[test]
     fn jura_fallback_never_replaces_a_stock_byte_glyph() {
         let legacy = test_font();
         let mut glyphs = std::collections::HashMap::new();
@@ -1292,7 +1383,7 @@ mod widescreen_font_tests {
             s2: 1.0, t2: 1.0, ..Default::default()
         });
         let _scope = UnicodeFallbackScope::enter(Some(std::sync::Arc::new(
-            super::super::UnicodeFallbackFont { glyphs, height: 12, cap_height: 8.0 },
+            super::super::UnicodeFallbackFont { glyphs, cap_heights: std::collections::HashMap::new(), failed: std::collections::HashSet::new(), height: 12, cap_height: 8.0 },
         )));
         let mut out = Vec::new();
         proportional_text_uniform(&mut out, "AЖA", &legacy, 10.0, 24.0,

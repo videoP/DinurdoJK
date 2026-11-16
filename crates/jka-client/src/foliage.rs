@@ -3,14 +3,16 @@ use jka_assets::shader::Shader;
 
 /// Covers the maximum shader displacement on every axis (in renderer units).
 pub(crate) const BOUNDS_PADDING: f32 = 8.0;
-pub(crate) const MATERIAL_FLAG: u32 = 1 << 18;
 
-pub(crate) const SHADER: &str = include_str!("foliage_wind.wgsl");
+pub(crate) fn shader() -> &'static str {
+    static SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SOURCE.get_or_init(|| format!("{}\n{}", crate::material_flags::shader_constants(), include_str!("foliage_wind.wgsl")))
+}
 
 /// World shader composition also includes the existing snow/footprint module.
-/// Models consume SHADER directly without binding any world-only resources.
+/// Models consume shader() directly without binding any world-only resources.
 pub(crate) fn surface_shader() -> String {
-    format!("{SHADER}\n{}", include_str!("surface_deformation.wgsl"))
+    format!("{}\n{}", shader(), include_str!("surface_deformation.wgsl"))
 }
 
 /// All scene cameras share the existing grass wind texture. Vertex-stage

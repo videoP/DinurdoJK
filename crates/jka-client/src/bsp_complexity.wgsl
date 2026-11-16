@@ -35,14 +35,14 @@ struct HeatmapVertexInput {
 @fragment fn fs_cost(input: HeatmapVertexInput) -> @location(0) vec4<f32> {
     let sampled = textureSample(base_texture, base_sampler, input.uv);
     var stage_alpha = material.color.a;
-    if ((material.header.z & 1048576u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_ALPHA_VERTEX) != 0u) {
         stage_alpha *= input.color.a;
-    } else if ((material.header.z & 2097152u) != 0u) {
+    } else if ((material.header.z & MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX) != 0u) {
         stage_alpha *= 1.0 - input.color.a;
     }
     let alpha = sampled.a * stage_alpha;
     let source_alpha = sampled.a * material.color.a;
-    let mask_alpha = select(alpha, source_alpha, (material.header.z & 1073741824u) != 0u);
+    let mask_alpha = select(alpha, source_alpha, (material.header.z & MATERIAL_FLAG_MASK_TEXTURE_ALPHA) != 0u);
     if ((material.params.x > 0.0 && mask_alpha < material.params.x)
         || (material.params.x < 0.0 && mask_alpha >= -material.params.x)) {
         discard;

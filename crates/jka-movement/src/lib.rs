@@ -772,6 +772,8 @@ pub struct PredictionEntity {
     pub saber_move: i32,
     /// 0 unknown, 1 func_train, 2 func_door/func_plat.
     pub mover_class: i32,
+    /// Wire entityState_t.solid; PM_CheckJump uses SOLID_BMODEL on brush hits.
+    pub solid: i32,
 }
 // Ownership is exclusive; native globals are always protected by NativeGuard.
 unsafe impl Send for PlayerState {}

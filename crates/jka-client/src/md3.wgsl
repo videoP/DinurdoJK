@@ -201,6 +201,54 @@ fn fs_glass(input: VertexOut) -> @location(0) vec4<f32> {
         camera.camera_pos_time.w, tint, f0);
 }
 
+// TaystJK rd-vanilla/tr_shade_calc.cpp RB_CalcDisintegrateColors.
+// The two shader passes encode their elapsed 0..1500ms in vertex/draw alpha.
+// Their reserved ranges never overlap the existing cloak/force-refraction tags.
+fn is_disintegration(tag: f32) -> bool {
+    return (tag >= -22.01 && tag <= -20.99)
+        || (tag >= -20.01 && tag <= -18.99);
+}
+
+fn disintegration_threshold2(tag: f32) -> f32 {
+    let progress = select(tag + 22.0, tag + 20.0, tag > -20.5);
+    let radius = clamp(progress, 0.0, 1.0) * 1500.0 * 0.045;
+    return radius * radius;
+}
+
+fn disintegration_keep(tag: f32, world: vec3<f32>, hit: vec3<f32>) -> bool {
+    let diff = hit - world;
+    return dot(diff, diff) >= disintegration_threshold2(tag);
+}
+
+// RF_DISINTEGRATE1: surviving skinned body, progressively charred in the
+// original squared-distance bands (+60, +150, +180).
+fn disintegration_body_color(
+    color: vec4<f32>, tag: f32, world: vec3<f32>, hit: vec3<f32>,
+) -> vec4<f32> {
+    let diff = hit - world;
+    let d2 = dot(diff, diff);
+    let threshold2 = disintegration_threshold2(tag);
+    if (d2 < threshold2) { discard; }
+    var shade = 1.0;
+    if (d2 < threshold2 + 60.0) {
+        shade = 0.0;
+    } else if (d2 < threshold2 + 150.0) {
+        shade = 111.0 / 255.0;
+    } else if (d2 < threshold2 + 180.0) {
+        shade = 175.0 / 255.0;
+    }
+    return vec4<f32>(color.rgb * shade, 1.0);
+}
+
+// RF_DISINTEGRATE2: TaystJK's burn material is drawn wherever the expanding
+// disintegration front has not yet consumed the surface.
+fn disintegration_burn_color(
+    color: vec4<f32>, tag: f32, world: vec3<f32>, hit: vec3<f32>,
+) -> vec4<f32> {
+    if (!disintegration_keep(tag, world, hit)) { discard; }
+    return vec4<f32>(color.rgb, clamp(color.a, 0.0, 1.0));
+}
+
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
@@ -215,6 +263,14 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
+    if (is_disintegration(input.color.a)) {
+        if (tex.a < 0.5) { discard; }
+        let lit = fogged(
+            model_wet_color_with_water(studio_light_color(lit_color(input.normal, input.world_position, tex) * vec4<f32>(input.color.rgb, 1.0), tex * vec4<f32>(input.color.rgb, 1.0), input.normal, input.world_position), input.normal, input.world_position, 0.0),
+            input.world_position, false);
+        return disintegration_body_color(lit, input.color.a,
+            input.world_position, input.predator_local);
+    }
     if tex.a < 0.5 {
         discard;
     }
@@ -229,6 +285,12 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
 @fragment
 fn fs_unlit(input: VertexOut) -> @location(0) vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
+    if (is_disintegration(input.color.a)) {
+        return disintegration_burn_color(
+            fogged(vec4<f32>(tex.rgb * input.color.rgb, tex.a),
+                input.world_position, false),
+            input.color.a, input.world_position, input.predator_local);
+    }
     if input.legacy_blob > 0.5 {
         // Classic JKA darkened encoded display RGB. Alpha blending in our
         // linear scene otherwise makes its ~50%-alpha black blob much fainter.
@@ -262,6 +324,8 @@ struct PrepassVertexOut {
     // Thermal heat-source distance carried by RT compute-skinned Ghoul2
     // (ghoul2_skin_compute.wgsl), < 0 for an ordinary MD3 / cold model.
     @location(3) heat_alpha: f32,
+    @location(4) @interpolate(flat) disintegration_tag: f32,
+    @location(5) disintegration_hit: vec3<f32>,
 };
 
 struct PrepassOut {
@@ -323,6 +387,8 @@ fn vs_prepass(input: VertexIn) -> PrepassVertexOut {
     // depth_hack holds positionLocal instead.
     let warm = !is_predator && input.depth_hack > 0.0 && input.depth_hack <= 0.5;
     output.heat_alpha = select(-1.0, 1.0 - (input.depth_hack - 0.01) / 0.48, warm);
+    output.disintegration_tag = input.color.a;
+    output.disintegration_hit = vec3<f32>(input.depth_hack, input.water_wetness, input.foliage_wind);
     return output;
 }
 
@@ -333,6 +399,10 @@ fn fs_prepass(input: PrepassVertexOut) -> PrepassOut {
 
 @fragment
 fn fs_prepass_mask(input: PrepassVertexOut) -> PrepassOut {
+    if (is_disintegration(input.disintegration_tag)
+        && !disintegration_keep(input.disintegration_tag,
+            input.world_position, input.disintegration_hit)) { discard; }
+
     if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
         discard;
     }
@@ -357,6 +427,10 @@ fn fs_prepass_motion(input: PrepassVertexOut) -> PrepassOut {
 
 @fragment
 fn fs_prepass_mask_motion(input: PrepassVertexOut) -> PrepassOut {
+    if (is_disintegration(input.disintegration_tag)
+        && !disintegration_keep(input.disintegration_tag,
+            input.world_position, input.disintegration_hit)) { discard; }
+
     if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
         discard;
     }
@@ -372,6 +446,10 @@ fn fs_rain_prepass(input: PrepassVertexOut) -> @location(0) f32 {
 
 @fragment
 fn fs_rain_prepass_mask(input: PrepassVertexOut) -> @location(0) f32 {
+    if (is_disintegration(input.disintegration_tag)
+        && !disintegration_keep(input.disintegration_tag,
+            input.world_position, input.disintegration_hit)) { discard; }
+
     if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
         discard;
     }
@@ -383,6 +461,10 @@ fn fs_rain_prepass_mask(input: PrepassVertexOut) -> @location(0) f32 {
 // surfaces need this discard. Same 0.5 cutoff as fs_prepass_mask.
 @fragment
 fn fs_shadow_mask(input: PrepassVertexOut) {
+    if (is_disintegration(input.disintegration_tag)
+        && !disintegration_keep(input.disintegration_tag,
+            input.world_position, input.disintegration_hit)) { discard; }
+
     if textureSample(base_texture, base_sampler, input.uv).a < 0.5 {
         discard;
     }

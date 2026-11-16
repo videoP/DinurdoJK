@@ -283,6 +283,9 @@ pub fn build_crosshair_vertices(
             Some(&ui.icon_shader_flags),
         );
     }
+    if ui.crosshair.style != 0 {
+        draw_hacking_bar(out, ui, screen_position, w, h);
+    }
     // The Studio reuses its otherwise-unused CrosshairName layout slot to
     // position the *actual* crosshair. This transform only runs in Studio:
     // cg_hudCrosshairName and normal gameplay remain unchanged.
@@ -297,6 +300,61 @@ pub fn build_crosshair_vertices(
             v.position=[x*2.0/w as f32-1.0,1.0-y*2.0/h as f32];
         }
     }
+}
+
+/// Faithful TaystJK CG_DrawHaqrBar (cg_draw.c). The yellow region represents
+/// time *remaining*, not time completed. Source geometry is in virtual 640x480
+/// units, with the same widescreen widthRatioCoef used by the old renderer.
+fn draw_hacking_bar(
+    out: &mut Vec<UiVertex>,
+    ui: &UiSnapshot,
+    screen_position: Option<[f32; 2]>,
+    w: u32,
+    h: u32,
+) {
+    let Some(hack) = ui.hack_progress else { return; };
+    if hack.base_time <= 0 || w == 0 || h == 0 { return; }
+
+    const HEALTH_WIDTH: f32 = 50.0;
+    const HEALTH_HEIGHT: f32 = 5.0;
+    let sx = w as f32 / 640.0;
+    let sy = h as f32 / 480.0;
+    let ratio = crate::lagometer::width_ratio_coef(w, h);
+    let [cx, cy] = screen_position.unwrap_or([w as f32 * 0.5, h as f32 * 0.5]);
+    let ch_w = ui.crosshair.size;
+    let ch_h = ui.crosshair.size;
+    let ch_x = cx / sx - ch_w * 0.5;
+    let ch_y = cy / sy - ch_h * 0.5;
+    let x = ch_x + (ch_w * 0.5 - HEALTH_WIDTH * 0.5) * ratio;
+    let y = ch_y + ch_h + 8.0;
+    let percent = (hack.end_time as f32 - hack.time as f32)
+        / hack.base_time as f32 * HEALTH_WIDTH * ratio;
+    // CG_DrawHaqrBar returns rather than clamping when the remaining-time
+    // calculation is outside the original bounds.
+    if percent > HEALTH_WIDTH || percent < 1.0 { return; }
+
+    // CG_DrawRect(x,y,50*ratio,5,1,black), equivalent 4-pixel border.
+    let width = HEALTH_WIDTH * ratio;
+    let edge = 1.0;
+    let black = [0.0, 0.0, 0.0, 1.0];
+    rect(out, x*sx, y*sy, width*sx, edge*sy, black, w, h);
+    rect(out, x*sx, (y+HEALTH_HEIGHT-edge)*sy, width*sx, edge*sy, black, w, h);
+    rect(out, x*sx, (y+edge)*sy, edge*sx, (HEALTH_HEIGHT-2.0*edge)*sy, black, w, h);
+    rect(out, (x+width-edge)*sx, (y+edge)*sy, edge*sx, (HEALTH_HEIGHT-2.0*edge)*sy, black, w, h);
+    rect(out, (x+ratio)*sx, (y+1.0)*sy,
+         (percent-ratio)*sx, (HEALTH_HEIGHT-1.0)*sy,
+         [1.0, 1.0, 0.0, 0.4], w, h);
+    rect(out, (x+percent)*sx, (y+1.0)*sy,
+         ((HEALTH_WIDTH-1.0)*ratio-percent)*sx, (HEALTH_HEIGHT-1.0)*sy,
+         [0.5, 0.5, 0.5, 0.1], w, h);
+
+    let icon = super::movement::ICON_HACK_TECH;
+    let (uv0, uv1) = ui.icon_uv(icon);
+    textured_rect_with_source(
+        out, x*sx, (y-HEALTH_WIDTH)*sy,
+        HEALTH_WIDTH*ratio*sx, HEALTH_WIDTH*sy,
+        uv0, uv1, [1.0; 4], ui.icon_texture_source(icon), w, h,
+    );
 }
 
 pub(in crate::ui) fn build_crosshair(
@@ -477,6 +535,55 @@ mod icon_aspect_tests {
                 - x.fold(f32::INFINITY, f32::min);
             assert!((width - 2.0 * h as f32 / 480.0).abs() < 0.01);
         }
+    }
+
+    #[test]
+    fn taystjk_hack_timer_uses_stock_icon_and_depleting_bar() {
+        let mut ui = UiSnapshot::default();
+        ui.video.draw_2d = true;
+        ui.hack_progress = Some(crate::ui::UiHackProgress {
+            end_time: 2_000, base_time: 1_000, time: 1_500,
+        });
+        let (w, h) = (1920_u32, 1080_u32);
+        assert_eq!(
+            super::super::movement::ICON_NAMES[super::super::movement::ICON_HACK_TECH],
+            "gfx/mp/c_icon_tech"
+        );
+
+        let mut baseline = Vec::new();
+        let mut no_hack = ui.clone();
+        no_hack.hack_progress = None;
+        build_crosshair_vertices(&mut baseline, &no_hack, None, w, h);
+        let mut vertices = Vec::new();
+        build_crosshair_vertices(&mut vertices, &ui, None, w, h);
+        // CG_DrawRect = four strips, CG_FillRect = two regions, CG_DrawPic = icon.
+        assert_eq!(vertices.len() - baseline.len(), 7 * 6);
+
+        let new_vertices = &vertices[baseline.len()..];
+        let yellow_quad = &new_vertices[4*6..5*6];
+        let bar_width = yellow_quad.iter().map(|v| (v.position[0]+1.0)*w as f32*0.5);
+        let bar_width = bar_width.clone().fold(f32::NEG_INFINITY, f32::max)
+            - bar_width.fold(f32::INFINITY, f32::min);
+        // Half of 50 virtual units, minus the 1-unit widescreen inset.
+        let ratio = crate::lagometer::width_ratio_coef(w,h);
+        let expected = (25.0*ratio - ratio)*w as f32/640.0;
+        assert!((bar_width-expected).abs() < 0.02);
+
+        let icon_quad = &new_vertices[6*6..7*6];
+        let bounds = |axis: usize| {
+            let coords = icon_quad.iter().map(|v| if axis == 0 {
+                (v.position[0]+1.0)*w as f32*0.5
+            } else { (1.0-v.position[1])*h as f32*0.5 });
+            coords.clone().fold(f32::NEG_INFINITY, f32::max)
+                - coords.fold(f32::INFINITY, f32::min)
+        };
+        assert!((bounds(0)-bounds(1)).abs() < 0.02);
+
+        // Source returns without drawing once the remaining time is below 1.
+        ui.hack_progress.as_mut().unwrap().time = 2_000;
+        vertices.clear();
+        build_crosshair_vertices(&mut vertices, &ui, None, w, h);
+        assert_eq!(vertices.len(), baseline.len());
     }
 
     #[test]

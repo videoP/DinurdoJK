@@ -433,6 +433,22 @@ struct Key {
     locals: Vec<(usize, scene::DynamicLight)>,
 }
 
+/// An explicit Realtime sun is lit by live CSM; its static source is not
+/// needed even if the general baked-sun-cache preference remains enabled for
+/// authored-sun removal. Ordinary (non-relit) cache users are unchanged.
+fn needs_static_replacement_sun(
+    cache: bool, debug_mode: u32, csm: bool, relighting_mode: u8, sun_override: bool,
+) -> bool {
+    cache && debug_mode == 0 && csm && !(sun_override && relighting_mode == 2)
+}
+
+/// Only replacement sunlight depends on the player's sun direction. Sky
+/// openness, white-sky transport and local emitters are fixed in map space.
+/// Never let time/yaw/pitch invalidate their cached geometry traces.
+fn static_trace_direction(bake_sun: bool, current: [f32; 3]) -> [f32; 3] {
+    if bake_sun { current } else { [0.0, -1.0, 0.0] }
+}
+
 /// A q3map LIGHTMAP_BY_VERTEX BSP receiver without a lightmap atlas coordinate.
 /// Its authored colour stays immutable; the sky-only GPU composition consumes
 /// this position-independent baked visibility using the same packed format as luxels.
@@ -916,7 +932,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
     );
     // Receiver triangle per covered luxel: terminator origins, edge AA and
     // the chart/normal debug layers. Owner-checked, so charts never mix.
-    let page_ids: Vec<Vec<usize>> = if key.bake_sun && (key.terminator || key.aa != 0 || key.debug_layers != 0 || key.sky != 0) {
+    let page_ids: Vec<Vec<usize>> = if key.bake_sun && (key.terminator || key.aa != 0 || key.debug_layers != 0) || key.sky != 0 {
         samples.par_iter().zip(&key.sizes).enumerate()
             .map(|(page, (texels, &size))| receiver_triangles(receivers, page, size, texels))
             .collect()
@@ -995,7 +1011,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
     progress.set(2, 40);
     let sun_total: u32 = samples.iter().map(|v| v.len() as u32).sum::<u32>().max(1);
     let sun_done = AtomicU32::new(0);
-    let mut pages: Vec<Vec<f32>> = samples
+    let mut pages: Vec<Vec<f32>> = if key.bake_sun { samples
         .par_iter()
         .zip(&key.sizes)
         .map(|(samples, size)| {
@@ -1008,7 +1024,6 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                     }
                     if cancel.load(Ordering::Relaxed) { return -1.0; }
                     let Some(sample) = sample else { return -1.0; };
-                    if !key.bake_sun { return 0.0; }
                     sun_flux(*sample)
                 })
                 .collect();
@@ -1020,7 +1035,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
             flux.extend(cosine);
             flux
         })
-        .collect();
+        .collect() } else { Vec::new() };
     progress.set(2, 600);
     if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
 
@@ -1100,7 +1115,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
     // authoritative: a vertex-colored sibling must not receive another sky
     // multiplier over an already composed lightmap. Stages share a geometry
     // range, so classify that range once before tracing any vertex.
-    let vertex_sky: Vec<VertexSkySample> = if key.bake_sun && key.sky == 2 {
+    let vertex_sky: Vec<VertexSkySample> = if key.sky == 2 {
         let lightmap_lit_ranges: std::collections::BTreeSet<(u32, u32)> = geometry.batches.iter()
             .flat_map(|batch| std::iter::once(batch).chain(batch.additive_companions.iter()))
             .filter(|batch| batch.modulate_lightmap || batch.texture_is_lightmap || batch.lightstyle_slot != 0)
@@ -1176,7 +1191,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                 if let Some(distance) = distance { open += visibility(origin, direction, distance); }
             }
             let facing = normal.dot(toward).max(0.0);
-            let direct = if facing > 0.0 {
+            let direct = if key.bake_sun && facing > 0.0 {
                 (sun_flux(StaticAoTexelSample {
                     position: position.to_array(), normal: normal.to_array(),
                 }) / facing).clamp(0.0, 1.0)
@@ -1193,7 +1208,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
     if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
 
     let mut transport = None;
-    let sky_pages = if key.bake_sun && key.sky != 0 {
+    let sky_pages = if key.sky != 0 {
         // The previous 87% "EDGE AA" state hid all sky tracing time. Reserve
         // a measured interval for the sky's 16 ambient hemisphere rays.
         // Direct visibility reuses the already completed sun/moon bake.
@@ -1374,22 +1389,33 @@ impl Renderer {
         } else {
             self.authored_sun()
         };
-        let bake_sun = self.baked_sun_cache
-            && self.baked_sun_debug_mode == 0
-            && self.cascaded_shadow_mode.is_csm();
+        // Realtime CSM already shades the replacement sun. In that mode a
+        // static directional bake adds no information and retraces the BSP on
+        // every time/yaw/pitch change. Keep Baked's directional bake intact.
+        let realtime_relight = self.sun_override && self.relighting_mode == 2;
+        let bake_sun = needs_static_replacement_sun(
+            self.baked_sun_cache, self.baked_sun_debug_mode, self.cascaded_shadow_mode.is_csm(),
+            self.relighting_mode, self.sun_override,
+        );
         let cloud_coverage_steps = if bake_sun { self.relight_cloud_coverage_steps() } else { 0 };
         let light_sources = self.added_map_light_sources();
         let bake_local = light_sources != 0 && self.baked_sun_debug_mode == 0;
-        let debug_layers = if matches!(self.lightmap_signal, 7 | 8) { self.lightmap_signal } else { 0 };
-        // B uses selected receiver normals and 16-ray ambient sky openness. Direct
-        // visibility comes from the existing sun/moon bake and its edge AA.
-        let sky = if bake_sun && self.sun_override && self.sky_world_bake_ab != 0
-            && self.sky_world_lighting_strength > 0.0 {
+        let debug_layers = if bake_sun && matches!(self.lightmap_signal, 7 | 8) {
+            self.lightmap_signal
+        } else { 0 };
+        // Protected rooms still need a one-shot *direction-independent* sky
+        // openness/transport bake in Realtime. The dynamic sun itself remains
+        // live CSM. Do not couple sky receiver preparation to sun tracing.
+        let sky = if self.baked_sun_cache && self.baked_sun_debug_mode == 0
+            && self.sun_override && self.sky_world_bake_ab != 0
+            && self.sky_world_lighting_strength > 0.0
+            && (bake_sun || (realtime_relight && self.sky_world_light_isolation)) {
             2
-        } else {
-            0
-        };
-        let sky_transport = sky == 2 && self.sky_backend == 1 && self.sky_world_light_isolation;
+        } else { 0 };
+        let sky_transport = sky == 2 && self.sky_world_light_isolation;
+        let trace_direction = static_trace_direction(bake_sun, sun.direction);
+        let aa = if bake_sun { self.baked_sun_aa } else { 0 };
+        let terminator = bake_sun && self.sun_terminator;
         let Some(world) = self.world.as_mut() else {
             return;
         };
@@ -1398,15 +1424,7 @@ impl Renderer {
             state.transport = None;
             state.sky_transport.clear();
         }
-        if self.sun_bake_deferred {
-            // A drag can begin while a previous trace is still running.
-            // Dropping Pending cancels it; no new worker starts until release.
-            if state.pending.take().is_some() {
-                state.bake_started = None;
-            }
-            return;
-        }
-        if (!bake_sun && !bake_local) || world.source_map || state.geometry.is_none() {
+        if (!bake_sun && sky == 0 && !bake_local) || world.source_map || state.geometry.is_none() {
             state.pending = None;
             state.key = None;
             state.bake_started = None;
@@ -1421,6 +1439,7 @@ impl Renderer {
             .baked_sun_cache
             .as_ref()
             .map_or(&world.lightmaps, |c| &c.original);
+        let images = &images[..world.baked_sun_lightmap_count];
         let same_sizes =
             state.source_sizes.len() == images.len()
                 && state.source_sizes.iter().zip(images).all(|(size, image)| {
@@ -1433,12 +1452,12 @@ impl Renderer {
             .or(state.failed.as_ref());
         let same_request = same_sizes
             && requested.is_some_and(|k| {
-                k.direction == sun.direction
+                k.direction == trace_direction
                     && k.cloud_coverage_steps == cloud_coverage_steps
                     && k.bake_sun == bake_sun
-                    && k.aa == self.baked_sun_aa
+                    && k.aa == aa
                     && k.normals == self.sun_receiver_normals
-                    && k.terminator == self.sun_terminator
+                    && k.terminator == terminator
                     && k.debug_layers == debug_layers
                     && k.sky == sky
                     && k.sky_transport == sky_transport
@@ -1452,6 +1471,15 @@ impl Renderer {
                     && k.models == self.draw_bsp_model_surfaces
                     && k.tinted == self.tinted_glass_enabled
             });
+        if self.sun_bake_deferred {
+            // Slider drags defer new direction-dependent work, but must not
+            // cancel an in-flight job whose key is still valid (intensity,
+            // Time of Day in Realtime, or unrelated menu interaction).
+            if !same_request && state.pending.take().is_some() {
+                state.bake_started = None;
+            }
+            return;
+        }
         let outcome = if same_request {
             state.pending.as_ref().and_then(|p| match p.rx.try_recv() {
                 Ok(value) => Some(value),
@@ -1483,7 +1511,7 @@ impl Renderer {
             .collect();
         state.source_sizes = base.clone();
         let key = Key {
-            direction: sun.direction,
+            direction: trace_direction,
             cloud_coverage_steps,
             visibility: self.sun_visibility,
             models: self.draw_bsp_model_surfaces,
@@ -1494,9 +1522,9 @@ impl Renderer {
                 base.clone()
             },
             bake_sun,
-            aa: self.baked_sun_aa,
+            aa,
             normals: self.sun_receiver_normals,
-            terminator: self.sun_terminator,
+            terminator,
             debug_layers,
             sky,
             sky_sizes: if sky == 2 { base.clone() } else { Vec::new() },
@@ -1786,11 +1814,33 @@ impl StaticSun {
     pub(in crate::renderer) fn ready(&self) -> bool {
         self.key.as_ref().is_some_and(|k| k.bake_sun) && !self.flux.is_empty()
     }
+    pub(in crate::renderer) fn sky_ready(&self) -> bool {
+        self.key.as_ref().is_some_and(|k| k.sky != 0)
+            && (!self.sky_normals.is_empty() || !self.vertex_sky.is_empty())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sky_and_local_cache_keys_ignore_live_sun_edits_but_baked_sun_does_not() {
+        assert!(needs_static_replacement_sun(true, 0, true, 1, true),
+            "Baked relighting recomputes replacement sunlight when its direction changes");
+        assert!(!needs_static_replacement_sun(true, 0, true, 2, true),
+            "Realtime relighting uses live CSM even when r_bakedSunCache is enabled");
+        assert!(needs_static_replacement_sun(true, 0, true, 2, false),
+            "ordinary non-relit users of the cache are not affected by Environment mode");
+        assert!(!needs_static_replacement_sun(false, 0, true, 1, true));
+        assert!(!needs_static_replacement_sun(true, 1, true, 1, true));
+        let sunrise = [0.0, -0.1, -0.995];
+        let midnight = [0.0, 1.0, 0.0];
+        assert_eq!(static_trace_direction(false, sunrise), static_trace_direction(false, midnight),
+            "Realtime sky transport and fixed local sources must survive time/yaw/pitch edits");
+        assert_ne!(static_trace_direction(true, sunrise), static_trace_direction(true, midnight),
+            "Baked replacement-sun visibility must follow edited sun direction");
+    }
 
     #[test]
     fn vertex_sky_bake_uses_world_stage_lighting_not_bsp_lightmap_metadata() {
@@ -2013,6 +2063,18 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let progress = BakeProgress::default();
         let pages = trace(&geometry, &key, &cancel, &progress, None).unwrap().sun;
+        let realtime_key = Key {
+            direction: static_trace_direction(false, [0.5, -0.5, 0.7]),
+            bake_sun: false, sky: 2, sky_sizes: vec![[32, 32]],
+            ..key.clone()
+        };
+        let sky_only = trace(&geometry, &realtime_key, &cancel, &progress, None).unwrap();
+        assert!(sky_only.sun.is_empty(), "Realtime must not trace replacement sunlight");
+        assert_eq!(sky_only.sky.len(), 1, "Realtime protection retains sky-openness receivers");
+        assert_eq!(sky_only.sky[0].len(), 32 * 32);
+        assert!(sky_only.sky[0].iter().any(|packed| *packed != 0));
+        assert!(sky_only.vertex_sky.iter().all(|vertex| (vertex.packed >> 6) & 31 == 0),
+            "sky-only receivers must not carry a stale directional sun trace");
         assert_eq!(pages[0][4 * 32 + 4], 0.0, "roof blocks the sun");
         assert_eq!(pages[0][4 * 32 + 24], 1.0, "open floor receives the sun");
         let cloudy_key = Key { cloud_coverage_steps: 20, ..key.clone() };

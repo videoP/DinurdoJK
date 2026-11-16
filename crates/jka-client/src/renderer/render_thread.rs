@@ -2072,8 +2072,8 @@ pub(in crate::renderer) fn render_thread_main(
                             renderer.stream_output.pause_unsupported("Spout is disabled in Render Studio");
                         }
                     }
-                    Ok(RenderCommand::SetCombatUi { zoom_scope, rocket_lock }) =>
-                        renderer.set_combat_ui(zoom_scope, rocket_lock),
+                    Ok(RenderCommand::SetCombatUi { zoom_scope, rocket_lock, hack_progress }) =>
+                        renderer.set_combat_ui(zoom_scope, rocket_lock, hack_progress),
                     Ok(RenderCommand::SetNeonMenu(frame)) => renderer.set_neon_menu(frame),
                     Ok(RenderCommand::SetNeonChrome(frame)) => renderer.set_neon_chrome(frame),
                     Ok(RenderCommand::SetNeonMenuCache(image)) => {
@@ -2553,6 +2553,7 @@ pub(in crate::renderer) fn render_thread_main(
                 if shader_progress_polled_at.elapsed() >= Duration::from_millis(90) {
                     shader_progress_polled_at = Instant::now();
                     renderer.refresh_shader_compile_progress();
+                    renderer.poll_unicode_fonts();
                 }
                 // One queued export capture per loop: it delivers this iteration.
                 if let Some(capture) = renderer.studio_capture_queue.pop_front() {

@@ -379,6 +379,7 @@ fn shader_source() -> Result<String, String> {
     let donor = ray_traced_world_shader_source(include_str!("../../bsp.wgsl"))?;
     let declaration = rt_models::declaration;
     let mut source = String::from("enable wgpu_ray_query;\n");
+    source.push_str(crate::material_flags::shader_constants());
     for name in ["Camera", "LightingSettings", "PointLight", "ClusterRecord"] {
         source.push_str(declaration(&donor, &format!("struct {name} "))?);
         source.push_str(";\n");

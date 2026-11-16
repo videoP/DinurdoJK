@@ -1,4 +1,5 @@
 //! World upload.
+use crate::material_flags::*;
 use crate::renderer::{
     average_skybox_color, build_draw_compaction_groups, collect_planar_reflectors,
     collect_static_ao_lightmap_triangles, collect_static_ao_render_triangles,
@@ -75,6 +76,27 @@ fn dump_world_batches(
     match std::fs::write(path, out) {
         Ok(()) => println!("JKA_DUMP_WORLD_BATCHES: wrote {}", std::path::Path::new(path).display()),
         Err(error) => println!("JKA_DUMP_WORLD_BATCHES: {error}"),
+    }
+}
+
+/// Cold-path proof of foliage provenance at the actual GPU upload boundary.
+/// r_pipelineTrace enables records; no readback or frame-loop work is added.
+pub(super) fn trace_inline_material(
+    source: &DrawBatch,
+    uniform: &MaterialUniform,
+    slot: &UniformSlot,
+    excluded: bool,
+    path: &str,
+) {
+    let word = uniform.header[3];
+    debug_assert_eq!(word & MATERIAL_FLAG_FOLIAGE_WIND != 0, source.foliage_wind);
+    debug_assert_eq!(word & MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION != 0, excluded);
+    if crate::pipeline_jobs::pipeline_trace_enabled() {
+        println!("[INLINE MATERIAL] {path} debug={} shader={} slot_offset={} z={:#010x} w={:#010x} source_wind={} uploaded_wind={} baked_receiver_excluded={}",
+            source.material_debug_index, source.bsp_shader_index, slot.offset,
+            uniform.header[2], word, source.foliage_wind,
+            word & MATERIAL_FLAG_FOLIAGE_WIND != 0,
+            word & MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION != 0);
     }
 }
 
@@ -188,6 +210,8 @@ pub(in crate::renderer) fn build_world(
         map.textures.len()
     };
     let source_map = map.map_file_stats.is_some();
+    let sub_bsp_boundary = map.sub_bsp_boundary;
+    let baked_sun_lightmap_count = sub_bsp_boundary.map_or(map.lightmaps.len(), |b| b.lightmap);
     let pbr_legacy_baked_color = !source_map
         && !map.lightmaps.iter().any(|image| image.label.to_ascii_lowercase().ends_with(".hdr"));
     let pbr_baked_color_flags = u32::from(pbr_legacy_baked_color)
@@ -290,16 +314,17 @@ pub(in crate::renderer) fn build_world(
     let texture_classify_ms = texture_classify_started.elapsed().as_secs_f64() * 1000.0;
     // No sunlight tracing, calibration or cache I/O on the upload thread.
     // Retain cheap material metadata plus shared inputs for a requested bake.
-    // All *N brush-model classes use the same original BSP lightmap rules.
+    // Main-map *N brush models use the same original BSP lightmap rules.
     // A door, rotating platform or mod-defined BMODEL keeps its authored
     // charts even when it moves: the single cached bake uses the compiled
-    // BSP pose. No class, instance-count or transform whitelist applies.
+    // BSP pose. Imported BSPs have a separate lighting context and must never
+    // cast at their untransformed coordinates in this static bake.
     // Unlightmapped/vertex-lit stages never acquire synthetic charts.
     let inline_bake_eligible: Vec<bool> = inline_batch_sources.iter().map(|batch| {
         !source_map && inline_vertices
             .get(batch.vertices.start as usize..batch.vertices.end as usize)
             .is_some_and(|vertices| inline_original_lightmap_receiver(
-                batch.lightmap, batch.pipeline.class, vertices, lightmap_data.len()))
+                batch.lightmap, batch.pipeline.class, vertices, baked_sun_lightmap_count))
     }).collect();
     let mut sun_bake_batches = if !source_map { coarse_sources.clone() } else { Vec::new() };
     let mut inline_bake_batches = 0usize;
@@ -317,6 +342,7 @@ pub(in crate::renderer) fn build_world(
         let mut seen_receivers = BTreeSet::<(u32, u32, usize)>::new();
         let mut seen_vertex_sky = BTreeSet::<(usize, u32, u32)>::new();
         for (slot, model) in inline_model_sources.iter().enumerate() {
+            if sub_bsp_boundary.is_some_and(|b| model.model >= b.model) { continue; }
             for index in model.batches.clone() {
                 let batch = &inline_batch_sources[index];
                 let lightmapped = inline_bake_eligible.get(index).copied().unwrap_or(false);
@@ -346,7 +372,7 @@ pub(in crate::renderer) fn build_world(
         }
     }
     if !inline_model_sources.is_empty() {
-        println!("[SUN LIGHTMAP] inline BSP: {} original-lightmap chart batch(es), {} original vertex-lit sky batch(es) (all BMODEL classes, compiled pose); {} model(s) without lightmap charts",
+        println!("[SUN LIGHTMAP] inline BSP: {} original-lightmap chart batch(es), {} original vertex-lit sky batch(es) (main BSP only, compiled pose); {} model(s) without lightmap charts",
             inline_bake_batches, inline_vertex_sky_batches,
             inline_model_sources.iter().filter(|m| !m.batches.clone().any(|index|
                 inline_bake_eligible.get(index).copied().unwrap_or(false))).count());
@@ -1299,11 +1325,11 @@ pub(in crate::renderer) fn build_world(
                 && baked_additive_ranges.contains(&(source.vertices.start, source.vertices.end))
                 && source.baked_sky_additive_stage()
                 && source.additive_companions.iter().all(DrawBatch::baked_sky_additive_stage);
-            if additive_bake_enabled { material_uniform.header[3] |= 1 << 19; }
+            if additive_bake_enabled { material_uniform.header[3] |= MATERIAL_FLAG_BAKED_ADDITIVE; }
             if inline_sources && !inline_baked_lightmap {
                 // No original lightmap receiver exists here; do not sample
                 // cached UV-space sun visibility on this stage.
-                material_uniform.header[3] |= 1 << 18;
+                material_uniform.header[3] |= MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION;
             }
             if let Some(appearance) = surface_key.and_then(|key| ocean_appearances.get(&key)) {
                 material_uniform.ocean_color = appearance.color;
@@ -1316,6 +1342,9 @@ pub(in crate::renderer) fn build_world(
                 MaterialFragmentKey::from_uniform(&material_uniform);
             let material_buffer =
                 material_arena.push(device, queue, bytemuck::bytes_of(&material_uniform));
+            if inline_sources {
+                trace_inline_material(&source, &material_uniform, &material_buffer, !inline_baked_lightmap, "upload base");
+            }
             // Extra authored stage descriptors share the existing material uniform
             // arena. Ordinary materials alias the base slot (zero extra uploads).
             let additive_uniforms: [UniformSlot; 2] = std::array::from_fn(|i| {
@@ -1323,14 +1352,18 @@ pub(in crate::renderer) fn build_world(
                     || material_buffer.clone(),
                     |companion| {
                         let mut aux = crate::renderer::material_uniform(companion, false);
-                        if additive_bake_enabled { aux.header[3] |= 1 << 19; }
-                        if inline_sources && !inline_baked_lightmap { aux.header[3] |= 1 << 18; }
+                        if additive_bake_enabled { aux.header[3] |= MATERIAL_FLAG_BAKED_ADDITIVE; }
+                        if inline_sources && !inline_baked_lightmap { aux.header[3] |= MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION; }
                         aux.params[3] = source.shader_time_offset;
                         aux.vector_t[3] = source.shader_clamp_time.unwrap_or(0.0);
                         if companion.texture.and_then(|idx| texture_clamp.get(idx)).copied().unwrap_or(false) {
-                            aux.header[3] |= 65536; // separate repeat/clamp sampler for each extra stage
+                            aux.header[3] |= MATERIAL_FLAG_ADDITIVE_CLAMP; // separate repeat/clamp sampler for each extra stage
                         }
-                        material_arena.push(device, queue, bytemuck::bytes_of(&aux))
+                        let slot = material_arena.push(device, queue, bytemuck::bytes_of(&aux));
+                        if inline_sources {
+                            trace_inline_material(companion, &aux, &slot, !inline_baked_lightmap, "upload additive");
+                        }
+                        slot
                     },
                 )
             });
@@ -2518,7 +2551,9 @@ pub(in crate::renderer) fn build_world(
                 static_sun_world_batch_count, static_sun_vertex_to_gpu)));
     let sun_bake = crate::renderer::lighting::sun_bake::SunBake::new(
         sun_bake_source.as_ref(), sun, baked_sun_encoding, sun_bake_batches,
-        texture_data, Arc::clone(&lightmap_data),
+        texture_data, if baked_sun_lightmap_count == lightmap_data.len() {
+            Arc::clone(&lightmap_data)
+        } else { Arc::new(lightmap_data[..baked_sun_lightmap_count].to_vec()) },
         &legacy_dlight_triangle_surfaces, &legacy_dlight_surfaces,
     );
 
@@ -2675,6 +2710,7 @@ pub(in crate::renderer) fn build_world(
             lightmaps,
             deluxemaps,
             lightmap_base_data: lightmap_data,
+            baked_sun_lightmap_count,
             static_ao_source,
             static_ao_source_to_gpu,
             static_ao_gpu_vertices,

@@ -73,6 +73,9 @@ impl GameSession {
                     }
                     self.client_game
                         .reset_gamestate(&self.decoder.configstrings, *server_command_sequence);
+                    self.permanent_entities = crate::cgame::permanent_entities_from_baselines(
+                        &self.decoder.baselines,
+                    );
                     self.event_presenter.clear();
                     if let Some(sound) = &mut self.sound_presenter {
                         sound.clear();

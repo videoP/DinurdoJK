@@ -290,13 +290,25 @@ impl GameSession {
         // FX_AdjustTime: effects spawned by this frame's events and entities
         // start at cg.time.
         self.weapon_fx.begin_frame(target_server_time);
-        self.presented_entities = self.client_game.present_entities_at(presentation_time_ms)?;
+        self.presented_entities = self.client_game.present_entities_at_with_smoothing(
+            presentation_time_ms, self.live && crate::cgame::remote_smoothing::mode() == 5)?;
         // Studio "Hide other players": drop other clients before any
         // presentation, so their bodies, sabers, shadows and sounds all go.
         if let Some(keep) = self.studio_visible_players.as_ref() {
             self.presented_entities.retain(|e| e.entity_type != crate::cgame::ET_PLAYER
                 || usize::from(e.number) >= crate::strafe_trail::MAX_CLIENTS || keep.contains(&e.number));
         }
+        // TaystJK registers EF_PERMANENT baselines independently of the
+        // snapshot stream. Include them before Pmove/CG_BuildSolidList so a
+        // server misc_bsp's solid ET_MOVER is predicted as well as rendered.
+        // The current snapshot wins when it contains the same entity number.
+        // Remote smoothing below only changes player presentation, never the
+        // authoritative mover states used for prediction.
+        crate::cgame::append_permanent_entities(
+            &mut self.presented_entities,
+            &self.permanent_entities,
+            target_server_time,
+        );
         let duel_states = [self.current_snapshot.as_ref(), self.next_snapshot.as_ref()]
             .map(|snapshot| snapshot.map_or_else(crate::cgame::PrivateDuelState::default,
                 |snapshot| self.client_game.private_duel_state_for_snapshot(snapshot)));
@@ -341,7 +353,7 @@ impl GameSession {
         // Only now replace REMOTE visual poses, so collision traces, prediction,
         // usercmds, and gameplay events never inherit an artificial buffer delay.
         // Demos and the unmodified legacy mode 0 take no additional path.
-        if self.live && crate::cgame::remote_smoothing::mode() != 0 {
+        if self.live && matches!(crate::cgame::remote_smoothing::mode(), 1..=4) {
             let now = Instant::now();
             self.remote_smoothing.prime(
                 self.current_snapshot.as_ref(), self.next_snapshot.as_ref(),
@@ -349,6 +361,9 @@ impl GameSession {
             );
             self.remote_smoothing.apply(presentation_time_ms, now, &mut self.presented_entities);
             self.remote_smoothing.report_if_enabled(now);
+        }
+        if self.live && crate::cgame::remote_smoothing::mode() == 5 {
+            self.remote_smoothing.report_if_enabled(Instant::now());
         }
         let sample = self
             .update_presented_player_state(
@@ -929,13 +944,13 @@ impl GameSession {
             player_present_started.elapsed().as_secs_f64() * 1000.0;
         // EternalJK keeps the local Ghoul2 instance active for first-person
         // saber/melee so the attached hilt and blade bolts keep presenting,
-        // but cg_fpls mode 3 turns the player-body surfaces off. Other weapons
-        // use the separate CG_AddViewWeapon-style first-person viewmodel path.
+        // and cg_fpls mode 1 hides only head/hoses, keeping hands and arms.
+        // Other weapons use the separate CG_AddViewWeapon viewmodel path.
         const WP_MELEE: i32 = 2;
         const WP_SABER: i32 = 3;
         // FPLS also applies when following a saber player: in spectator
-        // first-person mode it hides the actor's body surfaces but keeps the
-        // weapon hilt/blade. With cg_fpls 0 the camera is third person instead.
+        // first-person mode it hides the head/hoses while keeping posed arms,
+        // hands and saber. With cg_fpls 0 the camera is third person instead.
         let first_person_saber = sample_owns_camera
             && !sample_third_person
             && first_person_lightsaber
@@ -1026,11 +1041,11 @@ impl GameSession {
                             )?,
                         );
                     }
-                    // EternalJK/OpenJK CG_AddViewWeapon. This runs for every
-                    // ordinary first-person weapon, including saber/melee; FPLS
-                    // additionally keeps the local Ghoul2 saber/body instance above.
-                    // The bg_itemlist view_model is attached to the invisible
-                    // _hand.md3 tag parent with RF_DEPTHHACK semantics.
+                    // EternalJK/OpenJK CG_AddViewWeapon. First-person guns and
+                    // sabers use the _hand.md3 tag path with RF_DEPTHHACK.
+                    // Unarmed WP_MELEE intentionally skips the stun-baton MD3
+                    // shared with WP_STUN_BATON; the FPLS Ghoul2 path draws
+                    // the player's actual hands and arms instead.
                     const TEAM_SPECTATOR: i32 = 3;
                     if sample_owns_camera
                         && self.view_weapon.draw_gun != 0

@@ -18,15 +18,15 @@ struct Composition {
     static_csm: bool,
     /// Cached, ray-traced sky openness gates only the sky component.
     isolate_sky: bool,
-    /// Sky illumination (Blue Water environment or vanilla sunlight curve):
+    /// Sky illumination from the shared relighting environment:
     /// strength and quantized input key, so unchanged frames do not recompose.
     sky: Option<(f32, [i32; 6])>,
     /// r_skyWorldGainMode calibration (mode, authored toward-sun Y, valid).
     gain: [f32; 4],
 }
 
-/// Shared BSP sky-bake inputs. Vanilla doesn't initialize Blue Water just to
-/// sample a sun-elevation curve; the existing dummy atlas satisfies bindings.
+/// Shared BSP sky-bake inputs. Runtime relighting always uses the physical
+/// environment; elevation-only inputs remain available to diagnostic fixtures.
 pub(in crate::renderer) struct SkyInputs<'a> {
     pub normals: &'a [GpuImage],
     pub transport: &'a [GpuImage],
@@ -38,6 +38,8 @@ pub(in crate::renderer) struct SkyInputs<'a> {
 pub(in crate::renderer) struct LightmapCache {
     pub original: Vec<GpuImage>,
     corrected: Vec<GpuImage>,
+    /// Imported BSP pages remain aliases of their immutable authored lightmaps.
+    bake_page_count: usize,
     pipeline: wgpu::ComputePipeline,
     pub active: bool,
     /// AO/source writes invalidate the whole composition through this key.
@@ -279,7 +281,8 @@ impl LightmapCache {
     }
     /// `charts` are per-page original-resolution chart IDs; empty disables
     /// chart-aware reconstruction (pages without geometry, unit tests).
-    fn new(device: &wgpu::Device, queue: &wgpu::Queue, original: &[GpuImage], charts: &[Vec<u32>]) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, original: &[GpuImage], charts: &[Vec<u32>], bake_page_count: usize) -> Self {
+        assert!(bake_page_count <= original.len());
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shared lightmap composition"),
             source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(
@@ -431,7 +434,7 @@ impl LightmapCache {
             cache: None,
         });
         let sizes: Vec<_> = original
-            .iter()
+            .iter().take(bake_page_count)
             .map(|i| [i._texture.width(), i._texture.height()])
             .collect();
         let has_charts = !sizes.is_empty() && charts.len() == sizes.len()
@@ -491,7 +494,9 @@ impl LightmapCache {
         );
         Self {
             original: original.to_vec(),
-            corrected: corrected_images(device, &sizes),
+            corrected: corrected_images(device, &sizes[..bake_page_count]).into_iter()
+                .chain(original[bake_page_count..].iter().cloned()).collect(),
+            bake_page_count,
             pipeline,
             active: false,
             strength: None,
@@ -636,12 +641,17 @@ impl LightmapCache {
         colors: &[[f32; 4]],
         sky: Option<SkyInputs<'_>>,
     ) {
-        let sizes: Vec<_> = if composition.is_some() {
-            flux.iter()
-                .map(|i| [i._texture.width(), i._texture.height() / 2])
+        let mut sizes: Vec<_> = if composition.is_some() {
+            // Sky-only and local-light compositions are valid without a sun
+            // bake. Size every main-map page from its source in that state;
+            // the optional stacked sun-flux image only overrides its size.
+            self.original.iter().take(self.bake_page_count).enumerate()
+                .map(|(index, original)| flux.get(index).map_or(
+                    [original._texture.width(), original._texture.height()],
+                    |i| [i._texture.width(), i._texture.height() / 2]))
                 .collect()
         } else {
-            let original_sizes: Vec<_> = self.original.iter()
+            let original_sizes: Vec<_> = self.original.iter().take(self.bake_page_count)
                 .map(|i| [i._texture.width(), i._texture.height()])
                 .collect();
             // 2x cached reconstruction is memory, not new lighting information.
@@ -658,22 +668,27 @@ impl LightmapCache {
                 [w*factor, h*factor]
             }).collect()
         };
+        // Keep the aggregate page table stable, but never apply the main
+        // BSP's sunlight removal, sky gain or tone controls to imported pages.
+        sizes.extend(self.original[self.bake_page_count..].iter()
+            .map(|i| [i._texture.width(), i._texture.height()]));
         if self.corrected.len() != sizes.len() || self
             .corrected
             .iter()
             .zip(&sizes)
             .any(|(i, s)| i._texture.width() != s[0] || i._texture.height() != s[1])
         {
-            self.corrected = corrected_images(device, &sizes);
+            self.corrected = corrected_images(device, &sizes[..self.bake_page_count]).into_iter()
+                .chain(self.original[self.bake_page_count..].iter().cloned()).collect();
         }
         let static_csm = composition.is_some_and(|c| c.static_csm);
         let sky_strength = composition.and_then(|c| c.sky).map_or(0.0, |(strength, _)| strength);
         if !static_csm && sky_strength <= 0.0 {
             self.sun_aux.clear();
-        } else if self.sun_aux.len() != sizes.len() || self.sun_aux.iter().zip(&sizes)
+        } else if self.sun_aux.len() != self.bake_page_count || self.sun_aux.iter().zip(&sizes)
             .any(|(i, s)| i._texture.width() != s[0] || i._texture.height() != s[1])
         {
-            self.sun_aux = sun_aux_images(device, &sizes);
+            self.sun_aux = sun_aux_images(device, &sizes[..self.bake_page_count]);
         }
         let sky = sky.filter(|_| sky_strength > 0.0);
         let colors_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -688,7 +703,7 @@ impl LightmapCache {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("lightmap composition update"),
         });
-        for (index, (original, corrected)) in self.original.iter().zip(&self.corrected).enumerate()
+        for (index, (original, corrected)) in self.original.iter().zip(&self.corrected).enumerate().take(self.bake_page_count)
         {
             let fit = encoding.map_or([0.0, 1.0, 0.0, 1.0], |e| {
                 [
@@ -890,7 +905,9 @@ impl Renderer {
         // Keep the last *complete* lightmap composition visible during a UI
         // drag. Deferring a ray trace must not turn off sky gain, sun removal
         // or residual-light grading for the duration of a mouse press.
-        if self.sun_bake_deferred { return; }
+        // Realtime sky-only lighting changes are GPU recompositions over fixed
+        // receivers, not CPU traces. Keep them responsive during slider drags.
+        if self.sun_bake_deferred && !(self.sun_override && self.relighting_mode == 2) { return; }
         let sun = self.relit_celestial();
         let moon_light = if self.blue_water_night() {
             let direction = self.blue_water_moon_toward();
@@ -915,52 +932,48 @@ impl Renderer {
         let sun_ready = self.baked_sun_cache
             && world.static_sun.ready()
             && (removal || requested_removal <= 0.0 || world.sun.is_none());
+        // A Realtime protected sky needs cached receivers, not a cached sun.
+        // Its sky openness/transport is independent of time and sun direction.
+        let sky_ready = self.baked_sun_cache && world.static_sun.sky_ready();
         let local_ready = (self.added_map_light_sources() != 0) && world.static_sun.local_ready();
         let explicit_sun = self.sun_lighting || (self.sun_override && self.blue_water_night());
-        // The vanilla sky's daylight curve is independent of Blue Water's
-        // atmosphere. Keep the precomputed openness and smoothed normals from
-        // the existing static sun bake; evaluate gain only on input changes.
-        let vanilla_toward_sun = (self.sky_backend != 1 && self.sun_override).then(||
-            (-crate::renderer::Vec3::from_array(self.active_sun().direction).normalize_or_zero()).to_array()
-        );
-        let sky_light = if sun_ready && self.sun_override && self.sky_world_bake_ab != 0
-            && self.sky_world_lighting_strength > 0.0
-            && (!world.static_sun.sky_normals.is_empty() || !world.static_sun.vertex_sky.is_empty()) {
+        // All sky displays share the relighting environment and celestial key.
+        let sky_light = if sky_ready && self.sun_override && self.sky_world_bake_ab != 0
+            && self.sky_world_lighting_strength > 0.0 {
             let q = |v: f32, scale: f32| (v * scale).round() as i32;
-            if let Some(toward) = vanilla_toward_sun {
-                Some((self.sky_world_lighting_strength, [
-                    q(toward[0], 200.0), q(toward[1], 200.0), q(toward[2], 200.0), 0, 0, 2,
-                ]))
-            } else {
-                self.blue_water_sky.as_ref().map(|atmosphere| {
-                    let light = atmosphere.sky.light();
-                    let (direction, intensity, color_delta, moon) = if let Some((direction, intensity)) = moon_light {
-                        (direction, intensity, 0.70 - 1.0, 1)
-                    } else {
-                        ([light.direction.x, light.direction.y, light.direction.z],
-                         light.intensity, light.color.x - light.color.z, 0)
-                    };
-                    (self.sky_world_lighting_strength, [
-                        q(direction[0], 200.0), q(direction[1], 200.0), q(direction[2], 200.0),
-                        q(intensity.max(1e-6).log2(), 16.0), q(color_delta, 100.0), moon,
-                    ])
-                })
-            }
+            self.blue_water_sky.as_ref().map(|atmosphere| {
+                let light = atmosphere.sky.light();
+                let (direction, intensity, color_delta, moon) = if let Some((direction, intensity)) = moon_light {
+                    (direction, intensity, 0.70 - 1.0, 1)
+                } else {
+                    ([light.direction.x, light.direction.y, light.direction.z],
+                     light.intensity, light.color.x - light.color.z, 0)
+                };
+                (self.sky_world_lighting_strength, [
+                    q(direction[0], 200.0), q(direction[1], 200.0), q(direction[2], 200.0),
+                    q(intensity.max(1e-6).log2(), 16.0), q(color_delta, 100.0), moon,
+                ])
+            })
         } else { None };
         let composition = (supported
-            && (sun_ready || local_ready)
+            && (sun_ready || sky_light.is_some() || local_ready)
             && self.baked_sun_debug_mode == 0)
             .then(|| Composition {
                 generation: world.static_sun.generation,
-                radiance: sun.color.map(|c| c * sun.intensity.max(0.0) / 255.0),
-                direction: sun.direction,
-                strength: if self.cascaded_shadow_mode == crate::renderer::DynamicShadowsMode::CascadedShadowMapsEntities {
+                // With no baked replacement sun, none of these terms is read
+                // by the compositor. Keep them stable so realtime sun edits
+                // only recompose when the actual sky gain changes.
+                radiance: if sun_ready { sun.color.map(|c| c * sun.intensity.max(0.0) / 255.0) }
+                    else { [0.0; 3] },
+                direction: if sun_ready { sun.direction } else { [0.0; 3] },
+                strength: if !sun_ready
+                    || self.cascaded_shadow_mode == crate::renderer::DynamicShadowsMode::CascadedShadowMapsEntities {
                     0.0
                 } else { self.sun_shadow_strength * overcast_direct },
                 // The legacy/indirect mode must soften moving and static
                 // contrast together. Explicit-sun mode instead receives the
                 // already attenuated radiance from relit_celestial().
-                moving_strength: self.sun_shadow_strength * overcast_direct,
+                moving_strength: if sun_ready { self.sun_shadow_strength * overcast_direct } else { 0.0 },
                 mode: if !sun_ready {
                     0.0
                 } else if explicit_sun {
@@ -988,9 +1001,9 @@ impl Renderer {
             });
         // Smoothing is also available without relighting, including vanilla maps.
         let smoothing = self.lightmap_smoothing.min(2);
-        // Transport diagnostics never change the legacy OFF / vanilla path.
+        // Transport diagnostics require the isolated relighting path.
         let signal = if self.lightmap_signal >= 9
-            && (!self.sky_world_light_isolation || self.sky_backend != 1) {
+            && (!self.sky_world_light_isolation || !self.sun_override) {
             0
         } else { self.lightmap_signal.min(11) };
         let desired = removal || composition.is_some()
@@ -1021,12 +1034,12 @@ impl Renderer {
         let mut rebound = false;
         if desired {
             let c = world.baked_sun_cache.get_or_insert_with(|| {
-                let sizes: Vec<_> = world.lightmaps.iter()
+                let sizes: Vec<_> = world.lightmaps.iter().take(world.baked_sun_lightmap_count)
                     .map(|i| [i._texture.width(), i._texture.height()])
                     .collect();
                 let charts = world.static_sun.geometry.as_ref()
                     .map_or_else(Vec::new, |g| g.lightmap_charts(&sizes));
-                LightmapCache::new(&self.device, &self.queue, &world.lightmaps, &charts)
+                LightmapCache::new(&self.device, &self.queue, &world.lightmaps, &charts, world.baked_sun_lightmap_count)
             });
             c.compose(
                 &self.device,
@@ -1059,13 +1072,13 @@ impl Renderer {
                 },
                 sky_light.map(|_| SkyInputs {
                     normals: &world.static_sun.sky_normals,
-                    transport: if self.sky_world_light_isolation && self.sky_backend == 1 {
+                    transport: if self.sky_world_light_isolation {
                         &world.static_sun.sky_transport
                     } else { &[] },
-                    environment: self.blue_water_sky.as_ref().filter(|_| self.sky_backend == 1)
+                    environment: self.blue_water_sky.as_ref()
                         .map(|atmosphere| atmosphere.sky.environment()),
-                    moon: if self.sky_backend == 1 { moon_light } else { None },
-                    vanilla_toward_sun,
+                    moon: moon_light,
+                    vanilla_toward_sun: None,
                 }),
             );
             let environment = self.blue_water_sky.as_ref().map(|atmosphere| atmosphere.sky.environment());
@@ -1074,9 +1087,9 @@ impl Renderer {
                 &world.static_ao_gpu_vertices,
                 &world.static_sun.vertex_sky, world.static_sun.generation,
                 sky_light.map(|_| (
-                    environment.filter(|_| self.sky_backend == 1),
-                    if self.sky_backend == 1 { moon_light } else { None },
-                    vanilla_toward_sun,
+                    environment,
+                    moon_light,
+                    None,
                     self.sky_world_lighting_strength, self.sky_world_light_isolation,
                     self.sky_gain_calibration(),
                 )),
@@ -1205,7 +1218,7 @@ mod tests {
                 GpuImage::new(texture, view)
             };
             let source = image(wgpu::TextureFormat::Rgba32Float, 2, 1, bytemuck::cast_slice(&[1.0f32; 8]));
-            let mut cache = LightmapCache::new(&device, &queue, &[source], &[vec![1, 2]]);
+            let mut cache = LightmapCache::new(&device, &queue, &[source], &[vec![1, 2]], 1);
             // BOTH receivers have no direct sky access and no current moonlight.
             // Only the courtyard has bounced sky transport. The old visibility
             // heuristic incorrectly preserved the full daytime lightmap in both.
@@ -1306,7 +1319,7 @@ mod tests {
                     srgb: true,
                 },
             );
-            let mut cache = LightmapCache::new(&device, &queue, &[original], &[]);
+            let mut cache = LightmapCache::new(&device, &queue, &[original], &[], 1);
             // Two independent-resolution sunlight texels over one original texel.
             let texture = device.create_texture_with_data(
                 &queue,
@@ -1628,7 +1641,33 @@ fn baked_local_moving_visibility(light:PointLight,position:vec3<f32>,normal:vec3
                     srgb: true,
                 };
                 let original = crate::renderer::upload_texture(&device, &queue, &data);
-                let mut cache = LightmapCache::new(&device, &queue, &[original], &[]);
+                let imported = crate::renderer::upload_texture(&device, &queue, &data);
+                let pages = [original, imported.clone()];
+                // Realtime sky-only and local-only states can compose before
+                // (or without) any sun flux, with or without imported pages.
+                for page_count in [1, 2] {
+                    let mut pending = LightmapCache::new(&device, &queue, &pages[..page_count], &[], 1);
+                    for sky in [None, Some((1.0, [0; 6]))] {
+                        let composition = Composition {
+                            generation: 0, radiance: [0.0; 3], direction: [0.0; 3],
+                            strength: 0.0, moving_strength: 0.0, mode: 0.0,
+                            adjust: [1.0, 1.0, 0.0, 0.0], curve: [1.0, 1.0, 0.0, 0.0],
+                            static_csm: false, isolate_sky: false, sky, gain: [0.0; 4],
+                        };
+                        pending.compose(&device, &queue, None, [0.0; 3], 0.0,
+                            Some(&composition), 2, 0, &[], &[], &[], None);
+                        assert_eq!(pending.corrected.len(), page_count);
+                        assert_eq!(pending.corrected[0]._texture.width(), data.width);
+                        assert_eq!(pending.corrected[0]._texture.height(), data.height);
+                        if page_count == 2 { assert_eq!(pending.corrected[1]._texture, imported._texture); }
+                    }
+                }
+                let mut cache = LightmapCache::new(&device, &queue, &pages, &[], 1);
+                let mask_upload = super::super::sun_bake_upload::MaskUpload::new(&device);
+                let masked = mask_upload.apply(&device, &queue, &cache.original,
+                    &[data.clone(), data.clone()], &[vec![127; 6]]);
+                assert_eq!(masked.len(), 2, "main-map masks retain imported pages");
+                assert_eq!(masked[1]._texture, imported._texture);
                 let encoding = crate::scene::BakedSunEncoding {
                     exposure,
                     gamma: 1.0,
@@ -1641,6 +1680,9 @@ fn baked_local_moving_visibility(light:PointLight,position:vec3<f32>,normal:vec3
                 // original. The non-multiple-of-eight dimensions test dispatch bounds.
                 for strength in [1.0, 0.0, 0.5, 1.0] {
                     cache.bake(&device, &queue, encoding, [sun / 255.0; 3], strength);
+                    assert_eq!(cache.corrected.len(), 2);
+                    assert_eq!(cache.corrected[1]._texture, imported._texture,
+                        "imported lightmaps must bypass the main-map compositor");
                     let readback = device.create_buffer(&wgpu::BufferDescriptor {
                         label: None,
                         size: 512,

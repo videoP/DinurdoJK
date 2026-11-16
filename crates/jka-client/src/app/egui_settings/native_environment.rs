@@ -177,10 +177,10 @@ impl App {
         theme::section(
             ui,
             "MOON",
-            "Blue Water sky only. Relighting controls whether the moon illuminates the world. Phase controls appearance and automatic moon position; unlock position to hold it in place. Advanced environment holds sky-lightmap diagnostics.",
+            "Relighting uses this moon with every sky display mode. Blue Water also draws the moon. Phase controls appearance and automatic moon position; unlock position to hold it in place. Advanced environment holds sky-lightmap diagnostics.",
         );
         changed |= sky_slider(ui, "Moon phase", "0 and 1 are new moon; 0.5 is full. The automatic moon light follows phase, independently of its position lock.", &mut s.moon_phase, d.moon_phase, 0.0, 1.0);
-        theme::row(ui, "Moon intensity", "Direct moonlight strength for Blue Water nighttime Relighting (with cast shadows from CSM). Locked: follows the lunar phase (0 new, 2.5 full). Unlock to author 0..16 independently. The world needs Relight map; the water always follows it. Separate from moon disc brightness.", theme::Reset::None, |ui| {
+        theme::row(ui, "Moon intensity", "Direct moonlight strength for nighttime Relighting (with cast shadows from CSM). Locked: follows the lunar phase (0 new, 2.5 full). Unlock to author 0..16 independently. The world needs Relight map; the water always follows it. Separate from moon disc brightness.", theme::Reset::None, |ui| {
             let locked = !s.moon_intensity_custom;
             let mut shown = if locked { s.phase_moon_intensity() } else { s.moon_intensity };
             let label = format!("{shown:.2}");
@@ -227,7 +227,7 @@ impl App {
         theme::section(
             ui,
             "ATMOSPHERE",
-            "Blue Water sky only. Uses the sun controls above. Atmosphere changes recompute its lookup tables.",
+            "Shared relighting atmosphere; Blue Water also draws it as the sky. Uses the sun controls above. Atmosphere changes recompute its lookup tables.",
         );
         changed |= sky_slider(ui, "Rayleigh / blue scattering", "How strongly air scatters blue light. Higher gives a bluer daytime sky and redder sunsets.", &mut s.rayleigh, d.rayleigh, 0.0, 1.5);
         changed |= sky_slider(ui, "Atmospheric turbidity", "Haze and aerosol content. Higher is hazier and whiter.", &mut s.turbidity, d.turbidity, 1.0, 10.0);

@@ -613,8 +613,23 @@ impl HudRectContext {
     }
 }
 
-/// Stock (untransformed) rectangle of an element that is not anchored. These are
-/// the bounds the editor outlines; text elements are sized for typical content.
+/// Shared portrait geometry for the native shader, text stack and HUD editor.
+pub(crate) fn enemy_info_icon_rect(draw_fps: u8, draw_timer: bool, w: u32, h: u32) -> HudRect {
+    let sy = h as f32 / 480.0;
+    // DinJK's FPS/timer are screen-pixel text. Keep TaystJK's visible gap
+    // (8 virtual units) below them, rather than reserving full legacy rows.
+    let bottom = if draw_timer {
+        if draw_fps == 1 { 47.0 } else { 25.0 }
+    } else if draw_fps != 0 { 25.0 } else { 0.0 };
+    HudRect {
+        x: w as f32 - 65.0 * sy,
+        y: bottom + if bottom > 0.0 { 8.0 * sy } else { 5.0 * sy },
+        width: 60.0 * sy,
+        height: 60.0 * sy,
+    }
+}
+
+/// Stock bounds the editor outlines; text elements are sized for typical content.
 pub(crate) fn hud_stock_rect(
     id: HudElementId,
     ctx: &HudRectContext,
@@ -694,7 +709,11 @@ pub(crate) fn hud_stock_rect(
                 let width = 150.0 * sy;
                 HudRect {
                     x: (w as f32 - 10.0 - width).max(8.0),
-                    y: (12.0 + rows * 22.0) * sy,
+                    y: if ctx.enemy_info {
+                        // Typical leader panel: portrait, name/title and the
+                        // trailing BIGCHAR_HEIGHT + 2 used by TaystJK.
+                        enemy_info_icon_rect(ctx.draw_fps, ctx.draw_timer, w, h).y + 101.0 * sy
+                    } else { (12.0 + rows * 22.0) * sy },
                     width,
                     height: 12.0 * sy,
                 }
@@ -707,10 +726,10 @@ pub(crate) fn hud_stock_rect(
             height: (32.0 + 38.0 * (ctx.flag_status_rows.clamp(2, 3) - 1) as f32) * sy,
         },
         HudElementId::EnemyInfo => {
-            let rows = (ctx.draw_fps != 0) as u8 + ctx.draw_timer as u8;
-            // Matches CG_DrawUpperRight stacking. An editor-sized rectangle
-            // includes the icon, name, title, optional duel score and bar.
-            virtual_rect(500.0, 17.0 + 22.0*rows as f32, 135.0, 112.0)
+            let icon = enemy_info_icon_rect(ctx.draw_fps, ctx.draw_timer, w, h);
+            // Same right edge and square projection as the native icon/text.
+            HudRect { x: w as f32 - 140.0 * sy, y: icon.y,
+                width: 135.0 * sy, height: 127.0 * sy }
         }
         HudElementId::Chat => HudRect {
             x: 30.0 * sx, y: 373.0 * sy, width: CHATBOX_CUTOFF * sy, height: 52.0 * sy,
@@ -1151,6 +1170,35 @@ pub fn hud_element_rect(
 #[cfg(test)]
 mod neighbor_resize_tests {
     use super::{snap_hud_neighbor_size, snap_hud_rect_position, HudRect};
+
+    #[test]
+    fn enemy_info_matches_tayst_portrait_and_keeps_native_fps_gap() {
+        use super::{enemy_info_icon_rect, hud_stock_rect, hud_element_rect,
+            HudElementId, HudRectContext, HUD_UNMOVED};
+        for (w, h) in [(640, 480), (1920, 1080), (2560, 1440), (3440, 1440)] {
+            let sy = h as f32 / 480.0;
+            let mut ctx = HudRectContext::new(
+                Default::default(), &Default::default(), &Default::default(),
+                1, &Default::default(), Default::default(), false, [0.0; 2], 0,
+            );
+            ctx.draw_fps = 1;
+            let icon = enemy_info_icon_rect(1, false, w, h);
+            assert_eq!(icon.width, 60.0 * sy);
+            assert_eq!(icon.height, icon.width);
+            assert_eq!(icon.x + icon.width, w as f32 - 5.0 * sy);
+            assert_eq!(icon.y - 25.0, 8.0 * sy);
+            let stock = hud_stock_rect(HudElementId::EnemyInfo, &ctx, w, h);
+            assert_eq!(stock.y, icon.y);
+            assert_eq!(stock.x + stock.width, icon.x + icon.width);
+            let mut edited = HUD_UNMOVED;
+            edited.offset = [-48.0, 32.0];
+            let moved = hud_element_rect(HudElementId::EnemyInfo, edited, &ctx, w, h);
+            assert_eq!(moved.x, stock.x - 48.0);
+            assert_eq!(moved.y, stock.y + 32.0);
+            assert!(enemy_info_icon_rect(1, true, w, h).y > icon.y);
+            assert_eq!(enemy_info_icon_rect(0, false, w, h).y, 5.0 * sy);
+        }
+    }
 
 
     #[test]

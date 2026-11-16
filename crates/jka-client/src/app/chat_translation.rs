@@ -211,6 +211,17 @@ pub(in crate::app) enum ChatMenuAction {
 }
 
 impl ChatTranslation {
+    /// The floating console has its own egui atlas. Request its CJK fallback
+    /// from displayed text as well as from translation results.
+    pub(in crate::app) fn request_console_font(
+        &mut self, text: &str, base: &std::path::Path, game: Option<&std::path::Path>,
+    ) {
+        if !matches!(self.cjk_font, CjkFont::NotNeeded) { return; }
+        if let Some(target) = text.chars().find_map(console_cjk_target) {
+            self.cjk_font = load_cjk_font(target, base, game);
+        }
+    }
+
     pub(in crate::app) fn new(settings: ct::Settings) -> Self {
         Self { settings, ..Self::default() }
     }
@@ -723,7 +734,7 @@ impl App {
         message.translation_censored = censored;
         message.state = TranslationState::Done { source, target, text: translated.text };
         if matches!(target, "zh" | "ja" | "ko") && matches!(self.chat_translation.cjk_font, CjkFont::NotNeeded) {
-            self.chat_translation.cjk_font = load_cjk_font(target);
+            self.chat_translation.cjk_font = load_cjk_font(target, &self.base, self.game.as_deref());
         }
         // Update the chat-box line in place if it is still kept; an expired
         // line is not revived, the console keeps the translation.
@@ -1189,11 +1200,13 @@ impl App {
         }
     }
 
-    /// Chinese, Japanese and Korean translations need a system font in the
-    /// console; it is read off-thread the first time one arrives.
+    /// Install the floating console's fallback after its background read.
     pub(in crate::app) fn ensure_chat_translation_fonts(&mut self, ctx: &egui::Context) {
         let CjkFont::Loading(rx) = &self.chat_translation.cjk_font else { return };
-        let Ok(loaded) = rx.try_recv() else { return };
+        let Ok(loaded) = rx.try_recv() else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
+        };
         self.chat_translation.cjk_font = CjkFont::Done;
         let Some((name, bytes)) = loaded else { return };
         use egui::epaint::text::{FontInsert, FontPriority, InsertFontFamily};
@@ -1224,7 +1237,18 @@ impl App {
     }
 }
 
-fn load_cjk_font(target: &str) -> CjkFont {
+fn console_cjk_target(ch: char) -> Option<&'static str> {
+    match ch as u32 {
+        0x3000..=0x30FF | 0x31F0..=0x31FF => Some("ja"),
+        0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F
+        | 0xAC00..=0xD7AF | 0xD7B0..=0xD7FF => Some("ko"),
+        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+        | 0xFF00..=0xFFEF | 0x20000..=0x323AF => Some("zh"),
+        _ => None,
+    }
+}
+
+fn load_cjk_font(target: &str, base: &std::path::Path, game: Option<&std::path::Path>) -> CjkFont {
     let files: &[&str] = match target {
         "ja" => &["YuGothR.ttc", "meiryo.ttc", "msgothic.ttc"],
         "ko" => &["malgun.ttf", "gulim.ttc"],
@@ -1235,11 +1259,20 @@ fn load_cjk_font(target: &str) -> CjkFont {
         .flat_map(|dir| files.iter().map(move |file| dir.join(file)))
         .collect();
     let (tx, rx) = std::sync::mpsc::channel();
+    let base = base.to_owned();
+    let game = game.map(std::path::Path::to_owned);
     let _ = std::thread::Builder::new().name("chat-translate-font".to_owned()).spawn(move || {
-        let found = paths.iter().find_map(|path| {
+        // Use the same packaged face as the game UI; Windows language packs
+        // are optional. Keep all archive and font reads off the UI thread.
+        let found = (|| {
+            let mut assets = jka_assets::pk3::AssetSearchPath::open_game(&base, game.as_deref()).ok()?;
+            let asset = assets.read("fonts/NotoSansCJK-Regular.ttc", 32 * 1024 * 1024).ok()??;
+            ttf_parser::Face::parse(&asset.bytes, 0).ok()?;
+            Some(("NotoSansCJK".to_owned(), asset.bytes))
+        })().or_else(|| paths.iter().find_map(|path| {
             let bytes = std::fs::read(path).ok()?;
             Some((path.file_stem()?.to_string_lossy().into_owned(), bytes))
-        });
+        }));
         let _ = tx.send(found);
     });
     CjkFont::Loading(rx)

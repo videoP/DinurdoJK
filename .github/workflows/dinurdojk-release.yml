@@ -401,11 +401,11 @@ jobs:
           python -c 'from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; print("Ed25519 signer ready")'
           if ($LASTEXITCODE -ne 0) { throw 'Ed25519 signer import failed.' }
 
-      - name: Build optimized Release with DLAA
+      - name: Build optimized Release with DLSS
         if: steps.version.outputs.publish == 'true'
         shell: pwsh
         run: |
-          .\build.ps1 -Fetch -Dlss
+          .\build.ps1 -Fetch
           if ($LASTEXITCODE -ne 0) { throw 'DinurdoJK Release build failed.' }
           if (-not (Test-Path 'target/release/DinurdoJK.exe' -PathType Leaf)) {
             throw 'Missing release executable.'

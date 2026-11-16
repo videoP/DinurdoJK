@@ -2441,15 +2441,15 @@ app_cvars! {
     }
 
     APP_R_LIGHTMAPSIGNAL {
-        runtime: CvarDef::new("r_lightmapSignal", "", "0..11", "Composed-lightmap diagnostic (use with r_lightmap 1): 0 off, 1 authored lightmap as compiled, 2 authored residual after old-sun removal + indirect tone, 3 authored-sun flux that was removed, 4 new sun incident flux, 5 new sun cosine (bake normal . sun), 6 new sun visibility (green lit, red shadowed, blue facing away), 7 lightmap charts + receiver triangle edges, 8 bake-normal change from smoothing (0..20 degrees) + triangle edges, 9 direct white-sky response, 10 bounced white-sky response, 11 total white-sky response. 9-11 require Protect authored room lighting, Blue Water, CSM and sky bake; grayscale sqrt display, magenta unavailable. Transport is a fixed-white-sky estimate, not authored daylight fraction. 7/8 rebake; other views recompose only. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.lightmap_signal.to_string()), |app, value| App::cvar_set_r_lightmapsignal(app, APP_R_LIGHTMAPSIGNAL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lightmapsignal, None),
+        runtime: CvarDef::new("r_lightmapSignal", "", "0..11", "Composed-lightmap diagnostic (use with r_lightmap 1): 0 off, 1 authored lightmap as compiled, 2 authored residual after old-sun removal + indirect tone, 3 authored-sun flux that was removed, 4 new sun incident flux, 5 new sun cosine (bake normal . sun), 6 new sun visibility (green lit, red shadowed, blue facing away), 7 lightmap charts + receiver triangle edges, 8 bake-normal change from smoothing (0..20 degrees) + triangle edges, 9 direct white-sky response, 10 bounced white-sky response, 11 total white-sky response. 9-11 require Protect authored room lighting, Relight map, CSM and sky bake; grayscale sqrt display, magenta unavailable. Transport is a fixed-white-sky estimate, not authored daylight fraction. 7/8 rebake; other views recompose only. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.lightmap_signal.to_string()), |app, value| App::cvar_set_r_lightmapsignal(app, APP_R_LIGHTMAPSIGNAL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lightmapsignal, None),
         config: CvarBinding::NONE,
         implementations: [ impl App {
             fn cvar_set_r_lightmapsignal(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let mode = value.trim().parse::<u8>()
                     .ok().filter(|mode| *mode <= 11)
                     .ok_or_else(|| format!("{name}: expected 0..11"))?;
-                if mode >= 9 && (!self.video.sky_world_light_isolation || self.video.sky_backend != 1) {
-                    return Err(format!("{name}: sky transport views require Protect authored room lighting and Blue Water"));
+                if mode >= 9 && (!self.video.sky_world_light_isolation || !self.video.sun_override) {
+                    return Err(format!("{name}: sky transport views require Protect authored room lighting and Relight map"));
                 }
                 if self.video.lightmap_signal != mode {
                     self.video.lightmap_signal = mode;
@@ -2484,7 +2484,7 @@ app_cvars! {
     }
 
     APP_R_SKYWORLDBAKEAB {
-        runtime: CvarDef::new("r_skyWorldBakeAB", "", "0|1", "Static sky relighting A/B (default 1; requires CSM and r_bakedSunCache 1): 0=A, authored lightmap without sky gain; 1=B, Blue Water irradiance or vanilla sun-elevation sky gain in cached BSP lightmaps and eligible vertex-lit surfaces. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.sky_world_bake_ab.to_string()), |app, value| App::cvar_set_r_skyworldbakeab(app, APP_R_SKYWORLDBAKEAB.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_skyworldbakeab, None),
+        runtime: CvarDef::new("r_skyWorldBakeAB", "", "0|1", "Static sky relighting A/B (default 1; requires CSM and r_bakedSunCache 1): 0=A, authored lightmap without sky gain; 1=B, shared atmospheric sky gain in cached BSP lightmaps and eligible vertex-lit surfaces. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.sky_world_bake_ab.to_string()), |app, value| App::cvar_set_r_skyworldbakeab(app, APP_R_SKYWORLDBAKEAB.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_skyworldbakeab, None),
         config: CvarBinding::NONE,
         implementations: [ impl App {
             fn cvar_set_r_skyworldbakeab(&mut self, name: &str, value: &str) -> Result<(), String> {
@@ -2508,7 +2508,7 @@ app_cvars! {
     }
 
     APP_R_SKYWORLDGAINMODE {
-        runtime: CvarDef::new("r_skyWorldGainMode", "2", "0..2", "Sky-world gain calibration shared by Vanilla and Blue Water. 0 absolute response, 1 fade to authored daylight by sun elevation, 2 (default) day/night ratio against authored sun or daytime fallback. Blue Water adds atmospheric tint/moonlight; Vanilla has neither. Applies to baked lightmaps and vertex-lit surfaces.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_skyWorldGainMode", "2", "0..2", "Sky-world gain calibration shared by Vanilla and Blue Water. 0 absolute response, 1 fade to authored daylight by sun elevation, 2 (default) day/night ratio against authored sun or daytime fallback. Atmospheric tint and moonlight are independent of the sky display. Applies to baked lightmaps and vertex-lit surfaces.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.video.sky_world_gain_mode.to_string()),
             |app, value| App::cvar_set_r_skyworldgainmode(app, APP_R_SKYWORLDGAINMODE.entry.name, &value.to_string()))
             .with_text_setter(App::cvar_set_r_skyworldgainmode, None),
@@ -2562,7 +2562,7 @@ app_cvars! {
                     self.mark_config_dirty();
                 }
                 self.console_status = if enabled {
-                    "SKY LIGHT ISOLATION: transport-weighted day/night sky, protected enclosed lighting. Requires Blue Water / CSM / baked receivers.".to_owned()
+                    "SKY LIGHT ISOLATION: transport-weighted day/night sky, protected enclosed lighting. Requires Relight map / CSM / baked receivers.".to_owned()
                 } else {
                     "SKY LIGHT ISOLATION: legacy sky-world tint restored.".to_owned()
                 };

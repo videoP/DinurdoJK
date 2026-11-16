@@ -642,6 +642,11 @@ impl App {
             emote_radial_search: Default::default(),
             console_input: String::new(),
             console_cursor: 0,
+            console_input_selection_anchor: None,
+            console_input_selecting: false,
+            console_input_focused: true,
+            console_input_last_click: None,
+            console_input_click_count: 0,
             console_status: if front_end {
                 "MAIN MENU".into()
             } else {
@@ -674,6 +679,7 @@ impl App {
             chat_log: crate::chat_log::ChatLog::spawn(),
             console_suggest_index: 0,
             console_suggest_picked: false,
+            console_suggest_origin: None,
             console_suggest_hidden: false,
             console_map_suggest_cache: std::cell::RefCell::new(None),
             console_arg_suggest_cache: std::cell::RefCell::new(None),
@@ -737,6 +743,7 @@ impl App {
             console_search_index: None,
             chat_mode: ChatMode::Global,
             chat_input: String::new(),
+            chat_input_selected: false,
             chat_player_completion: None,
             chat_lines: VecDeque::with_capacity(16),
             chat_translation: crate::app::chat_translation::ChatTranslation::new(presentation.chat_translate.clone()),

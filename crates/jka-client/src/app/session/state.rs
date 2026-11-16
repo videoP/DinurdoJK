@@ -182,6 +182,7 @@ impl GameSession {
             siege_respawn_time: 0,
             siege_last_countdown: 0,
             presented_entities: Vec::new(),
+            permanent_entities: Vec::new(),
             audio_followed_entity: None,
             predicted_saber_cache: None,
             forced_player_models,

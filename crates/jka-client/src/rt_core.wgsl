@@ -281,9 +281,9 @@ fn rt_alpha_candidate_blocks(candidate: RayIntersection) -> bool {
     var alpha_multiplier = material.color.a;
     // Match the existing BSP shader's alphaGen semantics exactly. RGB generation
     // uses different bits; RT candidate rejection must only follow alphaGen.
-    if ((material.header.z & 1048576u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_ALPHA_VERTEX) != 0u) {
         alpha_multiplier *= vertex_alpha;
-    } else if ((material.header.z & 2097152u) != 0u) {
+    } else if ((material.header.z & MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX) != 0u) {
         alpha_multiplier *= (1.0 - vertex_alpha);
     }
     let alpha = rt_sample_alpha(material.texture.x, uv) * alpha_multiplier;
@@ -331,9 +331,9 @@ fn rt_candidate_glass_throughput(candidate: RayIntersection) -> vec3<f32> {
     var alpha_multiplier = material.color.a;
     // Match the existing BSP shader's alphaGen semantics exactly. RGB generation
     // uses different bits; RT candidate rejection must only follow alphaGen.
-    if ((material.header.z & 1048576u) != 0u) {
+    if ((material.header.z & MATERIAL_FLAG_ALPHA_VERTEX) != 0u) {
         alpha_multiplier *= vertex_alpha;
-    } else if ((material.header.z & 2097152u) != 0u) {
+    } else if ((material.header.z & MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX) != 0u) {
         alpha_multiplier *= (1.0 - vertex_alpha);
     }
     let sampled = rt_sample_rgba(material.texture.x, uv);

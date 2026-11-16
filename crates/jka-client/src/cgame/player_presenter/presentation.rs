@@ -2,7 +2,7 @@
 use crate::cgame::player_presenter::{
     angles_to_axis, bg_g2_player_angles, jk2_g2_player_angles, dismember_source_entity, dismember_source_ready,
     find_siege_class_visual, flatten_matrix3x4, foot_bolts_timed, footsteps,
-    fpls_mode3_surface_hidden, ghoul2_entity_radius, ghoul2_lod_for_view, ghoul2_model_scale,
+    fpls_mode1_surface_hidden, ghoul2_entity_radius, ghoul2_lod_for_view, ghoul2_model_scale,
     ghoul2_render_origin, ghoul2_render_transform, model_bolt_matrix_timed,
     model_bolt_origin_timed, multiply_3x4, openjk_look_target_origin,
     openjk_player_entity_needs_reset, openjk_vectoangles, player_angle_entity, player_entity_rgb,
@@ -15,7 +15,7 @@ use crate::cgame::player_presenter::{
     Ghoul2PresentationView, HashMap, HashSet, Instant, Matrix3x4, ModelResolution, PlayerAngleState,
     PlayerAnimationState, PlayerPresenter, PresentedEntity, MindTrickFade, RagdollMode, SaberBladeLengthKey,
     SaberBladeLengthState, ViewerAnimDebug, BONE_ANGLES_POSTMULT, DEFAULT_SABER_BLADE_LENGTH_MAX,
-    EF2_SHIP_DEATH, EF_DEAD, EF_JETPACK, EF_NODRAW, EF_RAG, ET_BODY, ET_NPC, ET_PLAYER, GT_SIEGE,
+    EF2_SHIP_DEATH, EF_DEAD, EF_DISINTEGRATION, EF_JETPACK, EF_NODRAW, EF_RAG, ET_BODY, ET_NPC, ET_PLAYER, GT_SIEGE,
     entity_is_mind_tricked,
     MAX_CLIENTS, MAX_SABER_BLADES, TEAM_SPECTATOR, WP_SABER, FP_SEE, PW_CLOAKED,
 };
@@ -440,7 +440,7 @@ impl PlayerPresenter {
                 }
                 body_alpha = fade.alpha / 255.0;
             }
-            if entity.entity_type != ET_BODY {
+            if entity.entity_type != ET_BODY && entity_eflags & EF_DISINTEGRATION == 0 {
                 self.queue_blob_shadow(entity);
             }
             if entity.entity_type == ET_NPC
@@ -525,12 +525,9 @@ impl PlayerPresenter {
             // Ghoul2 instance and its saber, turn the body surfaces off.
             let weapon = entity.state.field_i32("weapon").unwrap_or(0);
             let fpls = hidden && self.studio_fpls && matches!(weapon, 2 | 3);
-            self.queue_player_sprites(
-                entity,
-                game,
-                current_time,
-                !hidden,
-            );
+            if entity_eflags & EF_DISINTEGRATION == 0 {
+                self.queue_player_sprites(entity, game, current_time, !hidden);
+            }
             match self.present_player(
                 entity,
                 &info,
@@ -557,7 +554,7 @@ impl PlayerPresenter {
             }
 
             self.look = crate::japro_cg::Appearance::NORMAL;
-            if entity.entity_type != ET_BODY {
+            if entity.entity_type != ET_BODY && entity_eflags & EF_DISINTEGRATION == 0 {
                 match self.present_thrown_saber_for_player(
                     entity,
                     &info,
@@ -690,19 +687,22 @@ impl PlayerPresenter {
             self.report_player_status(entity.number, "submitted=0 reason=EF_NODRAW/EF2_SHIP_DEATH".to_owned());
             return Ok(Vec::new());
         }
-        let mut entity_alpha = entity_alpha;
-        self.look = crate::japro_cg::Appearance::NORMAL;
-        if entity.entity_type == ET_BODY {
-            if let Some(&started) = self.body_fade.get(&entity.number) {
-                // CG_Player: alpha = 254 - elapsed * 0.08, invisible below 1.
-                let byte = 254.0 - (current_time - started).max(0) as f32 * 0.08;
-                if byte < 1.0 {
-                    return Ok(Vec::new());
-                }
-                entity_alpha *= byte / 255.0;
+        // CG_Player / CG_General: EF_DISINTEGRATION takes precedence over
+        // EV_BODYFADE. A newly reused body-queue slot starts with a clean timer.
+        let disintegrating = entity.state.field_i32("eFlags").unwrap_or(0)
+            & EF_DISINTEGRATION != 0;
+        if disintegrating {
+            let started = self.disintegration_start.entry(entity.number).or_insert(current_time);
+            if current_time < *started { *started = current_time; }
+            if current_time.saturating_sub(*started) > 1500 {
+                return Ok(Vec::new());
             }
+        } else {
+            self.disintegration_start.remove(&entity.number);
+            self.disintegration_smoke_last.remove(&entity.number);
         }
-        if entity.entity_type != ET_BODY
+        self.look = crate::japro_cg::Appearance::NORMAL;
+        if entity.entity_type != ET_BODY && !disintegrating
             && entity.state.field_i32("eFlags").unwrap_or(0) & EF_NODRAW == 0
             && entity.state.field_i32("eFlags2").unwrap_or(0) & EF2_SHIP_DEATH == 0
         {
@@ -823,6 +823,30 @@ impl PlayerPresenter {
         // before CG_G2PlayerAngles and before any attachment/skin submissions.
         let attached_entity = self.vehicle_attached_entity(entity, current_time)?;
         let entity = attached_entity.as_ref().unwrap_or(entity);
+        // Snapshot entities call present_player directly, bypassing
+        // present_player_entity. Keep the TaystJK timers and corpse fade at
+        // the shared Ghoul2 entry so *remote* corpses animate as well.
+        let disintegrating = matches!(entity.entity_type, ET_PLAYER | ET_BODY)
+            && entity.state.field_i32("eFlags").unwrap_or(0) & EF_DISINTEGRATION != 0;
+        if disintegrating {
+            let started = self.disintegration_start.entry(entity.number).or_insert(current_time);
+            if current_time < *started { *started = current_time; }
+            if current_time.saturating_sub(*started) > 1500 {
+                return Ok(Vec::new());
+            }
+        } else {
+            self.disintegration_start.remove(&entity.number);
+            self.disintegration_smoke_last.remove(&entity.number);
+        }
+        let mut entity_alpha = entity_alpha;
+        if entity.entity_type == ET_BODY && !disintegrating {
+            if let Some(&started) = self.body_fade.get(&entity.number) {
+                // TaystJK CG_General: alpha = 254 - elapsed * 0.08.
+                let byte = 254.0 - current_time.saturating_sub(started).max(0) as f32 * 0.08;
+                if byte < 1.0 { return Ok(Vec::new()); }
+                entity_alpha *= byte / 255.0;
+            }
+        }
         self.poll_asset_completions();
 
         // CG_NewClientInfo/CG_RegisterClientModelname normalize team presentation
@@ -2144,17 +2168,16 @@ impl PlayerPresenter {
             );
         }
 
-        // EternalJK FPLS mode 3 keeps the local Ghoul2 instance alive so its
-        // attached saber hilt/blade presentation still works, but turns off the
-        // player-body roots with G2SURFACEFLAG_NODESCENDANTS. The local Ghoul2
-        // saber remains attached, while EternalJK still runs CG_AddViewWeapon
-        // afterwards for the weapon's ordinary first-person viewModel.
+        // TaystJK FPLS mode 1: keep the posed arms/hands (and their torso/hip
+        // ancestors) visible, hide head and hose branches to avoid obscuring
+        // the camera. The local Ghoul2 saber stays attached to its hand bolt;
+        // the separate CG_AddViewWeapon path remains unchanged.
         let fpls_surfaces;
         let body_surfaces = if first_person_saber {
             fpls_surfaces = model
                 .surfaces
                 .iter()
-                .filter(|surface| !fpls_mode3_surface_hidden(&model.glm, surface.surface_index))
+                .filter(|surface| !fpls_mode1_surface_hidden(&model.glm, surface.surface_index))
                 .cloned()
                 .collect::<Vec<_>>();
             fpls_surfaces.as_slice()
@@ -2202,6 +2225,62 @@ impl PlayerPresenter {
             true,
             dismember_selection.as_ref(),
         )?;
+
+        // TaystJK CG_Disintegration: submit precisely the body, twice, with
+        // RF_DISINTEGRATE2 (gfx/effects/burn) then RF_DISINTEGRATE1 (skin).
+        // The server's hit position is `origin2`. The 0.045-unit/ms spherical
+        // threshold and four burn bands are implemented in both WGPU model
+        // shaders; GPU skinned bodies retain their shared mesh and bones.
+        if e_flags & EF_DISINTEGRATION != 0 && matches!(entity.entity_type, ET_BODY | ET_PLAYER) {
+            if !submit_geometry { return Ok(Vec::new()); }
+            let started = self.disintegration_start.get(&entity.number)
+                .copied().unwrap_or(current_time);
+            let elapsed = current_time.saturating_sub(started);
+            self.ragdolls.freeze_for_disintegration(entity.number);
+            let hit = crate::cgame::entity_vec3(&entity.state, "origin2").unwrap_or(entity.origin);
+            let burn = self.custom_shader_material("gfx/effects/burn").0;
+            let mut draws = super::disintegration::disintegration_body_draws(
+                draws, elapsed, hit, burn,
+            );
+            if !raster_visible {
+                for surface in &mut draws { surface.raster_visible = false; }
+            }
+            // CG_Disintegration uses lower_lumbar and plays the authored smoke
+            // effect at most every 50ms during the first second. Keep one
+            // emission per entity/period, including at high render frame rates.
+            if elapsed < 1000 && self.disintegration_smoke_last.get(&entity.number)
+                .is_none_or(|last| current_time.saturating_sub(*last) >= 50)
+            {
+                self.disintegration_smoke_last.insert(entity.number, current_time);
+                let origin = model_bolt_origin_timed(
+                    &mut self.perf, &model, &pose, render_axis, render_origin, "lower_lumbar",
+                ).ok().flatten().unwrap_or(render_origin);
+                self.fx_requests.push(crate::cgame::player_presenter::PlayerFxRequest::EffectDir {
+                    name: "disruptor/death_smoke".to_owned(), origin,
+                    dir: [0.0, 1.0, 0.0],
+                });
+            }
+            return Ok(draws);
+        }
+        // TaystJK ET_BODY's ordinary fade is distinct from damage-triggered
+        // disintegration: the translucent corpse remains, with a late glowing
+        // body pass that begins 2500ms after EV_BODYFADE.
+        if entity.entity_type == ET_BODY {
+            if let Some(started) = self.body_fade.get(&entity.number).copied() {
+                let elapsed = current_time.saturating_sub(started);
+                if elapsed > 2500 && elapsed < 3200 && submit_geometry {
+                    let light_side = self.body_queue_copies.get(&entity.number)
+                        .is_some_and(|copy| copy._light_side);
+                    let shader = if light_side { "gfx/misc/personalshield" }
+                        else { "gfx/effects/sabers/red_glow" };
+                    let glow = self.custom_shader_material(shader).0;
+                    let added = super::disintegration::fade_body_glow(
+                        &draws, elapsed - 2500, render_origin, glow, light_side,
+                    );
+                    draws.extend(added);
+                }
+            }
+        }
 
         // TaystJK CG_Player force-speed trail: translucent duplicates of the
         // CURRENT animated Ghoul2 body, displaced to the previous two origins.

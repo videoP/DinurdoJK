@@ -5,6 +5,7 @@
 //! *stage tables* and indirect/cull descriptors, but retains all resident world
 //! geometry, lightmaps, grass, lighting, AO and ocean simulation state. Nothing
 //! in the ordinary frame/draw path consults the shader-name remap table.
+use crate::material_flags::*;
 use crate::renderer::{
     build_draw_compaction_groups, build_world_animation, create_cull_debug_bind_group,
     create_fast_world_bind_group, create_gpu_cull_bind_group, create_world_bind_group,
@@ -33,6 +34,7 @@ fn remapped_sun_geometry(
     let mut seen_lightmaps = BTreeSet::new();
     let mut seen_vertex = BTreeSet::new();
     for (slot, model) in map.inline_models.iter().enumerate() {
+        if map.base.sub_bsp_boundary.is_some_and(|b| model.model >= b.model) { continue; }
         let Some(instance) = world.inline_models.get(slot) else { continue; };
         for index in model.batches.clone() {
             let Some(batch) = map.inline_batches.get(index) else { continue; };
@@ -41,7 +43,7 @@ fn remapped_sun_geometry(
             let Some(source) = map.base.inline_vertices.get(start..end) else { continue; };
             if start < model.vertices.start as usize || end > model.vertices.end as usize { continue; }
             let lm = super::upload::inline_original_lightmap_receiver(
-                batch.lightmap, batch.pipeline.class, source, world.lightmaps.len());
+                batch.lightmap, batch.pipeline.class, source, world.baked_sun_lightmap_count);
             let sky = super::upload::inline_vertex_sky_receiver(batch);
             if !lm && !sky { continue; }
             if lm {
@@ -315,7 +317,7 @@ impl Renderer {
                 let inline_baked_lightmap = inline
                     && source.lightmap.is_some()
                     && candidates.iter().any(|old| old.inline_baked_lightmap);
-                if inline && !inline_baked_lightmap { uniform.header[3] |= 1 << 18; }
+                if inline && !inline_baked_lightmap { uniform.header[3] |= MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION; }
                 // Identical authored stages alias their existing GPU resources.
                 // The same geometry can have many stages; matching the first
                 // geometry owner unconditionally would accidentally restore
@@ -323,7 +325,7 @@ impl Renderer {
                 let reusable = candidates.iter().copied().find(|old| {
                     let old_detail = old.source.texture.and_then(|i| world.detail_texture_by_base.get(i).copied()).unwrap_or(0);
                     let mut old_uniform = material_uniform(&old.source, (old_detail & AUTO_DETAIL_ENABLED_BIT) != 0);
-                    if old.is_inline_entity && !old.inline_baked_lightmap { old_uniform.header[3] |= 1 << 18; }
+                    if old.is_inline_entity && !old.inline_baked_lightmap { old_uniform.header[3] |= MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION; }
                     crate::renderer::same_draw_state(&old.source, source)
                         // Suffix slots are recreated for each remap, so old
                         // bind groups may only be aliased for original slots.
@@ -371,7 +373,7 @@ impl Renderer {
                                     &prior.source,
                                     prior.source.texture.and_then(|i| world.detail_texture_by_base.get(i).copied())
                                         .is_some_and(|word| (word & AUTO_DETAIL_ENABLED_BIT) != 0));
-                                if inline && !prior.inline_baked_lightmap { prior_uniform.header[3] |= 1 << 18; }
+                                if inline && !prior.inline_baked_lightmap { prior_uniform.header[3] |= MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION; }
                                 bytemuck::bytes_of(&prior_uniform) == bytemuck::bytes_of(&uniform)
                             }
                     })
@@ -384,18 +386,25 @@ impl Renderer {
                 if reusable.is_none() && shared.is_none() {
                 let fragment_key = MaterialFragmentKey::from_uniform(&uniform);
                 let material_buffer = material_arena.push(&self.device, &self.queue, bytemuck::bytes_of(&uniform));
+                if inline {
+                    super::upload::trace_inline_material(source, &uniform, &material_buffer, !inline_baked_lightmap, "remap base");
+                }
                 let additive_uniforms: [UniformSlot; 2] = std::array::from_fn(|index| {
                     source.additive_companions.get(index).map_or_else(
                         || material_buffer.clone(),
                         |companion| {
                             let mut extra = material_uniform(companion, false);
-                            if inline && !inline_baked_lightmap { extra.header[3] |= 1 << 18; }
+                            if inline && !inline_baked_lightmap { extra.header[3] |= MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION; }
                             extra.params[3] = source.shader_time_offset;
                             extra.vector_t[3] = source.shader_clamp_time.unwrap_or(0.0);
                             if companion.texture.and_then(|i| texture_clamp.get(i)).copied().unwrap_or(false) {
-                                extra.header[3] |= 65536;
+                                extra.header[3] |= MATERIAL_FLAG_ADDITIVE_CLAMP;
                             }
-                            material_arena.push(&self.device, &self.queue, bytemuck::bytes_of(&extra))
+                            let slot = material_arena.push(&self.device, &self.queue, bytemuck::bytes_of(&extra));
+                            if inline {
+                                super::upload::trace_inline_material(companion, &extra, &slot, !inline_baked_lightmap, "remap additive");
+                            }
+                            slot
                         },
                     )
                 });

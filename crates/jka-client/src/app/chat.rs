@@ -132,6 +132,7 @@ impl App {
         }
         self.chat_mode = mode;
         self.chat_input.clear();
+        self.chat_input_selected = false;
         self.chat_player_completion = None;
         self.set_overlay(OverlayMode::Chat);
     }
@@ -237,6 +238,7 @@ impl App {
                 self.chat_input.truncate(word_start);
                 self.chat_input.push_str(&name);
                 self.chat_input.push(' ');
+                self.chat_input_selected = false;
                 self.publish_ui();
                 return;
             }
@@ -270,6 +272,7 @@ impl App {
         self.chat_input.truncate(word_start);
         self.chat_input.push_str(&name);
         self.chat_input.push(' ');
+        self.chat_input_selected = false;
         self.chat_player_completion = Some(ChatPlayerCompletionCycle {
             word_start,
             candidates,
@@ -283,11 +286,13 @@ impl App {
         // disconnect or transition to a demo or in-process solo game.
         if self.chat_unavailable() {
             self.chat_input.clear();
+            self.chat_input_selected = false;
             self.chat_player_completion = None;
             self.set_overlay(OverlayMode::None);
             return;
         }
         self.chat_player_completion = None;
+        self.chat_input_selected = false;
         let message = std::mem::take(&mut self.chat_input);
         if !message.is_empty() {
             // Port TaystJK Message_Key rather than feeding chat through the
@@ -349,6 +354,22 @@ mod tests {
         let bytes = chat_command_bytes(ChatMode::Global, &"Ж".repeat(90));
         assert_eq!(bytes.len(), b"say \"".len() + 148 + 1);
         assert!(std::str::from_utf8(&bytes).is_ok());
+    }
+
+    #[test]
+    fn unicode_chat_keeps_greek_and_middle_dot_distinct_from_cp437() {
+        // The chat editor must retain semantic Unicode; CP437 conversion is
+        // reserved for legacy name/byte paths, not pasted or typed chat text.
+        let message = "Γεια σου · Привет 你好";
+        let command = chat_command_bytes(ChatMode::Global, message);
+        let body = &command[b"say \"".len()..command.len() - 1];
+        let expected = crate::cgame::unicode_chat_wire_bytes(message);
+        assert_eq!(body, expected.as_slice());
+        // U+00B7 is a single Latin-1 protocol byte, not CP437's 0xFA ('ú').
+        assert_eq!(body.iter().filter(|&&byte| byte == 0xB7).count(), 1);
+        assert!(!body.contains(&0xFA));
+        let received = crate::cgame::bytes_to_lossless_ascii(body);
+        assert_eq!(crate::cgame::received_chat_for_display(&received, None), message);
     }
 
     #[test]

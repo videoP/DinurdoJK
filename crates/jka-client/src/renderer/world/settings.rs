@@ -174,13 +174,19 @@ impl Renderer {
         // for the previous mod. Drop it before requesting new mod artwork.
         self.ui_ext_image_loader = None;
         self.ui_ext_image_key.clear();
+        self.ui_state.extension_images.clear();
         self.ui_state.extension_shader_flags.clear();
+        self.ui_state.extension_image_dimensions.clear();
+        self.ui_state.extension_image_uvs.clear();
         self.ui_icon_shader_resolver = None;
         self.ui_icon_shader_materials.clear();
         self._ui_ext_images = crate::renderer::upload_texture(
             &self.device, &self.queue,
             &crate::renderer::overlay::blank_ui_extension_atlas(),
         );
+        // Release any geometry addressing the previous mount's atlas before
+        // the next asynchronous image request is committed.
+        self.rebuild_dynamic_ui();
         // Switching mods also invalidates the pending scoreboard avatar job
         // and its decoded cells. One bind-group rebuild covers both textures.
         self.invalidate_ui_avatars();
@@ -611,9 +617,9 @@ impl Renderer {
             || (self.baked_indirect_power - 1.0).abs() > 0.0001
             || self.baked_sun_debug_mode != 0
             || self.sun_lighting
-            // Blue Water moonlight shares this existing Relighting shader path.
+            // Moonlight shares this existing Relighting shader path.
             // Select the variant when Relighting is enabled, not every sunset.
-            || (self.sky_backend == 1 && self.sun_override)
+            || self.sun_override
             || ((self.baked_sun_removal > 0.0 || self.baked_sun_removal_auto || self.baked_sun_removal_contour)
                 && self.world.as_ref().is_some_and(|world| !world.source_map && world.sun_bake.baked_direction().is_some()))
     }

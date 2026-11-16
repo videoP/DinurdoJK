@@ -1,3 +1,4 @@
+use crate::material_flags::*;
 use super::*;
 
 #[test]
@@ -29,7 +30,7 @@ fn foliage_wind_vertex_gpu_moves_only_promoted_cards() {
         });
         let adapter = instance.request_adapter(&Default::default()).await.unwrap();
         let (device, queue) = adapter.request_device(&Default::default()).await.unwrap();
-        let source = format!("{}\n{}", crate::foliage::SHADER, r#"
+        let source = format!("{}\n{}", crate::foliage::shader(), r#"
 @group(0) @binding(0) var<storage, read_write> result: array<vec4<f32>, 8>;
 @compute @workgroup_size(8) fn main(@builtin(local_invocation_index) i: u32) {
     let p = vec3<f32>(10.0, 50.0, 20.0);
@@ -177,7 +178,7 @@ fn legacy_rgb_transfer_is_shared_by_fused_and_additive_bsp_paths() {
         assert!(shader.contains("fn legacy_rgb_encode("), "{name}: missing shared encoder");
         assert!(shader.contains("fn legacy_rgb_decode("), "{name}: missing fused decoder");
         assert!(shader.contains("fn legacy_rgb_output("), "{name}: missing additive output");
-        assert!(shader.contains("MATERIAL_LEGACY_ADDITIVE_SRGB: u32 = 536870912u"), "{name}: material bit changed");
+        assert!(shader.contains("MATERIAL_FLAG_LEGACY_SRGB"), "{name}: missing shared material flag");
         assert!(shader.contains("legacy_rgb_encode(overlay_sample.rgb)"), "{name}: fused path drifted");
         assert!(shader.contains("let vertex_wave_byte = round(clamp(waveform, 0.0, 1.0) * 255.0) / 255.0;"), "{name}: 8-bit TaystJK wave modulation missing");
         assert!(shader.contains("legacy_rgb_encode(texel_linear) * vertex_wave_byte"), "{name}: encoded-space wave modulation missing");
@@ -198,8 +199,8 @@ fn world_tcmods_match_taystjk_scroll_wrap_and_rotation_sign() {
         ("world-fast", include_str!("../../bsp_fast.wgsl")),
         ("world-lean", include_str!("../../bsp_lean.wgsl")),
         ("rt-core", include_str!("../../rt_core.wgsl")),
-        ("shadow", include_str!("../../shadow.wgsl")),
-        ("depth", include_str!("../../depth_prepass.wgsl")),
+        ("shadow", crate::material_flags::shadow_shader()),
+        ("depth", crate::material_flags::depth_shader()),
     ] {
         assert!(wgsl.contains("uv = uv + scroll - floor(scroll);"), "{name}: missing TaystJK scroll wrap");
         assert!(wgsl.contains("let radians = -a.y * time * 0.017453292519943295;"),
@@ -801,7 +802,7 @@ fn authored_world_lighting_diffuse_does_not_render_white() {
     assert_eq!(batches[1].rgb_gen, RgbGen::LightingDiffuse);
     let uniform = material_uniform(&batches[1], false);
     assert_eq!(uniform.color, [0.0, 0.0, 0.0, 0.35]);
-    assert_eq!(uniform.header[2] & 1, 0, "not rgbGen vertex");
+    assert_eq!(uniform.header[2] & MATERIAL_FLAG_RGB_VERTEX, 0, "not rgbGen vertex");
     let mut unaffected = batches[1].clone();
     unaffected.rgb_gen = RgbGen::Identity;
     assert_eq!(material_uniform(&unaffected, false).color, [1.0, 1.0, 1.0, 0.35]);
@@ -832,8 +833,8 @@ fn authored_alpha_identity_does_not_inherit_rgb_vertex_alpha() {
     crate::scene::append_sky_batches(&mut batches, &material, Some(0), None,
         false, 0..6, None, &[], [0; 4], [0.0; 4], false);
     let uniform = material_uniform(&batches[1], false);
-    assert_ne!(uniform.header[2] & 1, 0); // RGB from vertex
-    assert_eq!(uniform.header[2] & (1048576 | 2097152), 0); // no vertex alpha
+    assert_ne!(uniform.header[2] & MATERIAL_FLAG_RGB_VERTEX, 0); // RGB from vertex
+    assert_eq!(uniform.header[2] & (MATERIAL_FLAG_ALPHA_VERTEX | MATERIAL_FLAG_ALPHA_ONE_MINUS_VERTEX), 0); // no vertex alpha
 }
 
 #[test]
@@ -895,8 +896,8 @@ fn wave_color_and_alpha_generators_are_packed_for_the_shader() {
         false,
     );
     let uniform = material_uniform(&batches[1], false);
-    assert_ne!(uniform.header[2] & 134217728, 0);
-    assert_ne!(uniform.header[2] & 268435456, 0);
+    assert_ne!(uniform.header[2] & MATERIAL_FLAG_RGB_WAVE, 0);
+    assert_ne!(uniform.header[2] & MATERIAL_FLAG_ALPHA_WAVE, 0);
     assert_eq!(uniform.wave_rgb, [0.2, 0.03, 0.5, 0.04]);
     assert_eq!(uniform.wave_alpha, [0.5, 0.25, 0.1, 2.0]);
     assert_eq!(uniform.wave_funcs[..2], [0, 4]);
@@ -925,18 +926,18 @@ fn wave_color_and_alpha_generators_are_packed_for_the_shader() {
     let mut guarded = vector_batch.clone();
     guarded.authored_environment_composite = true;
     let guarded_uniform = material_uniform(&guarded, false);
-    assert_ne!(guarded_uniform.header[3] & 4, 0);
-    assert_eq!(guarded_uniform.header[2] & 8_388_608, 0,
+    assert_ne!(guarded_uniform.header[3] & MATERIAL_FLAG_AUTHORED_ENVIRONMENT, 0);
+    assert_eq!(guarded_uniform.header[2] & MATERIAL_FLAG_EXPLICIT_LIGHTMAP, 0,
         "the environment guard must not turn ordinary stages into explicit lightmap stages");
     guarded.authored_environment_composite = false;
     guarded.texture_is_lightmap = true;
     let lightmap_uniform = material_uniform(&guarded, false);
-    assert_ne!(lightmap_uniform.header[2] & 8_388_608, 0);
-    assert_eq!(lightmap_uniform.header[3] & 4, 0,
+    assert_ne!(lightmap_uniform.header[2] & MATERIAL_FLAG_EXPLICIT_LIGHTMAP, 0);
+    assert_eq!(lightmap_uniform.header[3] & MATERIAL_FLAG_AUTHORED_ENVIRONMENT, 0,
         "a real lightmap must not inherit the environment guard");
     // The outer box (no generators) leaves the wave flags clear.
     assert_eq!(
-        material_uniform(&batches[0], false).header[2] & (134217728 | 268435456),
+        material_uniform(&batches[0], false).header[2] & (MATERIAL_FLAG_RGB_WAVE | MATERIAL_FLAG_ALPHA_WAVE),
         0
     );
 }
@@ -1347,9 +1348,9 @@ fn dynamic_model_depth_phase_places_saber_fx_after_gpu_skinned_opaque_geometry()
 #[test]
 fn hiz_occlusion_shaders_validate() {
     for (name, source) in [
-        ("depth_prepass", include_str!("../../depth_prepass.wgsl")),
+        ("depth_prepass", crate::material_flags::depth_shader()),
         ("studio_lens", include_str!("../../studio_lens.wgsl")),
-        ("shadow", include_str!("../../shadow.wgsl")),
+        ("shadow", crate::material_flags::shadow_shader()),
         ("world_flares", include_str!("../../world_flares.wgsl")),
         ("gpu_cull", include_str!("../../gpu_cull.wgsl")),
         ("hiz_build", include_str!("../../hiz_build.wgsl")),
@@ -1421,7 +1422,7 @@ fn all_renderer_shaders_validate() {
         ("post_gamma", include_str!("../../post_gamma.wgsl")),
         ("crt_lottes_fast", include_str!("../../crt_lottes_fast.wgsl")),
         ("crt_lottes", include_str!("../../crt_lottes.wgsl")),
-        ("depth_prepass", include_str!("../../depth_prepass.wgsl")),
+        ("depth_prepass", crate::material_flags::depth_shader()),
         ("ssr_temporal", ssr_temporal.as_str()),
         ("ssr_visibility", include_str!("../../ssr_visibility.wgsl")),
         (

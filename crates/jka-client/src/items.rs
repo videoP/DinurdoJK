@@ -182,6 +182,28 @@ mod tests {
     }
 
     #[test]
+    fn jka_dl44_and_old_bryar_have_distinct_native_assets() {
+        // Probe the pinned JKA item table directly so a test runner's JK2
+        // filesystem state cannot silently select the JK2 presentation list.
+        let weapon = |tag| {
+            (1..jka_movement::bg_item_count())
+                .find(|&index| jka_movement::bg_item(index)
+                    .is_some_and(|item| item.item_type == IT_WEAPON && item.tag == tag))
+                .expect("JKA weapon in native bg_itemlist")
+        };
+        let dl44 = weapon(4); // WP_BRYAR_PISTOL, renamed blaster pistol in JKA
+        let bryar = weapon(16); // WP_BRYAR_OLD
+        assert_eq!(jka_movement::bg_item(dl44).unwrap().classname, "weapon_blaster_pistol");
+        assert_eq!(jka_movement::bg_item(bryar).unwrap().classname, "weapon_bryar_pistol");
+        assert_eq!(jka_movement::bg_item(dl44).unwrap().view_model,
+            "models/weapons2/blaster_pistol/blaster_pistol.md3");
+        assert_eq!(jka_movement::bg_item(bryar).unwrap().view_model,
+            "models/weapons2/briar_pistol/briar_pistol.md3");
+        assert_eq!(jka_movement::bg_item_icon(dl44).as_deref(), Some("gfx/hud/w_icon_blaster_pistol"));
+        assert_eq!(jka_movement::bg_item_icon(bryar).as_deref(), Some("gfx/hud/w_icon_briar"));
+    }
+
+    #[test]
     fn jk2_items_keep_jk2_assets_under_presentation_ids() {
         let items = jk2_items();
         let bryar = items

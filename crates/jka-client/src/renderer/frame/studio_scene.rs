@@ -118,7 +118,8 @@ impl Renderer {
     /// frame readbacks therefore contain the same per-demo HUD pixels.
     fn submit_studio_source_hud(&mut self,hud:&crate::ui::UiSnapshot) {
         use crate::ui;
-        let _unicode_scope = ui::UnicodeFallbackScope::enter(self.ui_jura_metrics.clone());
+        let _unicode_scope = ui::UnicodeFallbackScope::enter_with_requests(
+            self.ui_jura_metrics.clone(), Some(self.ui_unicode_worker.requests.clone()));
         let (w,h)=(self.config.width.max(1),self.config.height.max(1));
         // The key-art atlas is lazily resident in ordinary gameplay. Studio
         // can be opened directly from the main menu, so initialize it here too.
