@@ -744,6 +744,7 @@ impl App {
             chat_mode: ChatMode::Global,
             chat_input: String::new(),
             chat_input_selected: false,
+            chat_emoji_picker: Default::default(),
             chat_player_completion: None,
             chat_lines: VecDeque::with_capacity(16),
             chat_translation: crate::app::chat_translation::ChatTranslation::new(presentation.chat_translate.clone()),

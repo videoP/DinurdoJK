@@ -276,6 +276,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::CaptureFrontendScene { .. } => "CaptureFrontendScene",
         RenderCommand::CaptureVideoFrame { .. } => "CaptureVideoFrame",
         RenderCommand::SetUi(..) => "SetUi",
+        RenderCommand::ReloadChatEmojis => "ReloadChatEmojis",
         RenderCommand::RemapThumb { .. } => "RemapThumb",
         RenderCommand::RemapThumbsRelease => "RemapThumbsRelease",
         RenderCommand::SetStreamerSettings(..) => "SetStreamerSettings",
@@ -2064,6 +2065,7 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::CaptureFrontendScene { path, neutral_gamma }) => renderer.request_frontend_scene_capture(path, neutral_gamma),
                     Ok(RenderCommand::CaptureVideoFrame { frame_index, depth, alpha }) => renderer.request_video_frame_capture(frame_index, depth, alpha),
                     Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
+                    Ok(RenderCommand::ReloadChatEmojis) => renderer.reload_ui_chat_emojis(),
                     Ok(RenderCommand::RemapThumb { slot, size, rgba }) => renderer.set_remap_thumb(slot, size, rgba),
                     Ok(RenderCommand::RemapThumbsRelease) => renderer.release_remap_thumbs(),
                     Ok(RenderCommand::SetStreamerSettings(settings)) => {
@@ -3703,8 +3705,11 @@ pub(in crate::renderer) fn render_thread_main(
                 let pixels = u64::from(width) * u64::from(height);
                 format!("bounded({x},{y},{width},{height}) pixels={pixels}/{full_pixels}")
             } else {
-                "full".to_owned()
+                format!("full reason={}", last_info.legacy_transfer_reject)
             };
+            if !last_info.legacy_eligible_surfaces.is_empty() {
+                println!("[JKA PERF BLEND SURFACES]{}", last_info.legacy_eligible_surfaces);
+            }
             println!("[JKA PERF BLEND A/B] requested={} effective={} format={:?} encoded_draws={} encoded_active={} scene_copy_forced={} effective_post={} native_unorm_alias={} encoded_region={}",
                 requested_blend_mode,
                 effective_blend_mode,

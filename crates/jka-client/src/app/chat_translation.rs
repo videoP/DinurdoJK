@@ -189,6 +189,7 @@ pub(in crate::app) struct ChatTranslation {
     config: Option<Arc<ProviderConfig>>,
     in_session: bool,
     cjk_font: CjkFont,
+    pub(in crate::app) emoji_font: super::egui_menu::emoji::EmojiFont,
     /// Model address and instruction for the local provider, copied from
     /// the `cg_chatLlm*` settings.
     pub(in crate::app) local_model: (String, String),

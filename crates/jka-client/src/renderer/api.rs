@@ -1415,6 +1415,8 @@ pub enum RenderCommand {
     CaptureFrontendScene { path: PathBuf, neutral_gamma: bool },
     CaptureVideoFrame { frame_index: u64, depth: bool, alpha: bool },
     SetUi(UiSnapshot),
+    /// Reindex newly mounted gfx/emoji PNGs after fs_restart without vid_restart.
+    ReloadChatEmojis,
     /// Shader Remaps: decoded RGBA for one thumbnail atlas slot.
     RemapThumb { slot: usize, size: [u32; 2], rgba: Vec<u8> },
     /// Shader Remaps: drop the thumbnail atlas (page state discarded).
@@ -1602,6 +1604,10 @@ pub(in crate::renderer) struct FrameInfo {
     /// The executed bounded HDR/offscreen legacy encode/decode region, if any.
     /// None means the reference full-frame transfer or no legacy transfer.
     pub(in crate::renderer) legacy_transfer_rect: Option<(u32, u32, u32, u32)>,
+    /// Perf-trace only: why the bounded transfer fell back to full-frame.
+    pub(in crate::renderer) legacy_transfer_reject: &'static str,
+    /// Perf-trace only: legacy-blend-eligible surfaces this frame.
+    pub(in crate::renderer) legacy_eligible_surfaces: String,
     /// Opt-in diagnostic. Mutually exclusive encoder intervals; they do not
     /// measure GPU execution. `encode_pre_world` can include RT, shadows,
     /// reflections, and environment work on the unified path.

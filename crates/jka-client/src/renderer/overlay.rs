@@ -139,7 +139,7 @@ pub(in crate::renderer) fn create_ui_texture_group(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     sampler: &wgpu::Sampler,
-    images: [&GpuImage; 11],
+    images: [&GpuImage; 12],
     encoded: bool,
 ) -> wgpu::BindGroup {
     let views: Vec<_> = images.iter().map(|image| {
@@ -161,6 +161,7 @@ pub(in crate::renderer) fn create_ui_texture_group(
             wgpu::BindGroupEntry { binding: 9, resource: wgpu::BindingResource::TextureView(&views[8]) },
             wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(&views[9]) },
             wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(&views[10]) },
+            wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(&views[11]) },
         ],
     })
 }
@@ -322,6 +323,7 @@ impl Renderer {
         ui_state.clean_font.clone_from(&self.ui_clean_font_metrics);
         ui_state.enemy_info_font.clone_from(&self.ui_enemy_info_font_metrics);
         ui_state.avatar_atlas.clone_from(&self.ui_avatar_atlas);
+        ui_state.chat_emoji_atlas.clone_from(&self.ui_state.chat_emoji_atlas);
         ui_state.shader_compile_progress = self.ui_state.shader_compile_progress;
         ui_state.shader_compile_stage = self.ui_state.shader_compile_stage.clone();
         self.ui_state = ui_state;
@@ -332,6 +334,7 @@ impl Renderer {
         self.sync_ui_team_icons();
         self.sync_enemy_icon_shader();
         self.sync_ui_extension_images();
+        self.sync_ui_chat_emojis();
         self.sync_ui_loading_background();
         self.rebuild_ui();
     }
@@ -499,7 +502,7 @@ impl Renderer {
             &self._ui_font, &self._ui_small_font, splash, &self._ui_keys,
             &self._ui_icons, &self._ui_team_icons, &self._ui_ext_images,
             &self._ui_clean_font, &self._ui_avatars, &self._ui_remap_thumbs,
-            &self._ui_jura_font,
+            &self._ui_jura_font, &self._ui_chat_emojis,
         ];
         self.ui_bind_group = create_ui_texture_group(
             &self.device, &self.ui_texture_layout, &self._ui_font_sampler, images, false);
@@ -1410,6 +1413,7 @@ impl Renderer {
             replaced_native(&self.ui_state.spectator_broadcast) != replaced_native(&spectator_broadcast);
         self.ui_state.spectator_broadcast = spectator_broadcast;
         let avatars_ready = self.sync_ui_avatars();
+        self.sync_ui_chat_emojis();
         if native_vitals_changed {
             // The native health/force meters live in the stable dynamic batch.
             self.rebuild_dynamic_ui();
@@ -2584,7 +2588,7 @@ fn pack_native_icon_shelves(
 /// unlike the old fixed-cell atlas, ordinary 32px, 128px, 512px and HD art
 /// are copied byte-for-byte into this texture. Returns both pixels and per-icon
 /// UVs so weapons, Force icons, crosshairs and the lagometer share one binding.
-fn assemble_native_icon_atlas(
+pub(in crate::renderer) fn assemble_native_icon_atlas(
     mut images: Vec<Option<image::RgbaImage>>,
     max_texture_size: u32,
 ) -> (TextureData, Vec<([f32; 2], [f32; 2])>) {

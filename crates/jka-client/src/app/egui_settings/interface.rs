@@ -874,6 +874,14 @@ impl App {
                 ui.add_space(3.0);
             }
         });
+        theme::row(ui, "Image emotes", "TaystJK-compatible :name: and symbolic emotes (for example #:) from gfx/emoji PNGs. Unicode emoji stays enabled.", theme::Reset::None, |ui| {
+            for (enabled, label) in [(false, "Off"), (true, "On")] {
+                if theme::chip(ui, label, chat.emojis == enabled).clicked() && chat.emojis != enabled {
+                    let _ = self.set_console_cvar("cg_chatBoxEmojis", if enabled { "1" } else { "0" });
+                }
+                ui.add_space(3.0);
+            }
+        });
         let sliders: [(&str, &str, &str, f32, std::ops::RangeInclusive<f32>, &str); 4] = [
             ("Messages while typing", "cg_chatHistoryLines", "How many recent messages show at full strength while you type.", f32::from(chat.history_lines), 1.0..=20.0, ""),
             ("Fade after", "cg_chatFadeTime", "Seconds a message stays on screen.", chat.fade_time, 1.0..=60.0, " s"),

@@ -44,6 +44,8 @@ pub struct RagdollConfig {
     pub ccd: bool,
     pub sleeping: bool,
     pub debris_enabled: bool,
+    /// Only server EV_DEBRIS and EV_GLASS_SHATTER, not gibs or gameplay.
+    pub breakables_enhanced: bool,
     pub max_debris: u32,
     pub debris_lifetime_seconds: f32,
     pub max_ragdolls: u32,
@@ -73,6 +75,7 @@ impl Default for RagdollConfig {
             ccd: true,
             sleeping: true,
             debris_enabled: false,
+            breakables_enhanced: false,
             max_debris: 192,
             debris_lifetime_seconds: 10.0,
             max_ragdolls: 8,
@@ -324,6 +327,9 @@ struct GlassBody {
     body: Option<RigidBodyHandle>,
     spec: ShardSpec,
     centre: [f32; 3],
+    /// Orientation of the authored pane at spawn; the visible vertices are
+    /// stored in world space and transformed relative to this initial pose.
+    initial_rotation: Rotation,
     born_at: i32,
     activate_at: i32,
     expires_at: i32,
@@ -426,12 +432,17 @@ impl RagdollWorld {
         self.config.physics_enabled && self.config.debris_enabled && self.static_world_ready
     }
 
+    fn breakables_active(&self) -> bool {
+        self.config.physics_enabled && self.config.breakables_enhanced && self.static_world_ready
+    }
+
     fn world_active(&self) -> bool {
         // Do not step an otherwise-unused Rapier world merely because
         // cg_dismember is enabled. The first detached body is seeded after the
         // presentation prepass and starts integrating on the following frame.
         self.active() || (self.detached_physics_active() && !self.detached_limbs.is_empty())
-            || (self.debris_active() && (!self.debris.is_empty() || self.glass.iter().any(|g| g.body.is_some())))
+            || ((self.debris_active() || self.breakables_active())
+                && (!self.debris.is_empty() || self.glass.iter().any(|g| g.body.is_some())))
     }
 
     pub fn debug_enabled(&self) -> bool {
@@ -465,7 +476,8 @@ impl RagdollWorld {
 
     pub fn set_config(&mut self, config: RagdollConfig) {
         let was_enabled = self.config.enabled;
-        let debris_was_enabled = self.debris_active();
+        let debris_was_enabled = self.debris_active() || self.breakables_active();
+        let breakables_mode_changed = self.config.breakables_enhanced != config.breakables_enhanced;
         let rebuild_debris = self.config.ccd != config.ccd || self.config.sleeping != config.sleeping;
         let physics_was_enabled = self.config.physics_enabled;
         let debug_was = self.config.debug;
@@ -537,7 +549,8 @@ impl RagdollWorld {
         if self.config.dismemberment == 0 {
             self.clear_detached_limbs();
         }
-        if debris_was_enabled && (!self.debris_active() || rebuild_debris) {
+        if debris_was_enabled && (!(self.debris_active() || self.breakables_active())
+            || rebuild_debris || breakables_mode_changed) {
             self.clear_debris();
             self.clear_glass();
         }
@@ -1893,7 +1906,18 @@ impl RagdollWorld {
     /// and severed limbs. Returns false when the stock ballistic fallback is
     /// required (physics off or static collision not ready yet).
     pub(crate) fn spawn_debris(&mut self, specs: &[ChunkSpec], now: i32) -> bool {
-        if !self.debris_active() || self.config.max_debris == 0 {
+        self.spawn_debris_with_lifetime(specs, now, None, false)
+    }
+
+    pub(crate) fn spawn_breakable_debris(&mut self, specs: &[ChunkSpec], now: i32) -> bool {
+        self.spawn_debris_with_lifetime(specs, now, Some(15_000), true)
+    }
+
+    fn spawn_debris_with_lifetime(
+        &mut self, specs: &[ChunkSpec], now: i32, life_ms: Option<i32>, breakable: bool,
+    ) -> bool {
+        if !(if breakable { self.breakables_active() } else { self.debris_active() })
+            || self.config.max_debris == 0 {
             return false;
         }
         // Keep the authoritative spawn distribution/materials. Only the
@@ -1953,7 +1977,7 @@ impl RagdollWorld {
                 body,
                 qpath: spec.qpath.clone(),
                 scale: spec.scale,
-                expires_at: now.saturating_add((self.config.debris_lifetime_seconds * 1000.0) as i32),
+                expires_at: now.saturating_add(life_ms.unwrap_or((self.config.debris_lifetime_seconds * 1000.0) as i32)),
             });
             self.trim_debris_to_budget();
         }
@@ -1963,7 +1987,18 @@ impl RagdollWorld {
     /// Returns the prefix actually accepted; unaccepted quads remain legacy
     /// FX polys, including when physics/collision is unavailable.
     pub(crate) fn spawn_glass(&mut self, specs: &[ShardSpec], now: i32) -> usize {
-        if !self.debris_active() || self.config.max_debris == 0 {
+        self.spawn_glass_with_lifetime(specs, now, None, false)
+    }
+
+    pub(crate) fn spawn_breakable_glass(&mut self, specs: &[ShardSpec], now: i32) -> usize {
+        self.spawn_glass_with_lifetime(specs, now, Some(15_000), true)
+    }
+
+    fn spawn_glass_with_lifetime(
+        &mut self, specs: &[ShardSpec], now: i32, life_ms: Option<i32>, breakable: bool,
+    ) -> usize {
+        if !(if breakable { self.breakables_active() } else { self.debris_active() })
+            || self.config.max_debris == 0 {
             return 0;
         }
         let count = specs.len().min(self.config.max_debris as usize);
@@ -1983,9 +2018,10 @@ impl RagdollWorld {
                 body: None,
                 spec: spec.clone(),
                 centre,
+                initial_rotation: Rotation::IDENTITY,
                 born_at: now,
                 activate_at: now.saturating_add(spec.delay_ms.max(0)),
-                expires_at: now.saturating_add((self.config.debris_lifetime_seconds * 1000.0) as i32),
+                expires_at: now.saturating_add(life_ms.unwrap_or((self.config.debris_lifetime_seconds * 1000.0) as i32)),
             });
         }
         self.trim_debris_to_budget();
@@ -1997,18 +2033,38 @@ impl RagdollWorld {
             if glass.body.is_some() || now < glass.activate_at {
                 continue;
             }
-            let min = std::array::from_fn::<_, 3, _>(|axis| glass.spec.positions.iter()
-                .map(|point| point[axis]).fold(f32::INFINITY, f32::min));
-            let max = std::array::from_fn::<_, 3, _>(|axis| glass.spec.positions.iter()
-                .map(|point| point[axis]).fold(f32::NEG_INFINITY, f32::max));
-            // Axis-aligned at spawn: each pane is planar, with minimal thickness
-            // along its normal. The original quad remains the rendered surface.
-            let half = std::array::from_fn::<_, 3, _>(|axis| {
-                ((max[axis] - min[axis]) * 0.5).max(0.45).min(128.0) * JKA_TO_RAPIER
-            });
+            let origin = glass.spec.positions[0];
+            let u = Vector::from_array(std::array::from_fn(|i| glass.spec.positions[1][i] - origin[i]));
+            let v = Vector::from_array(std::array::from_fn(|i| glass.spec.positions[3][i] - origin[i]));
+            let normal = u.cross(v);
+            // Unlike the old AABB proxy, orient each thin collider to its
+            // actual shard plane. An inclined window must not generate fat
+            // axis-aligned glass bricks that collide before the pane reaches
+            // the floor. Degenerate event geometry retains the old safe proxy.
+            let (initial_rotation, half) = if u.length_squared() > 1.0e-6 && normal.length_squared() > 1.0e-6 {
+                let x = u.normalize();
+                let z = normal.normalize();
+                let y = z.cross(x);
+                let rotation = Rotation::from_mat3(&Matrix::from_cols(x, y, z)).normalize();
+                let half_extent = |axis: Vector| glass.spec.positions.iter()
+                    .map(|p| Vector::from_array(std::array::from_fn(|i| p[i] - glass.centre[i])).dot(axis).abs())
+                    .fold(0.0_f32, f32::max);
+                (rotation, [half_extent(x).max(0.45) * JKA_TO_RAPIER,
+                    half_extent(y).max(0.45) * JKA_TO_RAPIER,
+                    0.45 * JKA_TO_RAPIER])
+            } else {
+                let min = std::array::from_fn::<_, 3, _>(|axis| glass.spec.positions.iter()
+                    .map(|point| point[axis]).fold(f32::INFINITY, f32::min));
+                let max = std::array::from_fn::<_, 3, _>(|axis| glass.spec.positions.iter()
+                    .map(|point| point[axis]).fold(f32::NEG_INFINITY, f32::max));
+                (Rotation::IDENTITY, std::array::from_fn(|axis| {
+                    ((max[axis] - min[axis]) * 0.5).max(0.45).min(128.0) * JKA_TO_RAPIER
+                }))
+            };
+            glass.initial_rotation = initial_rotation;
             let body = self.bodies.insert(
                 RigidBodyBuilder::dynamic()
-                    .translation(Vector::from_array(glass.centre) * JKA_TO_RAPIER)
+                    .pose(Pose::from_parts(Vector::from_array(glass.centre) * JKA_TO_RAPIER, initial_rotation))
                     .linvel(Vector::from_array(glass.spec.velocity) * JKA_TO_RAPIER)
                     .angvel(Vector::new(glass.spec.rotation[0].to_radians(), glass.spec.rotation[1].to_radians(), 0.0))
                     .gravity_scale((-glass.spec.accel_z / JKA_GRAVITY).clamp(0.1, 2.0))
@@ -2043,7 +2099,7 @@ impl RagdollWorld {
             if now < glass.born_at || now >= glass.expires_at { return None; }
             let duration = (glass.expires_at - glass.born_at).max(1);
             let life = (now - glass.born_at) as f32 / duration as f32;
-            let alpha = if life < 0.85 { 0.15 } else { (0.15 - (life - 0.85)).max(0.0) };
+            let alpha = 0.15 * ((1.0 - life) / 0.15).clamp(0.0, 1.0);
             if alpha <= 0.0 { return None; }
             let positions = if let Some(handle) = glass.body {
                 let body = self.bodies.get(handle)?;
@@ -2053,7 +2109,7 @@ impl RagdollWorld {
                 let centre = display.translation * RAPIER_TO_JKA;
                 glass.spec.positions.map(|point| {
                     let relative = Vector::from_array(std::array::from_fn(|axis| point[axis] - glass.centre[axis]));
-                    let p = centre + display.rotation * relative;
+                    let p = centre + display.rotation * (glass.initial_rotation.inverse() * relative);
                     [p.x, p.y, p.z]
                 })
             } else {
@@ -2813,6 +2869,48 @@ mod tests {
         assert!(world.glass.iter().all(|g| g.body.is_some()));
         world.reset_dynamic_for_seek();
         assert!(world.glass.is_empty());
+    }
+
+    #[test]
+    fn enhanced_breakables_have_independent_physics_and_fifteen_second_life() {
+        let mut world = RagdollWorld::new();
+        world.set_config(RagdollConfig {
+            physics_enabled: true, breakables_enhanced: true,
+            debris_enabled: false, max_debris: 8,
+            debris_lifetime_seconds: 2.0, ..RagdollConfig::default()
+        });
+        let mesh = PhysicsMapMesh::from_jka_mesh(
+            vec![[-128., -128., 0.], [128., -128., 0.], [0., 128., 0.]],
+            vec![[0, 1, 2]],
+        ).unwrap();
+        world.set_map_mesh(&mesh).unwrap();
+        let chunk = ChunkSpec {
+            qpath: "models/chunks/rock/rock1_1.md3".into(),
+            origin: [0., 0., 48.], velocity: [0.; 3],
+            angles: [0.; 3], angle_velocity: [0.; 3],
+            life_ms: 1500, bounce_factor: 0.3, scale: 1.0,
+        };
+        assert!(!world.spawn_debris(&[chunk.clone()], 1000), "gib/debris toggle remains independent");
+        assert!(world.spawn_breakable_debris(&[chunk], 1000));
+        assert_eq!(world.debris[0].expires_at, 16_000);
+        let shard = ShardSpec {
+            positions: [[0., 0., 48.], [24., 24., 48.],
+                        [24., 24., 64.], [0., 0., 64.]],
+            uvs: [[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
+            velocity: [0.; 3], accel_z: -800., rotation: [0.; 2],
+            bounce: 0.25, delay_ms: 0,
+        };
+        assert_eq!(world.spawn_glass(&[shard.clone()], 1000), 0);
+        assert_eq!(world.spawn_breakable_glass(&[shard], 1000), 1);
+        assert_eq!(world.glass[0].expires_at, 16_000);
+        world.begin_frame(1000);
+        world.begin_frame(1050);
+        assert!(world.glass[0].body.is_some());
+        assert_ne!(world.glass[0].initial_rotation, Rotation::IDENTITY,
+            "an angled pane must receive an angled thin collider");
+        world.begin_frame(16_001);
+        assert!(world.glass.is_empty());
+        assert!(world.debris.is_empty());
     }
 
     #[test]

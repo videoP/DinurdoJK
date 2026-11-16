@@ -232,7 +232,9 @@ pub fn available_download_transports(
     client_http: bool,
     client_legacy: bool,
 ) -> (bool, bool) {
-    if server_disallows_downloads(serverinfo) {
+    // TaystJK/JK2MV CL_InitDownloads: cl_allowDownload 0 disables every
+    // download (HTTP included); missing referenced PK3s only print a warning.
+    if !client_legacy || server_disallows_downloads(serverinfo) {
         return (false, false);
     }
     let server_http = jk2 || info_value(serverinfo, b"sv_httpDownloads")

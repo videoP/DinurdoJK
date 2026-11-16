@@ -115,6 +115,8 @@ impl App {
                 self.push_console_line(format!("^3FS_RESTART:^7 {error}"));
             }
         }
+        self.chat_emoji_picker.invalidate();
+        self.render_command(RenderCommand::ReloadChatEmojis);
         self.publish_ui();
     }
 

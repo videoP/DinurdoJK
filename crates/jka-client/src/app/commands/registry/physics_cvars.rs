@@ -2,6 +2,36 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_R_BREAKABLES {
+        runtime: CvarDef::<App>::new(
+            "r_breakables", "", "0..1",
+            "Presentation of server breakables: 0 TaystJK Legacy, 1 Enhanced Rapier fragments (15 seconds).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(u8::from(app.video.breakables_enhanced).to_string()),
+            |app, value| App::cvar_set_r_breakables(app, APP_R_BREAKABLES.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_breakables, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.breakables_enhanced = value.trim() == "1";
+            }),
+            archive: Some((900, |state| u8::from(state.video.breakables_enhanced).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_breakables(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    match value.trim() {
+                        "0" => self.video.breakables_enhanced = false,
+                        "1" => self.video.breakables_enhanced = true,
+                        _ => return Err(format!("{name}: expected 0 (Legacy) or 1 (Enhanced)")),
+                    }
+                    self.physics_menu_changed();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_CLOTHAIRRESISTANCE {
         runtime: CvarDef::new(
                 "r_clothAirResistance",

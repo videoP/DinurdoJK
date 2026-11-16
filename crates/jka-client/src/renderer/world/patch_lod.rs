@@ -16,7 +16,57 @@ pub(in crate::renderer) struct PatchLodStats {
     pub selected_triangles: u64,
     pub lod_updates: u32,
     pub index_upload_bytes: u64,
+    /// `queue.write_buffer` calls issued (index spans + draw-range records).
+    /// Each call allocates its own wgpu staging buffer.
+    pub index_writes: u32,
+    /// Resident AUTO-4 recipes whose patch spans were rewritten.
+    pub recipe_rewrites: u32,
     pub cpu_lod_ms: f64,
+}
+
+/// Coalesces index writes at consecutive buffer offsets into one
+/// `write_buffer` call.
+struct IndexWriter<'a> {
+    queue: &'a wgpu::Queue,
+    buffer: &'a wgpu::Buffer,
+    start: u32,
+    data: Vec<u32>,
+    bytes: u64,
+    writes: u32,
+}
+
+impl<'a> IndexWriter<'a> {
+    fn new(queue: &'a wgpu::Queue, buffer: &'a wgpu::Buffer, mut data: Vec<u32>) -> Self {
+        data.clear();
+        Self { queue, buffer, start: 0, data, bytes: 0, writes: 0 }
+    }
+
+    /// The vector to append the indices that belong at `offset`.
+    fn at(&mut self, offset: u32) -> &mut Vec<u32> {
+        if !self.data.is_empty() && self.start + self.data.len() as u32 != offset {
+            self.flush();
+        }
+        if self.data.is_empty() {
+            self.start = offset;
+        }
+        &mut self.data
+    }
+
+    fn flush(&mut self) {
+        if self.data.is_empty() {
+            return;
+        }
+        self.queue.write_buffer(self.buffer, u64::from(self.start) * 4, bytemuck::cast_slice(&self.data));
+        self.bytes += self.data.len() as u64 * 4;
+        self.writes += 1;
+        self.data.clear();
+    }
+
+    /// Flushes and returns (scratch, bytes, writes).
+    fn finish(mut self) -> (Vec<u32>, u64, u32) {
+        self.flush();
+        (self.data, self.bytes, self.writes)
+    }
 }
 
 struct Grid {
@@ -65,8 +115,9 @@ pub(in crate::renderer) struct WorldPatchLod {
     recipe_members: Vec<Vec<usize>>,
     recipe_versions: Vec<Vec<u64>>,
     recipe_reserved: Vec<Option<Range<u32>>>,
-    dynamic_recipes: Vec<usize>,
     completed_recipes: u64,
+    /// AUTO-4 plan inputs of the last recipe pass (mode, cluster, area mask).
+    plan_key: Option<(PvsMode, Option<usize>, Option<[u8; 32]>)>,
     visible: Vec<bool>,
     needed: Vec<bool>,
     scratch: Vec<u32>,
@@ -289,7 +340,7 @@ impl WorldPatchLod {
         for geometry in &mut self.geometries {
             geometry.targets.clear();
         }
-        self.dynamic_recipes.clear();
+        self.plan_key = None;
     }
 
     pub fn bind(&mut self, batches: &mut [WorldBatch], set: u8) {
@@ -320,7 +371,6 @@ impl WorldPatchLod {
                 .any(|&m| full.get(m).is_some_and(|b| b.patch_geometry.is_some()))
             {
                 states[i] = Auto4GeometryState::Uncached;
-                self.dynamic_recipes.push(i);
             }
         }
         self.recipe_members = members
@@ -370,12 +420,13 @@ impl WorldPatchLod {
         ])
     }
 
+    /// Returns the live range, uploaded bytes and `write_buffer` calls.
     fn upload_geometry(
         &mut self,
         queue: &wgpu::Queue,
         buffer: &wgpu::Buffer,
         geometry: usize,
-    ) -> Option<(Range<u32>, u64)> {
+    ) -> Option<(Range<u32>, u64, u32)> {
         if !self.needs_rebuild(geometry) {
             return None;
         }
@@ -384,30 +435,25 @@ impl WorldPatchLod {
             !self.grids[id].suppressed
                 && self.grids[id].masks == self.grids[id].lod.selection(f32::INFINITY)
         });
-        let mut bytes = 0;
+        let (mut bytes, mut writes) = (0, 0);
         let range = if full {
             g.original.clone()
         } else {
             // Every part keeps its FULL offset inside `reserved`, so only the
             // patches whose LOD changed since `reserved` was written are
             // uploaded: a few KB, not the whole batch (9.5 MB per mouse
-            // movement on costadelsol's terrain).
-            let mut indices = std::mem::take(&mut self.scratch);
+            // movement on costadelsol's terrain). Adjacent spans share one write.
+            let mut writer = IndexWriter::new(queue, buffer, std::mem::take(&mut self.scratch));
             let mut offset = g.reserved.start;
             let mut slot = 0;
             for part in &g.parts {
                 match part {
                     Part::Static(range) => {
                         if g.reserved_versions.is_none() {
-                            queue.write_buffer(
-                                buffer,
-                                u64::from(offset) * 4,
-                                bytemuck::cast_slice(
-                                    &self.source.as_ref().expect("patch indices installed")
-                                        [range.start as usize..range.end as usize],
-                                ),
+                            writer.at(offset).extend_from_slice(
+                                &self.source.as_ref().expect("patch indices installed")
+                                    [range.start as usize..range.end as usize],
                             );
-                            bytes += u64::from(range.end - range.start) * 4;
                         }
                         offset += range.end - range.start;
                     }
@@ -415,19 +461,19 @@ impl WorldPatchLod {
                         let grid = &self.grids[*id];
                         let capacity = grid.source_range.end - grid.source_range.start;
                         if g.reserved_versions.as_ref().is_none_or(|v| v[slot] != grid.version) {
-                            indices.clear();
-                            self.padded_patch_indices(*id, &mut indices);
-                            queue.write_buffer(buffer, u64::from(offset) * 4, bytemuck::cast_slice(&indices));
-                            bytes += indices.len() as u64 * 4;
+                            self.padded_patch_indices(*id, writer.at(offset));
                         }
                         offset += capacity;
                         slot += 1;
                     }
                 }
             }
-            self.scratch = indices;
             debug_assert_eq!(offset - g.reserved.start, g.original.end - g.original.start);
-            g.reserved.start..offset
+            let range = g.reserved.start..offset;
+            let (scratch, written, calls) = writer.finish();
+            self.scratch = scratch;
+            (bytes, writes) = (written, calls);
+            range
         };
         let g = &mut self.geometries[geometry];
         g.active = range.clone();
@@ -435,9 +481,12 @@ impl WorldPatchLod {
             *version = self.grids[id].version;
         }
         if !full {
-            g.reserved_versions = Some(g.versions.clone());
+            match &mut g.reserved_versions {
+                Some(written) => written.clone_from(&g.versions),
+                None => g.reserved_versions = Some(g.versions.clone()),
+            }
         }
-        Some((range, bytes))
+        Some((range, bytes, writes))
     }
 
     /// One patch's selected indices padded with degenerate triangles to its
@@ -466,6 +515,7 @@ impl WorldPatchLod {
             .any(|(&version, &id)| version != self.grids[id].version)
     }
 
+    #[cfg(test)]
     fn geometry_indices(&self, geometry: usize, out: &mut Vec<u32>) {
         for part in &self.geometries[geometry].parts {
             match part {
@@ -502,19 +552,21 @@ impl WorldPatchLod {
     }
 
     /// Rewrite only the patch spans of a resident recipe whose grid version
-    /// differs from `written` (its last `recipe_signature`). Recipes use the
-    /// padded layout, so every span sits at a fixed offset. Returns bytes.
+    /// differs from the versions last written into it. Recipes containing
+    /// patches use the padded layout (every member at its FULL offset), so
+    /// every span sits at a fixed offset. Returns (bytes, writes).
     fn rewrite_recipe_patches(
         &mut self,
         queue: &wgpu::Queue,
         buffer: &wgpu::Buffer,
+        recipe: usize,
         members: &[usize],
         full: &[WorldBatch],
         start: u32,
-        written: &[u64],
-    ) -> u64 {
-        let mut indices = std::mem::take(&mut self.scratch);
-        let (mut offset, mut slot, mut bytes) = (start, 0, 0);
+    ) -> (u64, u32) {
+        let written = std::mem::take(&mut self.recipe_versions[recipe]);
+        let mut writer = IndexWriter::new(queue, buffer, std::mem::take(&mut self.scratch));
+        let (mut offset, mut slot) = (start, 0);
         for &member in members {
             let batch = &full[member];
             let Some(geometry) = batch.patch_geometry else {
@@ -527,10 +579,7 @@ impl WorldPatchLod {
                     Part::Patch(id) => {
                         let grid = &self.grids[*id];
                         if written.get(slot) != Some(&grid.version) {
-                            indices.clear();
-                            self.padded_patch_indices(*id, &mut indices);
-                            queue.write_buffer(buffer, u64::from(offset) * 4, bytemuck::cast_slice(&indices));
-                            bytes += indices.len() as u64 * 4;
+                            self.padded_patch_indices(*id, writer.at(offset));
                         }
                         offset += grid.source_range.end - grid.source_range.start;
                         slot += 1;
@@ -538,16 +587,28 @@ impl WorldPatchLod {
                 }
             }
         }
-        self.scratch = indices;
-        bytes
+        let (scratch, bytes, writes) = writer.finish();
+        self.scratch = scratch;
+        self.recipe_versions[recipe] = written;
+        self.store_recipe_versions(recipe);
+        (bytes, writes)
     }
 
-    fn recipe_indices(&self, members: &[usize], full: &[WorldBatch], out: &mut Vec<u32>) {
+    /// The padded recipe stream: every member at its FULL offset. Compiled
+    /// BSP-model members are padded the same way, so patch LOD and BSP-model
+    /// LOD each rewrite only their own spans of a mixed recipe.
+    fn recipe_indices(
+        &self,
+        members: &[usize],
+        full: &[WorldBatch],
+        bsp: &super::bsp_model_lod::BspModelLod,
+        out: &mut Vec<u32>,
+    ) {
         for &member in members {
             let batch = &full[member];
             if let Some(geometry) = batch.patch_geometry {
                 self.padded_geometry_indices(geometry, out);
-            } else {
+            } else if !bsp.append_batch_indices(&batch.full_indexed_range, true, out) {
                 let range = &batch.full_indexed_range;
                 out.extend_from_slice(
                     &self.source.as_ref().expect("patch indices installed")
@@ -561,6 +622,7 @@ impl WorldPatchLod {
     /// map load. This allocates nothing while ShitteR remains disabled.
     pub(in crate::renderer) fn shitter_active_ranges(
         &self,
+        bsp: &super::bsp_model_lod::BspModelLod,
         states: &[Auto4GeometryState],
         auto_members: &[Vec<usize>],
         full: &[WorldBatch],
@@ -581,7 +643,7 @@ impl WorldPatchLod {
                 let Some(members) = auto_members.get(geometry) else { continue; };
                 let mut indices = Vec::new();
                 if self.source.is_some() {
-                    self.recipe_indices(members, full, &mut indices);
+                    self.recipe_indices(members, full, bsp, &mut indices);
                 } else {
                     // AUTO4 runs even on maps without any curved BSP patches.
                     // WorldPatchLod has no source in that case; use the exact
@@ -602,50 +664,56 @@ impl WorldPatchLod {
     }
 
     /// Applied to a freshly completed worker result before it reaches the GPU.
+    /// Builds the padded stream for every recipe that contains patches,
+    /// including mixed patch/compiled-model recipes.
     pub fn collapse(
-        &mut self,
+        &self,
         recipe: usize,
         members: &[usize],
         full: &[WorldBatch],
+        bsp: &super::bsp_model_lod::BspModelLod,
         indices: &mut Vec<u32>,
     ) -> bool {
-        if self.recipe_members.get(recipe).is_none_or(Vec::is_empty) {
+        if !self.has_recipe(recipe) {
             return false;
         }
         indices.clear();
-        self.recipe_indices(members, full, indices);
+        self.recipe_indices(members, full, bsp, indices);
         true
     }
 
+    /// The recipe contains patch geometry (padded layout).
+    pub fn has_recipe(&self, recipe: usize) -> bool {
+        self.recipe_members.get(recipe).is_some_and(|members| !members.is_empty())
+    }
+
+    /// Record that `reserved` now holds this recipe's padded stream built from
+    /// the current grid selections (worker install or a BSP-model-LOD repack).
     pub fn note_collapse(&mut self, recipe: usize, reserved: Range<u32>, uploaded_bytes: u64) {
-        if self.recipe_members.get(recipe).is_some_and(|members|!members.is_empty()) {
-            self.recipe_versions[recipe] = self.recipe_signature(recipe);
+        if self.has_recipe(recipe) {
+            self.store_recipe_versions(recipe);
             self.recipe_reserved[recipe] = Some(reserved);
             self.pending_upload_bytes += uploaded_bytes;
         }
     }
 
-    fn recipe_signature(&self, recipe: usize) -> Vec<u64> {
+    fn recipe_grid_versions(&self, recipe: usize) -> impl Iterator<Item = u64> + '_ {
         self.recipe_members[recipe]
             .iter()
-            .flat_map(|&g| {
-                self.geometries[g]
-                    .grids
-                    .iter()
-                    .map(|&id| self.grids[id].version)
-            })
-            .collect()
+            .flat_map(|&g| self.geometries[g].grids.iter().map(|&id| self.grids[id].version))
     }
 
-    /// Append patch-selected indices for one FULL batch. A false return
-    /// delegates non-patch source pieces to BSP model LOD / original indices.
-    pub fn append_batch_indices(&self, batch: &WorldBatch, out: &mut Vec<u32>) -> bool {
-        let Some(g) = batch.patch_geometry else { return false; };
-        self.geometry_indices(g, out);
-        true
+    /// Whether the recipe's resident spans match every current grid version.
+    fn recipe_current(&self, recipe: usize) -> bool {
+        self.recipe_grid_versions(recipe).eq(self.recipe_versions[recipe].iter().copied())
     }
 
-    pub fn stats(&self) -> PatchLodStats { self.stats }
+    fn store_recipe_versions(&mut self, recipe: usize) {
+        let mut versions = std::mem::take(&mut self.recipe_versions[recipe]);
+        versions.clear();
+        versions.extend(self.recipe_grid_versions(recipe));
+        self.recipe_versions[recipe] = versions;
+    }
 
     /// Legacy dlight surface runs of a packed geometry, in FULL-detail index space.
     pub fn original_runs(&self, geometry: usize) -> &[crate::renderer::LegacyDlightRun] {
@@ -711,6 +779,8 @@ pub(in crate::renderer) fn update(
         return PatchLodStats {
             lod_updates: 0,
             index_upload_bytes: 0,
+            index_writes: 0,
+            recipe_rewrites: 0,
             cpu_lod_ms: 0.0,
             ..world.patch_lod.stats
         };
@@ -746,6 +816,8 @@ pub(in crate::renderer) fn update(
     let mut stats = PatchLodStats {
         lod_updates: 0,
         index_upload_bytes: std::mem::take(&mut lod.pending_upload_bytes),
+        index_writes: 0,
+        recipe_rewrites: 0,
         cpu_lod_ms: 0.0,
         ..lod.stats
     };
@@ -899,11 +971,12 @@ pub(in crate::renderer) fn update(
             if !lod.needed[geometry] && !suppression_changed {
                 continue;
             }
-            let Some((range, bytes)) = lod.upload_geometry(queue, &world.index_buffer, geometry)
+            let Some((range, bytes, writes)) = lod.upload_geometry(queue, &world.index_buffer, geometry)
             else {
                 continue;
             };
             stats.index_upload_bytes += bytes;
+            stats.index_writes += writes;
             if crate::renderer::collision_world_only() && crate::renderer::shitter_texture_enabled()
                 && range.start == lod.geometries[geometry].reserved.start
             {
@@ -934,6 +1007,7 @@ pub(in crate::renderer) fn update(
                 }
                 batch.indexed_range = range.clone();
                 batch.patch_suppressed = no_curves;
+                stats.index_writes += 2;
                 upload_batch_range(
                     queue,
                     &world.cull_records_buffer,
@@ -944,38 +1018,51 @@ pub(in crate::renderer) fn update(
         }
     }
     // A new lazy collapse may arrive on an otherwise unchanged camera frame.
-    // Repack only resident recipes whose members changed or whose cache slot moved.
-    let recipe_changes =
-        stats.lod_updates != 0 || lod.completed_recipes != world.auto4_collapse_cache.completed;
+    // Only recipes in the active AUTO-4 plan are drawn. A cached recipe outside
+    // it keeps its written versions and is brought current when a plan change
+    // (cluster, area mask, mode or a newly installed collapse) activates it.
+    let plan_key = (mode, world.last_cluster.flatten(), area_mask.copied());
+    let recipe_changes = mode == PvsMode::Auto
+        && (stats.lod_updates != 0
+            || lod.completed_recipes != world.auto4_collapse_cache.completed
+            || lod.plan_key != Some(plan_key));
     lod.completed_recipes = world.auto4_collapse_cache.completed;
-    for recipe_index in 0..if recipe_changes {
-        lod.dynamic_recipes.len()
-    } else {
-        0
-    } {
-        let recipe = lod.dynamic_recipes[recipe_index];
+    lod.plan_key = Some(plan_key);
+    let plan = if recipe_changes { std::mem::take(&mut world.auto4_active_plan) } else { Vec::new() };
+    for &batch_id in &plan {
+        let Some(&recipe) = batch_id
+            .checked_sub(world.auto4_variant_base)
+            .and_then(|variant| world.auto4_variant_geometry.get(variant))
+        else {
+            continue;
+        };
+        if !lod.has_recipe(recipe) {
+            continue;
+        }
         let Some(Auto4GeometryState::Ready { range, .. }) =
             world.auto4_collapse_cache.states.get(recipe)
         else {
             continue;
         };
         let range = range.clone();
-        let signature = lod.recipe_signature(recipe);
         if lod.recipe_reserved[recipe].as_ref() == Some(&range) {
-            if lod.recipe_versions[recipe] == signature {
+            // Material variants share one recipe; later visits find it current.
+            if lod.recipe_current(recipe) {
                 continue;
             }
             // Same slot, padded layout: rewrite just the patches that changed.
             // The recipe's draw range is unchanged.
-            let written = std::mem::take(&mut lod.recipe_versions[recipe]);
-            stats.index_upload_bytes += lod.rewrite_recipe_patches(
-                queue, &world.index_buffer, &world.auto4_geometry_members[recipe],
-                &world.full_batches, range.start, &written,
+            let (bytes, writes) = lod.rewrite_recipe_patches(
+                queue, &world.index_buffer, recipe, &world.auto4_geometry_members[recipe],
+                &world.full_batches, range.start,
             );
-            lod.recipe_versions[recipe] = signature;
+            stats.index_upload_bytes += bytes;
+            stats.index_writes += writes;
+            stats.recipe_rewrites += 1;
             if crate::renderer::collision_world_only() && crate::renderer::shitter_texture_enabled() {
                 let mut indexes = Vec::new();
-                lod.recipe_indices(&world.auto4_geometry_members[recipe], &world.full_batches, &mut indexes);
+                lod.recipe_indices(&world.auto4_geometry_members[recipe], &world.full_batches,
+                    &world.bsp_model_lod, &mut indexes);
                 let (cache, vertices, models) = (&mut world.shitter_slope_cache,
                     &world.static_ao_gpu_vertices, &world.inline_models);
                 if let Some(cache) = cache.as_mut() {
@@ -993,6 +1080,7 @@ pub(in crate::renderer) fn update(
         lod.recipe_indices(
             &world.auto4_geometry_members[recipe],
             &world.full_batches,
+            &world.bsp_model_lod,
             &mut indices,
         );
         assert!(
@@ -1006,7 +1094,9 @@ pub(in crate::renderer) fn update(
                 bytemuck::cast_slice(&indices),
             );
             stats.index_upload_bytes += indices.len() as u64 * 4;
+            stats.index_writes += 1;
         }
+        stats.recipe_rewrites += 1;
         if crate::renderer::collision_world_only() && crate::renderer::shitter_texture_enabled() {
             let (cache, vertices, models) = (&mut world.shitter_slope_cache,
                 &world.static_ao_gpu_vertices, &world.inline_models);
@@ -1022,9 +1112,14 @@ pub(in crate::renderer) fn update(
         crate::renderer::visibility::compaction::auto4_set_geometry_range(
             queue, world, recipe, active,
         );
+        // The stream also holds BSP-model LOD's current selections.
+        world.bsp_model_lod.note_collapse(recipe, range.clone());
         lod.recipe_reserved[recipe] = Some(range);
-        lod.recipe_versions[recipe] = signature;
+        lod.store_recipe_versions(recipe);
         lod.scratch = indices;
+    }
+    if recipe_changes {
+        world.auto4_active_plan = plan;
     }
     stats.cpu_lod_ms = started.map_or(0.0, |start| start.elapsed().as_secs_f64() * 1000.0);
     if speeds == 8 {
@@ -1037,7 +1132,7 @@ pub(in crate::renderer) fn update(
             } else {
                 100.0 * (1.0 - stats.selected_triangles as f64 / stats.full_triangles as f64)
             };
-            eprintln!("[JKA PATCH LOD] visible_patches={} full_triangles={} selected_triangles={} reduction={:.1}% lod_updates={} index_upload_bytes={} cpu_lod_ms={:.4}",stats.visible_patches,stats.full_triangles,stats.selected_triangles,reduction,stats.lod_updates,stats.index_upload_bytes,stats.cpu_lod_ms);
+            eprintln!("[JKA PATCH LOD] visible_patches={} full_triangles={} selected_triangles={} reduction={:.1}% lod_updates={} index_upload_bytes={} index_writes={} recipe_rewrites={} cpu_lod_ms={:.4}",stats.visible_patches,stats.full_triangles,stats.selected_triangles,reduction,stats.lod_updates,stats.index_upload_bytes,stats.index_writes,stats.recipe_rewrites,stats.cpu_lod_ms);
             lod.last_log = Some(Instant::now());
         }
     }
@@ -1202,7 +1297,7 @@ mod tests {
                 grid.masks = grid.lod.selection(0.0);
                 grid.version += 1;
             }
-            let (range, bytes) = lod.upload_geometry(&queue, &buffer, 0).unwrap();
+            let (range, bytes, _) = lod.upload_geometry(&queue, &buffer, 0).unwrap();
             // FULL-size layout: every part keeps its offset, patches padded.
             assert_eq!(range.end - range.start, original.end - original.start);
             assert_eq!(bytes, u64::from(range.end - range.start) * 4, "first upload fills the range");
@@ -1258,14 +1353,14 @@ mod tests {
             for grid in &mut lod.grids {
                 grid.version += 1;
             }
-            let (again, bytes) = lod.upload_geometry(&queue, &buffer, 0).unwrap();
+            let (again, bytes, _) = lod.upload_geometry(&queue, &buffer, 0).unwrap();
             assert_eq!(again, range);
             assert!(bytes <= patch_capacity, "{bytes} > {patch_capacity}");
             for grid in &mut lod.grids {
                 grid.masks = grid.lod.selection(f32::INFINITY);
                 grid.version += 1;
             }
-            let (range, bytes) = lod.upload_geometry(&queue, &buffer, 0).unwrap();
+            let (range, bytes, _) = lod.upload_geometry(&queue, &buffer, 0).unwrap();
             assert_eq!(range, original);
             assert_eq!(bytes, 0, "restoring full detail reuses immutable indices");
         });

@@ -4,7 +4,7 @@ use crate::app::egui_settings::{
     OCEAN_FOAM_COLOR, OCEAN_MAP_SIZE, OCEAN_MESH_QUALITY, OCEAN_NORMAL_STRENGTH, OCEAN_ROUGHNESS,
     OCEAN_SEA_SPRAY, OCEAN_UPDATES, OCEAN_WATER_COLOR, OCEAN_WIND_FOAM, PHYS_CCD,
     PHYS_CLIENT_ENABLED, PHYS_CLOTH, PHYS_CLOTH_AIR, PHYS_CLOTH_ANIMATION,
-    PHYS_CLOTH_BODY_COLLISION, PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_DEBRIS,
+    PHYS_CLOTH_BODY_COLLISION, PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_BREAKABLES, PHYS_DEBRIS,
     PHYS_DEBRIS_LIFETIME, PHYS_DEBRIS_MAX, PHYS_DEBUG_DRAW, PHYS_DISMEMBERMENT,
     PHYS_DISMEMBER_LIFETIME, PHYS_DISMEMBER_MAX, PHYS_EXPLOSION_IMPULSES, PHYS_FORCE_IMPULSES,
     PHYS_HAIR, PHYS_JIGGLE, PHYS_JIGGLE_BREAST, PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z,
@@ -609,6 +609,10 @@ impl App {
     pub(in crate::app::egui_settings) fn reset_physics_field(&mut self, field: u8) {
         // Use the same registered setter as the console/menu so mode switches
         // invalidate ragdolls and refresh their physical joint definitions.
+        if field == PHYS_BREAKABLES {
+            let _ = self.set_console_cvar("r_breakables", "0");
+            return;
+        }
         if field == PHYS_RAGDOLL_JOINT_MODEL {
             let _ = self.set_console_cvar("r_ragdollJointModel", &VideoSettings::default().ragdoll_joint_model.to_string());
             return;

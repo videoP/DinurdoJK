@@ -1061,7 +1061,7 @@ settings_cvars! { NetworkSettings;
     }
 
     APP_CL_ALLOWDOWNLOAD {
-        runtime: CvarDef::new("cl_allowDownload", "", "0..1", "Allow legacy Jedi Academy UDP PK3 autodownloads (svc_download). Used when HTTP is unavailable or fails.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cl_allowdownload(app)), |app, value| App::cvar_set_cl_allowdownload(app, APP_CL_ALLOWDOWNLOAD.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cl_allowdownload, None),
+        runtime: CvarDef::new("cl_allowDownload", "", "0..1", "Allow PK3 autodownloads (TaystJK master switch). 0 disables every download, HTTP included, and joins without a prompt; 1 allows HTTP (if cl_allowHttpDownload) with legacy UDP svc_download as the fallback.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cl_allowdownload(app)), |app, value| App::cvar_set_cl_allowdownload(app, APP_CL_ALLOWDOWNLOAD.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cl_allowdownload, None),
         config: CvarBinding {
                 load_presentation: Some(|settings, name, value| {
                     let _ = settings.network.set_cvar(name, value);

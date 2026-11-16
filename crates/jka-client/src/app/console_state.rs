@@ -73,7 +73,14 @@ impl ConsoleReflow {
         let mut start: usize = 0;
         let before = self.rows.len();
         loop {
-            let mut end = start.saturating_add(capacity).min(chars.len());
+            let mut end = start;
+            let mut cells = 0;
+            while end < chars.len() {
+                let width = ui::console_character_cells(chars[end]);
+                if end > start && cells + width > capacity { break; }
+                cells += width;
+                end += 1;
+            }
             if end < chars.len()
                 && !chars[end - 1].is_whitespace()
                 && !chars[end].is_whitespace()
@@ -822,9 +829,19 @@ impl App {
         let end = layout.rows.len().saturating_sub(self.console_scroll.min(max_scroll));
         let start = end.saturating_sub(capacity);
         let segment = layout.rows.get(start + row)?;
+        let plain = crate::logging::strip_jka_colors_with_hex(
+            &self.console_lines[segment.line], self.console_nwh_hex_colors());
+        let mut cells = 0;
+        let mut scalar = segment.start_col;
+        for ch in plain.chars().skip(segment.start_col).take(segment.end_col - segment.start_col) {
+            let width = ui::console_character_cells(ch);
+            if col < cells + width { break; }
+            cells += width;
+            scalar += 1;
+        }
         Some(ConsolePoint {
             line: segment.line,
-            col: (segment.start_col + col).min(segment.end_col),
+            col: scalar,
         })
     }
 

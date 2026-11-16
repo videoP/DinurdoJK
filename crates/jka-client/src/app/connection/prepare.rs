@@ -373,7 +373,8 @@ impl App {
     /// Once the gamestate arrives, only advertise a download action if the
     /// server permits it *and* an enabled transport is available.
     pub(in crate::app) fn live_can_autodownload(&self) -> bool {
-        let client_enabled = self.network.allow_http_downloads || self.network.allow_legacy_downloads;
+        // cl_allowDownload is the master switch (TaystJK CL_InitDownloads).
+        let client_enabled = self.network.allow_legacy_downloads;
         let Some(net) = self.net.as_ref() else { return client_enabled };
         let Some(serverinfo) = net.session().decoder().configstrings.get(&0) else {
             return client_enabled;

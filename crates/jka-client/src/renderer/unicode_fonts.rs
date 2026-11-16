@@ -6,7 +6,6 @@
 //! rasterizes requested glyphs. The render thread only places completed small
 //! rectangles into the atlas, then rebuilds the existing UI geometry.
 use super::{ui, GpuImage, Renderer};
-use jka_assets::pk3::AssetSearchPath;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -15,7 +14,6 @@ use std::{
 
 const ATLAS_SIDE: u32 = 2048;
 const MAX_BATCH: usize = 128;
-const FONT_FILE_LIMIT: usize = 32 * 1024 * 1024;
 
 struct FontJobResult {
     glyphs: Vec<(char, Option<ui::UnicodeGlyphBitmap>)>,
@@ -37,6 +35,7 @@ pub(super) struct UnicodeFontWorker {
     missing: HashSet<char>,
     glyphs: HashMap<char, ui::ProportionalGlyph>,
     cap_heights: HashMap<char, f32>,
+    colored: HashSet<char>,
     x: u32,
     y: u32,
     row_height: u32,
@@ -50,7 +49,7 @@ impl UnicodeFontWorker {
             requests: Arc::new(Mutex::new(HashSet::new())),
             in_flight: None, files: Arc::new(Mutex::new(FontFileCache::default())),
             base: base.to_owned(), game: game.map(Path::to_owned),
-            missing: HashSet::new(), glyphs: HashMap::new(), cap_heights: HashMap::new(),
+            missing: HashSet::new(), glyphs: HashMap::new(), cap_heights: HashMap::new(), colored: HashSet::new(),
             x: 0, y: 0, row_height: 0, resident: false, warned_atlas_full: false,
         }
     }
@@ -76,6 +75,7 @@ impl UnicodeFontWorker {
 /// alone cannot distinguish Chinese from Japanese; default Han to SC and
 /// route kana/Hangul to JP/KR faces respectively.
 fn preferred_font(ch: char) -> (&'static str, u32) {
+    if ui::is_emoji_candidate(ch) { return ("NotoColorEmoji.ttf", 0); }
     let cp = ch as u32;
     match cp {
         0x3000..=0x30FF | 0x31F0..=0x31FF => ("NotoSansCJK-Regular.ttc", 0), // Japanese
@@ -122,7 +122,7 @@ fn preferred_font(ch: char) -> (&'static str, u32) {
         0x1E900..=0x1E95F => ("NotoSansAdlam-Regular.ttf", 0),
         // Jura is only considered on a missing primary glyph. This includes
         // Latin Extended, Cyrillic, Greek, and explicit Jura chat styling.
-        _ => ("Jura-Regular.ttf", 0),
+        _ => ("Jura-Bold.ttf", 0),
     }
 }
 
@@ -133,16 +133,7 @@ fn load_font<'a>(
     game: Option<&Path>,
 ) -> Option<&'a [u8]> {
     if !files.files.contains_key(name) {
-        let loose = base.parent().unwrap_or(base).join("DinurdoJK").join("fonts").join(name);
-        let bytes = std::fs::metadata(&loose).ok()
-            .filter(|metadata| metadata.len() <= FONT_FILE_LIMIT as u64)
-            .and_then(|_| std::fs::read(&loose).ok())
-            .or_else(|| {
-                // Shared dinurdo-assets.pk4 and normal game filesystem paths.
-                let mut assets = AssetSearchPath::open_game(base, game).ok()?;
-                Some(assets.read(&format!("fonts/{name}"), FONT_FILE_LIMIT).ok()??.bytes)
-            })
-            .filter(|bytes: &Vec<u8>| bytes.len() <= FONT_FILE_LIMIT);
+        let bytes = ui::load_unicode_font(name, base, game);
         if bytes.is_none() {
             eprintln!("Unicode font not installed: {name} (fallback remains available)");
         }
@@ -157,10 +148,11 @@ fn raster_one(
     let primary = preferred_font(ch);
     let attempts = [
         primary,
-        ("Jura-Regular.ttf", 0), ("Jura-Bold.ttf", 0),
+        ("Jura-Bold.ttf", 0),
         ("NotoSans-Regular.ttf", 0),
         ("NotoSansSymbols-Regular.ttf", 0),
         ("NotoSansSymbols2-Regular.ttf", 0),
+        ("NotoColorEmoji.ttf", 0),
     ];
     let mut tried = HashSet::new();
     for (name, face) in attempts {
@@ -221,8 +213,12 @@ impl Renderer {
                         self.ui_unicode_worker.resident = true;
                         needs_binding = true;
                     }
-                    let rgba: Vec<u8> = bitmap.coverage.iter()
-                        .flat_map(|alpha| [255u8, 255, 255, *alpha]).collect();
+                    let rgba = if bitmap.rgba.is_empty() {
+                        bitmap.coverage.iter().flat_map(|alpha| [255u8, 255, 255, *alpha]).collect()
+                    } else {
+                        self.ui_unicode_worker.colored.insert(ch);
+                        bitmap.rgba
+                    };
                     self.queue.write_texture(
                         wgpu::TexelCopyTextureInfo {
                             texture: &self._ui_jura_font._texture, mip_level: 0,
@@ -246,6 +242,7 @@ impl Renderer {
             if changed || failures_updated {
                 self.ui_jura_metrics = Some(Arc::new(ui::UnicodeFallbackFont {
                     glyphs: self.ui_unicode_worker.glyphs.clone(),
+                    colored: self.ui_unicode_worker.colored.clone(),
                     cap_heights: self.ui_unicode_worker.cap_heights.clone(),
                     failed: self.ui_unicode_worker.missing.clone(),
                     height: 64, cap_height: 42.0,
@@ -311,7 +308,7 @@ mod tests {
         assert_eq!(preferred_font('한'), ("NotoSansCJK-Regular.ttc", 1));
         assert_eq!(preferred_font('م').0, "NotoNaskhArabic-Regular.ttf");
         assert_eq!(preferred_font('अ').0, "NotoSansDevanagariUI-Regular.ttf");
-        assert_eq!(preferred_font('Ж').0, "Jura-Regular.ttf");
+        assert_eq!(preferred_font('Ж').0, "Jura-Bold.ttf");
     }
     #[test]
     fn atlas_is_bounded_and_makes_no_allocation_until_first_glyph() {

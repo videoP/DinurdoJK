@@ -634,7 +634,7 @@ impl App {
             grass: self.video.grass,
             voxel_probe_gi: self.video.voxel_probe_gi,
             ocean: self.video.ocean,
-            client_physics: self.video.client_physics,
+            client_physics: self.video.client_physics || self.video.breakables_enhanced,
             gen_normal_maps: self.video.gen_normal_maps,
             float_lightmap: self.video.float_lightmap && (self.video.hdr || self.video.hdr_output != 0),
             overbright_bits: self.video.effective_overbright_bits(self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some()),
@@ -670,7 +670,7 @@ impl App {
     /// on for a map that was prepared without one builds just that mesh on a
     /// worker instead of restarting the renderer and re-preparing the world.
     pub(in crate::app) fn ensure_map_physics_mesh(&mut self) {
-        if !self.video.client_physics
+        if !(self.video.client_physics || self.video.breakables_enhanced)
             || self.front_end
             || self.loading.is_some()
             || self.live_without_world

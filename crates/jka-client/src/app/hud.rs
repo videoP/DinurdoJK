@@ -273,6 +273,8 @@ impl App {
             chat_mode: self.chat_mode,
             chat_input: self.chat_input.clone(),
             chat_input_selected: self.chat_input_selected,
+            chat_emoji_atlas: None, // Installed by the renderer, never by app snapshots.
+            chat_emoji_picker_available: self.chat_emoji_picker.can_show(self.chat_settings.emojis),
             chat_settings: self.chat_settings,
             chat_anim: self.chat_anim_ui(Instant::now()),
             chat_lines,

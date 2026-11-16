@@ -5,6 +5,7 @@ pub(crate) use display::AntiAliasingChoice;
 mod killfeed;
 mod match_stats;
 mod chat_anim;
+mod chat_emoji_picker;
 mod chat_llm;
 mod chat_translation;
 mod scoreboard_cursor;
@@ -67,6 +68,8 @@ mod session;
 mod settings;
 mod siege;
 mod text_input;
+#[cfg(windows)]
+pub(crate) mod alt_codes;
 mod tick;
 mod water_wetness;
 mod wallrun_camera;
@@ -1028,6 +1031,7 @@ pub struct App {
     chat_input: String,
     /// Ctrl+A selects the entire chat edit field; shared by Classic and Docked.
     chat_input_selected: bool,
+    chat_emoji_picker: chat_emoji_picker::ChatEmojiPicker,
     chat_player_completion: Option<ChatPlayerCompletionCycle>,
     chat_lines: VecDeque<ChatRecord>,
     /// `cg_chatTranslate*`: received messages, pending and finished translations.

@@ -1081,6 +1081,7 @@ impl App {
             session
                 .weapon_fx
                 .set_inline_model_bounds(stats.inline_model_bounds.clone());
+            session.weapon_fx.set_inline_model_glass_faces(stats.inline_model_glass_faces.clone());
         }
         session.player_presenter.set_physics_map_mesh(&map.physics_collision)?;
         // Replay to the clip's in-point before marking it ready. This used to

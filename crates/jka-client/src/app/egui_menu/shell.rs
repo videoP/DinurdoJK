@@ -34,6 +34,7 @@ impl App {
         self.model_placement.thumbnails_pending.clear();
         // egui textures die with the context; drop handles and in-flight keys.
         self.shader_remap_ui.thumbs = Default::default();
+        self.chat_emoji_picker.forget_egui_textures();
     }
 
     /// Console steals input, not the menu's visual layer or 3D preview.
@@ -99,6 +100,7 @@ impl App {
                     && self.window.is_some() && self.render.is_some());
         }
         self.egui_menu_active()
+            || self.chat_emoji_picker_visible()
             || (self.classic_console_chat_menu_open()
                 && self.video_confirmation.is_none()
                 && self.window.is_some()
@@ -190,6 +192,38 @@ impl App {
             }
             return matches!(event, WindowEvent::CursorMoved { .. }
                 | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. });
+        }
+        // The chat editor still owns all keyboard shortcuts. Only pointer
+        // interaction (and text typed into the picker's Search field) goes to
+        // egui, so clicking a thumbnail cannot trigger gameplay binds.
+        if !confirmation && self.chat_emoji_picker_visible() {
+            let search_focused = self.chat_emoji_picker.open && self.egui_ctx.egui_wants_keyboard_input();
+            let pointer = matches!(event, WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. });
+            let keyboard = search_focused && matches!(event,
+                WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(..));
+            if pointer || keyboard {
+                if let WindowEvent::CursorMoved { position, .. } = event {
+                    self.cursor_position = (position.x, position.y);
+                }
+                if let (Some(window), Some(state)) = (self.window.as_ref(), self.egui_state.as_mut()) {
+                    let result = state.on_window_event(window, event);
+                    self.egui_repaint_requested |= result.repaint;
+                }
+                // Escape remains application-owned so it can close the popup.
+                if keyboard && matches!(event, WindowEvent::KeyboardInput {
+                    event: KeyEvent { physical_key: PhysicalKey::Code(KeyCode::Escape), .. }, ..
+                }) { return false; }
+                return true;
+            }
+            // Update egui's Ctrl/Shift state without stealing it from chat.
+            if matches!(event, WindowEvent::ModifiersChanged(..)) {
+                if let (Some(window), Some(state)) = (self.window.as_ref(), self.egui_state.as_mut()) {
+                    let result = state.on_window_event(window, event);
+                    self.egui_repaint_requested |= result.repaint;
+                }
+            }
+            return false;
         }
         if !confirmation && !self.egui_menu_active() {
             return false;
@@ -394,6 +428,7 @@ impl App {
         if !self.front_end { self.release_neon_chrome(); }
         self.poll_server_browser_events();
         self.poll_ui_catalog();
+        self.poll_chat_emoji_picker();
         self.tick_shader_remap();
         if self.front_end && self.frontend_page == FrontendPage::PlayDemo {
             self.update_native_demo_browser();
@@ -566,6 +601,7 @@ impl App {
             self.egui_entity_labels(ui);
         }
         self.egui_console_chat_menu(ui.ctx());
+        self.egui_chat_emoji_picker(ui.ctx());
         if !self.egui_menu_active() {
             // Noninteractive developer HUDs must not enter egui's input
             // catcher: mouse look, wheel and attacks are handled explicitly

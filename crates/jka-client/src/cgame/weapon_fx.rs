@@ -1504,6 +1504,7 @@ pub struct WeaponFx {
     shards: Vec<Shard>,
     /// `(mins, maxs)` per inline model, for glass tessellation.
     inline_model_bounds: std::sync::Arc<[([f32; 3], [f32; 3])]>,
+    inline_model_glass_faces: std::sync::Arc<[Option<[[f32; 3]; 4]>]>,
     /// Per-frame presentation primitives that do not live in the FX scheduler
     /// (notably CG_DoSaber's RT_SABER_GLOW / RT_LINE submissions).
     immediate_draws: Vec<FxDraw>,
@@ -1629,6 +1630,7 @@ impl WeaponFx {
             gib_level: 0,
             shards: Vec::new(),
             inline_model_bounds: std::sync::Arc::from(Vec::new()),
+            inline_model_glass_faces: std::sync::Arc::from(Vec::new()),
             immediate_draws: Vec::new(),
             immediate_sounds: Vec::new(),
             immediate_lights: Vec::new(),
@@ -2214,6 +2216,10 @@ impl WeaponFx {
 
     pub fn set_inline_model_bounds(&mut self, bounds: std::sync::Arc<[([f32; 3], [f32; 3])]>) {
         self.inline_model_bounds = bounds;
+    }
+
+    pub fn set_inline_model_glass_faces(&mut self, faces: std::sync::Arc<[Option<[[f32; 3]; 4]>]>) {
+        self.inline_model_glass_faces = faces;
     }
 
     /// Glass shards are FX polys: advance them (delayed start, gravity, tumble,
@@ -4425,7 +4431,7 @@ impl WeaponFx {
                 if self.repeated_time {
                     return Some(EventDispatchResult::Handled("FX_GLASS_SHARDS"));
                 }
-                let specs = glass_shards(event, *model, &self.inline_model_bounds);
+                let specs = glass_shards(event, *model, &self.inline_model_bounds, &self.inline_model_glass_faces);
                 let offset = self.pending_glass.len();
                 self.pending_glass.extend(specs.iter().cloned());
                 for (index, spec) in specs.into_iter().enumerate() {
@@ -5005,14 +5011,14 @@ fn prepare_chunks(event: &PresentationEvent, game: &ClientGameState) -> Prepared
     PreparedFxEvent::Chunks(specs)
 }
 
-/// CG_GlassShatter + CG_DoGlass. The reference fetches the brush face from the
-/// renderer (`R_GetBModelVerts`); the glass is a thin box, so its face is the
-/// bounds' plane across the thinnest axis (width along the horizontal axis,
-/// height along Z when the glass is upright).
+/// CG_GlassShatter + CG_DoGlass. Prefer the actual authored brush-model quad
+/// (R_GetBModelVerts), including inclined panes. Only old maps without a usable
+/// planar quad use the bounds fallback; never substitute another entity's face.
 fn glass_shards(
     event: &PresentationEvent,
     model: Option<usize>,
     bounds: &[([f32; 3], [f32; 3])],
+    faces: &[Option<[[f32; 3]; 4]>],
 ) -> Vec<ShardSpec> {
     let state = &event.state;
     let dmg_pt = super::entity_vec3(state, "origin").unwrap_or(event.position);
@@ -5021,45 +5027,61 @@ fn glass_shards(
     let max_shards = state.field_i32("pos.trTime").unwrap_or(0).max(0) as usize;
 
     // The glass entity's own model, else the smallest inline model around the damage point.
-    let by_entity = model.and_then(|index| bounds.get(index).copied()).filter(|_| model != Some(0));
+    let by_entity = model.filter(|index| *index > 0 && *index < bounds.len());
     let by_point = || {
-        bounds
-            .iter()
-            .skip(1) // model 0 is the world
-            .filter(|(mins, maxs)| (0..3).all(|i| dmg_pt[i] >= mins[i] - 16.0 && dmg_pt[i] <= maxs[i] + 16.0))
-            .min_by(|a, b| {
+        bounds.iter().enumerate().skip(1) // model 0 is the world
+            .filter(|(_, (mins, maxs))| (0..3).all(|i| dmg_pt[i] >= mins[i] - 16.0 && dmg_pt[i] <= maxs[i] + 16.0))
+            .min_by(|(_, a), (_, b)| {
                 let volume = |(mins, maxs): &([f32; 3], [f32; 3])| (0..3).map(|i| maxs[i] - mins[i]).product::<f32>();
                 volume(a).total_cmp(&volume(b))
             })
-            .copied()
+            .map(|(index, _)| index)
     };
-    let Some((mins, maxs)) = by_entity.or_else(by_point) else {
+    let Some(model_index) = by_entity.or_else(by_point) else {
         return Vec::new();
     };
+    let (mins, maxs) = bounds[model_index];
 
-    let extent: [f32; 3] = std::array::from_fn(|i| maxs[i] - mins[i]);
-    let thin = (0..3).min_by(|&a, &b| extent[a].total_cmp(&extent[b])).unwrap_or(0);
-    let (u_axis, v_axis) = match thin {
-        0 => (1, 2),
-        1 => (0, 2),
-        _ => (0, 1),
+    let verts = faces.get(model_index).copied().flatten().unwrap_or_else(|| {
+        // Conservative fallback for maps whose BSP model has no 4-vertex
+        // planar surface. Normal maps use the authored pane, not this box.
+        let extent: [f32; 3] = std::array::from_fn(|i| maxs[i] - mins[i]);
+        let thin = (0..3).min_by(|&a, &b| extent[a].total_cmp(&extent[b])).unwrap_or(0);
+        let (u, v) = match thin { 0 => (1, 2), 1 => (0, 2), _ => (0, 1) };
+        let corner = |x: f32, y: f32| {
+            let mut p = [0.0; 3];
+            p[thin] = (mins[thin] + maxs[thin]) * 0.5;
+            p[u] = x;
+            p[v] = y;
+            p
+        };
+        [corner(mins[u], mins[v]), corner(maxs[u], mins[v]),
+         corner(maxs[u], maxs[v]), corner(mins[u], maxs[v])]
+    });
+    // CG_CalcHeightWidth: mean perpendicular distances to the two opposed
+    // edges, rather than the XYZ AABB dimensions (wrong for angled glass).
+    let distance_to_edge = |a: [f32; 3], b: [f32; 3]| -> f32 {
+        let base: [f32; 3] = std::array::from_fn(|i| b[i] - a[i]);
+        let len2 = base.iter().map(|v| v * v).sum::<f32>();
+        if len2 <= f32::EPSILON { return 0.0; }
+        let cross = [
+            base[1] * a[2] - base[2] * a[1],
+            base[2] * a[0] - base[0] * a[2],
+            base[0] * a[1] - base[1] * a[0],
+        ];
+        (cross.iter().map(|v| v * v).sum::<f32>() / len2).sqrt()
     };
-    let plane = (mins[thin] + maxs[thin]) * 0.5;
-    let corner = |u: f32, v: f32| {
-        let mut point = [0.0; 3];
-        point[thin] = plane;
-        point[u_axis] = u;
-        point[v_axis] = v;
-        point
+    let delta = |a: [f32; 3], b: [f32; 3]| -> [f32; 3] {
+        std::array::from_fn(|i| b[i] - a[i])
     };
-    let verts = [
-        corner(mins[u_axis], mins[v_axis]),
-        corner(maxs[u_axis], mins[v_axis]),
-        corner(maxs[u_axis], maxs[v_axis]),
-        corner(mins[u_axis], maxs[v_axis]),
-    ];
-    let width = extent[u_axis];
-    let height = extent[v_axis];
+    let edge_distance = |line: [f32; 3], point: [f32; 3]| -> f32 {
+        distance_to_edge(delta(verts[0], point), line)
+    };
+    let width = (edge_distance(delta(verts[0], verts[3]), verts[1])
+        + edge_distance(delta(verts[0], verts[3]), verts[2])) * 0.5;
+    let height = (edge_distance(delta(verts[0], verts[1]), verts[2])
+        + edge_distance(delta(verts[0], verts[1]), verts[3])) * 0.5;
+    if width <= f32::EPSILON || height <= f32::EPSILON { return Vec::new(); }
 
     let mut rng = SmallRng::new((event.receive_sequence as u32) ^ (event.server_time as u32).rotate_left(7));
     let mut off_x = [[0.0f32; 20]; 20];
@@ -6372,16 +6394,33 @@ mod event_beam_tests {
             0,
             &[("origin[0]", bits(100.0)), ("origin[1]", bits(2.0)), ("origin[2]", bits(60.0))],
         );
-        let specs = glass_shards(&shatter, Some(1), &bounds);
+        let specs = glass_shards(&shatter, Some(1), &bounds, &[]);
         assert!(specs.len() > 20, "a window this size breaks into many shards: {}", specs.len());
         assert!(specs.iter().all(|shard| shard.positions.iter().all(|p| (p[1] - 2.0).abs() < 1e-3)), "shards lie in the thin axis' mid-plane");
         let near = specs.iter().filter(|shard| shard.delay_ms == 0).count();
         assert!(near > 0 && near < specs.len(), "the impact area falls at once, the rest is delayed");
         // Entity model unknown: falls back to the box around the damage point.
-        assert_eq!(glass_shards(&shatter, None, &bounds).len(), specs.len());
+        assert_eq!(glass_shards(&shatter, None, &bounds, &[]).len(), specs.len());
         // Capped by pos.trTime.
         let capped = event(EntityEvent::EV_GLASS_SHATTER, 0, &[("origin[0]", bits(100.0)), ("origin[1]", bits(2.0)), ("origin[2]", bits(60.0)), ("pos.trTime", 7)]);
-        assert_eq!(glass_shards(&capped, Some(1), &bounds).len(), 7);
+        assert_eq!(glass_shards(&capped, Some(1), &bounds, &[]).len(), 7);
+    }
+
+    #[test]
+    fn glass_shatter_uses_rotated_authored_face_instead_of_bounds_plane() {
+        let bounds = [([-1.0e4; 3], [1.0e4; 3]), ([0.0, 0.0, 0.0], [200.0, 200.0, 120.0])];
+        let authored = [[0.0, 0.0, 0.0], [200.0, 200.0, 0.0],
+                        [200.0, 200.0, 120.0], [0.0, 0.0, 120.0]];
+        let faces = [None, Some(authored)];
+        let bits = |v: f32| v.to_bits();
+        let shatter = event(EntityEvent::EV_GLASS_SHATTER, 0,
+            &[("origin[0]", bits(100.0)), ("origin[1]", bits(100.0)), ("origin[2]", bits(60.0))]);
+        for model in [Some(1), None] {
+            let shards = glass_shards(&shatter, model, &bounds, &faces);
+            assert!(!shards.is_empty());
+            assert!(shards.iter().all(|shard| shard.positions.iter().all(|p|
+                (p[0] - p[1]).abs() < 1.0e-3)), "shards must remain on the angled pane");
+        }
     }
 
     #[test]

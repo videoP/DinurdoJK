@@ -133,6 +133,7 @@ impl App {
         self.chat_mode = mode;
         self.chat_input.clear();
         self.chat_input_selected = false;
+        self.chat_emoji_picker.open = false;
         self.chat_player_completion = None;
         self.set_overlay(OverlayMode::Chat);
     }
@@ -354,6 +355,16 @@ mod tests {
         let bytes = chat_command_bytes(ChatMode::Global, &"Ж".repeat(90));
         assert_eq!(bytes.len(), b"say \"".len() + 148 + 1);
         assert!(std::str::from_utf8(&bytes).is_ok());
+    }
+
+    #[test]
+    fn legacy_alt_code_glyph_survives_chat_wire_path() {
+        // This is the TaystJK result of U+2310 (Windows CP437 Alt+169):
+        // a font byte, not UTF-8 U+2310 and not CP437 byte 0xA9.
+        assert_eq!(chat_command_bytes(ChatMode::Global, &char::from(0x10).to_string()),
+            b"say \"\x10\"");
+        assert_eq!(chat_command_bytes(ChatMode::Global, &char::from(0xA9).to_string()),
+            [b"say \"".as_slice(), &[0xA9], b"\""].concat());
     }
 
     #[test]

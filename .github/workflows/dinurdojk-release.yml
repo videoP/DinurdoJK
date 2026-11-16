@@ -192,7 +192,9 @@ jobs:
           # All notices are tracked files. Fail NOW, before 30 minutes of Cargo.
           foreach ($name in @('FFmpeg-GPL-3.0.txt', 'FFmpeg-SOURCE-NOTICE.txt',
                                'OpenAL-Soft-LGPL-2.0.txt', 'DXC-LICENSE.txt',
-                               'DXC-ThirdPartyNotices.txt', 'Jura-OFL.txt')) {
+                               'DXC-ThirdPartyNotices.txt', 'Jura-OFL.txt',
+                              'Noto-CJK-copyright.txt', 'Noto-core-copyright.txt',
+                              'Noto-extra-copyright.txt', 'Noto-ui-copyright.txt')) {
             if (-not (Test-Path -LiteralPath (Join-Path 'release-licenses' $name) -PathType Leaf)) {
               throw "Missing committed release-licenses/$name. Run release-licenses/Fetch-Official-Notices.cmd locally, then commit the files."
             }
@@ -430,7 +432,9 @@ jobs:
           New-Item -ItemType Directory -Force $licenseDir | Out-Null
           foreach ($name in @('OpenAL-Soft-LGPL-2.0.txt', 'DXC-LICENSE.txt',
                               'DXC-ThirdPartyNotices.txt', 'FFmpeg-GPL-3.0.txt',
-                              'FFmpeg-SOURCE-NOTICE.txt', 'Jura-OFL.txt')) {
+                              'FFmpeg-SOURCE-NOTICE.txt', 'Jura-OFL.txt',
+                              'Noto-CJK-copyright.txt', 'Noto-core-copyright.txt',
+                              'Noto-extra-copyright.txt', 'Noto-ui-copyright.txt')) {
             Copy-Item -LiteralPath (Join-Path 'release-licenses' $name) -Destination (Join-Path $licenseDir $name) -ErrorAction Stop
           }
           Copy-Item (Join-Path $env:DLSS_SDK 'LICENSE.txt') (Join-Path $licenseDir 'NVIDIA-DLSS-SDK-LICENSE.txt') -ErrorAction Stop
@@ -450,7 +454,7 @@ jobs:
           # The full ZIP is for new/manual installations. Individual assets
           # are for the updater; the signed manifest binds their exact hashes.
           $archive = "dist/release/DinurdoJK-${{ steps.version.outputs.tag }}-full.zip"
-          python -c 'import sys, json, zipfile, pathlib, hashlib; p=pathlib.Path(sys.argv[1]); d=p.parent; z=zipfile.ZipFile(p); m=json.loads((d/"release-manifest.json").read_bytes()); files=set(m["files"]); names=set(z.namelist()); notices={n for n in names if n.startswith("licenses/")}; required={"licenses/Jura-OFL.txt","licenses/FFmpeg-GPL-3.0.txt","licenses/FFmpeg-SOURCE-NOTICE.txt","licenses/OpenAL-Soft-LGPL-2.0.txt","licenses/DXC-LICENSE.txt","licenses/DXC-ThirdPartyNotices.txt","licenses/NVIDIA-DLSS-SDK-LICENSE.txt"}; assert m["format"]==2; assert names==files|notices; assert required<=notices; assert all(not n.lower().endswith(".txt") for n in files); assert {"DinurdoJK.exe","DinurdoJK/shared/dinurdo-assets.pk4","DinurdoJK/dependencies/dxcompiler.dll","DinurdoJK/dependencies/dxil.dll","DinurdoJK/dependencies/ffmpeg.exe"}<=files; assert all(hashlib.sha256(z.read(n)).hexdigest()==f["sha256"] for n,f in m["files"].items()); print("Verified runtime-only signed manifest and full ZIP license notices")' $archive
+          python -c 'import sys, json, zipfile, pathlib, hashlib; p=pathlib.Path(sys.argv[1]); d=p.parent; z=zipfile.ZipFile(p); m=json.loads((d/"release-manifest.json").read_bytes()); files=set(m["files"]); names=set(z.namelist()); notices={n for n in names if n.startswith("licenses/")}; required={"licenses/Jura-OFL.txt","licenses/Noto-CJK-copyright.txt","licenses/Noto-core-copyright.txt","licenses/Noto-extra-copyright.txt","licenses/Noto-ui-copyright.txt","licenses/FFmpeg-GPL-3.0.txt","licenses/FFmpeg-SOURCE-NOTICE.txt","licenses/OpenAL-Soft-LGPL-2.0.txt","licenses/DXC-LICENSE.txt","licenses/DXC-ThirdPartyNotices.txt","licenses/NVIDIA-DLSS-SDK-LICENSE.txt"}; assert m["format"]==2; assert names==files|notices; assert required<=notices; assert all(not n.lower().endswith(".txt") for n in files); assert {"DinurdoJK.exe","DinurdoJK/shared/dinurdo-assets.pk4","DinurdoJK/dependencies/dxcompiler.dll","DinurdoJK/dependencies/dxil.dll","DinurdoJK/dependencies/ffmpeg.exe"}<=files; assert all(hashlib.sha256(z.read(n)).hexdigest()==f["sha256"] for n,f in m["files"].items()); print("Verified runtime-only signed manifest and full ZIP license notices")' $archive
           if ($LASTEXITCODE -ne 0) { throw 'Release layout, notices or hashes failed verification.' }
 
       - name: Upload signed updater artifact

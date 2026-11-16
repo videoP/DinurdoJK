@@ -45,6 +45,10 @@ UPDATE_FILES = (
 
 NOTICE_FILES = (
     "Jura-OFL.txt",
+    "Noto-CJK-copyright.txt",
+    "Noto-core-copyright.txt",
+    "Noto-extra-copyright.txt",
+    "Noto-ui-copyright.txt",
     "OpenAL-Soft-LGPL-2.0.txt",
     "EalMan-LGPL-2.1.txt",
     "Bevy-Solari-MIT.txt",
@@ -56,6 +60,10 @@ NOTICE_FILES = (
 )
 REQUIRED_NOTICES = (
     "Jura-OFL.txt",
+    "Noto-CJK-copyright.txt",
+    "Noto-core-copyright.txt",
+    "Noto-extra-copyright.txt",
+    "Noto-ui-copyright.txt",
     "OpenAL-Soft-LGPL-2.0.txt",
     "NVIDIA-DLSS-SDK-LICENSE.txt",
     "DXC-LICENSE.txt",

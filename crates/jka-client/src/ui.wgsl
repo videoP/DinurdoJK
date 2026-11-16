@@ -28,6 +28,8 @@ struct VertexOut {
 @group(0) @binding(10) var ui_remap_thumbs: texture_2d<f32>;
 // Only glyphs absent from the original JKA charset/fontdat.
 @group(0) @binding(11) var ui_jura_fallback: texture_2d<f32>;
+// Single atlas built from TaystJK-compatible gfx/emoji/*.png emotes.
+@group(0) @binding(12) var ui_chat_emojis: texture_2d<f32>;
 
 @vertex
 fn vs_main(input: VertexIn) -> VertexOut {
@@ -82,8 +84,14 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     } else if input.textured < 10.5 {
         // Shader Remaps thumbnail slot atlas; see ui::shader_remap.
         return textureSampleLevel(ui_remap_thumbs, ui_font_sampler, input.uv, 0.0) * input.color;
+    } else if input.textured > 13.5 {
+        return textureSampleLevel(ui_chat_emojis, ui_font_sampler, input.uv, 0.0) * input.color;
     } else {
         glyph = textureSampleGrad(ui_jura_fallback, ui_font_sampler, input.uv, uv_dx, uv_dy);
+        if input.textured > 12.5 {
+            // Embedded color emoji keep their authored RGB and caller opacity.
+            return vec4<f32>(glyph.rgb, input.color.a * glyph.a);
+        }
         // Fixed-cell Jura needs opaque stem cores after minification, like
         // charsgrid. Preserve proportional AA, tint and the caller's fade.
         if input.textured > 11.5 {

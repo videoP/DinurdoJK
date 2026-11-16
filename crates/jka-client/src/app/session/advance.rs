@@ -753,7 +753,7 @@ impl GameSession {
         let new_debris = self.weapon_fx.take_debris_spawns();
         if !new_debris.is_empty() {
             let promoted = self.player_presenter
-                .spawn_physics_debris(&new_debris, target_server_time);
+                .spawn_breakable_debris(&new_debris, target_server_time);
             self.weapon_fx.resolve_debris_promotion(promoted);
         }
         let new_gibs = self.weapon_fx.take_gib_spawns();
@@ -768,7 +768,7 @@ impl GameSession {
         let new_glass = self.weapon_fx.take_glass_spawns();
         if !new_glass.is_empty() {
             let promoted = self.player_presenter
-                .spawn_physics_glass(&new_glass, target_server_time);
+                .spawn_breakable_glass(&new_glass, target_server_time);
             self.weapon_fx.resolve_glass_promotion(promoted);
         }
         let local_hull_height = self.presented_player_state().map_or(40.0, |ps| {

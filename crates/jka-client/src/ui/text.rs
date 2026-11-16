@@ -53,6 +53,11 @@ impl Drop for UnicodeFallbackScope {
 /// Only missing glyphs enter the slow path. The caller never opens fonts,
 /// rasterizes, allocates GPU resources, or waits for the font worker.
 fn jura_glyph(ch: char) -> Option<(ProportionalGlyph, i16, f32)> {
+    // Emoji presentation selectors and joiners have no independent ink. This
+    // per-codepoint fallback does not yet compose multi-codepoint emoji.
+    if matches!(ch as u32, 0x200D | 0xFE0E..=0xFE0F | 0xE0020..=0xE007F | 0xE0100..=0xE01EF) {
+        return Some((ProportionalGlyph::default(), 64, 42.0));
+    }
     let ready = UNICODE_FALLBACK.with(|cell| {
         let borrowed = cell.borrow();
         let font = borrowed.as_ref()?;
@@ -81,6 +86,36 @@ fn jura_glyph(ch: char) -> Option<(ProportionalGlyph, i16, f32)> {
 const JURA_GLYPH_SOURCE: f32 = 11.0;
 const JURA_FIXED_GLYPH_SOURCE: f32 = 12.0;
 
+/// Console cell widths are independent of lazy font availability.
+pub(crate) fn console_character_cells(ch: char) -> usize {
+    match ch as u32 {
+        0x200D | 0xFE0E..=0xFE0F | 0xE0020..=0xE007F | 0xE0100..=0xE01EF => 0,
+        _ if super::is_emoji_candidate(ch) => 2,
+        _ => 1,
+    }
+}
+
+/// Display cells before a visible scalar offset, skipping active color codes.
+pub(crate) fn console_column_offset(value: &str, count: usize) -> usize {
+    let mut chars = value.char_indices().peekable();
+    let (mut seen, mut cells) = (0, 0);
+    while let Some((index, ch)) = chars.next() {
+        if let Some((skip, _)) = color_escape(value.as_bytes(), index, 1.0) {
+            while chars.peek().is_some_and(|(at, _)| *at < index + skip) { chars.next(); }
+            continue;
+        }
+        if seen == count { break; }
+        cells += console_character_cells(ch);
+        seen += 1;
+    }
+    cells
+}
+
+fn unicode_glyph_source(ch: char, fixed: bool) -> f32 {
+    let colored = UNICODE_FALLBACK.with(|cell| cell.borrow().as_ref().is_some_and(|font| font.colored.contains(&ch)));
+    if colored { 13.0 } else if fixed { JURA_FIXED_GLYPH_SOURCE } else { JURA_GLYPH_SOURCE }
+}
+
 /// For byte-compatible characters, always select the exact existing JKA glyph
 /// and atlas. For everything else, use Jura only when it actually contains it.
 fn proportional_glyph(font: &ProportionalFont, ch: char) -> (ProportionalGlyph, f32, f32) {
@@ -93,7 +128,7 @@ fn proportional_glyph(font: &ProportionalFont, ch: char) -> (ProportionalGlyph, 
         // fits in one byte. Preserve every actually authored JKA glyph.
     }
     if let Some((glyph, jura_height, _)) = jura_glyph(ch) {
-        return (glyph, f32::from(font.height) / f32::from(jura_height.max(1)), JURA_GLYPH_SOURCE);
+        return (glyph, f32::from(font.height) / f32::from(jura_height.max(1)), unicode_glyph_source(ch, false));
     }
     (font.glyphs[b'?' as usize], 1.0, 2.0)
 }
@@ -135,16 +170,42 @@ pub(in crate::ui) fn charset_glyph(
             // into the remaining cell instead of overlapping the next row.
             let split_v = v0 + baseline * dv;
             textured_rect_with_source(out, draw_x, draw_y, draw_w, baseline * scale_y,
-                [u0, v0], [u1, split_v], color, JURA_FIXED_GLYPH_SOURCE, w, h);
+                [u0, v0], [u1, split_v], color, unicode_glyph_source(ch, true), w, h);
             textured_rect_with_source(out, draw_x, cell_baseline, draw_w, below_space,
-                [u0, split_v], [u1, v1], color, JURA_FIXED_GLYPH_SOURCE, w, h);
+                [u0, split_v], [u1, v1], color, unicode_glyph_source(ch, true), w, h);
         } else {
             textured_rect_with_source(out, draw_x, draw_y, draw_w, ink_h * scale_y,
-                [u0, v0], [u1, v1], color, JURA_FIXED_GLYPH_SOURCE, w, h);
+                [u0, v0], [u1, v1], color, unicode_glyph_source(ch, true), w, h);
         }
     } else {
         glyph_quad_sized(out, b'?', x, y, glyph_w, glyph_h, color, w, h);
     }
+}
+
+/// Console emoji use two cells and preserve the bitmap's aspect ratio.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::ui) fn console_charset_glyph(
+    out: &mut Vec<UiVertex>, ch: char, x: f32, y: f32,
+    glyph_w: f32, glyph_h: f32, color: [f32; 4], w: u32, h: u32,
+) {
+    if unicode_glyph_source(ch, true) == 13.0 {
+        if let Some((glyph, _, _)) = jura_glyph(ch) {
+            let pad = super::ttf_font::PAD as f32;
+            let ink_w = f32::from(glyph.width) - 2.0 * pad;
+            let ink_h = f32::from(glyph.height) - 2.0 * pad;
+            if ink_w <= 0.0 || ink_h <= 0.0 { return; }
+            let scale = (glyph_w / ink_w).min(glyph_h * (14.0 / 16.0) / ink_h);
+            let size = [ink_w * scale, ink_h * scale];
+            let du = (glyph.s2 - glyph.s) / f32::from(glyph.width);
+            let dv = (glyph.t2 - glyph.t) / f32::from(glyph.height);
+            textured_rect_with_source(out, x + (glyph_w - size[0]) * 0.5,
+                y + (glyph_h - size[1]) * 0.5, size[0], size[1],
+                [glyph.s + pad * du, glyph.t + pad * dv],
+                [glyph.s2 - pad * du, glyph.t2 - pad * dv], color, 13.0, w, h);
+            return;
+        }
+    }
+    charset_glyph(out, ch, x, y, glyph_w, glyph_h, color, w, h);
 }
 
 pub(crate) struct NwhColorScope(bool);
@@ -727,11 +788,12 @@ pub(in crate::ui) fn console_text_sized(
             while chars.peek().is_some_and(|(at, _)| *at < index + skip) { chars.next(); }
             continue;
         }
-        if ch != ' ' {
-            charset_glyph(out, ch, cursor_x, cursor_y, char_width, char_height,
+        let cells = console_character_cells(ch) as f32;
+        if ch != ' ' && cells > 0.0 {
+            console_charset_glyph(out, ch, cursor_x, cursor_y, char_width * cells, char_height,
                 active_color, width, height);
         }
-        cursor_x += char_width;
+        cursor_x += char_width * cells;
     }
 }
 
@@ -970,6 +1032,7 @@ pub(in crate::ui) struct UiText<'a> {
     legacy: Option<&'a ProportionalFont>,
     /// TrueType font that lends its Cyrillic glyphs to JKA-font text.
     wide: Option<&'a ProportionalFont>,
+    named_emojis: Option<&'a super::ChatEmojiAtlas>,
     w: u32,
     h: u32,
 }
@@ -1009,12 +1072,12 @@ fn colour_after(run: &str, mut active: [f32; 4], alpha: f32) -> [f32; 4] {
 
 impl<'a> UiText<'a> {
     pub(in crate::ui) fn new(ui: &'a crate::ui::UiSnapshot, legacy: Option<&'a ProportionalFont>, w: u32, h: u32) -> Self {
-        Self { jura: false, clean: ui.clean_font.as_deref(), legacy, wide: None, w, h }
+        Self { jura: false, clean: ui.clean_font.as_deref(), legacy, wide: None, named_emojis: None, w, h }
     }
 
     /// Render redesigned UI geometry with the original JKA small font.
     pub(in crate::ui) fn legacy_only(legacy: Option<&'a ProportionalFont>, w: u32, h: u32) -> Self {
-        Self { jura: false, clean: None, legacy, wide: None, w, h }
+        Self { jura: false, clean: None, legacy, wide: None, named_emojis: None, w, h }
     }
 
     /// `legacy_only`, but characters the JKA font cannot have (Cyrillic in
@@ -1031,11 +1094,11 @@ impl<'a> UiText<'a> {
         let wide = if jura_loaded { None } else {
             ui.clean_font.as_deref().filter(|font| !font.cyrillic.is_empty())
         };
-        Self { jura: false, clean: None, legacy, wide: wide.filter(|_| legacy.is_some()), w, h }
+        Self { jura: false, clean: None, legacy, wide: wide.filter(|_| legacy.is_some()), named_emojis: None, w, h }
     }
 
     pub(in crate::ui) fn chat(ui: &'a crate::ui::UiSnapshot, legacy: Option<&'a ProportionalFont>, w: u32, h: u32) -> Self {
-        match ui.chat_settings.font() {
+        let mut text = match ui.chat_settings.font() {
             super::ChatFont::Classic => Self::legacy_with_wide(ui, legacy, w, h),
             super::ChatFont::Modern => Self::new(ui, legacy, w, h),
             super::ChatFont::Jura => {
@@ -1047,7 +1110,18 @@ impl<'a> UiText<'a> {
                 text.jura = ready_h && ready_question;
                 text
             }
+        };
+        if ui.chat_settings.emojis {
+            text.named_emojis = ui.chat_emoji_atlas.as_deref().filter(|atlas| atlas.count > 0);
         }
+        text
+    }
+
+    /// The user edits and transmits the literal shortcode. Only received
+    /// message presentation substitutes images, never the entry field.
+    pub(in crate::ui) fn without_chat_emojis(mut self) -> Self {
+        self.named_emojis = None;
+        self
     }
 
     fn jura_width(value: &str, px: f32) -> f32 {
@@ -1086,7 +1160,7 @@ impl<'a> UiText<'a> {
                         f32::from(glyph.width) * scale, f32::from(glyph.height) * scale,
                         [glyph.s, glyph.t], [glyph.s2, glyph.t2],
                         if shadow { [0.0, 0.0, 0.0, color[3] * 0.55] } else { active },
-                        JURA_GLYPH_SOURCE, self.w, self.h);
+                        if shadow { JURA_GLYPH_SOURCE } else { unicode_glyph_source(ch, false) }, self.w, self.h);
                 }
                 cursor += f32::from(glyph.horiz_advance.max(0)) * scale;
             }
@@ -1138,7 +1212,7 @@ impl<'a> UiText<'a> {
                 let fallback = ((ch as u32) > 255 && font.wide_glyph(ch).is_none())
                     .then(|| jura_glyph(ch)).flatten();
                 let (glyph, glyph_scale, source) = if let Some((glyph, height, _)) = fallback {
-                    (glyph, px / f32::from(height.max(1)), JURA_GLYPH_SOURCE)
+                    (glyph, px / f32::from(height.max(1)), unicode_glyph_source(ch, false))
                 } else {
                     (font.glyph_for(ch), scale, CLEAN_FONT_SOURCE)
                 };
@@ -1154,7 +1228,7 @@ impl<'a> UiText<'a> {
                         [glyph.s, glyph.t],
                         [glyph.s2, glyph.t2],
                         tint,
-                        source,
+                        if pass && source == 13.0 { JURA_GLYPH_SOURCE } else { source },
                         w,
                         h,
                     );
@@ -1177,8 +1251,23 @@ impl<'a> UiText<'a> {
         px / 12.0
     }
 
-    /// Advance width of `value`, colour codes excluded.
+    /// Advance width of `value`, color codes excluded. For chat, emotes are
+    /// proper inline objects, not glyph-space substitutions.
     pub(in crate::ui) fn width(&self, value: &str, px: f32) -> f32 {
+        if let Some(atlas) = self.named_emojis {
+            let mut width = 0.0;
+            atlas.for_each_part(value, |part| {
+                width += match part {
+                    super::chat_emoji::ChatPart::Text(text) => self.width_plain(text, px),
+                    super::chat_emoji::ChatPart::Image(_) => px * 0.85,
+                };
+            });
+            return width;
+        }
+        self.width_plain(value, px)
+    }
+
+    fn width_plain(&self, value: &str, px: f32) -> f32 {
         if self.jura { return Self::jura_width(value, px); }
         if let Some(font) = self.clean {
             Self::clean_width(font, value, px)
@@ -1222,6 +1311,34 @@ impl<'a> UiText<'a> {
     }
 
     pub(in crate::ui) fn draw(&self, out: &mut Vec<UiVertex>, value: &str, x: f32, baseline: f32, px: f32, color: [f32; 4]) {
+        if let Some(atlas) = self.named_emojis {
+            let mut cursor = x;
+            let mut active = color;
+            let size = px * 0.85;
+            atlas.for_each_part(value, |part| {
+                match part {
+                    super::chat_emoji::ChatPart::Text(text) => {
+                        self.draw_plain(out, text, cursor, baseline, px, active);
+                        cursor += self.width_plain(text, px);
+                        active = colour_after(text, active, color[3]);
+                    }
+                    super::chat_emoji::ChatPart::Image(cell) => {
+                        // Authored RGB never inherits JKA ^color codes; fading
+                        // still follows the enclosing chat message opacity.
+                        textured_rect_with_source(out, cursor, baseline - size * 0.85,
+                            size, size, cell.uv.0, cell.uv.1,
+                            [1.0, 1.0, 1.0, color[3]],
+                            super::chat_emoji::CHAT_EMOJI_SOURCE, self.w, self.h);
+                        cursor += size;
+                    }
+                }
+            });
+            return;
+        }
+        self.draw_plain(out, value, x, baseline, px, color);
+    }
+
+    fn draw_plain(&self, out: &mut Vec<UiVertex>, value: &str, x: f32, baseline: f32, px: f32, color: [f32; 4]) {
         if self.jura { self.jura_draw(out, value, x, baseline, px, color); return; }
         let (w, h) = (self.w, self.h);
         if let Some(font) = self.clean {
@@ -1284,7 +1401,7 @@ mod widescreen_font_tests {
             });
         }
         let _scope = UnicodeFallbackScope::enter(Some(std::sync::Arc::new(
-            super::super::UnicodeFallbackFont { glyphs, cap_heights: std::collections::HashMap::new(), failed: std::collections::HashSet::new(), height: 32, cap_height: 16.0 },
+            super::super::UnicodeFallbackFont { glyphs, colored: std::collections::HashSet::new(), cap_heights: std::collections::HashMap::new(), failed: std::collections::HashSet::new(), height: 32, cap_height: 16.0 },
         )));
         let mut out = Vec::new();
         fixed_charset_text(&mut out, "ЖІ", 10.0, 20.0, 8.0, 16.0,
@@ -1314,7 +1431,7 @@ mod widescreen_font_tests {
             1.0, [1.0; 4], true, 1920, 1080);
         let glyphs = value.chars().map(|ch| (ch, ProportionalGlyph::default())).collect();
         let _loaded = UnicodeFallbackScope::enter(Some(std::sync::Arc::new(
-            super::super::UnicodeFallbackFont { glyphs, cap_heights: std::collections::HashMap::new(), failed: std::collections::HashSet::new(), height: 64, cap_height: 40.0 },
+            super::super::UnicodeFallbackFont { glyphs, colored: std::collections::HashSet::new(), cap_heights: std::collections::HashMap::new(), failed: std::collections::HashSet::new(), height: 64, cap_height: 40.0 },
         )));
         let mut after = Vec::new();
         proportional_text_uniform(&mut after, &value, &legacy, 10.0, 24.0,
@@ -1333,7 +1450,7 @@ mod widescreen_font_tests {
         let _empty = UnicodeFallbackScope::enter(None);
         {
             let _loaded = UnicodeFallbackScope::enter(Some(std::sync::Arc::new(
-                super::super::UnicodeFallbackFont { glyphs, cap_heights: std::collections::HashMap::new(), failed: std::collections::HashSet::new(), height: 24, cap_height: 18.0 },
+                super::super::UnicodeFallbackFont { glyphs, colored: std::collections::HashSet::new(), cap_heights: std::collections::HashMap::new(), failed: std::collections::HashSet::new(), height: 24, cap_height: 18.0 },
             )));
             assert_eq!(proportional_text_width("^1AЖ", &legacy, 1.0), 27.0);
             assert_eq!(wrap_proportional_text("A ЖA", &legacy, 1.0, 27.0), "A\nЖA\n");
@@ -1359,7 +1476,7 @@ mod widescreen_font_tests {
         let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
         let failed_font = std::sync::Arc::new(super::super::UnicodeFallbackFont {
             glyphs: std::collections::HashMap::new(),
-            cap_heights: std::collections::HashMap::new(),
+            colored: std::collections::HashSet::new(), cap_heights: std::collections::HashMap::new(),
             failed: std::collections::HashSet::from(['\u{1F642}']),
             height: 64, cap_height: 42.0,
         });
@@ -1383,7 +1500,7 @@ mod widescreen_font_tests {
             s2: 1.0, t2: 1.0, ..Default::default()
         });
         let _scope = UnicodeFallbackScope::enter(Some(std::sync::Arc::new(
-            super::super::UnicodeFallbackFont { glyphs, cap_heights: std::collections::HashMap::new(), failed: std::collections::HashSet::new(), height: 12, cap_height: 8.0 },
+            super::super::UnicodeFallbackFont { glyphs, colored: std::collections::HashSet::new(), cap_heights: std::collections::HashMap::new(), failed: std::collections::HashSet::new(), height: 12, cap_height: 8.0 },
         )));
         let mut out = Vec::new();
         proportional_text_uniform(&mut out, "AЖA", &legacy, 10.0, 24.0,

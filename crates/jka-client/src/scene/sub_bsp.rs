@@ -143,6 +143,9 @@ fn append_sub_bsp(map: &mut PreparedMap, mut child: PreparedMap) -> Result<(), S
     let mut bounds = stats.inline_model_bounds.to_vec();
     bounds.extend_from_slice(&child_stats.inline_model_bounds);
     stats.inline_model_bounds = bounds.into();
+    let mut glass_faces = stats.inline_model_glass_faces.to_vec();
+    glass_faces.extend_from_slice(&child_stats.inline_model_glass_faces);
+    stats.inline_model_glass_faces = glass_faces.into();
     let mut midpoints = stats.inline_model_midpoints.to_vec();
     midpoints.extend_from_slice(&child_stats.inline_model_midpoints);
     stats.inline_model_midpoints = midpoints.into();

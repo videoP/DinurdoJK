@@ -37,7 +37,7 @@ pub(in crate::renderer) fn enabled() -> bool {
 
 // Deliberately preserve the original inclusive CPU timing fields next to the
 // new *non-overlapping* intervals so existing diagnostics are not redefined.
-const FIELDS: [&str; 257] = [
+const FIELDS: &[&str] = &[
     "frame_ms",
     "cpu_prepare_ms",
     "cpu_acquire_ms",
@@ -243,6 +243,8 @@ const FIELDS: [&str; 257] = [
     "patch_selected_triangles",
     "patch_lod_updates",
     "patch_index_upload_bytes",
+    "patch_index_writes",
+    "patch_recipe_rewrites",
     "patch_cpu_lod_ms",
     "world_variant_pending",
     "world_active_pipelines",
@@ -577,6 +579,8 @@ impl PerfRow {
                 info.patch_lod.selected_triangles as f64,
                 info.patch_lod.lod_updates as f64,
                 info.patch_lod.index_upload_bytes as f64,
+                f64::from(info.patch_lod.index_writes),
+                f64::from(info.patch_lod.recipe_rewrites),
                 info.patch_lod.cpu_lod_ms,
                 f64::from(u8::from(info.world_shader_programs.pending)),
                 f64::from(info.world_pipeline_counts.0),

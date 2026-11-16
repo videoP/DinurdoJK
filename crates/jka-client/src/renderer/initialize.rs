@@ -1225,6 +1225,7 @@ impl Renderer {
                 texture_entry(9),
                 texture_entry(10),
                 texture_entry(11),
+                texture_entry(12),
             ],
         });
         let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1310,6 +1311,7 @@ impl Renderer {
         let ui_jura_font = upload_cached_texture(&device, &queue,
             &empty_ui_font_texture("lazy Unicode fallback (not loaded)"));
         let ui_jura_metrics = Some(ui::UnicodeFallbackFont {
+            colored: std::collections::HashSet::new(),
             glyphs: std::collections::HashMap::new(),
             cap_heights: std::collections::HashMap::new(),
             failed: std::collections::HashSet::new(), height: 64, cap_height: 42.0,
@@ -1338,6 +1340,10 @@ impl Renderer {
             &queue,
             &empty_ui_font_texture("JKA UI team overlay atlas (not loaded)"),
         );
+        let ui_chat_emojis = upload_texture(
+            &device, &queue,
+            &empty_ui_font_texture("JKA chat emoji atlas (not loaded)"),
+        );
         let ui_ext_images = upload_texture(
             &device,
             &queue,
@@ -1362,7 +1368,7 @@ impl Renderer {
         let ui_images = [
             &ui_font, &ui_small_font, &ui_splash, &ui_keys, &ui_icons,
             &ui_team_icons, &ui_ext_images, &ui_clean_font, &ui_avatars,
-            &ui_remap_thumbs, &ui_jura_font,
+            &ui_remap_thumbs, &ui_jura_font, &ui_chat_emojis,
         ];
         let ui_bind_group = super::overlay::create_ui_texture_group(
             &device, &ui_texture_layout, &ui_font_sampler, ui_images, false);
@@ -2598,6 +2604,10 @@ impl Renderer {
             ui_encoded_bind_group,
             _ui_font: ui_font,
             _ui_jura_font: ui_jura_font,
+            _ui_chat_emojis: ui_chat_emojis,
+            ui_chat_emoji_job: None,
+            ui_chat_emoji_scope: None,
+            ui_chat_emoji_loaded: false,
             ui_jura_metrics: ui_jura_metrics.map(std::sync::Arc::new),
             ui_unicode_worker,
             _ui_small_font: ui_small_font,

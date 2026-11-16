@@ -174,6 +174,19 @@ pub(crate) fn set_legacy_blend_mode(mode: u8) {
     LEGACY_BLEND_MODE.store(mode.min(4), std::sync::atomic::Ordering::Relaxed);
 }
 
+// Session-only A/B for HDR/offscreen legacy model transfers (see draw.rs):
+// 0 original, 1 bound MSAA + GPU-skinned shells, 2 = 1 + scissored resolves.
+static LEGACY_BLEND_BOUNDS: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(2);
+
+pub(crate) fn legacy_blend_bounds() -> u8 {
+    LEGACY_BLEND_BOUNDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn set_legacy_blend_bounds(mode: u8) {
+    LEGACY_BLEND_BOUNDS.store(mode.min(2), std::sync::atomic::Ordering::Relaxed);
+}
+
 // Session-only planar reflection fill A/B: 0 full target, 1 scissor to the
 // reflector's screen rectangle, 2 scissor + depth mask of its screen polygon.
 static PLANAR_REFLECTION_MASK: std::sync::atomic::AtomicU8 =
@@ -232,6 +245,7 @@ mod live_river;
 mod models;
 mod neon_menu;
 mod overlay;
+pub(crate) mod chat_emoji;
 mod unicode_fonts;
 mod ui_gamma;
 mod portal_depth;
@@ -1072,6 +1086,11 @@ struct Renderer {
     ui_encoded_bind_group: wgpu::BindGroup,
     _ui_font: GpuImage,
     _ui_jura_font: GpuImage,
+    /// Source 14, one texture for individual gfx/emoji/*.png emotes.
+    _ui_chat_emojis: GpuImage,
+    ui_chat_emoji_job: Option<std::sync::mpsc::Receiver<chat_emoji::ChatEmojiBuild>>,
+    ui_chat_emoji_scope: Option<(Option<PathBuf>, Option<u8>)>,
+    ui_chat_emoji_loaded: bool,
     ui_jura_metrics: Option<std::sync::Arc<ui::UnicodeFallbackFont>>,
     ui_unicode_worker: unicode_fonts::UnicodeFontWorker,
     _ui_small_font: GpuImage,

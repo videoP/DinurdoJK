@@ -881,6 +881,9 @@ pub struct BspMapStats {
     /// `(mins, maxs)` of each inline model, indexed like the midpoints. CGame's
     /// glass shatter tessellates the brush's face from these.
     pub inline_model_bounds: std::sync::Arc<[([f32; 3], [f32; 3])]>,
+    /// The dominant authored planar quad of each inline brush model, kept in
+    /// BSP world coordinates for CG_GlassShatter / R_GetBModelVerts parity.
+    pub inline_model_glass_faces: std::sync::Arc<[Option<[[f32; 3]; 4]>]>,
     pub brushes: usize,
     pub brush_sides: usize,
     pub planes: usize,

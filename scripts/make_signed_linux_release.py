@@ -85,7 +85,14 @@ def create(binary: Path, phonon: Path, asset: Path, license_file: Path,
         'DinurdoJK/shared/dinurdo-assets.pk4': read_safe(asset),
     }
     license_bytes = read_safe(license_file)
-    jura_notice = read_safe(Path('release-licenses/Jura-OFL.txt'))
+    # Notices ship only in the manual archive, outside the updater payload.
+    notices = {name: read_safe(Path('release-licenses') / name) for name in (
+        'Jura-OFL.txt',
+        'Noto-CJK-copyright.txt',
+        'Noto-core-copyright.txt',
+        'Noto-extra-copyright.txt',
+        'Noto-ui-copyright.txt',
+    )}
     if sum(len(data) for data in payload.values()) > MAX_FILE:
         raise ValueError('Linux signed install payload exceeds client aggregate size limit')
     metadata = {
@@ -134,7 +141,8 @@ def create(binary: Path, phonon: Path, asset: Path, license_file: Path,
         tar_file(archive_out, 'Launch-DinurdoJK.sh', launch, 0o755)
         tar_file(archive_out, 'README-LINUX.txt', readme, 0o644)
         tar_file(archive_out, 'licenses/Steam-Audio-Apache-2.0.txt', license_bytes, 0o644)
-        tar_file(archive_out, 'licenses/Jura-OFL.txt', jura_notice, 0o644)
+        for name, data in notices.items():
+            tar_file(archive_out, f'licenses/{name}', data, 0o644)
     with tarfile.open(archive, 'r:gz') as archive_in:
         for name, data in payload.items():
             member = archive_in.getmember(name)

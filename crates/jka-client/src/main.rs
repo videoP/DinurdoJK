@@ -372,10 +372,6 @@ fn main() -> std::process::ExitCode {
         Err(e) => std::eprintln!("Pending update could not start: {e}"),
     }
 
-    if let Err(error) = updater::install_bundled_notices() {
-        std::eprintln!("Could not install bundled license notices: {error}");
-    }
-
     // DinurdoJK/ (with its dependencies) must sit beside the executable. Check
     // before logging creates anything there, and say so in a dialog: this
     // process has no visible console yet, so a bare exit looks like a crash.
@@ -664,9 +660,9 @@ fn main() -> std::process::ExitCode {
         use winit::platform::windows::EventLoopBuilderExtWindows;
         event_loop_builder.with_msg_hook(|message| {
             renderer::input_diag_win32_message(message);
-            // False means continue Winit's normal message dispatch. The hook is
-            // observation-only and must never consume WM_INPUT.
-            false
+            // Only completed Windows Alt+numpad character messages are
+            // consumed. Never intercept WM_INPUT or ordinary keypresses.
+            app::alt_codes::capture_message(message)
         });
     }
     let event_loop = match event_loop_builder.build() {

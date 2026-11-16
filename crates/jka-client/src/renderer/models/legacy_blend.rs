@@ -27,8 +27,9 @@ pub(in crate::renderer) type LegacyTransferRect = (u32, u32, u32, u32);
 /// This never changes the format or dimensions of the FP16 scene/encoded target.
 pub(in crate::renderer) fn bounded_legacy_transfer_rect(
     surfaces: &[DynamicModelSurface], view_proj: Mat4, width: u32, height: u32,
-) -> Option<LegacyTransferRect> {
-    if width == 0 || height == 0 { return None; }
+    gpu_skinned_bounds: bool,
+) -> Result<LegacyTransferRect, &'static str> {
+    if width == 0 || height == 0 { return Err("zero_extent"); }
     let mut min_x = f32::INFINITY;
     let mut min_y = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
@@ -36,42 +37,210 @@ pub(in crate::renderer) fn bounded_legacy_transfer_rect(
     let mut seen = false;
     let mut total_vertices = 0usize;
     for surface in surfaces.iter().filter(|s| eligible(s.alpha_mode)) {
-        // Eligible GPU-skinned shells can move anywhere within their pose;
-        // source vertices/bind-pose bounds are NOT world-space bounds. FX
-        // instance/partial blob buffers likewise differ from source vertices.
-        if surface.ghoul2_gpu.is_some() || surface.fx_gpu_sprites.is_some() {
-            return None;
+        // RT-only casters never reach colour, so they cannot need a transfer.
+        if gpu_skinned_bounds && !surface.raster_visible { continue; }
+        // GPU FX sprites (saber blade glow/core, flares) never draw in the
+        // encoded pass (draw_phase_inner skips them for legacy_effects), so
+        // they need no transfer region. Mode 0 keeps the original rejection.
+        if surface.fx_gpu_sprites.is_some() {
+            if gpu_skinned_bounds { continue; }
+            return Err("fx_gpu_sprites");
+        }
+        if let Some(skin) = surface.ghoul2_gpu.as_ref() {
+            // Source vertices are bind-pose, NOT world positions. Without the
+            // r_legacyBlendBounds A/B, keep the original full-frame fallback.
+            if !gpu_skinned_bounds { return Err("ghoul2_gpu"); }
+            total_vertices = total_vertices.saturating_add(skin.vertices.len());
+            if total_vertices > 24_000 { return Err("vertex_budget"); }
+            let (lo, hi) = ghoul2_render_bounds(skin)?;
+            // Entirely behind the camera: nothing of it can be rasterized.
+            let Some((x0, y0, x1, y1)) = surface_screen_rect(lo, hi, view_proj, width, height, true)?
+            else { continue; };
+            min_x = min_x.min(x0);
+            min_y = min_y.min(y0);
+            max_x = max_x.max(x1);
+            max_y = max_y.max(y1);
+            seen = true;
+            continue;
         }
         if surface.indices.is_empty() { continue; }
-        if surface.vertices.is_empty() { return None; }
+        if surface.vertices.is_empty() { return Err("no_cpu_vertices"); }
         total_vertices = total_vertices.saturating_add(surface.vertices.len());
         // Avoid spending a large CPU budget scanning a crowded character scene
         // just to save a pair of GPU fullscreen transfer draws.
-        if total_vertices > 24_000 { return None; }
+        if total_vertices > 24_000 { return Err("vertex_budget"); }
         let mut lo = [f32::INFINITY; 3];
         let mut hi = [f32::NEG_INFINITY; 3];
         for vertex in surface.vertices.iter() {
             // WGSL foliage_model_position changes vertex positions in the VS.
             // We cannot bound it from the undeformed source without its wind.
-            if vertex.foliage_wind != 0.0 { return None; }
+            if vertex.foliage_wind != 0.0 { return Err("foliage_wind"); }
             for axis in 0..3 {
                 let v = vertex.position[axis];
-                if !v.is_finite() { return None; }
+                if !v.is_finite() { return Err("non_finite"); }
                 lo[axis] = lo[axis].min(v);
                 hi[axis] = hi[axis].max(v);
             }
         }
-        let (x0, y0, x1, y1) =
-            crate::renderer::aabb_screen_rect(lo, hi, view_proj, width, height)?;
-        if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) { return None; }
+        let Some((x0, y0, x1, y1)) =
+            surface_screen_rect(lo, hi, view_proj, width, height, gpu_skinned_bounds)?
+        else { continue; };
         min_x = min_x.min(x0);
         min_y = min_y.min(y0);
         max_x = max_x.max(x1);
         max_y = max_y.max(y1);
         seen = true;
     }
-    if !seen { return None; }
-    padded_transfer_rect((min_x, min_y, max_x, max_y), width, height)
+    if !seen {
+        // Bounds A/B: every eligible surface was skipped (GPU sprites, RT-only,
+        // or entirely behind the camera), so the encoded pass rasterizes
+        // nothing. A 1-pixel transfer replaces the full-frame fallback.
+        if gpu_skinned_bounds { return Ok((0, 0, 1, 1)); }
+        return Err("no_bounded_surface");
+    }
+    padded_transfer_rect((min_x, min_y, max_x, max_y), width, height).ok_or("near_fullscreen")
+}
+
+/// Screen bounds of a renderer-space AABB. `clip_camera_plane` (r_legacyBlendBounds
+/// >= 1) clips the box edges at a tiny positive w instead of rejecting a box
+/// that crosses the camera plane, so a large effect mesh around the viewer
+/// (e.g. map light cones) still yields a conservative rectangle; points at that
+/// plane project far off-screen and are clamped by `padded_transfer_rect`.
+/// Ok(None): the box is entirely behind the camera and cannot draw.
+fn surface_screen_rect(
+    lo: [f32; 3], hi: [f32; 3], view_proj: Mat4, width: u32, height: u32,
+    clip_camera_plane: bool,
+) -> Result<Option<(f32, f32, f32, f32)>, &'static str> {
+    if !clip_camera_plane {
+        let rect = crate::renderer::aabb_screen_rect(lo, hi, view_proj, width, height)
+            .ok_or("camera_plane")?;
+        if ![rect.0, rect.1, rect.2, rect.3].iter().all(|v| v.is_finite()) { return Err("non_finite"); }
+        return Ok(Some(rect));
+    }
+    const MIN_W: f32 = 1.0e-4;
+    let corner = |i: usize| view_proj * glam::Vec4::new(
+        if i & 1 == 0 { lo[0] } else { hi[0] },
+        if i & 2 == 0 { lo[1] } else { hi[1] },
+        if i & 4 == 0 { lo[2] } else { hi[2] },
+        1.0,
+    );
+    let clip: [glam::Vec4; 8] = std::array::from_fn(corner);
+    let (w, h) = (width as f32, height as f32);
+    let mut rect = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    let mut add = |c: glam::Vec4| {
+        let x = (c.x / c.w * 0.5 + 0.5) * w;
+        let y = (0.5 - c.y / c.w * 0.5) * h;
+        rect = (rect.0.min(x), rect.1.min(y), rect.2.max(x), rect.3.max(y));
+    };
+    for (i, c) in clip.iter().enumerate() {
+        if c.w > MIN_W { add(*c); }
+        // Each box edge once: to the corner that differs in one higher bit.
+        for bit in [1usize, 2, 4] {
+            if i & bit != 0 { continue; }
+            let d = clip[i | bit];
+            if (c.w > MIN_W) != (d.w > MIN_W) {
+                let t = (MIN_W - c.w) / (d.w - c.w);
+                add(*c + (d - *c) * t);
+            }
+        }
+    }
+    if !rect.0.is_finite() { return Ok(None); }
+    if ![rect.0, rect.1, rect.2, rect.3].iter().all(|v| v.is_finite()) { return Err("non_finite"); }
+    Ok(Some(rect))
+}
+
+/// Conservative renderer-space AABB of a GPU-skinned Ghoul2 surface, from the
+/// same skinning, jiggle, bulge and entity transform as `ghoul2_skin.wgsl`
+/// vs_main. Only the few eligible additive shells (e.g. a saber hilt glow) are
+/// evaluated here, under the caller's vertex budget.
+fn ghoul2_render_bounds(
+    skin: &crate::renderer::Ghoul2GpuSkinning,
+) -> Result<([f32; 3], [f32; 3]), &'static str> {
+    // Foliage wind moves vertices in the VS from a time-varying field.
+    if skin.foliage_wind { return Err("foliage_wind"); }
+    let transform = |bone: &crate::renderer::Ghoul2GpuBone, p: [f32; 3]| -> [f32; 3] {
+        let row = |r: &[f32; 4]| r[0] * p[0] + r[1] * p[1] + r[2] * p[2] + r[3];
+        [row(&bone.row0), row(&bone.row1), row(&bone.row2)]
+    };
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for vertex in skin.vertices.iter() {
+        let count = vertex.weight_count.clamp(1, 4) as usize;
+        let mut points = [[0.0f32; 3]; 4];
+        for (slot, point) in points.iter_mut().enumerate().take(count) {
+            let bone = skin.bones.get(vertex.bone_indices[slot] as usize).ok_or("bone_index")?;
+            *point = transform(bone, vertex.position);
+        }
+        let w = vertex.weights;
+        let p: [f32; 3] = std::array::from_fn(|axis| match count {
+            1 => points[0][axis],
+            2 => w[0] * (points[0][axis] - points[1][axis]) + points[1][axis],
+            3 => w[0] * points[0][axis] + w[1] * points[1][axis]
+                + (1.0 - w[0] - w[1]) * points[2][axis],
+            _ => w[0] * points[0][axis] + w[1] * points[1][axis] + w[2] * points[2][axis]
+                + (1.0 - w[0] - w[1] - w[2]) * points[3][axis],
+        });
+        // Jiggle adds offset * effective weight, and the effective weight is
+        // never above the stored weight.
+        let pad = if vertex.jiggle_weight > 0.0 {
+            skin.jiggle_offsets.get(vertex.jiggle_region as usize).map_or(0.0, |offset| {
+                (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt()
+                    * vertex.jiggle_weight.abs()
+            })
+        } else {
+            0.0
+        };
+        for axis in 0..3 {
+            if !p[axis].is_finite() || !pad.is_finite() { return Err("non_finite"); }
+            lo[axis] = lo[axis].min(p[axis] - pad);
+            hi[axis] = hi[axis].max(p[axis] + pad);
+        }
+    }
+    if !lo[0].is_finite() { return Err("no_cpu_vertices"); }
+    // Bulge pushes along the normalized model normal, before the entity axis.
+    let bulge = skin.bulge_height.abs();
+    let mut render_lo = [f32::INFINITY; 3];
+    let mut render_hi = [f32::NEG_INFINITY; 3];
+    for corner in 0..8 {
+        let m = [
+            if corner & 1 == 0 { lo[0] - bulge } else { hi[0] + bulge },
+            if corner & 2 == 0 { lo[1] - bulge } else { hi[1] + bulge },
+            if corner & 4 == 0 { lo[2] - bulge } else { hi[2] + bulge },
+        ];
+        let a = &skin.axis;
+        let world: [f32; 3] = std::array::from_fn(|i|
+            skin.origin[i] + a[0][i] * m[0] + a[1][i] * m[1] + a[2][i] * m[2]);
+        // JKA -> renderer: [x, z, -y] (ghoul2_skin.wgsl jka_to_render).
+        let render = [world[0], world[2], -world[1]];
+        for axis in 0..3 {
+            render_lo[axis] = render_lo[axis].min(render[axis]);
+            render_hi[axis] = render_hi[axis].max(render[axis]);
+        }
+    }
+    Ok((render_lo, render_hi))
+}
+
+/// Perf-trace diagnostic: one entry per legacy-blend-eligible surface.
+pub(in crate::renderer) fn describe_eligible_surfaces(surfaces: &[DynamicModelSurface]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for surface in surfaces.iter().filter(|s| eligible(s.alpha_mode)) {
+        let kind = if surface.ghoul2_gpu.is_some() {
+            "g2gpu"
+        } else if surface.fx_gpu_sprites.is_some() {
+            "fxgpu"
+        } else {
+            "cpu"
+        };
+        let name = surface.ghoul2_gpu.as_ref().map(|skin| skin.mesh_key.to_string())
+            .or_else(|| surface.material_trace.as_deref().map(str::to_owned))
+            .unwrap_or_default();
+        let texture = surface.texture.as_ref().map_or("-", |texture| texture.label.as_str());
+        let _ = write!(out, " [ent={} {kind} {:?} visible={} verts={} mesh={} tex={}]",
+            surface.entity_num, surface.alpha_mode, u8::from(surface.raster_visible),
+            surface.vertex_count(), name.chars().take(96).collect::<String>(), texture);
+    }
+    out
 }
 
 /// Extra pixels cover raster precision and the small projection/vertex math
@@ -110,6 +279,10 @@ pub(in crate::renderer) struct LegacyModelBlend {
     /// always this object's own target. Rebuilt when the scene view changes.
     world_encode_source: Option<(wgpu::TextureView, wgpu::BindGroup)>,
     world_decode_source: Option<wgpu::BindGroup>,
+    /// Model-path MSAA only (r_legacyBlendBounds 2): decode that averages the
+    /// encoded samples itself, so a bounded transfer needs no full-frame
+    /// hardware resolves. Pipelines: [0] MSAA scene target, [1] resolved scene.
+    msaa_resolve_decode: Option<(wgpu::BindGroupLayout, [wgpu::RenderPipeline; 2])>,
 }
 
 impl LegacyModelBlend {
@@ -302,7 +475,61 @@ impl LegacyModelBlend {
             per_sample,
             world_encode_source: None,
             world_decode_source: None,
+            msaa_resolve_decode: (!per_sample && size.2 > 1)
+                .then(|| Self::msaa_resolve_decode(device, size.2, size.3)),
         }
+    }
+
+    fn msaa_resolve_decode(
+        device: &wgpu::Device, samples: u32, format: wgpu::TextureFormat,
+    ) -> (wgpu::BindGroupLayout, [wgpu::RenderPipeline; 2]) {
+        let mut image_entry = texture_entry(0);
+        image_entry.ty = wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2, multisampled: true,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("legacy model bounded resolve-decode"),
+            entries: &[image_entry],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("legacy model bounded resolve-decode"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", include_str!("../../legacy_model_blend.wgsl"), TRANSFER_RESOLVE_DECODE).into(),
+            ),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = |count: u32| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("legacy model bounded resolve-decode"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vertex"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { count, ..Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("decode_resolve"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: crate::pipeline_cache::get().as_ref(),
+        });
+        let pipelines = [pipeline(samples), pipeline(1)];
+        (layout, pipelines)
     }
 
     /// Outside any render pass: (re)build the cached world transfer bind
@@ -503,6 +730,7 @@ impl DynamicModelRenderer {
         camera: &wgpu::BindGroup,
         native_unorm_view: Option<&wgpu::TextureView>,
         transfer_rect: Option<LegacyTransferRect>,
+        bounded_msaa_resolve: bool,
     ) {
         if !self.legacy_blend_active() {
             return;
@@ -537,15 +765,30 @@ impl DynamicModelRenderer {
             return;
         }
         let blend = self.legacy_blend.as_ref().unwrap();
+        // r_legacyBlendBounds 2: with MSAA and a bounded rect, skip both
+        // full-frame hardware resolves. Inside the rect the decode averages the
+        // encoded samples itself (the resolve's box filter) and writes the same
+        // value to the MSAA scene and the resolved scene; outside it neither
+        // target changes, and the scene already equals resolve(MSAA scene).
+        let manual_resolve = match (bounded_msaa_resolve, transfer_rect, msaa,
+            blend.msaa_view.as_ref(), blend.msaa_resolve_decode.as_ref())
+        {
+            (true, Some(rect), Some(msaa_scene), Some(encoded), Some((layout, pipelines))) =>
+                Some((rect, msaa_scene, encoded, layout, pipelines)),
+            _ => None,
+        };
         let encode_source = blend.bind(device, scene);
-        let decode_source = blend.bind(device, &blend.view);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("legacy model encoded blending"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: blend.msaa_view.as_ref().unwrap_or(&blend.view),
                     depth_slice: None,
-                    resolve_target: blend.msaa_view.as_ref().map(|_| &blend.view),
+                    resolve_target: if manual_resolve.is_some() {
+                        None
+                    } else {
+                        blend.msaa_view.as_ref().map(|_| &blend.view)
+                    },
                     ops: wgpu::Operations {
                         // In the bounded case the encode triangle overwrites
                         // every pixel subsequently decoded; a full-image
@@ -576,6 +819,37 @@ impl DynamicModelRenderer {
             pass.draw(0..3, 0..1);
             self.draw_encoded_legacy_models(&mut pass, camera);
         }
+        if let Some(((x, y, w, h), msaa_scene, encoded, layout, pipelines)) = manual_resolve {
+            let source = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("legacy model bounded resolve-decode source"),
+                layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(encoded),
+                }],
+            });
+            for (target, pipeline) in [(msaa_scene, &pipelines[0]), (scene, &pipelines[1])] {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("legacy model bounded return to linear"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                pass.set_scissor_rect(x, y, w, h);
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &source, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            return;
+        }
+        let decode_source = blend.bind(device, &blend.view);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("legacy model return to linear"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -613,6 +887,26 @@ const TRANSFER_MSAA: &str = r#"
 }
 @fragment fn decode(@builtin(position) p:vec4<f32>, @builtin(sample_index) sample:u32) -> @location(0) vec4<f32> {
     let c = textureLoad(image,vec2<i32>(p.xy),i32(sample));
+    return vec4(legacy_effect_decode(c.rgb),c.a);
+}
+"#;
+
+// Bounded MSAA model transfer: box-resolve the encoded samples (what the
+// hardware resolve would produce), then decode. Written at pixel rate.
+const TRANSFER_RESOLVE_DECODE: &str = r#"
+@group(0) @binding(0) var image: texture_multisampled_2d<f32>;
+@vertex fn vertex(@builtin(vertex_index) i:u32) -> @builtin(position) vec4<f32> {
+    let p = array<vec2<f32>,3>(vec2(-1.0,-1.0),vec2(3.0,-1.0),vec2(-1.0,3.0));
+    return vec4(p[i],0.0,1.0);
+}
+@fragment fn decode_resolve(@builtin(position) p:vec4<f32>) -> @location(0) vec4<f32> {
+    let pixel = vec2<i32>(p.xy);
+    let count = textureNumSamples(image);
+    var sum = vec4<f32>(0.0);
+    for (var s = 0u; s < count; s = s + 1u) {
+        sum = sum + textureLoad(image, pixel, i32(s));
+    }
+    let c = sum / f32(count);
     return vec4(legacy_effect_decode(c.rgb),c.a);
 }
 "#;

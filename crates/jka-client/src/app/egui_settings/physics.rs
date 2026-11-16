@@ -2,7 +2,7 @@
 use crate::app::egui_settings::{
     quality_table_row, segmented_row, theme, App, PHYS_CCD, PHYS_CLIENT_ENABLED,
     PHYS_CLOTH, PHYS_CLOTH_AIR, PHYS_CLOTH_ANIMATION, PHYS_CLOTH_BODY_COLLISION,
-    PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_DEBRIS, PHYS_DEBRIS_LIFETIME,
+    PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_BREAKABLES, PHYS_DEBRIS, PHYS_DEBRIS_LIFETIME,
     PHYS_DEBRIS_MAX, PHYS_DEBUG_DRAW, PHYS_DISMEMBERMENT, PHYS_DISMEMBER_LIFETIME,
     PHYS_DISMEMBER_MAX, PHYS_EXPLOSION_IMPULSES, PHYS_FORCE_IMPULSES, PHYS_JIGGLE,
     PHYS_JIGGLE_BREAST, PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z, PHYS_JIGGLE_BREAST_REMESH_TOP_Z, PHYS_HAIR,
@@ -454,6 +454,17 @@ impl App {
             "DEBRIS",
             "Short-lived physical fragments spawned from presentation events.",
         );
+        const BREAKABLES: [(u8, &str); 2] = [(0, "Legacy"), (1, "Enhanced")];
+        if let Some(mode) = segmented_row(
+            ui,
+            "Breakables",
+            "Server breakable / glass presentation only. Legacy uses TaystJK trajectories and 6-second glass. Enhanced simulates fragments with Rapier for 15 seconds. Does not change server destruction or collision.",
+            theme::Reset::Physics(PHYS_BREAKABLES),
+            u8::from(self.video.breakables_enhanced),
+            &BREAKABLES,
+        ) {
+            let _ = self.set_console_cvar("r_breakables", &mode.to_string());
+        }
         self.egui_physics_toggle(
             ui,
             "Physical debris",

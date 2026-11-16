@@ -8036,22 +8036,33 @@ impl Renderer {
         // skinning, foliage deformation, camera-plane crossing, etc.) keeps
         // the original full-frame path. MSAA remains full-frame because its
         // attachment resolve is not scissor-limited.
-        let legacy_transfer_rect = if legacy_mode4_fallback
-            && self.msaa_samples == 1 && self.studio_world_viewport.is_none()
-        {
+        // r_legacyBlendBounds A/B: 0 original (MSAA and GPU-skinned shells
+        // always full-frame); 1 also bound MSAA and GPU-skinned Ghoul2 shells;
+        // 2 = 1 plus scissored shader resolves instead of the full-frame MSAA
+        // hardware resolves.
+        let legacy_bounds_mode = crate::renderer::legacy_blend_bounds();
+        let legacy_transfer_bound = if !legacy_mode4_fallback {
+            Err("not_mode4_fallback")
+        } else if self.msaa_samples != 1 && legacy_bounds_mode == 0 {
+            Err("msaa")
+        } else if self.studio_world_viewport.is_some() {
+            Err("studio_viewport")
+        } else {
             crate::renderer::models::legacy_blend::bounded_legacy_transfer_rect(
-                dynamic_models, view_proj, render_width, render_height)
-        } else {
-            None
+                dynamic_models, view_proj, render_width, render_height, legacy_bounds_mode >= 1)
         };
-        info.legacy_transfer_rect = if self.dynamic_model_renderer.legacy_blend_active() {
-            legacy_transfer_rect
-        } else {
-            None
-        };
+        let legacy_transfer_rect = legacy_transfer_bound.ok();
+        if self.dynamic_model_renderer.legacy_blend_active() {
+            info.legacy_transfer_rect = legacy_transfer_rect;
+            if perf_timing {
+                info.legacy_transfer_reject = legacy_transfer_bound.err().unwrap_or("");
+                info.legacy_eligible_surfaces =
+                    crate::renderer::models::legacy_blend::describe_eligible_surfaces(dynamic_models);
+            }
+        }
         self.dynamic_model_renderer.composite_legacy_blend(&self.device,&mut encoder,
             scene_output,self.targets.msaa_view.as_ref(),&self.targets.depth_view,&self.camera_bind_group,
-            legacy_unorm_view.as_ref(),legacy_transfer_rect);
+            legacy_unorm_view.as_ref(),legacy_transfer_rect, legacy_bounds_mode >= 2);
         // In non-threaded mode, resolve after the last main scene pass closes.
         // Threaded mode already resolved in the prefix before handing it off.
         self.frame_time_graph.resolve_stats(&mut encoder);

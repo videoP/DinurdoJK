@@ -998,7 +998,9 @@ impl App {
             // TaystJK skips the downloads and carries on with the gamestate;
             // a missing PK3 reference alone must not block an installed map.
             if !self.pending_live_gamestate {
-                if crate::download::server_disallows_downloads(serverinfo) {
+                if !self.network.allow_legacy_downloads {
+                    self.push_console_line("^3Autodownload is disabled (cl_allowDownload 0); joining without downloads.");
+                } else if crate::download::server_disallows_downloads(serverinfo) {
                     self.push_console_line("^3Skipping downloads, because the server does not allow downloads.");
                 } else {
                     self.push_console_line("^3Skipping downloads, because no enabled download transport is available.");

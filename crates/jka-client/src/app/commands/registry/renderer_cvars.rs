@@ -3802,7 +3802,7 @@ app_cvars! {
 
     APP_R_IGPU_MEMORY_AB {
         runtime: CvarDef::new("r_igpuMemoryAB", "", "0..1", "Real GPU depth buffer A/B: 0 original Depth32Float (32 bits/pixel), 1 Depth16Unorm (16 bits/pixel). Recreates renderer and pipelines on Apply Video Settings or vid_restart; no resolution changes or color conversion. Archived.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::VidRestart,
-            |app| CvarValue::String(crate::renderer::igpu_depth_requested().to_string()),
+            |_app| CvarValue::String(crate::renderer::igpu_depth_requested().to_string()),
             |app, value| App::cvar_set_igpu_memory_ab(app, APP_R_IGPU_MEMORY_AB.entry.name, &value.to_string())
         ).with_text_setter(App::cvar_set_igpu_memory_ab, Some(|name, value| {
             value.trim().parse::<u8>().ok().filter(|v| *v <= 1)
@@ -5301,6 +5301,30 @@ app_cvars! {
                     2 => "native blend with resolve",
                     3 => "native blend without legacy-forced resolve",
                     _ => "direct SDR UNORM alias (unsupported targets fall back to mode 0)",
+                });
+                Ok(())
+            }
+        }]
+    }
+
+    APP_R_LEGACYBLENDBOUNDS {
+        runtime: CvarDef::new(
+            "r_legacyBlendBounds", "2", "0..2",
+            "Legacy model-blend transfer bounds A/B (session-only, live). Applies when r_legacyBlendTransfer 4 falls back to the HDR/offscreen transfer (post, MSAA, glass): 0 original (MSAA or GPU-skinned shells such as a saber hilt glow encode/decode the whole frame); 1 scissor encode/decode to the shells' projected bounds, including MSAA and GPU-skinned Ghoul2; 2 = 1 and, with MSAA, replace the two full-frame resolves with scissored shader resolves.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app| CvarValue::String(crate::renderer::legacy_blend_bounds().to_string()),
+            |app, value| App::cvar_set_r_legacyblendbounds(app, APP_R_LEGACYBLENDBOUNDS.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_legacyblendbounds, None),
+        config: CvarBinding::NONE,
+        implementations: [impl App {
+            fn cvar_set_r_legacyblendbounds(&mut self, name: &str, value: &str) -> Result<(), String> {
+                let mode = value.trim().parse::<u8>().ok().filter(|mode| *mode <= 2)
+                    .ok_or_else(|| format!("{name} expects 0, 1 or 2"))?;
+                crate::renderer::set_legacy_blend_bounds(mode);
+                self.console_status = format!("LEGACY BLEND BOUNDS: {}", match mode {
+                    0 => "original (full-frame for MSAA / GPU-skinned)",
+                    1 => "bounded incl. MSAA + GPU-skinned",
+                    _ => "bounded + scissored MSAA resolves",
                 });
                 Ok(())
             }

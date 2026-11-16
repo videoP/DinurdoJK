@@ -94,11 +94,14 @@ fn console_plain_sized(
     out: &mut Vec<UiVertex>, value: &str, x: f32, y: f32,
     char_width: f32, char_height: f32, color: [f32; 4], width: u32, height: u32,
 ) {
-    for (index, ch) in value.chars().enumerate() {
-        if ch != ' ' {
-            super::text::charset_glyph(out, ch, x + index as f32 * char_width, y,
-                char_width, char_height, color, width, height);
+    let mut cursor_x = x;
+    for ch in value.chars() {
+        let cells = super::console_character_cells(ch) as f32;
+        if ch != ' ' && cells > 0.0 {
+            super::text::console_charset_glyph(out, ch, cursor_x, y,
+                char_width * cells, char_height, color, width, height);
         }
+        cursor_x += char_width * cells;
     }
 }
 
@@ -203,7 +206,7 @@ pub(in crate::ui) fn console_plain(
     let mut cursor_x = x;
     for ch in value.chars() {
         if ch != ' ' {
-            super::text::charset_glyph(out, ch, cursor_x, y,
+            super::text::console_charset_glyph(out, ch, cursor_x, y,
                 CONSOLE_CHAR_WIDTH, CONSOLE_CHAR_HEIGHT, color, width, height);
         }
         cursor_x += CONSOLE_CHAR_WIDTH;
@@ -680,9 +683,9 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                 let active = ui.console_search_active_spans.contains(hit);
                 rect(
                     out,
-                    20.0 + hit.start_col as f32 * char_width,
+                    20.0 + super::console_column_offset(line, hit.start_col) as f32 * char_width,
                     line_y - 2.0,
-                    (hit.end_col - hit.start_col) as f32 * char_width,
+                    (super::console_column_offset(line, hit.end_col) - super::console_column_offset(line, hit.start_col)) as f32 * char_width,
                     line_step,
                     if active {
                         [0.95, 0.62, 0.10, 0.88]
@@ -728,9 +731,9 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                 if right_col > left_col {
                     rect(
                         out,
-                        20.0 + left_col as f32 * char_width,
+                        20.0 + super::console_column_offset(line, left_col) as f32 * char_width,
                         line_y - 2.0,
-                        (right_col - left_col) as f32 * char_width,
+                        (super::console_column_offset(line, right_col) - super::console_column_offset(line, left_col)) as f32 * char_width,
                         line_step,
                         [0.08, 0.46, 0.62, 0.55],
                         w,
@@ -774,14 +777,14 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                     .take(link.end_col - link.start_col)
                     .collect();
                 console_plain_sized(
-                    out, &linked_text, 20.0 + link.start_col as f32 * char_width,
+                    out, &linked_text, 20.0 + super::console_column_offset(line, link.start_col) as f32 * char_width,
                     line_y, char_width, line_step, CON_CYAN(), w, h,
                 );
                 rect(
                     out,
-                    20.0 + link.start_col as f32 * char_width,
+                    20.0 + super::console_column_offset(line, link.start_col) as f32 * char_width,
                     line_y + line_step - 2.0,
-                    (link.end_col - link.start_col) as f32 * char_width,
+                    (super::console_column_offset(line, link.end_col) - super::console_column_offset(line, link.start_col)) as f32 * char_width,
                     1.0,
                     with_alpha(CON_CYAN(), 0.95),
                     w,
@@ -886,8 +889,8 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         let start = start.min(ui.console_input.len());
         let end = end.min(ui.console_input.len());
         if start < end && ui.console_input.is_char_boundary(start) && ui.console_input.is_char_boundary(end) {
-            let left = text_x + visible_text_len(&ui.console_input[..start]) as f32 * char_width;
-            let right = text_x + visible_text_len(&ui.console_input[..end]) as f32 * char_width;
+            let left = text_x + super::console_column_offset(&ui.console_input[..start], usize::MAX) as f32 * char_width;
+            let right = text_x + super::console_column_offset(&ui.console_input[..end], usize::MAX) as f32 * char_width;
             let clipped_right = right.min(w as f32 - 8.0);
             if clipped_right > left {
                 rect(out, left, input_y - 1.0, clipped_right - left, line_step + 2.0,
@@ -922,7 +925,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
                             .eq_ignore_ascii_case(fragment.as_bytes())
                 }) {
                     let end_x =
-                        text_x + visible_text_len(&ui.console_input) as f32 * char_width;
+                        text_x + super::console_column_offset(&ui.console_input, usize::MAX) as f32 * char_width;
                     console_plain_sized(
                         out, &name[fragment.len()..], end_x, input_y,
                         char_width, line_step, with_alpha(CON_CYAN(), 0.42), w, h,
@@ -932,7 +935,7 @@ pub(in crate::ui) fn build_console(out: &mut Vec<UiVertex>, ui: &UiSnapshot, w: 
         }
     }
     let caret_x =
-        text_x + visible_text_len(&ui.console_input[..cursor]) as f32 * char_width;
+        text_x + super::console_column_offset(&ui.console_input[..cursor], usize::MAX) as f32 * char_width;
     rect(
         out,
         caret_x,

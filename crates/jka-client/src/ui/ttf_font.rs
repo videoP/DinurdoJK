@@ -337,6 +337,7 @@ pub fn rasterize(bytes: &[u8]) -> Result<RasterizedFont, String> {
 #[derive(Debug)]
 pub struct UnicodeFallbackFont {
     pub glyphs: std::collections::HashMap<char, ProportionalGlyph>,
+    pub colored: std::collections::HashSet<char>,
     /// Per-glyph face cap height; mixing scripts cannot change console sizing.
     pub cap_heights: std::collections::HashMap<char, f32>,
     /// Known unsupported characters require no further worker/lock traffic.
@@ -353,6 +354,28 @@ pub struct UnicodeGlyphBitmap {
     pub glyph: ProportionalGlyph,
     pub cap_height: f32,
     pub coverage: Vec<u8>,
+    /// Straight-alpha color pixels, empty for ordinary outline glyphs.
+    pub rgba: Vec<u8>,
+}
+
+/// Shared optional-font lookup for the renderer and floating console workers.
+pub(crate) fn load_unicode_font(name: &str, base: &std::path::Path, game: Option<&std::path::Path>) -> Option<Vec<u8>> {
+    const LIMIT: usize = 32 * 1024 * 1024;
+    let read = |path: std::path::PathBuf| {
+        std::fs::metadata(&path).ok().filter(|m| m.len() <= LIMIT as u64)?;
+        std::fs::read(path).ok().filter(|bytes| bytes.len() <= LIMIT)
+    };
+    read(base.parent().unwrap_or(base).join("DinurdoJK").join("fonts").join(name))
+        .or_else(|| {
+            let mut assets = jka_assets::pk3::AssetSearchPath::open_game(base, game).ok()?;
+            Some(assets.read(&format!("fonts/{name}"), LIMIT).ok()??.bytes)
+        })
+        .or_else(|| system_font_dirs().into_iter().find_map(|dir| read(dir.join(name))))
+}
+
+/// Candidate ranges; the font's cmap remains the authority on coverage.
+pub(crate) fn is_emoji_candidate(ch: char) -> bool {
+    matches!(ch as u32, 0x2300..=0x23FF | 0x2600..=0x27BF | 0x1F000..=0x1FAFF)
 }
 
 pub fn rasterize_unicode_glyph(
@@ -370,10 +393,44 @@ pub fn rasterize_unicode_glyph(
         horiz_advance: advance.round().clamp(0.0, i16::MAX as f32) as i16,
         ..ProportionalGlyph::default()
     };
+    if let Some(bitmap) = face.glyph_raster_image(id, LINE_PIXELS as u16) {
+        if bitmap.format == ttf_parser::RasterImageFormat::PNG {
+            // Bound both the declared strike and decoded PNG before allocation.
+            if bitmap.width > 512 || bitmap.height > 512 || bitmap.pixels_per_em == 0 {
+                return Err("Unicode bitmap dimensions exceed 512px".into());
+            }
+            let mut reader = image::ImageReader::with_format(
+                std::io::Cursor::new(bitmap.data), image::ImageFormat::Png);
+            let mut limits = image::Limits::default();
+            limits.max_image_width = Some(512);
+            limits.max_image_height = Some(512);
+            limits.max_alloc = Some(4 * 1024 * 1024);
+            reader.limits(limits);
+            let decoded = reader.decode().map_err(|error| error.to_string())?.into_rgba8();
+            let bitmap_scale = scale * f32::from(face.units_per_em()) / f32::from(bitmap.pixels_per_em);
+            let width = (decoded.width() as f32 * bitmap_scale).round().max(1.0) as u32;
+            let height = (decoded.height() as f32 * bitmap_scale).round().max(1.0) as u32;
+            if width > 188 || height > 188 { return Err("Unicode bitmap exceeds atlas cell".into()); }
+            let resized = image::imageops::resize(&decoded, width, height, image::imageops::FilterType::Triangle);
+            let mut padded = image::RgbaImage::new(width + 2 * PAD as u32, height + 2 * PAD as u32);
+            image::imageops::replace(&mut padded, &resized, i64::from(PAD), i64::from(PAD));
+            glyph.width = padded.width() as i16;
+            glyph.height = padded.height() as i16;
+            glyph.horiz_offset = (f32::from(bitmap.x) * bitmap_scale).round() as i16 - PAD as i16;
+            glyph.baseline = ((f32::from(bitmap.y) + decoded.height() as f32) * bitmap_scale).round() as i32 + PAD;
+            return Ok(Some(UnicodeGlyphBitmap {
+                character, glyph, cap_height: height as f32,
+                coverage: Vec::new(), rgba: padded.into_raw(),
+            }));
+        }
+    }
     let Some(bounds) = face.outline_glyph(id, &mut NullBuilder) else {
-        // Spaces and combining marks can have no independent outline.
+        // Only intentional invisible characters may stop the fallback search.
+        if !character.is_whitespace() && !matches!(character as u32, 0x200B..=0x200F | 0xFE00..=0xFE0F | 0xE0100..=0xE01EF) {
+            return Ok(None);
+        }
         return Ok(Some(UnicodeGlyphBitmap {
-            character, glyph, cap_height, coverage: Vec::new(),
+            character, glyph, cap_height, coverage: Vec::new(), rgba: Vec::new(),
         }));
     };
     let left = (f32::from(bounds.x_min) * scale).floor() as i32 - PAD;
@@ -397,7 +454,7 @@ pub fn rasterize_unicode_glyph(
     glyph.baseline = top;
     let coverage = rasterize_lines(&outline.lines, width as usize, height as usize)
         .into_iter().map(|value| (value * 255.0).round() as u8).collect();
-    Ok(Some(UnicodeGlyphBitmap { character, glyph, cap_height, coverage }))
+    Ok(Some(UnicodeGlyphBitmap { character, glyph, cap_height, coverage, rgba: Vec::new() }))
 }
 
 /// Bounds-only pass.

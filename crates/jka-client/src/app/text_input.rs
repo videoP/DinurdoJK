@@ -3,6 +3,56 @@ use crate::app::{App, ElementState, KeyCode, KeyEvent, OverlayMode};
 use std::time::{Duration, Instant};
 
 impl App {
+    /// Inject only native completed Windows Alt+numpad input into the shared
+    /// editors. Unlike ordinary Unicode typing/paste, this is already a
+    /// TaystJK legacy byte and may deliberately refer to a 0x01..0x1F font
+    /// glyph (e.g. Alt+169 on a CP437 OEM Windows setup becomes glyph 0x10).
+    #[cfg(windows)]
+    pub(in crate::app) fn dispatch_windows_alt_codes(&mut self) {
+        // The emoji picker Search field is egui-owned; do not send its text to
+        // the chat entry behind it. The hook likewise remains disabled until
+        // the shared editors have focus again.
+        let editor_active = matches!(self.overlay, OverlayMode::Chat | OverlayMode::Console)
+            && !(self.overlay == OverlayMode::Chat && self.chat_emoji_picker.open
+                && self.egui_ctx.egui_wants_keyboard_input());
+        super::alt_codes::set_enabled(editor_active);
+        for byte in super::alt_codes::take_completed() {
+            // NUL cannot be embedded in JKA reliable commands. CR/LF and the
+            // usual editing keys are not printable glyphs in the text field.
+            if matches!(byte, 0 | 8 | 9 | 10 | 13) { continue; }
+            let ch = char::from(byte);
+            match self.overlay {
+                OverlayMode::Chat if editor_active => {
+                    let mut used = crate::cgame::unicode_input_wire_len(&self.chat_input);
+                    if self.chat_input_selected { used = 0; }
+                    if used + 1 > 160 { continue; }
+                    if self.chat_input_selected {
+                        self.chat_input.clear();
+                        self.chat_input_selected = false;
+                    }
+                    self.chat_input.push(ch);
+                    self.chat_player_completion = None;
+                    self.publish_ui();
+                }
+                OverlayMode::Console if editor_active && !matches!(byte, b'`' | b'~') => {
+                    self.console_cursor = self.console_cursor.min(self.console_input.len());
+                    if self.console_input_selection_bounds().is_some() {
+                        self.delete_console_input_selection();
+                    }
+                    if crate::cgame::unicode_input_wire_len(&self.console_input) >= 160 { continue; }
+                    self.console_input.insert(self.console_cursor, ch);
+                    self.console_cursor += ch.len_utf8();
+                    self.focus_console_input();
+                    self.console_history_index = None;
+                    self.console_scroll = 0;
+                    self.console_suggest_reset();
+                    self.publish_ui();
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub(in crate::app) fn console_prev_boundary(input: &str, cursor: usize) -> usize {
         let cursor = cursor.min(input.len());
         input[..cursor]
@@ -116,8 +166,10 @@ impl App {
                 }
             }
             let ch = input[offset..].chars().next().expect("valid UTF-8 boundary");
+            let cells = crate::ui::console_character_cells(ch);
+            if column < visible + cells { return offset; }
             offset += ch.len_utf8();
-            visible += 1;
+            visible += cells;
         }
         input.len()
     }
@@ -590,6 +642,14 @@ impl App {
         }
         match code {
             KeyCode::Escape => {
+                if self.chat_emoji_picker.open {
+                    self.chat_emoji_picker.open = false;
+                    self.egui_ctx.memory_mut(|memory| if let Some(focused) = memory.focused() {
+                        memory.surrender_focus(focused);
+                    });
+                    self.egui_repaint_requested = true;
+                    return;
+                }
                 self.chat_input.clear();
                 self.chat_input_selected = false;
                 self.chat_player_completion = None;

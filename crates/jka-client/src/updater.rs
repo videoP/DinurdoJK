@@ -455,24 +455,6 @@ fn stage_for(tag: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// New notices travel in the already-allowed executable, so older clients
-/// can update without accepting new signed manifest paths. Keep the installed
-/// notice loose, beside the other release licenses, on every platform.
-pub(crate) fn install_bundled_notices() -> Result<(), String> {
-    const JURA: &[u8] = include_bytes!("../../../release-licenses/Jura-OFL.txt");
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let root = executable.parent().ok_or("executable has no parent directory")?;
-    let directory = root.join("licenses");
-    assert_no_reparse(&directory)?;
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    let notice = directory.join("Jura-OFL.txt");
-    assert_no_reparse(&notice)?;
-    if fs::read(&notice).ok().as_deref() != Some(JURA) {
-        fs::write(&notice, JURA).map_err(|error| error.to_string())?;
-    }
-    Ok(())
-}
-
 fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     assert_no_reparse(path)?;
     let file = File::open(path).map_err(|e| e.to_string())?;

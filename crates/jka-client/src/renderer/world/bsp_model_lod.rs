@@ -210,12 +210,24 @@ impl BspModelLod {
 
     /// Use the live LOD stream, never the worker's immutable original stream.
     /// Called only for geometry without patch LOD (those are owned by patch_lod).
-    pub fn append_batch_indices(&self, original: &Range<u32>, out: &mut Vec<u32>) -> bool {
+    /// `padded` keeps the member at its FULL length with degenerate triangles,
+    /// the layout of every AUTO-4 recipe that also contains patches.
+    pub fn append_batch_indices(&self, original: &Range<u32>, padded: bool, out: &mut Vec<u32>) -> bool {
         let Some(&id) = self.range_lookup.get(&(original.start, original.end)) else {
             return false;
         };
-        let g = &self.geometries[id];
         let Some(source) = self.original_indices.as_deref() else { return false; };
+        let start = out.len();
+        self.append_geometry_indices(id, source, out);
+        if padded {
+            let pad = source[original.start as usize];
+            out.resize(start + (original.end - original.start) as usize, pad);
+        }
+        true
+    }
+
+    fn append_geometry_indices(&self, id: usize, source: &[u32], out: &mut Vec<u32>) {
+        let g = &self.geometries[id];
         for part in &g.parts {
             match part {
                 Part::Untouched(r) => out.extend_from_slice(&source[r.start as usize..r.end as usize]),
@@ -228,11 +240,28 @@ impl BspModelLod {
                 }
             }
         }
-        true
     }
 
-    fn recipe_signature(&self, recipe: usize) -> Vec<u64> {
-        self.recipe_members[recipe].iter().map(|&g| self.geometries[g].version).collect()
+    /// Whether the recipe's resident stream matches every member's version.
+    fn recipe_current(&self, recipe: usize) -> bool {
+        self.recipe_members[recipe].iter().map(|&g| self.geometries[g].version)
+            .eq(self.recipe_versions[recipe].iter().copied())
+    }
+
+    fn store_recipe_versions(&mut self, recipe: usize) {
+        let mut versions = std::mem::take(&mut self.recipe_versions[recipe]);
+        versions.clear();
+        versions.extend(self.recipe_members[recipe].iter().map(|&g| self.geometries[g].version));
+        self.recipe_versions[recipe] = versions;
+    }
+
+    /// Record that `reserved` now holds this recipe built from the current
+    /// selections (worker install or a patch-LOD repack of a mixed recipe).
+    pub fn note_collapse(&mut self, recipe: usize, reserved: Range<u32>) {
+        if self.has_recipe(recipe) {
+            self.store_recipe_versions(recipe);
+            self.recipe_reservations[recipe] = Some(reserved);
+        }
     }
 
     pub fn finish(&mut self, original_indices: Arc<Vec<u32>>) {
@@ -412,38 +441,55 @@ pub(in crate::renderer) fn update(
     }
     // The physical AUTO4 draw must reflect the same source-piece LOD as its
     // FULL fallback. Repack inside the existing allocated collapse range, with
-    // no new batches, and preserve patch LOD's selections in mixed recipes.
+    // no new batches. A recipe that also contains patches uses patch LOD's
+    // padded layout (every member at its FULL offset): here only this module's
+    // changed members are rewritten, never patch spans, so a patch LOD change
+    // does not invalidate the recipe.
     let changed_recipes = view_changed
-        || lod.completed_recipes != world.auto4_collapse_cache.completed
-        || world.patch_lod.stats().lod_updates != 0;
+        || lod.completed_recipes != world.auto4_collapse_cache.completed;
     if changed_recipes {
         lod.completed_recipes = world.auto4_collapse_cache.completed;
         // AUTO4 may keep previous clusters in its LRU cache; don't repack
         // non-visible cached geometries whenever the camera moves.
-        let mut needed = vec![false; lod.recipe_members.len()];
-        for &batch_id in &world.auto4_active_plan {
-            if batch_id < world.auto4_variant_base { continue; }
-            let variant = batch_id - world.auto4_variant_base;
-            if let Some(&recipe) = world.auto4_variant_geometry.get(variant) {
-                if let Some(slot) = needed.get_mut(recipe) { *slot = true; }
-            }
-        }
-        for (recipe, &active) in needed.iter().enumerate() {
-            if !active || lod.recipe_members[recipe].is_empty() { continue; }
+        let plan = std::mem::take(&mut world.auto4_active_plan);
+        for &batch_id in &plan {
+            let Some(&recipe) = batch_id.checked_sub(world.auto4_variant_base)
+                .and_then(|variant| world.auto4_variant_geometry.get(variant)) else { continue; };
+            if !lod.has_recipe(recipe) { continue; }
             let Some(crate::renderer::Auto4GeometryState::Ready { range, .. }) =
                 world.auto4_collapse_cache.states.get(recipe) else { continue; };
             let reserved = range.clone();
-            let signature = lod.recipe_signature(recipe);
-            if lod.recipe_reservations[recipe].as_ref() == Some(&reserved)
-                && lod.recipe_versions[recipe] == signature
-                && !(lod.recipe_has_patches[recipe] && world.patch_lod.stats().lod_updates != 0)
-            { continue; }
+            let resident = lod.recipe_reservations[recipe].as_ref() == Some(&reserved);
+            // Material variants share one recipe; later visits find it current.
+            if resident && lod.recipe_current(recipe) { continue; }
+            if resident && lod.recipe_has_patches[recipe] {
+                let written = std::mem::take(&mut lod.recipe_versions[recipe]);
+                let (mut offset, mut slot) = (reserved.start, 0);
+                for &member in &world.auto4_geometry_members[recipe] {
+                    let r = &world.full_batches[member].full_indexed_range;
+                    if let Some(&id) = lod.range_lookup.get(&(r.start, r.end)) {
+                        if written.get(slot) != Some(&lod.geometries[id].version) {
+                            scratch.clear();
+                            lod.append_batch_indices(r, true, &mut scratch);
+                            queue.write_buffer(&world.index_buffer, u64::from(offset) * 4, bytemuck::cast_slice(&scratch));
+                        }
+                        slot += 1;
+                    }
+                    offset += r.end - r.start;
+                }
+                lod.recipe_versions[recipe] = written;
+                lod.store_recipe_versions(recipe);
+                continue;
+            }
+            let members = &world.auto4_geometry_members[recipe];
             scratch.clear();
-            for &member in &world.auto4_geometry_members[recipe] {
-                let batch = &world.full_batches[member];
-                if world.patch_lod.append_batch_indices(batch, &mut scratch) { continue; }
-                if lod.append_batch_indices(&batch.full_indexed_range, &mut scratch) { continue; }
-                scratch.extend_from_slice(&source[batch.full_indexed_range.start as usize..batch.full_indexed_range.end as usize]);
+            let padded = world.patch_lod.collapse(recipe, members, &world.full_batches, &lod, &mut scratch);
+            if !padded {
+                for &member in members {
+                    let r = &world.full_batches[member].full_indexed_range;
+                    if lod.append_batch_indices(r, false, &mut scratch) { continue; }
+                    scratch.extend_from_slice(&source[r.start as usize..r.end as usize]);
+                }
             }
             // Resident allocation is sized for the original, never a reduced
             // result. Patch LOD can only reduce it, too.
@@ -456,9 +502,14 @@ pub(in crate::renderer) fn update(
             }
             let active = reserved.start..reserved.start + scratch.len() as u32;
             crate::renderer::visibility::compaction::auto4_set_geometry_range(queue, world, recipe, active);
-            lod.recipe_versions[recipe] = signature;
+            if padded {
+                // The stream also holds patch LOD's current selections.
+                world.patch_lod.note_collapse(recipe, reserved.clone(), 0);
+            }
+            lod.store_recipe_versions(recipe);
             lod.recipe_reservations[recipe] = Some(reserved);
         }
+        world.auto4_active_plan = plan;
     }
     if debug && view_changed {
         let state = (selected, tris_full, tris_selected);

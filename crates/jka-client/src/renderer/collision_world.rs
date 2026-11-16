@@ -416,7 +416,7 @@ fn push_shitter_draw(draws: &mut Vec<super::DrawIndexedIndirectArgs>, first: u32
 /// These are not rebuilt or even inspected while ShitteR is disabled.
 pub(in crate::renderer) fn cache_active_shitter_lod(world: &mut super::WorldGpu) {
     let ranges = world.patch_lod.shitter_active_ranges(
-        &world.auto4_collapse_cache.states, &world.auto4_geometry_members, &world.full_batches,
+        &world.bsp_model_lod, &world.auto4_collapse_cache.states, &world.auto4_geometry_members, &world.full_batches,
         &world.remap_index_source,
     );
     for (start, indices) in ranges {

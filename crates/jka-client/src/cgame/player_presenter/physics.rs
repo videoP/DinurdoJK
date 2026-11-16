@@ -234,6 +234,12 @@ impl PlayerPresenter {
         self.ragdolls.spawn_debris(specs, current_time)
     }
 
+    pub(crate) fn spawn_breakable_debris(
+        &mut self, specs: &[crate::cgame::weapon_fx::ChunkSpec], current_time: i32,
+    ) -> bool {
+        self.ragdolls.spawn_breakable_debris(specs, current_time)
+    }
+
     pub(crate) fn physics_debris_models(&self, time: i32) -> Vec<crate::cgame::weapon_fx::ChunkModel> {
         self.ragdolls.debris_models(time)
     }
@@ -243,6 +249,12 @@ impl PlayerPresenter {
         current_time: i32,
     ) -> usize {
         self.ragdolls.spawn_glass(specs, current_time)
+    }
+
+    pub(crate) fn spawn_breakable_glass(
+        &mut self, specs: &[crate::cgame::weapon_fx::ShardSpec], current_time: i32,
+    ) -> usize {
+        self.ragdolls.spawn_breakable_glass(specs, current_time)
     }
 
     pub(crate) fn physics_glass_draws(&self, time: i32) -> Vec<crate::fx::system::FxDraw> {

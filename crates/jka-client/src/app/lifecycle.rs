@@ -107,6 +107,8 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
+        #[cfg(windows)]
+        super::alt_codes::set_window(&window);
         crate::startup_timeline::mark(crate::startup_timeline::Milestone::WindowCreated);
         // Capture the monitor's desktop size BEFORE entering exclusive mode.
         // The mode switch can change monitor.size(), so this also makes a
@@ -2034,6 +2036,7 @@ impl ApplicationHandler<UserEvent> for App {
                     playback
                         .weapon_fx
                         .set_inline_model_bounds(Arc::clone(&stats.inline_model_bounds));
+                    playback.weapon_fx.set_inline_model_glass_faces(Arc::clone(&stats.inline_model_glass_faces));
                 }
                 if let Some(stats) = bsp_stats {
                     if crate::logging::renderer_verbose_enabled(2) {
@@ -3605,6 +3608,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(windows)]
+        self.dispatch_windows_alt_codes();
         // Fullscreen/backend restarts are deliberately staged across event-loop
         // turns so Windows can finish changing the HWND/display mode before the
         // next WGPU surface is created.

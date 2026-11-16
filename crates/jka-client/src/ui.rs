@@ -12,7 +12,10 @@ pub use hud::movement::{FORCE_ICON_NAMES, FORCE_EXTENSION_ICON_NAMES, FORCE_POWE
 #[allow(unused_imports)]
 pub use text::ProportionalGlyph;
 pub(crate) use text::UnicodeFallbackScope;
+pub(crate) use chat_emoji::{ChatEmojiAtlas, ChatEmojiCell, tayst_emoji_trigger};
+pub(crate) use text::{console_character_cells, console_column_offset};
 mod chat;
+mod chat_emoji;
 mod compose;
 mod studio_race;
 pub use studio_race::{StudioRaceUi,StudioRaceRunnerUi};
@@ -69,7 +72,7 @@ mod ttf_font;
 pub(crate) use ttf_font::{
     system_font_dirs, list_system_fonts, rasterize as rasterize_ttf_font, UnicodeFallbackFont,
     UnicodeGlyphBitmap, rasterize_unicode_glyph, studio_default_system_fonts, STUDIO_FONT_CLASSIC,
-    STUDIO_PACKAGED_FONTS,
+    STUDIO_PACKAGED_FONTS, load_unicode_font, is_emoji_candidate,
 };
 pub(crate) use studio_race::draw_labels as draw_studio_labels;
 mod studio_race_map;
@@ -230,7 +233,7 @@ pub use text::{
     UiVertex,
 };
 use text::{
-    color_code, color_escape, console_text, fixed_charset_text, proportional_centerprint_text, proportional_text, proportional_text_uniform, proportional_text_width, text,
+    color_escape, console_text, fixed_charset_text, proportional_centerprint_text, proportional_text, proportional_text_uniform, proportional_text_width, text,
     truncate_jka_text, wrap_proportional_text,
 };
 
@@ -318,6 +321,8 @@ pub struct ChatSettings {
     pub font_override: Option<ChatFont>,
     /// Messages shown at full strength while typing.
     pub history_lines: u8,
+    /// TaystJK gfx/emoji PNG named/symbolic shortcuts; Unicode remains independent.
+    pub emojis: bool,
     /// Seconds a message stays on screen before it fades.
     pub fade_time: f32,
     /// Seconds a message is kept for the typing view.
@@ -339,7 +344,7 @@ impl ChatSettings {
 
 impl Default for ChatSettings {
     fn default() -> Self {
-        Self { style: 2, font_override: None, history_lines: 8, fade_time: 10.0, history_time: 120.0, mute_after_attack: 2.0 }
+        Self { style: 2, font_override: None, history_lines: 8, emojis: true, fade_time: 10.0, history_time: 120.0, mute_after_attack: 2.0 }
     }
 }
 
@@ -1845,8 +1850,12 @@ pub struct UiSnapshot {
     pub chat_mode: ChatMode,
     pub chat_input: String,
     pub chat_input_selected: bool,
+    /// The chat composer has a usable emoji picker button.
+    pub chat_emoji_picker_available: bool,
     pub chat_lines: Vec<UiChatLine>,
     pub chat_settings: ChatSettings,
+    /// Renderer-owned atlas of TaystJK named PNG emotes; not transmitted in chat.
+    pub(crate) chat_emoji_atlas: Option<std::sync::Arc<ChatEmojiAtlas>>,
     pub chat_anim: UiChatAnim,
     pub console_notify_lines: Vec<UiConsoleNotifyLine>,
     pub center_print: Option<UiCenterPrint>,
@@ -2005,8 +2014,10 @@ impl Default for UiSnapshot {
             chat_mode: ChatMode::Global,
             chat_input: String::new(),
             chat_input_selected: false,
+            chat_emoji_picker_available: false,
             chat_lines: Vec::new(),
             chat_settings: ChatSettings::default(),
+            chat_emoji_atlas: None,
             chat_anim: UiChatAnim::default(),
             console_notify_lines: Vec::new(),
             center_print: None,

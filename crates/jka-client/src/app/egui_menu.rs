@@ -38,6 +38,7 @@ mod server_browser_layout;
 pub(in crate::app) mod settings_search;
 mod shell;
 mod hl2_console;
+pub(super) mod emoji;
 mod solo;
 
 // The whole in-game menu, drawn with egui.

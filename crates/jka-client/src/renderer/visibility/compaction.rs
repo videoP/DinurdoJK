@@ -696,18 +696,20 @@ pub(in crate::renderer) fn auto4_accept_collapse(
         world.auto4_collapse_cache.states[geometry] = Auto4GeometryState::Deferred;
         return;
     };
-    if world.bsp_model_lod.has_recipe(geometry) {
+    // Recipes containing patches (including mixed patch/compiled-model ones)
+    // use patch LOD's padded layout; compiled-model-only recipes are packed.
+    if !world.patch_lod.collapse(geometry, &world.auto4_geometry_members[geometry], &world.full_batches,
+        &world.bsp_model_lod, &mut result.indices)
+        && world.bsp_model_lod.has_recipe(geometry)
+    {
         result.indices.clear();
         let members = &world.auto4_geometry_members[geometry];
         for &member in members {
             let batch = &world.full_batches[member];
-            if world.patch_lod.append_batch_indices(batch, &mut result.indices) { continue; }
-            if world.bsp_model_lod.append_batch_indices(&batch.full_indexed_range, &mut result.indices) { continue; }
+            if world.bsp_model_lod.append_batch_indices(&batch.full_indexed_range, false, &mut result.indices) { continue; }
             let original = world.bsp_model_lod.source_indices().expect("BSP LOD immutable indices");
             result.indices.extend_from_slice(&original[batch.full_indexed_range.start as usize..batch.full_indexed_range.end as usize]);
         }
-    } else {
-        world.patch_lod.collapse(geometry, &world.auto4_geometry_members[geometry], &world.full_batches, &mut result.indices);
     }
     if !result.indices.is_empty() {
         queue.write_buffer(
@@ -733,6 +735,7 @@ pub(in crate::renderer) fn auto4_accept_collapse(
     }
     let active_range = range.start..range.start+result.indices.len() as u32;
     world.patch_lod.note_collapse(geometry,range.clone(),result.indices.len() as u64*4);
+    world.bsp_model_lod.note_collapse(geometry, range.clone());
     world.auto4_collapse_cache.states[geometry] = Auto4GeometryState::Ready {
         range: range.clone(),
         last_used_frame: world.auto4_collapse_cache.frame,

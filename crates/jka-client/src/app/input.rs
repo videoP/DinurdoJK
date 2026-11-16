@@ -313,6 +313,8 @@ impl App {
             }
         }
         self.overlay = overlay;
+        #[cfg(windows)]
+        super::alt_codes::set_enabled(matches!(overlay, OverlayMode::Chat | OverlayMode::Console));
         // Console is a temporary input/paint layer over its originating menu.
         // It must not close Profile (which clears the isolated character stage
         // and commits staged model changes), only the menu's actual exit does.

@@ -306,6 +306,9 @@ pub struct VideoSettings {
     pub physics_props: bool,
     pub physics_prop_max: u32,
     pub physics_debris: bool,
+    /// Server-authored EV_DEBRIS / EV_GLASS_SHATTER presentation only.
+    /// False = TaystJK legacy, true = Rapier fragments retained 15 seconds.
+    pub breakables_enhanced: bool,
     pub physics_debris_max: u32,
     pub physics_debris_lifetime: f32,
     pub physics_player_push: bool,
@@ -971,6 +974,7 @@ impl Default for VideoSettings {
             physics_props: true,
             physics_prop_max: 96,
             physics_debris: true,
+            breakables_enhanced: false,
             physics_debris_max: 192,
             physics_debris_lifetime: 10.0,
             physics_player_push: true,

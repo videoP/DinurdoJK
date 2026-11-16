@@ -466,6 +466,34 @@ pub(in crate::scene) fn prepare_internal(
             .iter()
             .map(|model| (model.mins, model.maxs))
             .collect(),
+        inline_model_glass_faces: bsp
+            .models
+            .iter()
+            .map(|model| {
+                // RE_GetBModelVerts reads authored model geometry, not the
+                // axial model bounds. Select the main pane face once at load.
+                model.surfaces.clone().filter_map(|index| {
+                    let surface = bsp.surfaces.get(index)?;
+                    if surface.kind != jka_assets::bsp::SurfaceKind::Planar {
+                        return None;
+                    }
+                    let vertices = bsp.vertices.get(surface.vertices.clone())?;
+                    if vertices.len() != 4 {
+                        return None; // No invented quad for an arbitrary polygon.
+                    }
+                    let quad: [[f32; 3]; 4] = std::array::from_fn(|i| vertices[i].position);
+                    let a = std::array::from_fn::<_, 3, _>(|i| quad[1][i] - quad[0][i]);
+                    let b = std::array::from_fn::<_, 3, _>(|i| quad[3][i] - quad[0][i]);
+                    let cross: [f32; 3] = [
+                        a[1] * b[2] - a[2] * b[1],
+                        a[2] * b[0] - a[0] * b[2],
+                        a[0] * b[1] - a[1] * b[0],
+                    ];
+                    let area_squared = cross.iter().map(|c| c * c).sum::<f32>();
+                    (area_squared > 1.0).then_some((area_squared, quad))
+                }).max_by(|a, b| a.0.total_cmp(&b.0)).map(|(_, quad)| quad)
+            })
+            .collect(),
         brushes: bsp.brushes.len(),
         brush_sides: bsp.brush_sides.len(),
         planes: bsp.planes.len(),

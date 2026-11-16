@@ -266,6 +266,29 @@ app_cvars! {
         implementations: []
     }
 
+    APP_CG_CHATBOXEMOJIS {
+        runtime: CvarDef::new("cg_chatBoxEmojis", "1", "0|1",
+            "Render TaystJK gfx/emoji PNG named emotes in chat (Unicode emoji unaffected).",
+            CvarType::Bool, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Bool(app.chat_settings.emojis),
+            |app, value| {
+                let CvarValue::Bool(v) = value else { unreachable!("validated cvar type") };
+                app.chat_settings.emojis = v;
+                app.mark_config_dirty();
+                app.publish_ui();
+                app.publish_transient_ui();
+                Ok(())
+            }),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _name, value| {
+                if let Some(v) = parse_bool(value) { settings.chat.emojis = v; }
+            }),
+            archive: Some((28129, |state| u8::from(state.presentation.chat.emojis).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: []
+    }
+
     APP_CG_CHATHISTORYLINES {
         runtime: CvarDef::new("cg_chatHistoryLines", "8", "1..20",
             "Messages shown at full strength while you type (docked chat).",

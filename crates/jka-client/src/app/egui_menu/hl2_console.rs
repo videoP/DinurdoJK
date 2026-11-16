@@ -302,6 +302,7 @@ fn console_resize_grip(ctx: &egui::Context, window_rect: egui::Rect) -> Option<(
 
 impl App {
     pub(in crate::app) fn egui_hl2_console(&mut self, ctx: &egui::Context) {
+        self.chat_translation.emoji_font.poll(ctx);
         self.chat_translation.request_console_font(&self.console_input, &self.base, self.game.as_deref());
         self.chat_translation.request_console_font(&self.console_search_input, &self.base, self.game.as_deref());
         self.ensure_chat_translation_fonts(ctx);
@@ -510,7 +511,8 @@ impl App {
                                         egui::pos2(origin.x + end, rect.bottom()),
                                     ), 0.0, egui::Color32::from_rgb(68, 107, 146));
                                 }
-                                painter.galley(origin, galley.clone(), LABEL);
+                                self.chat_translation.emoji_font.paint(&painter, origin, galley.clone(), LABEL,
+                                    &self.base, self.game.as_deref());
                                 let mut toggled_this_row = false;
                                 if let Some(id) = chat_id {
                                     if let Some(checked) = self.console_chat_translate_checked(id) {
@@ -691,7 +693,8 @@ impl App {
                                     egui::pos2(input_origin.x + right, text_rect.bottom() - 1.0),
                                 ), egui::CornerRadius::ZERO, egui::Color32::from_rgb(120, 174, 211));
                             }
-                            painter.galley(input_origin, text_galley, color);
+                            self.chat_translation.emoji_font.paint(&painter, input_origin, text_galley, color,
+                                &self.base, self.game.as_deref());
                             let caret_offset = ui.painter().layout_no_wrap(
                                 self.console_input[..self.console_cursor].to_owned(), font, color,
                             ).size().x;

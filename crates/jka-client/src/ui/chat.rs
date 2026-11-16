@@ -98,7 +98,8 @@ pub(in crate::ui) fn build_chat_history(
     if ui.chat_lines.is_empty() {
         return;
     }
-    if ui.chat_settings.font() != super::ChatFont::Classic {
+    if ui.chat_settings.font() != super::ChatFont::Classic
+        || (ui.chat_settings.emojis && ui.chat_emoji_atlas.as_ref().is_some_and(|a| a.count > 0)) {
         build_classic_selected_history(out, ui, small_font, w, h);
         return;
     }
@@ -332,7 +333,10 @@ pub(in crate::ui) fn build_chat_input(
     let padding_y = 6.0 * scale;
     let underline = (2.0 * scale).max(1.0);
     let width = (w as f32 - margin * 2.0).max(big_char);
-    let max_columns = ((width - padding_x * 2.0) / big_char).floor().max(1.0) as usize;
+    // Keep the right end of the native bar free for the egui emoji button.
+    let reserved_width = if ui.chat_emoji_picker_available { 43.0 * scale } else { 0.0 };
+    let text_width = (width - reserved_width).max(big_char);
+    let max_columns = ((text_width - padding_x * 2.0) / big_char).floor().max(1.0) as usize;
 
     let prompt = match ui.chat_mode {
         ChatMode::Global => "SAY:",
@@ -341,9 +345,9 @@ pub(in crate::ui) fn build_chat_input(
     };
     let field = format!("{prompt} {}_", ui.chat_input);
     let selected_font = (ui.chat_settings.font() != super::ChatFont::Classic)
-        .then(|| super::text::UiText::chat(ui, small_font, w, h));
+        .then(|| super::text::UiText::chat(ui, small_font, w, h).without_chat_emojis());
     let wrapped = if let Some(txt) = &selected_font {
-        super::chat_dock::wrap(txt, &field, big_char, width - padding_x * 2.0).join("\n")
+        super::chat_dock::wrap(txt, &field, big_char, text_width - padding_x * 2.0).join("\n")
     } else {
         wrap_fixed_chat_text(&field, max_columns)
     };
