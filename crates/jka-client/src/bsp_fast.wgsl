@@ -141,6 +141,28 @@ fn wave_value(func: u32, p: vec4<f32>, time: f32) -> f32 {
     }
     return p.x + v * p.y;
 }
+// jk2mv/OpenJK RB_CalcWaveColor: non-noise waves are scaled by tr.identityLight
+// before the 0..1 clamp (render_flags.y bits 17/18 = overbright output on).
+fn rgb_wave_glow(func: u32, p: vec4<f32>, time: f32) -> f32 {
+    var v = wave_value(func, p, time);
+    if (func < 5u && (camera.render_flags.y & (131072u | 262144u)) != 0u) {
+        v = v * 0.5;
+    }
+    return clamp(v, 0.0, 1.0);
+}
+// Bit 19: JK2 encoded color. The glow byte multiplies the encoded texel, so
+// with sRGB-decoded textures the equivalent linear multiplier is decode(glow).
+fn jk2_encoded_wave() -> bool {
+    return (camera.render_flags.y & 524288u) != 0u;
+}
+fn rgb_wave_color(func: u32, p: vec4<f32>, time: f32) -> f32 {
+    let g = rgb_wave_glow(func, p, time);
+    if (jk2_encoded_wave()) {
+        return select(pow((g + 0.055) / 1.055, 2.4), g / 12.92, g <= 0.04045);
+    }
+    return g;
+}
+
 
 // JaPro: subtract the remap offset, then apply a positive clampTime.
 // vector_t.w is reserved for the limit; zero leaves the clock unbounded.
@@ -153,7 +175,7 @@ fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
     var out = color;
     let time = shader_stage_time();
     if ((material.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u) {
-        let g = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, time), 0.0, 1.0);
+        let g = rgb_wave_color(material.wave_funcs.x, material.wave_rgb, time);
         out = vec4<f32>(vec3<f32>(g), out.a);
     }
     if ((material.header.z & MATERIAL_FLAG_ALPHA_WAVE) != 0u) {
@@ -432,10 +454,10 @@ fn encoded_world_output(color: vec4<f32>) -> vec4<f32> {
 }
 fn legacy_rgb_output(color: vec4<f32>) -> vec4<f32> {
     if ((material.header.z & MATERIAL_FLAG_LEGACY_SRGB) != 0u) {
-        let has_wave = (material.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u;
+        let has_wave = (material.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u && !jk2_encoded_wave();
         var wave = 1.0;
         if (has_wave) {
-            wave = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, shader_stage_time()), 0.0, 1.0);
+            wave = rgb_wave_glow(material.wave_funcs.x, material.wave_rgb, shader_stage_time());
         }
         let source = legacy_additive_source(color, wave, has_wave);
         if (LEGACY_WORLD_ENCODED_BLEND) {
@@ -617,7 +639,7 @@ fn additive_stage_tint(m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
         color.a *= (1.0 - vertex_color.a);
     }
     if ((m.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u) {
-        let wave = clamp(wave_value(m.wave_funcs.x, m.wave_rgb, additive_time(m)), 0.0, 1.0);
+        let wave = rgb_wave_color(m.wave_funcs.x, m.wave_rgb, additive_time(m));
         color = vec4<f32>(vec3<f32>(wave), color.a);
     }
     if ((m.header.z & MATERIAL_FLAG_ALPHA_WAVE) != 0u) {
@@ -629,10 +651,10 @@ fn additive_stage_tint(m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
 fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
     var sample = texel * additive_stage_tint(m, vertex_color);
     if ((m.header.z & MATERIAL_FLAG_LEGACY_SRGB) != 0u) {
-        let has_wave = (m.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u;
+        let has_wave = (m.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u && !jk2_encoded_wave();
         var wave = 1.0;
         if (has_wave) {
-            wave = clamp(wave_value(m.wave_funcs.x, m.wave_rgb, additive_time(m)), 0.0, 1.0);
+            wave = rgb_wave_glow(m.wave_funcs.x, m.wave_rgb, additive_time(m));
         }
         sample = legacy_additive_source(sample, wave, has_wave);
     }
@@ -869,26 +891,19 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
     return base;
 }
 
-@fragment fn fs_sky(input: VertexOut) -> @location(0) vec4<f32> {
-    // Convert the renderer's [x,z,-y] direction back to JKA coordinates.
-    let d = normalize(vec3<f32>(input.sky_dir_ao.x, -input.sky_dir_ao.z, input.sky_dir_ao.y));
-    // The runtime override replaces sky cubemaps AND authored sky-cloud stages.
-    // World geometry is never touched. Restore the OpenJK sky on the next frame
-    // by switching this bit off; this requires no pipeline rebuild.
-    if ((camera.render_flags.y & 2u) != 0u) {
-        if (material.header.x == 4u) { discard; }
-        return experimental_star_nest_sky(d);
+// tr_sky.cpp draws the outer box with glColor3f(identityLight); pre-compensate the output
+// overbright gain. Bit 17: JK2 SDR (encoded-space halve), bit 18: linear halve.
+fn outer_sky_identity_light(color: vec4<f32>) -> vec4<f32> {
+    let sky_flags = camera.render_flags.y;
+    if ((sky_flags & 131072u) != 0u) {
+        return vec4<f32>(jk2_fast_decode(jk2_fast_encode(color.rgb) * 0.5), color.a);
     }
-    if (material.header.x == 4u) {
-        // A cloud-layer stage of the sky shader (tcGen sky cloud).
-        return sky_cloud_color(input, d);
+    if ((sky_flags & 262144u) != 0u) {
+        return vec4<f32>(color.rgb * 0.5, color.a);
     }
-    if ((material.header.w & MATERIAL_FLAG_SKYBOX) == 0u) {
-        // skyParms "-" has no outerbox. OpenJK draws no skybox here, so leave
-        // the scene clear color visible (global-fog color when the BSP has one).
-        discard;
-    }
-
+    return color;
+}
+fn fast_sky_box_raw(d: vec3<f32>) -> vec4<f32> {
     let a = abs(d);
     if (a.x >= a.y && a.x >= a.z) {
         if (d.x >= 0.0) {
@@ -912,6 +927,29 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
     }
     let m = a.z;
     return textureSample(sky_dn, sky_sampler, sky_uv(-d.y / m, d.x / m));
+}
+
+@fragment fn fs_sky(input: VertexOut) -> @location(0) vec4<f32> {
+    // Convert the renderer's [x,z,-y] direction back to JKA coordinates.
+    let d = normalize(vec3<f32>(input.sky_dir_ao.x, -input.sky_dir_ao.z, input.sky_dir_ao.y));
+    // The runtime override replaces sky cubemaps AND authored sky-cloud stages.
+    // World geometry is never touched. Restore the OpenJK sky on the next frame
+    // by switching this bit off; this requires no pipeline rebuild.
+    if ((camera.render_flags.y & 2u) != 0u) {
+        if (material.header.x == 4u) { discard; }
+        return experimental_star_nest_sky(d);
+    }
+    if (material.header.x == 4u) {
+        // A cloud-layer stage of the sky shader (tcGen sky cloud).
+        return sky_cloud_color(input, d);
+    }
+    if ((material.header.w & MATERIAL_FLAG_SKYBOX) == 0u) {
+        // skyParms "-" has no outerbox. OpenJK draws no skybox here, so leave
+        // the scene clear color visible (global-fog color when the BSP has one).
+        discard;
+    }
+
+    return outer_sky_identity_light(fast_sky_box_raw(d));
 }
 
 

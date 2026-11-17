@@ -298,6 +298,8 @@ pub struct PlayerPresenter {
     swim_turn_bank: f32,
     /// cg_moveLean (0..1): airborne acceleration-first cosmetic lean.
     move_lean: f32,
+    /// cg_jk2LeanFix: JK2 1.02-only, player-relative velocity pitch.
+    jk2_lean_fix: bool,
     /// TaystJK cg_saberTeamColors (archive, default 1). Skin forcing is unconditional
     /// in ordinary team games; this only controls saber normalization.
     saber_team_colors: bool,

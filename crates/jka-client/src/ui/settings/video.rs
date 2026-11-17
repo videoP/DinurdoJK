@@ -133,7 +133,6 @@ pub struct VideoSettings {
     pub rgb565: u8,
     pub collision_world: bool,
     pub shitter_texture: bool,
-    pub legacy_blend_transfer: u8,
     /// `r_fastsky`: 0 normal textured sky, 1 pale sky blue, 2..9 TaystJK palette, 10 red.
     pub fast_sky: u8,
     /// Debug overlays for trigger volumes and clip/collision-only brushes.
@@ -863,7 +862,6 @@ impl Default for VideoSettings {
             rgb565: 0,
             collision_world: false,
             shitter_texture: false,
-            legacy_blend_transfer: 4,
             fast_sky: 0,
             draw_triggers: false,
             draw_clip_brushes: false,
@@ -1047,7 +1045,7 @@ impl Default for VideoSettings {
             sun_receiver_normals: 1,
             sun_terminator: false,
             sky_world_bake_ab: 1,
-            sky_world_light_isolation: false,
+            sky_world_light_isolation: true,
             sky_world_gain_mode: 2,
             sky_world_lighting_strength: 1.0,
             bake_threads: 0,
@@ -1272,14 +1270,22 @@ impl VideoSettings {
     pub const SUN_LOCK_INTENSITY: u8 = 4;
 
     pub fn active_relighting_mode(&self) -> u8 {
-        if self.sun_override { self.relighting_mode.clamp(1, 2) } else { 0 }
+        if self.sun_override { self.relighting_mode.clamp(1, 3) } else { 0 }
+    }
+
+    /// The relighting mode implied by the shared Baked/Realtime environment
+    /// choice: Baked -> 1; Realtime -> 2 (additive), or 3 if Fully Realtime was
+    /// already selected, since both ride on the Realtime environment.
+    pub fn enabled_relighting_mode(&self) -> u8 {
+        if self.environment_mode == 0 { 1 } else if self.relighting_mode == 3 { 3 } else { 2 }
     }
 
     pub fn parse_relighting_mode(value: &str) -> Option<u8> {
         match value.trim().to_ascii_lowercase().as_str() {
             "0" | "off" | "false" => Some(0),
             "1" | "baked" | "on" | "true" => Some(1),
-            "2" | "realtime" => Some(2),
+            "2" | "realtime" | "additive" => Some(2),
+            "3" | "full" | "fully" | "fullrealtime" | "fullyrealtime" => Some(3),
             _ => None,
         }
     }
@@ -1291,7 +1297,7 @@ impl VideoSettings {
     /// nearby world casters were explicitly requested; Realtime needs world CSM.
     pub fn effective_shadow_mode(&self) -> DynamicShadowsMode {
         if self.sun_override {
-            if self.static_world_csm || self.active_relighting_mode() == 2 {
+            if self.static_world_csm || self.active_relighting_mode() >= 2 {
                 DynamicShadowsMode::CascadedShadowMaps
             } else {
                 DynamicShadowsMode::CascadedShadowMapsEntities
@@ -1324,10 +1330,12 @@ impl VideoSettings {
         effective.sky_world_lighting_strength = if self.sun_override {
             self.sky_world_lighting_strength.clamp(0.0, 1.0)
         } else { 0.0 };
-        if self.active_relighting_mode() == 2 {
+        if self.active_relighting_mode() >= 2 {
             // Preserve the newer isolation path: trace sky receivers into
             // cached lighting instead of fullscreen tinting enclosed rooms.
-            let traced_sky = self.sky_world_light_isolation && self.effective_shadow_mode().is_csm();
+            // Fully Realtime has no cached lighting to trace into.
+            let traced_sky = self.active_relighting_mode() == 2
+                && self.sky_world_light_isolation && self.effective_shadow_mode().is_csm();
             if traced_sky {
                 effective.blue_water_environment.world_lighting = 0.0;
                 effective.baked_sun_cache = true;
@@ -1345,6 +1353,16 @@ impl VideoSettings {
             // the atmosphere gain only takes over toward dusk/night.
             effective.sun_lighting = true;
             effective.entity_sun_lighting = true;
+            if self.active_relighting_mode() == 3 {
+                // The authored lightmap is ignored, so nothing may be baked,
+                // composed or subtracted from it.
+                effective.baked_sun_cache = false;
+                effective.sky_world_bake_ab = 0;
+                effective.baked_sun_removal = 0.0;
+                effective.baked_sun_removal_auto = false;
+                effective.baked_sun_removal_contour = false;
+                effective.blue_water_environment.world_lighting = effective.sky_world_lighting_strength;
+            }
         }
         if !self.sun_override {
             effective.baked_sun_cache = false;
@@ -1358,8 +1376,9 @@ impl VideoSettings {
         }
         // Residual baked-light grading belongs to Baked only. Render with
         // neutral values in Off/Realtime without overwriting saved edits.
+        // Fully Realtime reuses the brightness slider as its flat ambient level.
         if self.active_relighting_mode() != 1 {
-            effective.baked_indirect_scale = 1.0;
+            if self.active_relighting_mode() != 3 { effective.baked_indirect_scale = 1.0; }
             effective.baked_indirect_saturation = 1.0;
             effective.baked_indirect_power = 1.0;
             effective.baked_indirect_highlight_preserve = 0.0;

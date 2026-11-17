@@ -94,7 +94,10 @@ const GREEN: [f32; 4] = [0.0, 0.613, 0.097, 1.0];
 const RED: [f32; 4] = [0.835, 0.015, 0.015, 1.0];
 const ORANGE: [f32; 4] = [1.0, 0.658, 0.062, 1.0];
 const LEFT_INNER: &str = "gfx/hud/hudleft_innerframe";
-const LEFT_FRAME: &str = "gfx/hud/hudleft";
+// MVSDK code/cgame/cg_main.c registers HUDLeftFrame as static_test;
+// CG_DrawHUDLeftFrame2 draws it over the health/armor figures. This is the
+// authored left-hand scanline overlay, not the unrelated hudleft image.
+const LEFT_FRAME: &str = "gfx/hud/static_test";
 const RIGHT_INNER: &str = "gfx/hud/hudright_innerframe";
 const RIGHT_FRAME: &str = "gfx/hud/hudrightframe";
 const ARMOR_OUTER: &str = "gfx/hud/armor1";
@@ -751,14 +754,14 @@ mod tests {
     }
 
     #[test]
-    fn jk2_left_frame_uses_the_existing_hudleft_artwork() {
-        // gfx/hud/hudleft.tga is loaded by the implicit-image qpath below.
-        // Do not register the unrelated static_test instead.
-        assert_eq!(LEFT_FRAME, "gfx/hud/hudleft");
+    fn jk2_left_frame_uses_mvsdk_scanline_overlay() {
+        // MVSDK cg_main.c: HUDLeftFrame = "gfx/hud/static_test".
+        // cg_draw.c draws it last (CG_DrawHUDLeftFrame2), above the gauges.
+        assert_eq!(LEFT_FRAME, "gfx/hud/static_test");
         let mut images = Vec::new();
         append_jk2_hud_images(&mut images, 1);
-        assert!(images.iter().any(|name| name == "gfx/hud/hudleft"));
-        assert!(!images.iter().any(|name| name == "gfx/hud/static_test"));
+        assert!(images.iter().any(|name| name == "gfx/hud/static_test"));
+        assert!(!images.iter().any(|name| name == "gfx/hud/hudleft"));
     }
 
     #[test]

@@ -221,7 +221,7 @@ fn fingerprint(source: &Source, sun: scene::DirectionalSun, encoding: Option<sce
     // Same deterministic FoldHasher on disk and across runs. Bump the cache
     // magic/version whenever reconstruction math changes.
     let mut hash = scene::FoldHasher::default();
-    hash.write(b"baked-sun-v6-direction-search");
+    hash.write(b"baked-sun-v9-no-patch-casters");
     hash.write(&source.cache.map_hash.to_le_bytes());
     hash.write(bytemuck::cast_slice(&source.vertices));
     hash.write(bytemuck::cast_slice(&source.surface_ids));
@@ -343,6 +343,7 @@ fn run(
                     &mut images,
                     &source.surface_ids,
                     source.surfaces.len(),
+                    &source.surfaces,
                     sun,
                     encoding,
                     cancelled,

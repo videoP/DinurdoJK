@@ -1053,6 +1053,7 @@ impl PlayerPresenter {
         let swim_tilt_strength = self.swim_tilt;
         let swim_bank_strength = self.swim_turn_bank;
         let move_lean_strength = self.move_lean;
+        let jk2_lean_fix = self.jk2_lean_fix;
         let runtime = self
             .entities
             .get_mut(&entity.number)
@@ -1423,7 +1424,7 @@ impl PlayerPresenter {
                 let result = jk2_g2_player_angles(
                     jk2, &jk2_entity, current_time, angle_render_origin,
                     entity.angles, frametime, anim(ci_legs), anim(ci_torso),
-                    Some(&motion_matrix), &mut runtime.player_angles,
+                    Some(&motion_matrix), jk2_lean_fix, &mut runtime.player_angles,
                 )?;
                 if super::jk2_angle_debug() {
                     let m = &motion_matrix;

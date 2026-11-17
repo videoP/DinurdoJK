@@ -194,13 +194,26 @@ pub(in crate::renderer) fn classic_vertex_illumination(
 ) -> [f32; 3] {
     let incoming = normal.dot(Vec3::from_array(light.direction)).max(0.0);
     let sun_incoming = normal.dot(Vec3::from_array(light.sun_direction)).max(0.0);
+    let encoded = jk2_encoded_entity_light();
     std::array::from_fn(|channel| {
-        (light.ambient[channel]
+        let value = (light.ambient[channel]
             + incoming * light.directed[channel]
             + sun_incoming * light.sun_directed[channel])
             .clamp(0.0, 255.0)
-            / 255.0
+            / 255.0;
+        if encoded { crate::renderer::brightness_settings::srgb_decode(value) } else { value }
     })
+}
+
+/// JK2MV (rd-vanilla) multiplies the RB_CalcDiffuseColor bytes into the
+/// encoded framebuffer color; with a linear scene that is a decoded multiply.
+/// Process-wide presentation mode: set by the render thread on JK2/JKA
+/// transitions, read by model preparation (including worker threads).
+pub(in crate::renderer) static JK2_ENCODED_ENTITY_LIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(in crate::renderer) fn jk2_encoded_entity_light() -> bool {
+    JK2_ENCODED_ENTITY_LIGHT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub(in crate::renderer) struct Ghoul2GpuMesh {
@@ -424,8 +437,8 @@ pub(in crate::renderer) struct DynamicPreparedDraw {
 /// cached here and upload only final CPU-evaluated bones plus per-draw transforms.
 /// The renderer still knows nothing about demo/network provenance or JKA state.
 pub(in crate::renderer) struct DynamicModelRenderer {
-    /// Frame-latched: 0 reference 16-bit, 1 encoded 8-bit, 2 direct+resolve,
-    /// 3 direct without the legacy-forced scene resolve.
+    /// Frame-latched: 4 display-space alias (swapchain or scene target), or 0
+    /// when neither alias fits and the bounded FP16 encode/decode transfer runs.
     pub(in crate::renderer) legacy_blend_mode: u8,
     /// Frame-latched with `legacy_blend_mode == 4`: the encoded draws target a
     /// UNORM view of the offscreen sRGB scene (or its MSAA) target instead of

@@ -143,6 +143,133 @@ pub(in crate::renderer) fn rasterize_lightmap_texels(
     texels
 }
 
+/// Lightmap samples and chart owners with a gutter band. Covered luxels are
+/// exactly `rasterize_lightmap_texels`/`rasterize_lightmap_owners` (first
+/// triangle wins). An uncovered luxel within `reach` luxels of a triangle in
+/// UV space takes the NEAREST triangle's owner (`triangle.owner`) and a sample
+/// at the closest point on it, i.e. clamp-to-edge for that chart. q3map2
+/// atlases have no gutters, so bilinear sampling at a chart edge reads one
+/// luxel past it; this keeps that luxel lit by the chart that reads it rather
+/// than by an arbitrary neighbouring island elsewhere in the map.
+pub(in crate::renderer) fn rasterize_lightmap_band(
+    triangles: &[crate::renderer::StaticAoLightmapTriangle],
+    lightmap_sizes: &[[u32; 2]],
+    reach: f32,
+) -> (Vec<Vec<Option<StaticAoTexelSample>>>, Vec<Vec<u32>>) {
+    let mut samples = rasterize_lightmap_texels(triangles, lightmap_sizes, 1);
+    let mut owners = rasterize_lightmap_owners(triangles, lightmap_sizes, 1);
+    let mut best: Vec<Vec<f32>> = lightmap_sizes
+        .iter()
+        .map(|&[w, h]| vec![f32::INFINITY; w as usize * h as usize])
+        .collect();
+    let mut band: Vec<Vec<Option<StaticAoTexelSample>>> =
+        samples.iter().map(|page| vec![None; page.len()]).collect();
+    for triangle in triangles {
+        let Some(&[width, height]) = lightmap_sizes.get(triangle.texture) else {
+            continue;
+        };
+        if width == 0 || height == 0 || triangle.owner == 0 {
+            continue;
+        }
+        let size = Vec2::new(width as f32, height as f32);
+        let p = triangle.uvs.map(|uv| Vec2::from_array(uv) * size - Vec2::splat(0.5));
+        if cross2(p[1] - p[0], p[2] - p[0]).abs() < 1.0e-8 {
+            continue;
+        }
+        let min = (p[0].min(p[1]).min(p[2]) - Vec2::splat(reach)).floor().max(Vec2::ZERO);
+        let max = (p[0].max(p[1]).max(p[2]) + Vec2::splat(reach))
+            .ceil()
+            .min(size - Vec2::ONE);
+        if max.x < min.x || max.y < min.y {
+            continue;
+        }
+        let page = triangle.texture;
+        for y in min.y as u32..=max.y as u32 {
+            for x in min.x as u32..=max.x as u32 {
+                let index = y as usize * width as usize + x as usize;
+                if samples[page][index].is_some() {
+                    continue;
+                }
+                let q = Vec2::new(x as f32, y as f32);
+                let (closest, bary) = closest_point_on_triangle_2d(q, p);
+                let distance = closest.distance(q);
+                if distance > reach || distance >= best[page][index] {
+                    continue;
+                }
+                let position = Vec3::from_array(triangle.positions[0]) * bary[0]
+                    + Vec3::from_array(triangle.positions[1]) * bary[1]
+                    + Vec3::from_array(triangle.positions[2]) * bary[2];
+                let normal = (Vec3::from_array(triangle.normals[0]) * bary[0]
+                    + Vec3::from_array(triangle.normals[1]) * bary[1]
+                    + Vec3::from_array(triangle.normals[2]) * bary[2])
+                    .normalize_or_zero();
+                if normal.length_squared() < 0.5 {
+                    continue;
+                }
+                best[page][index] = distance;
+                owners[page][index] = triangle.owner;
+                band[page][index] = Some(StaticAoTexelSample {
+                    position: position.to_array(),
+                    normal: normal.to_array(),
+                });
+            }
+        }
+    }
+    for (page, extra) in samples.iter_mut().zip(band) {
+        for (sample, extra) in page.iter_mut().zip(extra) {
+            if sample.is_none() {
+                *sample = extra;
+            }
+        }
+    }
+    (samples, owners)
+}
+
+/// Closest point on a 2D triangle and its barycentric weights (Ericson,
+/// Real-Time Collision Detection 5.1.5).
+fn closest_point_on_triangle_2d(q: Vec2, t: [Vec2; 3]) -> (Vec2, [f32; 3]) {
+    let (a, b, c) = (t[0], t[1], t[2]);
+    let ab = b - a;
+    let ac = c - a;
+    let ap = q - a;
+    let d1 = ab.dot(ap);
+    let d2 = ac.dot(ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return (a, [1.0, 0.0, 0.0]);
+    }
+    let bp = q - b;
+    let d3 = ab.dot(bp);
+    let d4 = ac.dot(bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return (b, [0.0, 1.0, 0.0]);
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return (a + ab * v, [1.0 - v, v, 0.0]);
+    }
+    let cp = q - c;
+    let d5 = ab.dot(cp);
+    let d6 = ac.dot(cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return (c, [0.0, 0.0, 1.0]);
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return (a + ac * w, [1.0 - w, 0.0, w]);
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        return (b + (c - b) * w, [0.0, 1.0 - w, w]);
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    (a + ab * v + ac * w, [1.0 - v - w, v, w])
+}
+
 pub(in crate::renderer) fn rasterize_static_ao_owners(
     source: &StaticAoWorldSource,
     scale: u32,

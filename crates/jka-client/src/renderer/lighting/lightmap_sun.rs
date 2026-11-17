@@ -130,20 +130,28 @@ impl Geometry {
     }
 
     /// Per-luxel lightmap chart IDs at the ORIGINAL lightmap resolution, for
-    /// the compositor's chart-aware reconstruction. 0 = no chart. Padding
-    /// luxels inherit their single adjacent chart, as bilinear sampling expects.
+    /// the compositor's chart-aware reconstruction. 0 = no chart. Gutter
+    /// luxels belong to the NEAREST chart (not a dilation tie-break), matching
+    /// the local lamp-sum bake's gutter samples exactly.
     pub(in crate::renderer) fn lightmap_charts(&self, sizes: &[[u32; 2]]) -> Vec<Vec<u32>> {
+        crate::renderer::static_ao::bvh::rasterize_lightmap_band(
+            &self.charted_receivers(), sizes, LIGHTMAP_GUTTER_REACH,
+        ).1
+    }
+
+    /// Receivers with `owner` = 1-based lightmap chart (UV island).
+    fn charted_receivers(&self) -> Vec<crate::renderer::StaticAoLightmapTriangle> {
         let mut charted = (*self.receivers).clone();
         for (triangle, chart) in charted.iter_mut().zip(triangle_charts(&self.receivers)) {
             triangle.owner = chart;
         }
-        let mut charts = crate::renderer::static_ao::bvh::rasterize_lightmap_owners(&charted, sizes, 1);
-        for (page, &[w, h]) in charts.iter_mut().zip(sizes) {
-            crate::renderer::static_ao::bvh::dilate_static_ao_owners(page, w, h, 1);
-        }
-        charts
+        charted
     }
 }
+
+/// Luxels within this UV distance of a chart are that chart's gutter: one
+/// bilinear footprint past its edge, plus diagonal corners.
+const LIGHTMAP_GUTTER_REACH: f32 = 1.5;
 
 /// Lightmap charts are the connected components of lightmap-UV space: the
 /// triangles of one BSP surface share UV vertices; separately packed atlas
@@ -429,7 +437,10 @@ struct Key {
     /// Diagnostic transport is gated by authored-room protection (Blue Water).
     sky_transport: bool,
     local_sources: u32,
+    /// Per-light layers (moving-shadow correction) under the 64 MiB budget.
     local_sizes: Vec<[u32; 2]>,
+    /// Chart-exact RGB lamp sum, normally at the original luxel resolution.
+    local_total_sizes: Vec<[u32; 2]>,
     locals: Vec<(usize, scene::DynamicLight)>,
 }
 
@@ -439,7 +450,7 @@ struct Key {
 fn needs_static_replacement_sun(
     cache: bool, debug_mode: u32, csm: bool, relighting_mode: u8, sun_override: bool,
 ) -> bool {
-    cache && debug_mode == 0 && csm && !(sun_override && relighting_mode == 2)
+    cache && debug_mode == 0 && csm && !(sun_override && relighting_mode >= 2)
 }
 
 /// Only replacement sunlight depends on the player's sun direction. Sky
@@ -466,6 +477,8 @@ pub(in crate::renderer) struct VertexSkySample {
 struct BakeOutput {
     sun: Vec<Vec<f32>>,
     local: Vec<Vec<f32>>,
+    /// Per page: R, G, B lamp-sum layers at `Key::local_total_sizes`.
+    local_totals: Vec<Vec<f32>>,
     /// Per sun page: valid bit, octahedral normal, ambient and direct visibility.
     sky: Vec<Vec<u32>>,
     vertex_sky: Vec<VertexSkySample>,
@@ -510,6 +523,8 @@ pub(in crate::renderer) struct StaticSun {
     key: Option<Key>,
     pub flux: Vec<GpuImage>,
     pub local_flux: Vec<GpuImage>,
+    /// Full-resolution RGB lamp sum (3 R32F layers) read by the compositor.
+    pub local_totals: Vec<GpuImage>,
     /// R32Uint packed smoothed normal + sky visibility per sun page.
     pub sky_normals: Vec<GpuImage>,
     pub vertex_sky: Vec<VertexSkySample>,
@@ -646,6 +661,32 @@ fn alpha_at(
         1.0
     };
     image.rgba.get(pixel + 3).copied().unwrap_or(255) as f32 / 255.0 * batch.color[3] * vertex_alpha
+}
+
+/// `fill_chart_border`, restricted to neighbours of the gap luxel's own chart
+/// (`owners` = chart ids, dilated like the compositor's chart map).
+fn fill_chart_border_owned(values: &mut [f32], size: [u32; 2], owners: &[u32]) {
+    let original = values.to_vec();
+    let width = size[0] as i32;
+    let height = size[1] as i32;
+    for (i, value) in values.iter_mut().enumerate().filter(|(_, v)| **v < 0.0) {
+        let owner = owners.get(i).copied().unwrap_or(0);
+        let (x, y) = ((i % width as usize) as i32, (i / width as usize) as i32);
+        let mut sum = 0.0;
+        let mut count = 0;
+        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let (nx, ny) = (x + dx, y + dy);
+            if nx < 0 || ny < 0 || nx >= width || ny >= height {
+                continue;
+            }
+            let n = ny as usize * width as usize + nx as usize;
+            if original[n] >= 0.0 && (owner == 0 || owners.get(n) == Some(&owner)) {
+                sum += original[n];
+                count += 1;
+            }
+        }
+        *value = if count > 0 { sum / count as f32 } else { 0.0 };
+    }
 }
 
 fn fill_chart_border(values: &mut [f32], size: [u32; 2]) {
@@ -971,7 +1012,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
             })
             .collect();
         progress.set(6, 955);
-        return Ok(BakeOutput { sun: pages, local: Vec::new(), sky: Vec::new(), vertex_sky: Vec::new(), transport: None });
+        return Ok(BakeOutput { sun: pages, local: Vec::new(), local_totals: Vec::new(), sky: Vec::new(), vertex_sky: Vec::new(), transport: None });
     }
     if key.bake_sun && key.terminator {
         samples.par_iter_mut().zip(&page_ids).zip(&key.sizes)
@@ -1217,10 +1258,16 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
         // Trace at ORIGINAL resolution, then resample within the same chart.
         // Only diffuse sky openness belongs on this lower-resolution grid.
         // The compositor reads direct visibility from the antialiased sun flux.
+        // Sky openness uses the same gutter band as the chart map and
+        // transport: seam luxels are traced for their own (nearest) chart.
+        let (base_samples, base_band_charts) = if key.sky == 2 {
+            let mut charted = receivers.to_vec();
+            for (triangle, &chart) in charted.iter_mut().zip(&charts) { triangle.owner = chart; }
+            crate::renderer::static_ao::bvh::rasterize_lightmap_band(&charted, &key.sky_sizes, LIGHTMAP_GUTTER_REACH)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let base_visibility: Vec<Vec<f32>> = if key.sky == 2 {
-            let base_samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(
-                receivers, &key.sky_sizes, 1,
-            );
             const RAYS: usize = 16;
             let sky_total = base_samples.iter().map(|texels| texels.len() as u32).sum::<u32>().max(1);
             let sky_done = AtomicU32::new(0);
@@ -1262,13 +1309,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
             &transport_surface, cancel, progress, &vertex_sky,
         );
         progress.set(4, 885);
-        let base_charts: Vec<Vec<u32>> = if key.sky == 2 {
-            let mut charted = receivers.to_vec();
-            for (triangle, &chart) in charted.iter_mut().zip(&charts) { triangle.owner = chart; }
-            crate::renderer::static_ao::bvh::rasterize_lightmap_owners(&charted, &key.sky_sizes, 1)
-        } else {
-            Vec::new()
-        };
+        let base_charts: Vec<Vec<u32>> = base_band_charts;
         let pack_done = AtomicU32::new(0);
         let pack_total = samples.len() as u32;
         samples.par_iter().zip(&page_ids).zip(&key.sizes).enumerate()
@@ -1328,52 +1369,143 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
         &key.local_sizes,
         1,
     );
+    // Chart ids per texel at both resolutions. Owners use the same coverage
+    // rule and triangle order as the texel rasterizer, so ids match samples.
+    let (local_charts, full_samples, full_charts) = if key.locals.is_empty() {
+        (Vec::new(), Vec::new(), Vec::new())
+    } else {
+        let charted = geometry.charted_receivers();
+        use crate::renderer::static_ao::bvh::{rasterize_lightmap_band, rasterize_lightmap_owners};
+        // Full resolution: every gutter luxel is lit by its nearest chart at
+        // the closest point on that chart (same ownership as the compositor).
+        let (full_samples, full_charts) =
+            rasterize_lightmap_band(&charted, &key.local_total_sizes, LIGHTMAP_GUTTER_REACH);
+        (
+            rasterize_lightmap_owners(&charted, &key.local_sizes, 1),
+            full_samples,
+            full_charts,
+        )
+    };
+    let lights = key.locals.len();
+    let trace_light = |light: &scene::DynamicLight, position: Vec3, normal: Vec3| {
+        let origin = position + normal * 0.5;
+        let delta = Vec3::from_array(light.position) - origin;
+        visibility(origin, delta.normalize_or_zero(), delta.length())
+    };
     let local_done=AtomicU32::new(0);
     let local_total=key.local_sizes.len() as u32;
-    let local = local_samples
+    let (local, local_totals): (Vec<_>, Vec<_>) = local_samples
         .par_iter()
         .zip(&key.local_sizes)
-        .map(|(samples, size)| {
-            let mut page = Vec::with_capacity(samples.len() * (key.locals.len() + 3));
-            let mut totals = vec![[0.0f32; 3]; samples.len()];
-            for (_, light) in &key.locals {
-                let mut layer: Vec<f32> = samples
+        .zip(&local_charts)
+        .zip(full_samples.par_iter().zip(&key.local_total_sizes).zip(&full_charts))
+        .map(|(((samples, size), charts), ((full, full_size), full_charts))| {
+            let n = samples.len();
+            let mut page = Vec::with_capacity(n * (lights + 3));
+            let mut totals = vec![[0.0f32; 3]; n];
+            // Traced visibility per (light, low-res texel); -1 = not traced.
+            let mut low_visibility = vec![-1.0f32; n * lights];
+            for (li, (_, light)) in key.locals.iter().enumerate() {
+                let traced: Vec<(f32, f32)> = samples
                     .par_iter()
                     .map(|sample| {
                         if cancel.load(Ordering::Relaxed) {
-                            return -1.0;
+                            return (-1.0, -1.0);
                         }
                         let Some(sample) = sample else {
-                            return -1.0;
+                            return (-1.0, -1.0);
                         };
                         let position = Vec3::from_array(sample.position);
                         let normal = Vec3::from_array(sample.normal);
                         let incident = super::lightmap_local::irradiance(light, position, normal);
                         if incident <= 0.0 {
-                            return 0.0;
+                            return (0.0, -1.0);
                         }
-                        let origin = position + normal * 0.5;
-                        let delta = Vec3::from_array(light.position) - origin;
-                        incident * visibility(origin, delta.normalize_or_zero(), delta.length())
+                        let v = trace_light(light, position, normal);
+                        (incident * v, v)
                     })
                     .collect();
+                let mut layer: Vec<f32> = traced.iter().map(|t| t.0).collect();
+                for (slot, t) in low_visibility[li * n..(li + 1) * n].iter_mut().zip(&traced) {
+                    *slot = t.1;
+                }
                 fill_chart_border(&mut layer, *size);
                 for (total, value) in totals.iter_mut().zip(&layer) {
                     for c in 0..3 { total[c] += value * light.color[c]; }
                 }
                 page.extend(layer);
             }
+            // Low-res sum stays for the world shader's moving-shadow terms.
             for c in 0..3 { page.extend(totals.iter().map(|total| total[c])); }
-            let n=local_done.fetch_add(1,Ordering::Relaxed)+1;
-            progress.fraction(915, 35, n, local_total);
-            page
+            let done=local_done.fetch_add(1,Ordering::Relaxed)+1;
+            progress.fraction(915, 15, done, local_total);
+            // Chart-exact RGB sum at full resolution. Irradiance is analytic;
+            // visibility reuses the low-res result only when all four bilinear
+            // taps are in this texel's own chart and agree for that light.
+            // Chart borders, thin charts and shadow edges are traced exactly.
+            let [lw, lh] = *size;
+            let [fw, fh] = *full_size;
+            let scale = [lw as f32 / fw.max(1) as f32, lh as f32 / fh.max(1) as f32];
+            let full_rgb: Vec<[f32; 3]> = full
+                .par_iter()
+                .enumerate()
+                .map(|(i, sample)| {
+                    if cancel.load(Ordering::Relaxed) {
+                        return [-1.0; 3];
+                    }
+                    let Some(sample) = sample else {
+                        return [-1.0; 3];
+                    };
+                    let (x, y) = ((i % fw as usize) as f32, (i / fw as usize) as f32);
+                    let at = [(x + 0.5) * scale[0] - 0.5, (y + 0.5) * scale[1] - 0.5];
+                    let base = [at[0].floor() as i32, at[1].floor() as i32];
+                    let chart = full_charts[i];
+                    let mut taps = [0usize; 4];
+                    let mut trusted = chart != 0;
+                    for (tap, (dx, dy)) in taps.iter_mut().zip([(0, 0), (1, 0), (0, 1), (1, 1)]) {
+                        let tx = (base[0] + dx).clamp(0, lw as i32 - 1) as usize;
+                        let ty = (base[1] + dy).clamp(0, lh as i32 - 1) as usize;
+                        *tap = ty * lw as usize + tx;
+                        trusted &= samples[*tap].is_some() && charts[*tap] == chart;
+                    }
+                    let position = Vec3::from_array(sample.position);
+                    let normal = Vec3::from_array(sample.normal);
+                    let mut rgb = [0.0f32; 3];
+                    for (li, (_, light)) in key.locals.iter().enumerate() {
+                        let incident = super::lightmap_local::irradiance(light, position, normal);
+                        if incident <= 0.0 {
+                            continue;
+                        }
+                        let known = &low_visibility[li * n..(li + 1) * n];
+                        let first = known[taps[0]];
+                        let reuse = trusted
+                            && first >= 0.0
+                            && taps[1..].iter().all(|&t| (known[t] - first).abs() < 1.0e-3);
+                        let v = if reuse { first } else { trace_light(light, position, normal) };
+                        for c in 0..3 { rgb[c] += incident * v * light.color[c]; }
+                    }
+                    rgb
+                })
+                .collect();
+            // Gutter luxels already hold their own chart's light. Anything
+            // left (beyond every chart's gutter) is filled from same-chart
+            // neighbours only; averaging across charts let a lamp-lit island
+            // elsewhere in the map tint an unrelated wall's edge.
+            let mut full_page = Vec::with_capacity(full_rgb.len() * 3);
+            for c in 0..3 {
+                let mut layer: Vec<f32> = full_rgb.iter().map(|rgb| rgb[c]).collect();
+                fill_chart_border_owned(&mut layer, *full_size, full_charts);
+                full_page.extend(layer);
+            }
+            progress.fraction(930, 20, done, local_total);
+            (page, full_page)
         })
-        .collect();
+        .unzip();
     progress.set(6, 955);
     if cancel.load(Ordering::Relaxed) {
         Err("cancelled".into())
     } else {
-        Ok(BakeOutput { sun: pages, local, sky: sky_pages, vertex_sky, transport })
+        Ok(BakeOutput { sun: pages, local, local_totals, sky: sky_pages, vertex_sky, transport })
     }
 }
 
@@ -1393,13 +1525,14 @@ impl Renderer {
         // static directional bake adds no information and retraces the BSP on
         // every time/yaw/pitch change. Keep Baked's directional bake intact.
         let realtime_relight = self.sun_override && self.relighting_mode == 2;
+        let fully_realtime = self.fully_realtime_world();
         let bake_sun = needs_static_replacement_sun(
             self.baked_sun_cache, self.baked_sun_debug_mode, self.cascaded_shadow_mode.is_csm(),
             self.relighting_mode, self.sun_override,
         );
         let cloud_coverage_steps = if bake_sun { self.relight_cloud_coverage_steps() } else { 0 };
         let light_sources = self.added_map_light_sources();
-        let bake_local = light_sources != 0 && self.baked_sun_debug_mode == 0;
+        let bake_local = light_sources != 0 && self.baked_sun_debug_mode == 0 && !fully_realtime;
         let debug_layers = if bake_sun && matches!(self.lightmap_signal, 7 | 8) {
             self.lightmap_signal
         } else { 0 };
@@ -1430,6 +1563,7 @@ impl Renderer {
             state.bake_started = None;
             state.flux.clear();
             state.local_flux.clear();
+            state.local_totals.clear();
             state.sky_normals.clear();
             state.vertex_sky.clear();
             state.local_lights.clear();
@@ -1535,6 +1669,11 @@ impl Renderer {
                 0
             },
             local_sizes: super::lightmap_local::output_sizes(
+                &base,
+                locals.len(),
+                self.device.limits().max_texture_dimension_2d,
+            ),
+            local_total_sizes: super::lightmap_local::total_sizes(
                 &base,
                 locals.len(),
                 self.device.limits().max_texture_dimension_2d,
@@ -1655,6 +1794,39 @@ impl Renderer {
                             GpuImage::new(texture, view)
                         })
                         .collect();
+                    state.local_totals = pages
+                        .local_totals
+                        .iter()
+                        .zip(&key.local_total_sizes)
+                        .map(|(pixels, size)| {
+                            use wgpu::util::DeviceExt;
+                            let texture = self.device.create_texture_with_data(
+                                &self.queue,
+                                &wgpu::TextureDescriptor {
+                                    label: Some("baked local irradiance RGB sum"),
+                                    size: wgpu::Extent3d {
+                                        width: size[0],
+                                        height: size[1],
+                                        depth_or_array_layers: 3,
+                                    },
+                                    mip_level_count: 1,
+                                    sample_count: 1,
+                                    dimension: wgpu::TextureDimension::D2,
+                                    format: wgpu::TextureFormat::R32Float,
+                                    usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                        | wgpu::TextureUsages::COPY_DST,
+                                    view_formats: &[],
+                                },
+                                wgpu::util::TextureDataOrder::LayerMajor,
+                                bytemuck::cast_slice(pixels),
+                            );
+                            let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                                ..Default::default()
+                            });
+                            GpuImage::new(texture, view)
+                        })
+                        .collect();
                     state.sky_normals = pages.sky.iter().zip(&key.sizes).map(|(packed, size)| {
                         use wgpu::util::DeviceExt;
                         let texture = self.device.create_texture_with_data(
@@ -1687,10 +1859,11 @@ impl Renderer {
                         );
                     }
                     println!(
-                        "[LOCAL LIGHTMAP] baked {} static emitters into {} page(s), sizes {:?}",
+                        "[LOCAL LIGHTMAP] baked {} static emitters into {} page(s), per-light sizes {:?}, RGB sum sizes {:?}",
                         key.locals.len(),
                         state.local_flux.len(),
-                        key.local_sizes
+                        key.local_sizes,
+                        key.local_total_sizes
                     );
                     state.key = Some(key);
                     state.generation = state.generation.wrapping_add(1).max(1);
@@ -1809,7 +1982,8 @@ impl StaticSun {
         *self = Self::new(Some(geometry));
     }
     pub(in crate::renderer) fn local_ready(&self) -> bool {
-        self.key.is_some() && !self.local_flux.is_empty() && !self.local_lights.is_empty()
+        self.key.is_some() && !self.local_flux.is_empty() && !self.local_totals.is_empty()
+            && !self.local_lights.is_empty()
     }
     pub(in crate::renderer) fn ready(&self) -> bool {
         self.key.as_ref().is_some_and(|k| k.bake_sun) && !self.flux.is_empty()
@@ -2048,6 +2222,7 @@ mod tests {
             sky_transport: false,
             local_sources: 0,
             local_sizes: Vec::new(),
+            local_total_sizes: Vec::new(),
             locals: Vec::new(),
         };
         assert_eq!(bake_worker_count(1, 1), 1);
@@ -2175,6 +2350,7 @@ mod tests {
         };
         let mut local_key = key.clone();
         local_key.local_sizes = vec![[32, 32]];
+        local_key.local_total_sizes = vec![[32, 32]];
         local_key.locals = vec![
             (0, lamp),
             (

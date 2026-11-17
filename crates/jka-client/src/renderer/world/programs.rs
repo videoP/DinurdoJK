@@ -647,7 +647,9 @@ pub(in crate::renderer) fn generated_source(
         // carried from the vertex shader. Do not re-run wave_value in the FS:
         // generated stage programs intentionally evaluate it only in the VS.
         let additive_wave_eval = format!(
-            "wave = clamp(wave_value({}u, material.wave_rgb, shader_stage_time()), 0.0, 1.0);",
+            // rgb_wave_glow == rgb_wave_color whenever this legacy path runs
+            // (JK2 encoded color disables it), so the VS value is exact.
+            "wave = rgb_wave_glow({}u, material.wave_rgb, shader_stage_time());",
             m.vertex_recipe.wave_funcs[0],
         );
         assert!(source.contains(&additive_wave_eval), "additive waveform must remain vertex-only");

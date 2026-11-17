@@ -300,7 +300,6 @@ impl QualityPreset {
             ("r_vertexLight", "0"),
             ("r_lightmap", "0"),
             ("r_colorClearMode", "1"), // Auto; NEVER unconditional skip
-            ("r_legacyBlendTransfer", "4"), // direct SDR path, no transfer
             ("r_rgb565", "0"),
             ("r_igpuMemoryAB", "0"),
         ]);
@@ -658,7 +657,6 @@ mod tests {
         for preset in QualityPreset::ALL {
             let settings = preset.settings();
             assert!(settings.contains(&("r_colorClearMode", "1")));
-            assert!(settings.contains(&("r_legacyBlendTransfer", "4")));
             assert_eq!(settings.last(), Some(&("r_igpuMemoryAB", if preset == QualityPreset::Shitter {"1"} else {"0"})));
         }
     }

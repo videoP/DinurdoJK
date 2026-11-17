@@ -205,7 +205,14 @@ impl Renderer {
                 models.entity_dlights.extend(world.static_sun.local_lights.iter()
                     .filter(|(_,light)| !fixture_accents ||
                         !super::lightmap_local::source_enabled(light, super::lightmap_local::AUTHORED))
-                    .take(remaining).map(|(_,light)| EntityDlight {position:Vec3::from_array(light.position),color:Vec3::from_array(light.color)*light.intensity.max(0.0)*0.35,radius:light.radius.max(0.0)}));
+                    .take(remaining).map(|(_,light)| if light.falloff == scene::DynamicLightFalloff::InverseSquare {
+                        // add_entity_dlights adds 16 r^2 / d^2 grid units; this
+                        // radius makes that exactly photons / d^2 (q3map units).
+                        EntityDlight {position:Vec3::from_array(light.position),color:Vec3::from_array(light.color),
+                            radius:(light.intensity.max(0.0)*255.0/16.0).sqrt()}
+                    } else {
+                        EntityDlight {position:Vec3::from_array(light.position),color:Vec3::from_array(light.color)*light.intensity.max(0.0)*0.35,radius:light.radius.max(0.0)}
+                    }));
             }
         }
     }
@@ -262,6 +269,18 @@ impl Renderer {
             let is_area=light.emitter_normal.iter().any(|v|v.abs()>1e-6);
             let shadow_only = baked_layer.is_none() && self.inferred_shadow_source_enabled(world,index)
                 && !self.static_runtime_light_enabled(world,index,light);
+            // Baked q3map area lamps reach the GPU only as shadow/wet-specular
+            // sources; their diffuse light is in the lamp lightmap. The smooth
+            // runtime formula must not see photons/255, so upload an equivalent
+            // smooth intensity matching inverse-square at a quarter radius.
+            let q3map_area = light.falloff == crate::renderer::scene::DynamicLightFalloff::InverseSquare
+                && light.emitter_normal.iter().any(|v| v.abs() > 1e-6);
+            let (gpu_intensity, gpu_falloff) = if q3map_area {
+                let quarter = (light.radius * 0.25).max(16.0);
+                (light.intensity / (quarter * quarter) / (0.75 * 0.75 * 0.35), 0.0)
+            } else {
+                (light.intensity, light.falloff.shader_value())
+            };
             gpu_lights.push(GpuPointLight {
                 position_radius: [
                     light.position[0],
@@ -273,7 +292,7 @@ impl Renderer {
                     light.color[0],
                     light.color[1],
                     light.color[2],
-                    light.intensity,
+                    gpu_intensity,
                 ],
                 emitter: [
                     light.emitter_normal[0],
@@ -310,7 +329,7 @@ impl Renderer {
                 ],
                 shadow: [
                     shadow_slot_by_light.get(index).copied().unwrap_or(0) as f32,
-                    light.falloff.shader_value(),
+                    gpu_falloff,
                     light.extra_distance,
                     0.0,
                 ],
@@ -507,10 +526,15 @@ impl Renderer {
             ],
             baked_sun_debug_mode: [if sun_bake_ready { self.baked_sun_debug_mode } else { 0 }, u32::from(self.baked_sun_cache_active()), u32::from(self.static_sun_lightmap_active()) | (u32::from(self.baked_local_lightmap_active()) << 1) | (u32::from(self.baked_local_shadows && !self.baked_local_lightmap_active()) << 2) | (u32::from(self.static_world_csm_composed()) << 3) | (u32::from(self.baked_sun_removal_contour && self.world.as_ref().is_some_and(|world| world.sun_bake.contour_masks.is_some())) << 4), u32::from(self.baked_local_moving_casters()) | (u32::from(all_local_baked)<<1) | (u32::from(self.lamp_shadow_ab == 4)<<2)
                 | (u32::from(self.world.as_ref().and_then(|w| w.baked_sun_cache.as_ref())
-                    .is_some_and(|cache| cache.sky_overlay_active()))<<8)],
+                    .is_some_and(|cache| cache.sky_overlay_active()))<<8)
+                // Bit 9: Fully Realtime. The shader never reads authored lightmaps.
+                | (u32::from(self.fully_realtime_world()) << 9)],
             runtime_sun_direction: {
                 let toward = -Vec3::from_array(runtime_light.direction);
-                [toward.x, toward.y, toward.z, 0.0]
+                // w is reserved for the authored vanilla-sky night blend.
+                // Reuse the already-uploaded light settings; no new bind group,
+                // per-frame CPU sky texture rewrite, or world pipeline variant.
+                [toward.x, toward.y, toward.z, self.vanilla_sky_night_strength()]
             },
             runtime_sun_radiance: {
                 let rgb = radiance(runtime_light);

@@ -371,8 +371,23 @@ impl App {
         // for intermission, so no periodic poll is required here.
         let Some(net) = self.net.as_mut() else { return };
         let realtime = net.realtime();
-        net.session_mut()
-            .set_cgame_time(realtime, self.network.time_nudge);
+        // Negative cl_timeNudge pushes cgame time ahead of the server to hide
+        // latency for prediction; a spectator/follower has nothing to predict, so
+        // only positive (delay) nudges apply there.
+        let mut time_nudge = self.network.time_nudge;
+        if time_nudge < 0 {
+            const PMF_FOLLOW: i32 = 4096;
+            const PERS_TEAM: usize = 3;
+            const TEAM_SPECTATOR: i32 = 3;
+            let spectating = self.current_player_state().is_some_and(|ps| {
+                ps.persistant[PERS_TEAM] == TEAM_SPECTATOR || ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW != 0
+            });
+            if spectating {
+                time_nudge = 0;
+            }
+        }
+        let Some(net) = self.net.as_mut() else { return };
+        net.session_mut().set_cgame_time(realtime, time_nudge);
         if net.state() >= jka_protocol::session::ConnectionState::Primed {
             // Subframe CL_MouseMove already advanced cl.viewangles on each raw
             // mouse event. Client-frame work only packages the current angles.
@@ -1136,6 +1151,7 @@ impl App {
             session.player_presenter.set_swim_tilt(self.swim_tilt);
             session.player_presenter.set_swim_turn_bank(self.swim_turn_bank);
             session.player_presenter.set_move_lean(self.move_lean);
+            session.player_presenter.set_jk2_lean_fix(self.jk2_lean_fix);
             session
                 .player_presenter
                 .set_saber_team_colors(self.saber_team_colors);

@@ -2775,7 +2775,7 @@ impl Renderer {
             sun_receiver_normals: 1,
             sun_terminator: false,
             sky_world_bake_ab: 1,
-            sky_world_light_isolation: false,
+            sky_world_light_isolation: true,
             sky_world_gain_mode: 2,
             sky_world_lighting_strength: 1.0,
             bake_threads: 0,

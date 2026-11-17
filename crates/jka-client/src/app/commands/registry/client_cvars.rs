@@ -1436,6 +1436,40 @@ app_cvars! {
         ]
     }
 
+    APP_CG_JK2LEANFIX {
+        runtime: CvarDef::new(
+            "cg_jk2LeanFix", "0", "0|1",
+            "JK2 1.02 only: 0=stock world-axis pitch; 1=player-relative velocity pitch. JK2 1.04 remains unchanged. No additional roll.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(u8::from(app.jk2_lean_fix).to_string()),
+            |app, value| App::cvar_set_cg_jk2leanfix(app, APP_CG_JK2LEANFIX.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_cg_jk2leanfix, None),
+        config: CvarBinding {
+            load_presentation: Some(|settings, _, value| {
+                if let Some(enabled) = parse_bool(value) { settings.jk2_lean_fix = enabled; }
+            }),
+            archive: Some((27004, |state| u8::from(state.presentation.jk2_lean_fix).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_cg_jk2leanfix(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    let enabled = match value.trim() {
+                        "0" => false,
+                        "1" => true,
+                        _ => return Err("cg_jk2LeanFix expects 0 or 1".to_owned()),
+                    };
+                    self.jk2_lean_fix = enabled;
+                    if let Some(session) = self.game_session.as_mut() {
+                        session.player_presenter.set_jk2_lean_fix(enabled);
+                    }
+                    self.mark_config_dirty();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_CG_WALLRUNYAW {
         runtime: CvarDef::new(
             "cg_wallRunYaw", "0", "0|1|2|3",

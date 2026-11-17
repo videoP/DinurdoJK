@@ -1223,6 +1223,9 @@ pub struct ClassicEntityLightGrid {
     size: [f32; 3],
     bounds: [u32; 3],
     external_hdr: bool,
+    /// tr.identityLight: 1 / (1 << overbrightBits). Scales the minimum ambient
+    /// add and the ambient clamp exactly as R_SetupEntityLighting does.
+    identity_light: f32,
     cells: Vec<ClassicLightGridCell>,
     /// Unit direction toward the map's baked sun once `estimate_sun_weights`
     /// has run; `None` means no sun share is known for this grid.
@@ -1427,8 +1430,10 @@ impl ClassicEntityLightGrid {
         // The classic LDR path adds a 32-unit minimum ambient term. Rend2's HDR
         // lightgrid path skips this while HDR lighting is active.
         if !self.external_hdr {
-            ambient = ambient.map(|value| value + 32.0);
-            ambient = ambient.map(|value| value.clamp(0.0, 255.0));
+            // tr.identityLight * 32, clamped to tr.identityLightByte.
+            let identity = self.identity_light;
+            ambient = ambient.map(|value| value + identity * 32.0);
+            ambient = ambient.map(|value| value.clamp(0.0, (255.0 * identity).floor()));
         } else {
             ambient = ambient.map(|value| value.max(0.0));
         }
@@ -1576,6 +1581,10 @@ pub struct LegacyDlightSurface {
     pub plane: [f32; 4],
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
+    /// Bezier patch surface. q3map2's Jedi Academy profile (and Raven's q3map)
+    /// cast no sun shadows from patches unless -patchshadows was given, so the
+    /// authored-sun reconstruction must not treat them as occluders.
+    pub patch: bool,
 }
 
 #[derive(Clone)]

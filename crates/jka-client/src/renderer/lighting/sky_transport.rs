@@ -153,7 +153,15 @@ pub(super) fn bake(
         return None;
     }
     let started = std::time::Instant::now();
-    let samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(receivers, &key.sky_sizes, 1);
+    // Gutter luxels (just past each chart's edge, read by bilinear sampling)
+    // get their own nearest-chart sample. Without them a seam had no transport,
+    // fell back to the coarse packed sky openness, and could be room-protected
+    // as a bright line at night.
+    let mut charted = receivers.to_vec();
+    for (t, chart) in charted.iter_mut().zip(super::triangle_charts(receivers)) { t.owner = chart; }
+    let (samples, owners) = crate::renderer::static_ao::bvh::rasterize_lightmap_band(
+        &charted, &key.sky_sizes, super::LIGHTMAP_GUTTER_REACH,
+    );
     let total = samples.iter().map(|p| p.len() as u32).sum::<u32>().max(1);
     let done = AtomicU32::new(0);
     let pages: Vec<Vec<[f32; 2]>> = samples.par_iter().enumerate().map(|(page, samples)| {
@@ -169,9 +177,6 @@ pub(super) fn bake(
         }).collect()
     }).collect();
     if cancel.load(Ordering::Relaxed) { return None; }
-    let mut charted = receivers.to_vec();
-    for (t, chart) in charted.iter_mut().zip(super::triangle_charts(receivers)) { t.owner = chart; }
-    let owners = crate::renderer::static_ao::bvh::rasterize_lightmap_owners(&charted, &key.sky_sizes, 1);
     let pages = pages.into_par_iter().zip(&owners).zip(&key.sky_sizes)
         .map(|((page, owners), &size)| filter_page(&page, owners, size)).collect();
     if cancel.load(Ordering::Relaxed) { return None; }

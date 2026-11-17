@@ -459,7 +459,9 @@ impl DynamicModelRenderer {
                     color: skin.color,
                     params: [
                         bone_base,
-                        u32::from(classic_light.is_some()),
+                        // bit 1: JK2MV encoded-space light multiply.
+                        u32::from(classic_light.is_some())
+                            | (u32::from(classic_light.is_some() && super::types::jk2_encoded_entity_light()) << 1),
                         base_vertex,
                         u32::from(skin.env_map),
                     ],

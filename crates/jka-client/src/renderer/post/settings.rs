@@ -150,7 +150,8 @@ impl Renderer {
             self.blue_water_environment.moon_intensity,
             self.blue_water_environment.moon_intensity_custom,
         );
-        self.relighting_mode = effects.relighting_mode.min(2);
+        let old_relighting_mode = self.relighting_mode;
+        self.relighting_mode = effects.relighting_mode.min(3);
         self.sun_override = effects.sun_override;
         self.sky_sun_custom = effects.sky_sun_custom;
         if previous_sun.0 != self.sun_override && self.entity_fixture_lighting_ab {
@@ -201,6 +202,7 @@ impl Renderer {
                 self.baked_indirect_power, self.baked_indirect_highlight_preserve,
                 self.baked_sun_edge_softness, self.baked_sun_direct_limit)
             || previous_sun != current_sun
+            || old_relighting_mode != self.relighting_mode
             || old_sun_lighting != self.sun_lighting;
         // Defer the lighting uniform upload until AFTER the new sky and moon
         // settings are installed. Otherwise the first slider change writes the

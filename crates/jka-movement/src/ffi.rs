@@ -77,6 +77,7 @@ unsafe extern "C" {
         ci_legs: i32,
         ci_torso: i32,
         motion_matrix: *const f32,
+        player_relative_lean: i32,
         state: *mut PlayerAngleState,
         result: *mut PlayerAngleResult,
     ) -> i32;

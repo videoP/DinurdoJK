@@ -14,7 +14,25 @@ pub(super) fn overcast_direct_fraction(coverage_steps: u8) -> f32 {
     1.0 - 0.92 * coverage.powf(1.35)
 }
 
+/// Positive Y means the sunlight travels downward from below the horizon.
+/// Twilight starts shortly before sunset and reaches full darkness ~10 degrees
+/// below the horizon. Using the existing celestial direction keeps manual time,
+/// locked axes and system-time sampling on exactly the same schedule.
+pub(super) fn vanilla_sky_night_fraction(sun_travel_y: f32) -> f32 {
+    let t = ((sun_travel_y + 0.04) / 0.22).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 impl Renderer {
+    /// This affects authored vanilla sky only while Relight world is enabled.
+    /// With relighting off, JKA sky retains its authored RGB output.
+    pub(in crate::renderer) fn vanilla_sky_night_strength(&self) -> f32 {
+        if self.sky_backend != 0 || !self.sun_override {
+            return 0.0;
+        }
+        vanilla_sky_night_fraction(self.active_sun().direction[1])
+    }
+
     /// r_skyWorldGainMode inputs shared by every Blue Water world-gain consumer:
     /// [mode, authored toward-sun Y, 1, 0]. The reference is the BSP's own baked
     /// sun (q3map_sun, else the shadow-detected direction, which is searched for
@@ -269,5 +287,19 @@ mod overcast_tests {
         assert!(overcast_direct_fraction(10) < 1.0);
         assert!(overcast_direct_fraction(10) > overcast_direct_fraction(20));
         assert!((overcast_direct_fraction(20) - 0.08).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod vanilla_sky_night_tests {
+    use super::vanilla_sky_night_fraction;
+
+    #[test]
+    fn daytime_preserves_original_sky_and_twilight_is_smooth() {
+        assert_eq!(vanilla_sky_night_fraction(-0.4), 0.0);
+        assert_eq!(vanilla_sky_night_fraction(-0.04), 0.0);
+        assert!((vanilla_sky_night_fraction(0.07) - 0.5).abs() < 1e-5);
+        assert_eq!(vanilla_sky_night_fraction(0.18), 1.0);
+        assert_eq!(vanilla_sky_night_fraction(0.6), 1.0);
     }
 }

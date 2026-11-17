@@ -43,8 +43,21 @@ impl App {
                     self.set_sun_override(enabled, enabled);
                 }
             });
-        let mode = if self.video.environment_mode == 0 { "Baked" } else { "Realtime" };
+        let light_mode = self.video.enabled_relighting_mode();
+        let mode = match light_mode { 1 => "Baked", 2 => "Realtime additive", _ => "Fully realtime" };
         theme::hint(ui, &format!("Environment mode: {mode}. Sky controls and rendering mode are on Sky; settings are retained when world relighting is off."), theme::TEXT_DIM());
+        if self.video.active_relighting_mode() == 3 {
+            let defaults = VideoSettings::default();
+            self.baked_slider(
+                ui,
+                "Ambient level",
+                "Flat indirect light that replaces the discarded lightmap in Fully realtime (1.0 = 25% grey before sky gain). Shares the Baked indirect brightness setting. Direct light comes from the live sun/moon and map lights only.",
+                theme::Reset::None,
+                0.0..=2.0,
+                defaults.baked_indirect_scale,
+                |v| &mut v.baked_indirect_scale,
+            );
+        }
         if theme::ghost_button(ui, "OPEN SKY / TIME & SUN").clicked() {
             self.video_section = VideoSection::Sun;
         }
@@ -266,7 +279,7 @@ impl App {
             }
             ui.add_enabled_ui(baked_sun_ready, |ui| {
                 theme::row(ui, "Automatic sunlight removal",
-                    "Auto uses a single robust sun/shadow edge fit. Contour Guided fits local strengths along shadow contours and conservatively estimates nearby bounce gradients; corrections blend smoothly on the same BSP lightmap chart. Both modes are background-baked and cached.",
+                    "Auto uses one map-wide strength: the median of local shadow-edge fits, one vote per 128-unit world zone. Contour Guided keeps each zone's own strength and fades between neighbouring zones (across lightmap charts), so bounce differences around the map are respected. Both modes are background-baked and cached.",
                     theme::Reset::None, |ui| {
                         ui.horizontal(|ui| {
                             if ui.selectable_label(self.video.baked_sun_removal_auto && !self.video.baked_sun_removal_contour, "Auto").clicked() {
@@ -308,7 +321,7 @@ impl App {
                                 });
                             }
                             crate::renderer::BakedSunAutoStatus::ContourGuided => {
-                                ui.label("Contour-guided field ready (variable strength + local bounce)");
+                                ui.label("Zone field ready (local strength per 128-unit zone)");
                             }
                             crate::renderer::BakedSunAutoStatus::Calibrating => {
                                 ui.label("Calibrating...");

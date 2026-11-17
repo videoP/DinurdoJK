@@ -147,10 +147,14 @@ impl App {
         // ----------------------------------------------------- rendering --
         theme::section(ui, "ENVIRONMENT RENDERING", "One shared quality/update mode for the visible sky and world relighting (if enabled).");
         if let Some(mode) = segmented_row(ui, "Rendering mode",
-            "Baked caches clear Blue Water sky faces and cached world illumination; editing time automatically refreshes affected caches. Realtime evaluates sky and enabled relighting live. Baked system time is sampled once per map load.",
-            theme::Reset::None, self.video.environment_mode,
-            &[(0u8, "Baked"), (1u8, "Realtime")]) {
-            self.set_environment_mode(mode);
+            "Baked caches clear Blue Water sky faces and cached world illumination; editing time automatically refreshes affected caches. Realtime additive evaluates sky and enabled relighting live over the authored lightmap. Fully realtime also ignores the authored lightmap entirely (nothing is baked): flat ambient (Ambient level on Relighting) plus live sun/moon and map lights. Baked system time is sampled once per map load.",
+            theme::Reset::None,
+            if self.video.environment_mode == 0 { 0u8 } else if self.video.relighting_mode == 3 { 2 } else { 1 },
+            &[(0u8, "Baked"), (1u8, "Realtime additive"), (2u8, "Fully realtime")]) {
+            // set_environment_mode keeps a stored Fully realtime choice, so
+            // pick the target relighting_mode before applying the environment.
+            self.video.relighting_mode = match mode { 0 => 1, 1 => 2, _ => 3 };
+            self.set_environment_mode(mode.min(1));
         }
         theme::hint(ui, if self.video.sun_override {
             "World relighting is enabled: it follows this shared environment mode."

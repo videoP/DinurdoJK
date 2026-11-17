@@ -31,7 +31,7 @@ app_cvars! {
     }
 
     APP_R_RELIGHTMAP {
-        runtime: CvarDef::new("r_relightMap", "", "0|1|2", "0 Off: authored illumination. 1 Baked: existing cached relighting and saved nearby world shadows. 2 Realtime: live Sky world lighting and world CSM. Sun and moon positions are on Sky; r_sunOverride is a legacy alias.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_relightMap", "", "0|1|2|3", "0 Off: authored illumination. 1 Baked: existing cached relighting and saved nearby world shadows. 2 Realtime additive: live Sky world lighting and world CSM over the authored lightmap. 3 Fully realtime: the authored lightmap is ignored; flat ambient (r_bakedIndirectScale) plus live sun/moon CSM and map lights. Sun and moon positions are on Sky; r_sunOverride is a legacy alias.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(app.video.active_relighting_mode().to_string()),
             |app, value| App::cvar_set_r_relightmap(app, APP_R_RELIGHTMAP.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_relightmap, None),
         config: CvarBinding {
@@ -39,7 +39,7 @@ app_cvars! {
                 if let Some(mode) = crate::ui::VideoSettings::parse_relighting_mode(value) {
                     settings.relighting_mode = mode;
                     settings.sun_override = mode != 0;
-                    if mode != 0 { settings.environment_mode = mode - 1; }
+                    if mode != 0 { settings.environment_mode = (mode - 1).min(1); }
                 }
             }),
             archive: Some((56, |state| state.video.active_relighting_mode().to_string())),
@@ -48,7 +48,7 @@ app_cvars! {
         implementations: [impl App {
             fn cvar_set_r_relightmap(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let mode = crate::ui::VideoSettings::parse_relighting_mode(value)
-                    .ok_or_else(|| format!("{name}: expected 0 (Off), 1 (Baked), or 2 (Realtime)"))?;
+                    .ok_or_else(|| format!("{name}: expected 0 (Off), 1 (Baked), 2 (Realtime additive), or 3 (Fully realtime)"))?;
                 self.set_relighting_mode(mode);
                 Ok(())
             }
@@ -69,7 +69,9 @@ app_cvars! {
                 };
                 if let Some(mode) = mode {
                     settings.environment_mode = mode;
-                    if settings.sun_override { settings.relighting_mode = mode + 1; }
+                    if settings.sun_override {
+                        settings.relighting_mode = if mode == 0 { 1 } else if settings.relighting_mode == 3 { 3 } else { 2 };
+                    }
                 }
             }),
             archive: Some((57, |state| state.video.environment_mode.to_string())),
@@ -2259,7 +2261,7 @@ app_cvars! {
     }
 
     APP_R_BAKEDSUNREMOVALCONTOUR {
-        runtime: CvarDef::new("r_bakedSunRemovalContour", "", "0|1", "Use the cached contour-guided original sunlight removal field: local shadow-edge direct fits plus conservative nearby bounced-light gradients. 0 returns to Auto or manual. Fails closed when the lightmap has insufficient valid contours.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_bakedSunRemovalContour", "", "0|1", "Use the cached zone-guided original sunlight removal field: shadow-edge strength fits pooled per 128-unit world zone and blended smoothly between zones. 0 returns to Auto or manual. Fails closed when the lightmap has too few zones with shadow edges.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(bool_value(app.video.baked_sun_removal_contour)),
             |app, value| App::cvar_set_r_bakedsunremovalcontour(app, APP_R_BAKEDSUNREMOVALCONTOUR.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_bakedsunremovalcontour, None),
         config: CvarBinding {
@@ -2542,7 +2544,7 @@ app_cvars! {
     }
 
     APP_R_SKYWORLDLIGHTISOLATION {
-        runtime: CvarDef::new("r_skyWorldLightIsolation", "0", "0|1", "Protect authored room lighting using cached direct and two-bounce sky transport (0 legacy, 1 transport-weighted). Outdoor shadows follow day/night lighting; sealed rooms retain their authored illumination. Baked: use r_skyWorldBakeAB 1. Realtime: route static BSP sky into the cached composition while retaining live CSM shadows. Approximate: original BSP lightmaps do not separate sky GI from every compiled point light.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_skyWorldLightIsolation", "1", "0|1", "Protect authored room lighting using cached direct and two-bounce sky transport (0 legacy, 1 transport-weighted). Outdoor shadows follow day/night lighting; sealed rooms retain their authored illumination. Baked: use r_skyWorldBakeAB 1. Realtime: route static BSP sky into the cached composition while retaining live CSM shadows. Approximate: original BSP lightmaps do not separate sky GI from every compiled point light.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(bool_value(app.video.sky_world_light_isolation)),
             |app, value| App::cvar_set_r_skyworldlightisolation(app, APP_R_SKYWORLDLIGHTISOLATION.entry.name, &value.to_string()))
             .with_text_setter(App::cvar_set_r_skyworldlightisolation, None),
@@ -5268,91 +5270,6 @@ app_cvars! {
                 }
             }
         ]
-    }
-
-    APP_R_LEGACYBLENDTRANSFER {
-        runtime: CvarDef::new(
-            "r_legacyBlendTransfer", "4", "0..4",
-            "Model-blend mode (default 4, archived): 0 exact 16-bit encoded intermediate+resolve (reference); 1 8-bit encoded intermediate; 2 native blend+resolve; 3 native blend without forced resolve; 4 direct encoded-space blend into the SDR swapchain UNORM alias (no transfers; automatically falls back to mode 0 for HDR/MSAA/offscreen/post).",
-            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
-            |_app| CvarValue::String(crate::renderer::legacy_blend_mode().to_string()),
-            |app, value| App::cvar_set_r_legacyblendtransfer(app, APP_R_LEGACYBLENDTRANSFER.entry.name, &value.to_string()),
-        ).with_text_setter(App::cvar_set_r_legacyblendtransfer, None),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                settings.legacy_blend_transfer = value.trim().parse::<u8>().ok().filter(|v| *v <= 4).unwrap_or(settings.legacy_blend_transfer);
-            }),
-            archive: Some((37126, |state| state.video.legacy_blend_transfer.to_string())),
-            ..CvarBinding::NONE
-        },
-        implementations: [impl App {
-            fn cvar_set_r_legacyblendtransfer(&mut self, name: &str, value: &str) -> Result<(), String> {
-                let mode = value.trim().parse::<u8>()
-                    .map_err(|_| format!("{name} expects 0, 1, 2, 3 or 4"))?;
-                if mode > 4 { return Err(format!("{name} expects 0, 1, 2, 3 or 4")); }
-                crate::renderer::set_legacy_blend_mode(mode);
-                if self.video.legacy_blend_transfer != mode {
-                    self.video.legacy_blend_transfer = mode;
-                    self.mark_config_dirty();
-                }
-                self.console_status = format!("LEGACY MODEL TRANSFERS: {}", match mode {
-                    0 => "16-bit encoded reference",
-                    1 => "8-bit encoded A/B",
-                    2 => "native blend with resolve",
-                    3 => "native blend without legacy-forced resolve",
-                    _ => "direct SDR UNORM alias (unsupported targets fall back to mode 0)",
-                });
-                Ok(())
-            }
-        }]
-    }
-
-    APP_R_LEGACYSCENEALIAS {
-        runtime: CvarDef::new(
-            "r_legacySceneAlias", "1", "0..1",
-            "Legacy model-blend scene alias A/B (session-only, live). 1: when r_legacyBlendTransfer 4 cannot draw into the swapchain (gamma/post, MSAA) but the scene target is 8-bit sRGB, additive/legacy model effects blend in display space through a UNORM view of that same scene target (lighting stays linear, no copies; MSAA adds a resolve scissored to the effects). 0: use the FP16 encode/decode transfer (r_legacyBlendBounds). FP16 scenes (HDR, glow, halation) always use the transfer.",
-            CvarType::String, CvarFlags::NONE, LatchScope::None,
-            |_app| CvarValue::String(u8::from(crate::renderer::legacy_scene_alias()).to_string()),
-            |app, value| App::cvar_set_r_legacyscenealias(app, APP_R_LEGACYSCENEALIAS.entry.name, &value.to_string()),
-        ).with_text_setter(App::cvar_set_r_legacyscenealias, None),
-        config: CvarBinding::NONE,
-        implementations: [impl App {
-            fn cvar_set_r_legacyscenealias(&mut self, name: &str, value: &str) -> Result<(), String> {
-                let enabled = match value.trim() {
-                    "0" => false,
-                    "1" => true,
-                    _ => return Err(format!("{name} expects 0 or 1")),
-                };
-                crate::renderer::set_legacy_scene_alias(enabled);
-                self.console_status = format!("LEGACY SCENE ALIAS: {}",
-                    if enabled { "display-space blend into the scene target" } else { "FP16 transfer" });
-                Ok(())
-            }
-        }]
-    }
-
-    APP_R_LEGACYBLENDBOUNDS {
-        runtime: CvarDef::new(
-            "r_legacyBlendBounds", "2", "0..2",
-            "Legacy model-blend transfer bounds A/B (session-only, live). Applies when r_legacyBlendTransfer 4 falls back to the HDR/offscreen transfer (post, MSAA, glass): 0 original (MSAA or GPU-skinned shells such as a saber hilt glow encode/decode the whole frame); 1 scissor encode/decode to the shells' projected bounds, including MSAA and GPU-skinned Ghoul2; 2 = 1 and, with MSAA, replace the two full-frame resolves with scissored shader resolves.",
-            CvarType::String, CvarFlags::NONE, LatchScope::None,
-            |_app| CvarValue::String(crate::renderer::legacy_blend_bounds().to_string()),
-            |app, value| App::cvar_set_r_legacyblendbounds(app, APP_R_LEGACYBLENDBOUNDS.entry.name, &value.to_string()),
-        ).with_text_setter(App::cvar_set_r_legacyblendbounds, None),
-        config: CvarBinding::NONE,
-        implementations: [impl App {
-            fn cvar_set_r_legacyblendbounds(&mut self, name: &str, value: &str) -> Result<(), String> {
-                let mode = value.trim().parse::<u8>().ok().filter(|mode| *mode <= 2)
-                    .ok_or_else(|| format!("{name} expects 0, 1 or 2"))?;
-                crate::renderer::set_legacy_blend_bounds(mode);
-                self.console_status = format!("LEGACY BLEND BOUNDS: {}", match mode {
-                    0 => "original (full-frame for MSAA / GPU-skinned)",
-                    1 => "bounded incl. MSAA + GPU-skinned",
-                    _ => "bounded + scissored MSAA resolves",
-                });
-                Ok(())
-            }
-        }]
     }
 
     APP_R_PLANARREFLECTIONMASK {

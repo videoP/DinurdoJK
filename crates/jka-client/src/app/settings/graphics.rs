@@ -371,7 +371,11 @@ impl App {
             // mutating the saved quality-preset or ordinary shadow selection.
         }
         self.video.sun_override = enabled;
-        self.video.relighting_mode = if enabled { self.video.environment_mode.min(1) + 1 } else { 0 };
+        // Disabling keeps the stored choice (active_relighting_mode() reports 0
+        // while off) so Fully Realtime survives a Relight world off/on cycle.
+        if enabled {
+            self.video.relighting_mode = self.video.enabled_relighting_mode();
+        }
         if !enabled {
             self.baked_sun_debug_view = 0;
             self.sun_ray_until = None;
@@ -383,7 +387,7 @@ impl App {
         self.sync_post_effects();
         // The same master gate is used by r_relightMap / r_sunOverride and
         // the menu; enable live clock tracking on either entry path.
-        if enabled && self.video.relight_match_system_time && self.video.active_relighting_mode() == 2 {
+        if enabled && self.video.relight_match_system_time && self.video.active_relighting_mode() >= 2 {
             self.sync_relighting_system_clock(false, true);
         }
         self.mark_config_dirty();
@@ -392,7 +396,9 @@ impl App {
 
     pub(in crate::app) fn set_relighting_mode(&mut self, mode: u8) {
         if mode != 0 {
+            // 2 Realtime additive and 3 Fully realtime share the Realtime sky.
             self.video.environment_mode = mode.min(2) - 1;
+            self.video.relighting_mode = mode.min(3);
         }
         self.set_sun_override(mode != 0, mode != 0);
         self.render_command(RenderCommand::SetBlueSkyCubeAB(
@@ -403,7 +409,9 @@ impl App {
     /// One shared Baked/Realtime choice, even if world relighting is off.
     pub(in crate::app) fn set_environment_mode(&mut self, mode: u8) {
         self.video.environment_mode = mode.min(1);
-        self.video.relighting_mode = if self.video.sun_override { self.video.environment_mode + 1 } else { 0 };
+        if self.video.sun_override {
+            self.video.relighting_mode = self.video.enabled_relighting_mode();
+        }
         self.render_command(RenderCommand::SetBlueSkyCubeAB(
             if self.video.environment_mode == 0 { self.video.blue_sky_cube_ab } else { 0 },
         ));

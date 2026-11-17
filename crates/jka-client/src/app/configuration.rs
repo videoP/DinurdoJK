@@ -126,6 +126,7 @@ impl App {
             swim_tilt: self.swim_tilt,
             swim_turn_bank: self.swim_turn_bank,
             move_lean: self.move_lean,
+            jk2_lean_fix: self.jk2_lean_fix,
             zoom_fov: self.japro_zoom_fov,
             view_bob: self.view_bob,
             view_weapon: self.view_weapon,

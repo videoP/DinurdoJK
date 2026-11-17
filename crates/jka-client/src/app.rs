@@ -952,6 +952,8 @@ pub struct App {
     swim_turn_bank: f32,
     /// Archived speed + acceleration/braking player body pitch.
     move_lean: f32,
+    /// Archived JK2 1.02-only player-relative velocity lean correction.
+    jk2_lean_fix: bool,
     /// DinurdoJK compact player-model visibility override. `0` disables; one
     /// model applies to all other players; `ally,enemy` splits team relations.
     force_model: String,

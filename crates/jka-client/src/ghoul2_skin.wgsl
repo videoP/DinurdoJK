@@ -341,7 +341,13 @@ fn vs_main(input: VertexIn, @builtin(instance_index) draw_index: u32) -> VertexO
             vec3<f32>(0.0),
             vec3<f32>(1.0),
         );
-        draw_color = vec4<f32>(draw.color.rgb * lighting, draw.color.a);
+        var applied = lighting;
+        if ((draw.params.y & 2u) != 0u) {
+            // JK2MV multiplies these bytes in encoded framebuffer space.
+            applied = select(pow((lighting + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)),
+                lighting / 12.92, lighting <= vec3<f32>(0.04045));
+        }
+        draw_color = vec4<f32>(draw.color.rgb * applied, draw.color.a);
     }
     if (!is_disintegration(draw.color.a)) {
         draw_color.a = draw_color.a * specular_alpha(draw, world, world_normal);

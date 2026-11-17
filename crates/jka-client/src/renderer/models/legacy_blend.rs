@@ -21,13 +21,12 @@ pub(in crate::renderer) type LegacyTransferRect = (u32, u32, u32, u32);
 
 /// Conservative CPU-world-geometry bounds for legacy HDR/offscreen blending.
 ///
-/// Only the fallback from requested mode 4 uses this. Explicit mode 0 stays
-/// completely full-frame as an image-correctness reference. A failed proof
-/// deliberately returns None (full-frame), never a guessed rectangle.
+/// Used by the mode-4 fallback transfer and the scene alias's MSAA resolve.
+/// A failed proof deliberately returns an error (full-frame), never a guessed
+/// rectangle.
 /// This never changes the format or dimensions of the FP16 scene/encoded target.
 pub(in crate::renderer) fn bounded_legacy_transfer_rect(
     surfaces: &[DynamicModelSurface], view_proj: Mat4, width: u32, height: u32,
-    gpu_skinned_bounds: bool,
 ) -> Result<LegacyTransferRect, &'static str> {
     if width == 0 || height == 0 { return Err("zero_extent"); }
     let mut min_x = f32::INFINITY;
@@ -38,23 +37,18 @@ pub(in crate::renderer) fn bounded_legacy_transfer_rect(
     let mut total_vertices = 0usize;
     for surface in surfaces.iter().filter(|s| eligible(s.alpha_mode)) {
         // RT-only casters never reach colour, so they cannot need a transfer.
-        if gpu_skinned_bounds && !surface.raster_visible { continue; }
+        if !surface.raster_visible { continue; }
         // GPU FX sprites (saber blade glow/core, flares) never draw in the
         // encoded pass (draw_phase_inner skips them for legacy_effects), so
-        // they need no transfer region. Mode 0 keeps the original rejection.
-        if surface.fx_gpu_sprites.is_some() {
-            if gpu_skinned_bounds { continue; }
-            return Err("fx_gpu_sprites");
-        }
+        // they need no transfer region.
+        if surface.fx_gpu_sprites.is_some() { continue; }
         if let Some(skin) = surface.ghoul2_gpu.as_ref() {
-            // Source vertices are bind-pose, NOT world positions. Without the
-            // r_legacyBlendBounds A/B, keep the original full-frame fallback.
-            if !gpu_skinned_bounds { return Err("ghoul2_gpu"); }
+            // Source vertices are bind-pose, NOT world positions: skin them.
             total_vertices = total_vertices.saturating_add(skin.vertices.len());
             if total_vertices > 24_000 { return Err("vertex_budget"); }
             let (lo, hi) = ghoul2_render_bounds(skin)?;
             // Entirely behind the camera: nothing of it can be rasterized.
-            let Some((x0, y0, x1, y1)) = surface_screen_rect(lo, hi, view_proj, width, height, true)?
+            let Some((x0, y0, x1, y1)) = surface_screen_rect(lo, hi, view_proj, width, height)?
             else { continue; };
             min_x = min_x.min(x0);
             min_y = min_y.min(y0);
@@ -82,8 +76,7 @@ pub(in crate::renderer) fn bounded_legacy_transfer_rect(
                 hi[axis] = hi[axis].max(v);
             }
         }
-        let Some((x0, y0, x1, y1)) =
-            surface_screen_rect(lo, hi, view_proj, width, height, gpu_skinned_bounds)?
+        let Some((x0, y0, x1, y1)) = surface_screen_rect(lo, hi, view_proj, width, height)?
         else { continue; };
         min_x = min_x.min(x0);
         min_y = min_y.min(y0);
@@ -92,31 +85,21 @@ pub(in crate::renderer) fn bounded_legacy_transfer_rect(
         seen = true;
     }
     if !seen {
-        // Bounds A/B: every eligible surface was skipped (GPU sprites, RT-only,
-        // or entirely behind the camera), so the encoded pass rasterizes
-        // nothing. A 1-pixel transfer replaces the full-frame fallback.
-        if gpu_skinned_bounds { return Ok((0, 0, 1, 1)); }
-        return Err("no_bounded_surface");
+        // Every eligible surface was skipped (GPU sprites, RT-only, or
+        // entirely behind the camera), so the encoded pass rasterizes nothing.
+        return Ok((0, 0, 1, 1));
     }
     padded_transfer_rect((min_x, min_y, max_x, max_y), width, height).ok_or("near_fullscreen")
 }
 
-/// Screen bounds of a renderer-space AABB. `clip_camera_plane` (r_legacyBlendBounds
-/// >= 1) clips the box edges at a tiny positive w instead of rejecting a box
-/// that crosses the camera plane, so a large effect mesh around the viewer
+/// Screen bounds of a renderer-space AABB. Box edges are clipped at a tiny
+/// positive w instead of rejecting a box that crosses the camera plane, so a large effect mesh around the viewer
 /// (e.g. map light cones) still yields a conservative rectangle; points at that
 /// plane project far off-screen and are clamped by `padded_transfer_rect`.
 /// Ok(None): the box is entirely behind the camera and cannot draw.
 fn surface_screen_rect(
     lo: [f32; 3], hi: [f32; 3], view_proj: Mat4, width: u32, height: u32,
-    clip_camera_plane: bool,
 ) -> Result<Option<(f32, f32, f32, f32)>, &'static str> {
-    if !clip_camera_plane {
-        let rect = crate::renderer::aabb_screen_rect(lo, hi, view_proj, width, height)
-            .ok_or("camera_plane")?;
-        if ![rect.0, rect.1, rect.2, rect.3].iter().all(|v| v.is_finite()) { return Err("non_finite"); }
-        return Ok(Some(rect));
-    }
     const MIN_W: f32 = 1.0e-4;
     let corner = |i: usize| view_proj * glam::Vec4::new(
         if i & 1 == 0 { lo[0] } else { hi[0] },
@@ -279,7 +262,7 @@ pub(in crate::renderer) struct LegacyModelBlend {
     /// always this object's own target. Rebuilt when the scene view changes.
     world_encode_source: Option<(wgpu::TextureView, wgpu::BindGroup)>,
     world_decode_source: Option<wgpu::BindGroup>,
-    /// Model-path MSAA only (r_legacyBlendBounds 2): decode that averages the
+    /// Model-path MSAA only: decode that averages the
     /// encoded samples itself, so a bounded transfer needs no full-frame
     /// hardware resolves. Pipelines: [0] MSAA scene target, [1] resolved scene.
     msaa_resolve_decode: Option<(wgpu::BindGroupLayout, [wgpu::RenderPipeline; 2])>,
@@ -784,7 +767,6 @@ impl DynamicModelRenderer {
         camera: &wgpu::BindGroup,
         native_unorm_view: Option<&wgpu::TextureView>,
         transfer_rect: Option<LegacyTransferRect>,
-        bounded_msaa_resolve: bool,
     ) {
         if !self.legacy_blend_active() {
             return;
@@ -878,15 +860,15 @@ impl DynamicModelRenderer {
             return;
         }
         let blend = self.legacy_blend.as_ref().unwrap();
-        // r_legacyBlendBounds 2: with MSAA and a bounded rect, skip both
+        // With MSAA and a bounded rect, skip both
         // full-frame hardware resolves. Inside the rect the decode averages the
         // encoded samples itself (the resolve's box filter) and writes the same
         // value to the MSAA scene and the resolved scene; outside it neither
         // target changes, and the scene already equals resolve(MSAA scene).
-        let manual_resolve = match (bounded_msaa_resolve, transfer_rect, msaa,
+        let manual_resolve = match (transfer_rect, msaa,
             blend.msaa_view.as_ref(), blend.msaa_resolve_decode.as_ref())
         {
-            (true, Some(rect), Some(msaa_scene), Some(encoded), Some((layout, pipelines))) =>
+            (Some(rect), Some(msaa_scene), Some(encoded), Some((layout, pipelines))) =>
                 Some((rect, msaa_scene, encoded, layout, pipelines)),
             _ => None,
         };

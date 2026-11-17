@@ -1634,6 +1634,8 @@ pub(in crate::renderer) fn render_thread_main(
                             renderer.overbright_bits = bits;
                             let color_mode_changed = renderer.jk2_legacy_color != jk2_mode;
                             renderer.jk2_legacy_color = jk2_mode;
+                            super::models::types::JK2_ENCODED_ENTITY_LIGHT
+                                .store(jk2_mode, std::sync::atomic::Ordering::Relaxed);
                             if color_mode_changed {
                                 if let Some(world) = renderer.world.as_mut() {
                                     world.fast_pipelines.clear();
@@ -3690,7 +3692,7 @@ pub(in crate::renderer) fn render_thread_main(
                 .chain(renderer.dynamic_model_renderer.skin_draws.iter().map(|d| d.alpha_mode))
                 .filter(|m| crate::renderer::models::legacy_blend::eligible(*m)).count();
             let effective_blend_mode = renderer.dynamic_model_renderer.legacy_blend_mode;
-            let requested_blend_mode = crate::renderer::legacy_blend_mode();
+            let requested_blend_mode = 4u8;
             let effective_blend_format = if effective_blend_mode == 4 {
                 renderer.config.format.remove_srgb_suffix()
             } else {

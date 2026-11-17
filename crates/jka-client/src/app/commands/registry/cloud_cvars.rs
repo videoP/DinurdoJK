@@ -302,7 +302,7 @@ app_cvars! {
         implementations:[impl App {fn cvar_set_bluesky_filmic(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.filmic=parse_bool(value).ok_or_else(||format!("{name} expects 0/1"))?; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]
     }
     APP_R_BLUESKYNIGHTSKY {
-        runtime:CvarDef::new("r_blueSkyNightSky","1","0.0..1.0","Night sky dome glow and ocean sky reflection; not moonlight/world lighting",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
+        runtime:CvarDef::new("r_blueSkyNightSky","0","0.0..1.0","Night sky dome glow and ocean sky reflection; not moonlight/world lighting",CvarType::String,CvarFlags::ARCHIVE,LatchScope::None,
             |app:&App|CvarValue::String(app.video.blue_water_environment.night_sky.to_string()),|app,value|App::cvar_set_bluesky_night_sky(app,APP_R_BLUESKYNIGHTSKY.entry.name,&value.to_string())).with_text_setter(App::cvar_set_bluesky_night_sky,None),
         config:CvarBinding {load_video:Some(|settings,_name,value,_context| {if let Ok(v)=value.parse::<f32>() {if v.is_finite() {settings.blue_water_environment.night_sky=v.clamp(0.0, 1.0) as f32;}}}),archive:Some((27327,|state|state.video.blue_water_environment.night_sky.to_string())),..CvarBinding::NONE},
         implementations:[impl App {fn cvar_set_bluesky_night_sky(app:&mut Self,name:&str,value:&str)->Result<(),String>{app.video.blue_water_environment.night_sky=App::parse_cvar_finite(name,value)?.clamp(0.0,1.0) as f32; app.sync_post_effects();app.mark_config_dirty();app.publish_ui();Ok(())}}]

@@ -188,6 +188,8 @@ pub struct ClientPresentationSettings {
     pub swim_turn_bank: f32,
     /// cg_moveLean: airborne acceleration/braking lean (0..1).
     pub move_lean: f32,
+    /// cg_jk2LeanFix: use player-relative JK2 1.02 velocity pitch; 1.04 stock.
+    pub jk2_lean_fix: bool,
     /// Userinfo / network cvars (name, rate, snaps, cl_maxpackets, ...).
     pub network: crate::net::NetworkSettings,
     /// jaPRO cgame options: `cg_stylePlayer`, the race timer, spectator aids.
@@ -470,6 +472,7 @@ impl Default for ClientPresentationSettings {
             swim_tilt: 0.9,
             swim_turn_bank: 1.0,
             move_lean: 0.75,
+            jk2_lean_fix: false,
             network: crate::net::NetworkSettings::default(),
             japro: crate::japro_cg::JaproCgame::default(),
             master_servers: crate::server_browser::DEFAULT_MASTER_CVARS.map(str::to_owned),
@@ -1018,14 +1021,13 @@ mod tests {
         video.collision_world = true;
         video.shitter_texture = true;
         video.competitive_ab = 5;
-        video.legacy_blend_transfer = 4;
         save_video_settings(&path, video, &crate::keybinds::Bindings::default(),
             &ClientPresentationSettings::default(), &AudioSettings::default()).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         for (name, value) in [
             ("r_igpuAB", "19"), ("r_igpuMemoryAB", "1"), ("r_rgb565", "1"),
             ("r_collisionWorld", "1"), ("r_shitterTexture", "1"),
-            ("r_competitiveAB", "5"), ("r_legacyBlendTransfer", "4"),
+            ("r_competitiveAB", "5"),
         ] {
             assert!(text.contains(&format!("seta {name} \"{value}\"")), "{name}");
         }
@@ -1037,7 +1039,6 @@ mod tests {
         assert!(loaded.collision_world);
         assert!(loaded.shitter_texture);
         assert_eq!(loaded.competitive_ab, 5);
-        assert_eq!(loaded.legacy_blend_transfer, 4);
         // Each value is an ordinary independent preference. No preset replay
         // should undo a manual choice, and older configs retain safe defaults.
         fs::write(&path, "seta r_collisionWorld \"0\"\nseta r_rgb565 \"1\"\n").unwrap();

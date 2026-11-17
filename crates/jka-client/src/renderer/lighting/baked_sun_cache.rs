@@ -907,7 +907,7 @@ impl Renderer {
         // or residual-light grading for the duration of a mouse press.
         // Realtime sky-only lighting changes are GPU recompositions over fixed
         // receivers, not CPU traces. Keep them responsive during slider drags.
-        if self.sun_bake_deferred && !(self.sun_override && self.relighting_mode == 2) { return; }
+        if self.sun_bake_deferred && !(self.sun_override && self.relighting_mode >= 2) { return; }
         let sun = self.relit_celestial();
         let moon_light = if self.blue_water_night() {
             let direction = self.blue_water_moon_toward();
@@ -935,7 +935,8 @@ impl Renderer {
         // A Realtime protected sky needs cached receivers, not a cached sun.
         // Its sky openness/transport is independent of time and sun direction.
         let sky_ready = self.baked_sun_cache && world.static_sun.sky_ready();
-        let local_ready = (self.added_map_light_sources() != 0) && world.static_sun.local_ready();
+        let local_ready = (self.added_map_light_sources() != 0) && !self.fully_realtime_world()
+            && world.static_sun.local_ready();
         let explicit_sun = self.sun_lighting || (self.sun_override && self.blue_water_night());
         // All sky displays share the relighting environment and celestial key.
         let sky_light = if sky_ready && self.sun_override && self.sky_world_bake_ab != 0
@@ -1055,20 +1056,19 @@ impl Renderer {
                 smoothing,
                 signal,
                 &world.static_sun.flux,
+                // The full-resolution RGB lamp sum (layers R, G, B). Unit
+                // colours make the compositor's colour-weighted layer loop
+                // reproduce it exactly; per-light colours are already applied.
+                // Reduced per-light layers remain for moving-shadow terms only.
                 if local_ready {
-                    &world.static_sun.local_flux
+                    &world.static_sun.local_totals
                 } else {
                     &[]
                 },
-                &if local_ready {
-                    world
-                        .static_sun
-                        .local_lights
-                        .iter()
-                        .map(|(_, l)| [l.color[0], l.color[1], l.color[2], 1.0])
-                        .collect::<Vec<_>>()
+                if local_ready {
+                    &[[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0]][..]
                 } else {
-                    Vec::new()
+                    &[]
                 },
                 sky_light.map(|_| SkyInputs {
                     normals: &world.static_sun.sky_normals,

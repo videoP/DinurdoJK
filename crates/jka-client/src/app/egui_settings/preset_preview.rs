@@ -355,7 +355,7 @@ mod tests {
     fn scoped_mapping_matches_visible_rows() {
         for preset in QualityPreset::ALL {
             for (name, _) in preset.settings() {
-                if ["r_pvsMode", "r_igpuAB", "r_igpuMemoryAB", "r_fragmentShaderMode", "r_competitiveAB", "r_colorClearMode", "r_legacyBlendTransfer", "r_fullbright", "r_vertexLight", "r_lightmap"].contains(&name) {
+                if ["r_pvsMode", "r_igpuAB", "r_igpuMemoryAB", "r_fragmentShaderMode", "r_competitiveAB", "r_colorClearMode", "r_fullbright", "r_vertexLight", "r_lightmap"].contains(&name) {
                     assert_eq!(preset_cvar_section(name), None);
                 } else {
                     assert!(preset_cvar_section(name).is_some(), "unmapped preset cvar: {name}");

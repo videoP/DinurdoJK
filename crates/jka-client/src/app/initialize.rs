@@ -68,7 +68,6 @@ impl App {
         crate::renderer::set_collision_world_only(video.collision_world);
         crate::renderer::set_shitter_texture_enabled(video.shitter_texture);
         crate::renderer::set_competitive_ab_mode(video.competitive_ab);
-        crate::renderer::set_legacy_blend_mode(video.legacy_blend_transfer);
         crate::logging::set_developer_level(video.developer_level);
         crate::logging::set_renderer_verbose_level(video.renderer_verbose);
         let audio = config::load_audio_settings(&config_path);
@@ -694,6 +693,7 @@ impl App {
             swim_tilt: presentation.swim_tilt,
             swim_turn_bank: presentation.swim_turn_bank,
             move_lean: presentation.move_lean,
+            jk2_lean_fix: presentation.jk2_lean_fix,
             force_model: presentation.force_model.clone(),
             forced_player_models,
             japro_zoom_fov: presentation.zoom_fov,

@@ -159,6 +159,7 @@ impl App {
         session.player_presenter.set_swim_tilt(self.swim_tilt);
         session.player_presenter.set_swim_turn_bank(self.swim_turn_bank);
         session.player_presenter.set_move_lean(self.move_lean);
+        session.player_presenter.set_jk2_lean_fix(self.jk2_lean_fix);
         session
             .player_presenter
             .set_saber_team_colors(self.saber_team_colors);

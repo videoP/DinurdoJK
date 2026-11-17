@@ -132,6 +132,19 @@ fn count_world_program_bind(info: &mut FrameInfo, binding: WorldPipelineBinding)
 }
 
 impl Renderer {
+    /// Legacy identityLight/color-space bits in camera render_flags.y.
+    /// Bit 17: overbright on, JK2 SDR (skybox halved in encoded space);
+    /// bit 18: overbright on, linear (skybox halved linearly). Either bit also
+    /// scales rgbGen wave by identityLight. Bit 19: JK2 encoded color
+    /// (rgbGen wave glow multiplies the encoded texel).
+    pub(in crate::renderer) fn overbright_sky_flag(&self) -> u32 {
+        let jk2_encoded = self.jk2_legacy_color && !self.hdr_enabled;
+        let overbright = if self.overbright_bits == 0 { 0 }
+            else if jk2_encoded { 1 << 17 }
+            else { 1 << 18 };
+        overbright | (u32::from(jk2_encoded) << 19)
+    }
+
     // Unified's planar far-water tail uses a black lower sky hemisphere. The
     // original curved Blue Water horizon needs the authored sky behind its
     // lower limb; suppressing that sky opens a black band above the water.
@@ -184,8 +197,10 @@ impl Renderer {
         } else {
             self.encoder_finish_threads
         };
-        // Keep post target selection and model drawing on the same A/B mode.
-        self.dynamic_model_renderer.legacy_blend_mode = crate::renderer::legacy_blend_mode();
+        // Legacy model effects always request the display-space path (mode 4);
+        // the per-frame gate below picks swapchain alias, scene alias, or the
+        // bounded FP16 transfer (mode 0) for targets neither alias can serve.
+        self.dynamic_model_renderer.legacy_blend_mode = 4;
         // Every frame path (asset preview, unified) is entered from
         // here, so one check covers them all. On a dead device the first queue
         // write of the frame fails silently and the panic surfaces wherever that
@@ -622,7 +637,7 @@ impl Renderer {
             // declares the view format on the scene and MSAA textures). Post
             // makes scene_output that target; MSAA aliases its MSAA texture.
             let scene_format = self.gameplay_scene_format();
-            legacy_scene_alias = !compatible && crate::renderer::legacy_scene_alias()
+            legacy_scene_alias = !compatible
                 && (plan.use_post || self.msaa_samples > 1)
                 && scene_format.is_srgb()
                 && self.dynamic_model_renderer.fx_sprite_surface_format == scene_format
@@ -929,7 +944,8 @@ impl Renderer {
                     | (u32::from(self.sky_fractal_override) << 1)
                     | (u32::from(self.motion_vectors_wanted() || self.rt_local_cache_wanted()) << 2)
                     | (u32::from(self.sky_perf_probe) << 8)
-                    | self.ocean_sky_horizon_flag()),
+                    | self.ocean_sky_horizon_flag()
+                    | self.overbright_sky_flag()),
                 self.classic_world_render_flags(),
                 if self.motion_vectors_wanted() {
                     self.taa_frame_index
@@ -1550,7 +1566,8 @@ impl Renderer {
                         1,
                         (u32::from(self.static_bsp_ao_enabled) | (u32::from(self.sky_fractal_override) << 1)
                             | (u32::from(self.sky_perf_probe) << 8)
-                            | self.ocean_sky_horizon_flag()),
+                            | self.ocean_sky_horizon_flag()
+                            | self.overbright_sky_flag()),
                         self.classic_world_render_flags(),
                         0,
                     ],
@@ -8054,26 +8071,21 @@ impl Renderer {
         // skinning, foliage deformation, camera-plane crossing, etc.) keeps
         // the original full-frame path. MSAA remains full-frame because its
         // attachment resolve is not scissor-limited.
-        // r_legacyBlendBounds A/B: 0 original (MSAA and GPU-skinned shells
-        // always full-frame); 1 also bound MSAA and GPU-skinned Ghoul2 shells;
-        // 2 = 1 plus scissored shader resolves instead of the full-frame MSAA
-        // hardware resolves.
-        let legacy_bounds_mode = crate::renderer::legacy_blend_bounds();
+        // Bound the fallback transfer (and the scene alias's MSAA resolve) to
+        // the projected legacy surfaces, including MSAA and GPU-skinned Ghoul2.
         let scene_alias_msaa = self.dynamic_model_renderer.legacy_scene_alias
             && self.dynamic_model_renderer.legacy_blend_mode == 4 && self.msaa_samples > 1;
         let legacy_transfer_bound = if scene_alias_msaa {
             // Scene alias: the rect only scissors its MSAA resolve.
             crate::renderer::models::legacy_blend::bounded_legacy_transfer_rect(
-                dynamic_models, view_proj, render_width, render_height, true)
+                dynamic_models, view_proj, render_width, render_height)
         } else if !legacy_mode4_fallback {
             Err("not_mode4_fallback")
-        } else if self.msaa_samples != 1 && legacy_bounds_mode == 0 {
-            Err("msaa")
         } else if self.studio_world_viewport.is_some() {
             Err("studio_viewport")
         } else {
             crate::renderer::models::legacy_blend::bounded_legacy_transfer_rect(
-                dynamic_models, view_proj, render_width, render_height, legacy_bounds_mode >= 1)
+                dynamic_models, view_proj, render_width, render_height)
         };
         let legacy_transfer_rect = legacy_transfer_bound.ok();
         if self.dynamic_model_renderer.legacy_blend_active() {
@@ -8093,7 +8105,7 @@ impl Renderer {
         }
         self.dynamic_model_renderer.composite_legacy_blend(&self.device,&mut encoder,
             scene_output,self.targets.msaa_view.as_ref(),&self.targets.depth_view,&self.camera_bind_group,
-            legacy_unorm_view.as_ref(),legacy_transfer_rect, legacy_bounds_mode >= 2);
+            legacy_unorm_view.as_ref(),legacy_transfer_rect);
         // In non-threaded mode, resolve after the last main scene pass closes.
         // Threaded mode already resolved in the prefix before handing it off.
         self.frame_time_graph.resolve_stats(&mut encoder);

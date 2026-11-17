@@ -181,6 +181,7 @@ fn one_atlas_sunlight_is_bit_identical_with_one_or_four_workers() {
                     &mut images,
                     &source.surface_ids,
                     source.surfaces.len(),
+                    &source.surfaces,
                     source.sun.unwrap(),
                     source.encoding.unwrap(),
                     &AtomicBool::new(false),

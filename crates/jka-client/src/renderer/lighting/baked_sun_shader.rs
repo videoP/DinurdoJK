@@ -15,7 +15,37 @@ fn sky_octahedral_decode(e:vec2<f32>)->vec3<f32> {
 // The Blue Water sky world illumination of blue_water_scene.wgsl `light`,
 // evaluated once per luxel with the bake's smoothed normal (and optional sky
 // visibility) instead of a per-pixel depth-derived facet normal.
-fn sky_world_gain(at:vec2<i32>)->vec3<f32> {
+// `authored_sun` = this luxel's authored-sun flux (the removal mask), 0 when
+// unknown. Room protection keeps authored light whose source is not the sky.
+// A luxel the authored sun reached is daylight by definition, even in a nook
+// with little sky-dome access (under a step lip, beside a balcony): protecting
+// it kept its daytime brightness at night as a crisp bright wedge.
+fn authored_sun_daylight_share(authored_sun:f32)->f32 {
+    return smoothstep(0.004,0.04,max(authored_sun,0.0));
+}
+// Strongest authored-sun mask within +/-2 original luxels (~32 units) on the
+// SAME atlas chart. One mask ray per luxel can clip a step lip or balcony
+// edge that q3map2's own sample cleared, so a sunlit nook may read zero at its
+// own luxel; a genuine room is far larger than this window. Never reads another
+// chart: neighbouring atlas islands are unrelated parts of the map.
+fn authored_sun_near(at:vec2<f32>)->f32 {
+    let dims=vec2<i32>(textureDimensions(source));
+    let p=clamp(vec2<i32>(round(at)),vec2(0),dims-1);
+    let own=textureLoad(source,p,0).a;
+    if any(dims!=vec2<i32>(textureDimensions(charts))) { return own; }
+    let owner=textureLoad(charts,p,0).r;
+    if owner==0u { return own; }
+    var best=own;
+    for (var y=-2; y<=2; y+=1) {
+        for (var x=-2; x<=2; x+=1) {
+            let q=clamp(p+vec2(x,y),vec2(0),dims-1);
+            if textureLoad(charts,q,0).r!=owner { continue; }
+            best=max(best,textureLoad(source,q,0).a);
+        }
+    }
+    return best;
+}
+fn sky_world_gain(at:vec2<i32>, authored_sun:f32)->vec3<f32> {
     if parameters.sky.y<0.5 { return vec3(1.0); }
     let packed=textureLoad(sky_normals,at,0).r;
     if (packed & 0x80000000u)==0u { return vec3(1.0); }
@@ -23,8 +53,14 @@ fn sky_world_gain(at:vec2<i32>)->vec3<f32> {
     let n=sky_octahedral_decode(e);
     let ambient_visibility=f32(packed&63u)/63.0;
     if parameters.sky.y>1.5 {
-        return vanilla_sky_gain(n,parameters.moon.xyz,ambient_visibility,parameters.sky.x,
-            parameters.smoothing.w > 0.5,parameters.gain);
+        let isolate=parameters.smoothing.w > 0.5;
+        let protected_gain=vanilla_sky_gain(n,parameters.moon.xyz,ambient_visibility,parameters.sky.x,
+            isolate,parameters.gain);
+        let sun_share=authored_sun_daylight_share(authored_sun);
+        if !isolate || sun_share<=0.0 { return protected_gain; }
+        let open_gain=vanilla_sky_gain(n,parameters.moon.xyz,ambient_visibility,parameters.sky.x,
+            false,parameters.gain);
+        return mix(protected_gain,open_gain,sun_share);
     }
     // Reuse the completed, edge-antialiased sun/moon bake at its native
     // resolution. Do not introduce a second shadow edge from the original
@@ -59,7 +95,7 @@ fn sky_world_gain(at:vec2<i32>)->vec3<f32> {
             let transported=sample_sky_transport(uv*vec2<f32>(textureDimensions(sky_transport))-0.5);
             if all(transported>=vec2(0.0)) { response=transported; }
         }
-        weight=sky_transport_daylight_share(response);
+        weight=max(sky_transport_daylight_share(response),authored_sun_daylight_share(authored_sun));
     }
     return mix(vec3(1.0),full_gain,parameters.sky.x*weight);
 }
@@ -140,6 +176,32 @@ fn sample_sky_transport(at:vec2<f32>)->vec2<f32> {{
     }}
     if weights<1e-5 {{ return vec2(-1.0); }}
     return response/weights;
+}}
+// Lamp sum at the original luxel grid: bilinear over the 2x2 taps of the
+// nearest luxel's own chart only (renormalized), like filtered_source. Always
+// chart-aware, independent of the smoothing toggle. Reduced or test-sized
+// inputs that do not match the chart map keep the plain lookup.
+fn sample_local_chart(uv:vec2<f32>, layer:i32)->f32 {{
+    let dims=vec2<i32>(textureDimensions(baked_local_texture));
+    if any(dims!=vec2<i32>(textureDimensions(charts))) {{ return sample_baked_local(uv,layer); }}
+    let at=uv*vec2<f32>(dims)-0.5;
+    let p=vec2<i32>(floor(at));
+    let f=fract(at);
+    let nearest=clamp(p+select(vec2(0),vec2(1),f>=vec2(0.5)),vec2(0),dims-1);
+    let owner=textureLoad(charts,nearest,0).r;
+    var total=0.0;
+    var weights=0.0;
+    for (var y=0; y<2; y+=1) {{
+        for (var x=0; x<2; x+=1) {{
+            let tap=clamp(p+vec2(x,y),vec2(0),dims-1);
+            if owner!=0u && textureLoad(charts,tap,0).r!=owner {{ continue; }}
+            let w=select(1.0-f.x,f.x,x==1)*select(1.0-f.y,f.y,y==1);
+            total+=max(textureLoad(baked_local_texture,tap,layer,0).r,0.0)*w;
+            weights+=w;
+        }}
+    }}
+    if weights<1e-5 {{ return max(textureLoad(baked_local_texture,nearest,layer,0).r,0.0); }}
+    return total/weights;
 }}
 fn filtered_source(at:vec2<f32>)->vec4<f32> {{
     let p=vec2<i32>(floor(at));
@@ -269,11 +331,12 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {{
     if parameters.curve.z > 0.0 {{
         if parameters.sun.w <= 0.0 {{ result = vec4(baked_indirect_tone(base.rgb),0.0); }}
         let uv=(vec2<f32>(id.xy)+0.5)/vec2<f32>(dims);
-        for (var i=0u;i<u32(parameters.curve.z);i+=1u) {{ local += local_colors[i].rgb*sample_baked_local(uv,i32(i)); }}
+        for (var i=0u;i<u32(parameters.curve.z);i+=1u) {{ local += local_colors[i].rgb*sample_local_chart(uv,i32(i)); }}
         if !keep_local {{ result = vec4(result.rgb + local, result.a); }}
     }}
     let explicit_sun=parameters.sun.w>0.0 && parameters.sun.w<1.5;
-    let gain=sky_world_gain(vec2<i32>(id.xy));
+    // Source alpha is the authored-sun removal mask whenever removal is active.
+    let gain=sky_world_gain(vec2<i32>(id.xy),select(0.0,authored_sun_near(at),parameters.fit.z==4.0));
     let gain_y=max(baked_luminance(gain),1e-4);
     result=vec4(result.rgb*gain,result.a*select(1.0,gain_y,explicit_sun));
     if keep_local {{ result = vec4(result.rgb + local, result.a); }}

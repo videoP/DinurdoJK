@@ -571,6 +571,7 @@ pub fn jk2_g2_player_angles(
     ci_legs: i32,
     ci_torso: i32,
     motion_matrix: Option<&[f32; 12]>,
+    player_relative_lean: bool,
     state: &mut PlayerAngleState,
 ) -> Result<PlayerAngleResult, String> {
     if version != 2 && version != 4 {
@@ -583,7 +584,7 @@ pub fn jk2_g2_player_angles(
             i32::from(version), input, time, lerp_origin.as_ptr(),
             lerp_angles.as_ptr(), frametime, ci_legs, ci_torso,
             motion_matrix.map_or(std::ptr::null(), |matrix| matrix.as_ptr()),
-            state, &mut result,
+            i32::from(player_relative_lean), state, &mut result,
         )
     };
     if ok == 0 {

@@ -11,6 +11,7 @@ use jka_assets::ghoul2::{multiply_3x4, GlaAnimation, Matrix3x4};
 use glam::Mat3;
 use rapier3d::{
     math::{Matrix, Pose, Rotation, Vector},
+    parry::{query::ShapeCastOptions, shape::Ball},
     prelude::*,
 };
 use std::collections::{HashMap, HashSet};
@@ -22,6 +23,18 @@ const RAPIER_TO_JKA: f32 = 1.0 / JKA_TO_RAPIER;
 const LIVING_RAGDOLL_RECOVERY_MS: i32 = 180;
 const KNOCKDOWN_RAGDOLL_RECOVERY_MS: i32 = 240;
 const JKA_GRAVITY: f32 = 800.0;
+/// Collider tag restricted to the server-event EV_DEBRIS / EV_GLASS_SHATTER
+/// rigid bodies promoted by r_breakables 1 (not gibs, players or map solids).
+const BREAKABLE_FRAGMENT_TAG: u128 = 0x4252_4541_4b41_424c_45;
+const PROJECTILE_SWEEP_RADIUS: f32 = 3.0 * JKA_TO_RAPIER;
+const PROJECTILE_IMPULSE_SPEED: f32 = 360.0 * JKA_TO_RAPIER;
+const EXPLOSION_RADIUS: f32 = 280.0 * JKA_TO_RAPIER;
+const EXPLOSION_IMPULSE_SPEED: f32 = 430.0 * JKA_TO_RAPIER;
+
+fn is_breakable_fragment(_handle: ColliderHandle, collider: &Collider) -> bool {
+    collider.user_data == BREAKABLE_FRAGMENT_TAG
+}
+
 // Volko61/better-ragdoll (solver.py Params, GPL-3.0-or-later): exact
 // angular spring / damping coefficients, in seconds and SI units.
 // Rapier's position solver remains responsible for anchors and collision;
@@ -330,6 +343,7 @@ struct GlassBody {
     /// Orientation of the authored pane at spawn; the visible vertices are
     /// stored in world space and transformed relative to this initial pose.
     initial_rotation: Rotation,
+    enhanced: bool,
     born_at: i32,
     activate_at: i32,
     expires_at: i32,
@@ -342,6 +356,14 @@ pub(crate) struct PhysicsPlayer {
     pub mins: [f32; 3],
     pub maxs: [f32; 3],
     pub teleport_bit: i32,
+}
+
+#[derive(Clone, Copy)]
+struct MissileSample {
+    position: Vector,
+    trajectory_time: i32,
+    sampled_at: i32,
+    last_hit: Option<RigidBodyHandle>,
 }
 
 struct PlayerCollider {
@@ -369,6 +391,7 @@ pub struct RagdollWorld {
     previous_body_poses: HashMap<RigidBodyHandle, Pose>,
     instances: HashMap<u16, RagdollInstance>,
     player_colliders: HashMap<u16, PlayerCollider>,
+    missile_samples: HashMap<u16, MissileSample>,
     detached_limbs: HashMap<u16, DetachedLimbBody>,
     debris: Vec<DebrisBody>,
     glass: Vec<GlassBody>,
@@ -404,6 +427,7 @@ impl RagdollWorld {
             previous_body_poses: HashMap::new(),
             instances: HashMap::new(),
             player_colliders: HashMap::new(),
+            missile_samples: HashMap::new(),
             detached_limbs: HashMap::new(),
             debris: Vec::new(),
             glass: Vec::new(),
@@ -445,6 +469,13 @@ impl RagdollWorld {
                 && (!self.debris.is_empty() || self.glass.iter().any(|g| g.body.is_some())))
     }
 
+    /// A live server-event breakable can be pushed even with r_ragdolls 0.
+    /// Do not create or update kinematic player proxies with no bodies to touch.
+    pub(crate) fn wants_player_contacts(&self) -> bool {
+        self.active() || (self.breakables_active()
+            && (!self.debris.is_empty() || !self.glass.is_empty()))
+    }
+
     pub fn debug_enabled(&self) -> bool {
         self.config.debug
     }
@@ -464,6 +495,7 @@ impl RagdollWorld {
     /// Drop only dynamic ragdoll state; keep the map collider and configuration.
     pub fn reset_dynamic_for_seek(&mut self) {
         self.clear_player_colliders();
+        self.missile_samples.clear();
         self.clear_instances();
         self.clear_detached_limbs();
         self.clear_debris();
@@ -528,7 +560,7 @@ impl RagdollWorld {
         // collider remains installed; only dynamic ragdoll instances are reset.
         if was_enabled && !self.config.enabled {
             self.clear_instances();
-            self.clear_player_colliders();
+            if !self.wants_player_contacts() { self.clear_player_colliders(); }
         }
         if physics_was_enabled && !self.config.physics_enabled {
             self.clear_detached_limbs();
@@ -553,6 +585,10 @@ impl RagdollWorld {
             || rebuild_debris || breakables_mode_changed) {
             self.clear_debris();
             self.clear_glass();
+        }
+        if !self.breakables_active() {
+            self.missile_samples.clear();
+            if !self.active() { self.clear_player_colliders(); }
         }
         self.trim_to_budget();
         self.trim_detached_to_budget();
@@ -593,7 +629,7 @@ impl RagdollWorld {
     /// Players are kinematic in this visual world: they transfer motion to
     /// corpses without feeding any forces back into authoritative pmove.
     pub(crate) fn set_players(&mut self, players: &[PhysicsPlayer], current_time: i32) {
-        if !self.active() {
+        if !self.wants_player_contacts() {
             self.clear_player_colliders();
             return;
         }
@@ -674,6 +710,7 @@ impl RagdollWorld {
             self.clear_debris();
             self.clear_glass();
             self.clear_player_colliders();
+            self.missile_samples.clear();
             self.accumulator = 0.0;
             return;
         }
@@ -1961,11 +1998,13 @@ impl RagdollWorld {
             // enabling debris-debris contacts without forcing ragdoll coupling.
             let radius = (3.0 * spec.scale).clamp(0.5, 12.0) * JKA_TO_RAPIER;
             let groups = InteractionGroups::new(
-                Group::GROUP_2, Group::GROUP_1 | Group::GROUP_2,
+                Group::GROUP_2, Group::GROUP_1 | Group::GROUP_2
+                    | (if breakable { Group::GROUP_3 } else { Group::empty() }),
                 InteractionTestMode::default(),
             );
             self.colliders.insert_with_parent(
                 ColliderBuilder::ball(radius)
+                    .user_data(if breakable { BREAKABLE_FRAGMENT_TAG } else { 0 })
                     .mass(0.3)
                     .friction(0.8)
                     .restitution(spec.bounce_factor.clamp(0.0, 1.0))
@@ -2019,6 +2058,7 @@ impl RagdollWorld {
                 spec: spec.clone(),
                 centre,
                 initial_rotation: Rotation::IDENTITY,
+                enhanced: breakable,
                 born_at: now,
                 activate_at: now.saturating_add(spec.delay_ms.max(0)),
                 expires_at: now.saturating_add(life_ms.unwrap_or((self.config.debris_lifetime_seconds * 1000.0) as i32)),
@@ -2078,11 +2118,13 @@ impl RagdollWorld {
             }
             self.colliders.insert_with_parent(
                 ColliderBuilder::cuboid(half[0], half[1], half[2])
+                    .user_data(if glass.enhanced { BREAKABLE_FRAGMENT_TAG } else { 0 })
                     .mass(0.12)
                     .friction(0.65)
                     .restitution(glass.spec.bounce.clamp(0.0, 1.0))
                     .collision_groups(InteractionGroups::new(
-                        Group::GROUP_2, Group::GROUP_1 | Group::GROUP_2,
+                        Group::GROUP_2, Group::GROUP_1 | Group::GROUP_2
+                            | (if glass.enhanced { Group::GROUP_3 } else { Group::empty() }),
                         InteractionTestMode::default(),
                     )),
                 body,
@@ -2090,6 +2132,105 @@ impl RagdollWorld {
             );
             glass.body = Some(body);
         }
+    }
+
+    /// Cosmetic reaction to an authoritative missile impact. Only promoted
+    /// breakable fragments receive forces. The server never sees these bodies.
+    pub(crate) fn breakable_impact(&mut self, origin: [f32; 3], direction: [f32; 3], explosive: bool) {
+        if !self.breakables_active() || (self.debris.is_empty() && self.glass.is_empty())
+            || !origin.iter().chain(direction.iter()).all(|v| v.is_finite()) {
+            return;
+        }
+        let centre = Vector::from_array(origin) * JKA_TO_RAPIER;
+        let radius = if explosive { EXPLOSION_RADIUS } else { 18.0 * JKA_TO_RAPIER };
+        let mut impulses = Vec::new();
+        {
+            let predicate = is_breakable_fragment;
+            let filter = QueryFilter::only_dynamic().predicate(&predicate);
+            let query = self.broad_phase.as_query_pipeline(
+                self.narrow_phase.query_dispatcher(), &self.bodies, &self.colliders, filter);
+            let shape = Ball::new(radius);
+            for (_handle, collider) in query.intersect_shape(
+                Pose::from_parts(centre, Rotation::IDENTITY), &shape,
+            ) {
+                let Some(handle) = collider.parent() else { continue; };
+                let Some(body) = self.bodies.get(handle) else { continue; };
+                let delta = body.translation() - centre;
+                let dist = delta.length();
+                let falloff = if explosive { (1.0 - dist / radius).clamp(0.0, 1.0) } else { 1.0 };
+                if falloff <= 0.0 { continue; }
+                let dir = if explosive {
+                    (delta + Vector::Z * (30.0 * JKA_TO_RAPIER)).normalize_or_zero()
+                } else {
+                    let direction = Vector::from_array(direction);
+                    if direction.length_squared() > 0.01 { direction.normalize() }
+                    else { (delta + Vector::Z * JKA_TO_RAPIER).normalize_or_zero() }
+                };
+                let speed = if explosive { EXPLOSION_IMPULSE_SPEED } else { PROJECTILE_IMPULSE_SPEED };
+                impulses.push((handle, dir * (speed * falloff)));
+            }
+        }
+        for (handle, delta_velocity) in impulses {
+            if let Some(body) = self.bodies.get_mut(handle) {
+                body.apply_impulse(delta_velocity * body.mass(), true);
+            }
+        }
+    }
+
+    /// Sweep the visible ET_MISSILE trajectory across tagged rigid bodies.
+    /// A projectile still follows the server; this creates only a local kick.
+    /// The broadphase avoids a missile-by-every-fragment loop at high FPS.
+    pub(crate) fn observe_breakable_missiles(&mut self, entities: &[PresentedEntity], now: i32) {
+        if !self.breakables_active() || (self.debris.is_empty() && self.glass.is_empty()) {
+            self.missile_samples.clear();
+            return;
+        }
+        let mut live = HashSet::new();
+        for entity in entities.iter().filter(|e| e.entity_type == crate::cgame::ET_MISSILE) {
+            let trajectory_time = entity.state.field_i32("pos.trTime").unwrap_or(0);
+            // Stationary mines, hooks and motionless entities cannot sweep fragments.
+            if entity.state.field_i32("pos.trType").unwrap_or(0) == 0 { continue; }
+            if !entity.origin.iter().all(|v| v.is_finite()) { continue; }
+            live.insert(entity.number);
+            let position = Vector::from_array(entity.origin) * JKA_TO_RAPIER;
+            let previous = self.missile_samples.insert(entity.number, MissileSample {
+                position, trajectory_time, sampled_at: now, last_hit: None,
+            });
+            let Some(previous) = previous else { continue; };
+            let dt = now.saturating_sub(previous.sampled_at);
+            let displacement = position - previous.position;
+            if previous.trajectory_time != trajectory_time || dt <= 0 || dt > 100
+                || displacement.length_squared() < (0.01 * JKA_TO_RAPIER).powi(2)
+                || displacement.length_squared() > (256.0 * JKA_TO_RAPIER).powi(2) {
+                continue; // new shot, demo seek, teleport or sparse snapshots
+            }
+            let hit = {
+                let predicate = is_breakable_fragment;
+                let filter = QueryFilter::only_dynamic().predicate(&predicate);
+                let query = self.broad_phase.as_query_pipeline(
+                    self.narrow_phase.query_dispatcher(), &self.bodies, &self.colliders, filter);
+                let shape = Ball::new(PROJECTILE_SWEEP_RADIUS);
+                let mut options = ShapeCastOptions::default();
+                options.max_time_of_impact = 1.0;
+                query.cast_shape(
+                    &Pose::from_parts(previous.position, Rotation::IDENTITY),
+                    displacement, &shape, options,
+                ).and_then(|(collider, _hit)| self.colliders.get(collider)?.parent())
+            };
+            if let Some(sample) = self.missile_samples.get_mut(&entity.number) {
+                sample.last_hit = hit;
+            }
+            if let Some(handle) = hit.filter(|handle| previous.last_hit != Some(*handle)) {
+                if let Some(body) = self.bodies.get_mut(handle) {
+                    let velocity = displacement / (dt as f32 * 0.001);
+                    let direction = velocity.normalize_or_zero();
+                    if direction.length_squared() > 0.0 {
+                        body.apply_impulse(direction * PROJECTILE_IMPULSE_SPEED * body.mass(), true);
+                    }
+                }
+            }
+        }
+        self.missile_samples.retain(|entity, _| live.contains(entity));
     }
 
     /// Tessellated UVs/transparency/shader are preserved. Rapier supplies only
@@ -2211,6 +2352,7 @@ impl RagdollWorld {
         self.previous_body_poses.clear();
         self.instances.clear();
         self.player_colliders.clear();
+        self.missile_samples.clear();
         self.detached_limbs.clear();
         self.debris.clear();
         self.glass.clear();
@@ -2911,6 +3053,45 @@ mod tests {
         world.begin_frame(16_001);
         assert!(world.glass.is_empty());
         assert!(world.debris.is_empty());
+    }
+
+    #[test]
+    fn enhanced_breakables_are_player_contactable_and_react_to_impacts_without_ragdolls() {
+        let mut world = RagdollWorld::new();
+        world.set_config(RagdollConfig {
+            physics_enabled: true, breakables_enhanced: true,
+            enabled: false, debris_enabled: false, max_debris: 8,
+            ..RagdollConfig::default()
+        });
+        let mesh = PhysicsMapMesh::from_jka_mesh(
+            vec![[-256., -256., 0.], [256., -256., 0.], [0., 256., 0.]],
+            vec![[0, 1, 2]],
+        ).unwrap();
+        world.set_map_mesh(&mesh).unwrap();
+        let chunk = ChunkSpec {
+            qpath: "models/chunks/rock/rock1_1.md3".into(),
+            origin: [36., 0., 24.], velocity: [0.; 3],
+            angles: [0.; 3], angle_velocity: [0.; 3],
+            life_ms: 1500, bounce_factor: 0.3, scale: 1.0,
+        };
+        assert!(world.spawn_breakable_debris(&[chunk], 1000));
+        assert!(!world.active(), "ragdoll bodies remain disabled");
+        assert!(world.wants_player_contacts());
+        world.set_players(&[contact_player(0.0)], 1000);
+        assert!(world.player_colliders.contains_key(&0));
+        let shard = world.debris[0].body;
+        let collider = world.bodies[shard].colliders()[0];
+        let groups = world.colliders[collider].collision_groups();
+        assert!(groups.filter.contains(Group::GROUP_3), "breakable must accept player proxies");
+        assert_eq!(world.colliders[collider].user_data, BREAKABLE_FRAGMENT_TAG);
+        world.begin_frame(1000);
+        world.begin_frame(1017);
+        let old_speed = world.bodies[shard].linvel().length();
+        world.breakable_impact([36., 0., 24.], [1., 0., 0.], false);
+        assert!(world.bodies[shard].linvel().length() > old_speed);
+        let first_speed = world.bodies[shard].linvel().length();
+        world.breakable_impact([0., 0., 24.], [0., 0., 0.], true);
+        assert!(world.bodies[shard].linvel().length() > first_speed);
     }
 
     #[test]

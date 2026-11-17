@@ -825,7 +825,7 @@ impl Renderer {
         }
 
         // Evaluate the ocean-sky flag before mutably borrowing the companion targets.
-        let sky_horizon_flag = self.ocean_sky_horizon_flag();
+        let sky_horizon_flag = self.ocean_sky_horizon_flag() | self.overbright_sky_flag();
         let target = self.companion_scene_targets.get_mut(&request.id)?;
         if target.last_render_at.elapsed() < COMPANION_SCENE_FRAME_INTERVAL {
             return None;

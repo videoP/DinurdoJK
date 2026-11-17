@@ -34,7 +34,24 @@ pub(in crate::renderer) fn shadow_source_enabled(light: &scene::DynamicLight, ma
 /// Per-light R32F irradiance stays within 64 MiB, independently of the sun.
 /// Lower-resolution local pages preserve the original UV charts and page count.
 pub(super) fn output_sizes(base: &[[u32; 2]], lights: usize, limit: u32) -> Vec<[u32; 2]> {
-    if base.is_empty() || lights == 0 {
+    if lights == 0 {
+        return Vec::new();
+    }
+    budget_sizes(base, lights + 3, limit)
+}
+
+/// The compositor's RGB lamp sum: three R32F layers under the same 64 MiB cap,
+/// so it stays at the original luxel resolution for ordinary BSP atlases.
+/// Charts thinner than a reduced per-light texel then keep their own light.
+pub(super) fn total_sizes(base: &[[u32; 2]], lights: usize, limit: u32) -> Vec<[u32; 2]> {
+    if lights == 0 {
+        return Vec::new();
+    }
+    budget_sizes(base, 3, limit)
+}
+
+fn budget_sizes(base: &[[u32; 2]], layers: usize, limit: u32) -> Vec<[u32; 2]> {
+    if base.is_empty() {
         return Vec::new();
     }
     let mut divisor = 1u32;
@@ -45,7 +62,7 @@ pub(super) fn output_sizes(base: &[[u32; 2]], lights: usize, limit: u32) -> Vec<
             .collect();
         let bytes: u64 = sizes
             .iter()
-            .map(|s| u64::from(s[0]) * u64::from(s[1]) * (lights + 3) as u64 * 4)
+            .map(|s| u64::from(s[0]) * u64::from(s[1]) * layers as u64 * 4)
             .sum();
         if bytes <= 64 * 1024 * 1024 && sizes.iter().all(|s| s[0] <= limit && s[1] <= limit) {
             return sizes;
@@ -78,6 +95,15 @@ pub(super) fn irradiance(light: &scene::DynamicLight, position: Vec3, normal: Ve
     } else {
         1.0
     };
+    if light.falloff == scene::DynamicLightFalloff::InverseSquare {
+        // q3map2 LightContributionToSample, -fast area branch:
+        // photons * cos(receiver) * cos(emitter) / max(16, d)^2, with
+        // extraDist spreading. intensity = photons / 255 (lightmap units).
+        let spread = (distance * distance + light.extra_distance * light.extra_distance)
+            .sqrt()
+            .max(16.0);
+        return light.intensity * facing * emission / (spread * spread);
+    }
     let falloff = (1.0 - distance / light.radius).max(0.0);
     light.intensity * facing * emission * falloff * falloff * 0.35
 }
@@ -176,8 +202,15 @@ impl crate::renderer::Renderer {
         self.activate_world_pipeline_variant();
         self.history_valid = false;
     }
+    /// Fully Realtime relighting ignores the authored lightmap entirely: no
+    /// sun/sky/lamp composition is built from it and the shader substitutes a
+    /// flat ambient term (`relighting_mode == 3`).
+    pub(in crate::renderer) fn fully_realtime_world(&self) -> bool {
+        self.sun_override && self.relighting_mode == 3
+    }
     pub(in crate::renderer) fn baked_local_lightmap_active(&self) -> bool {
         self.added_map_light_sources() != 0
+            && !self.fully_realtime_world()
             && self.world.as_ref().is_some_and(|w| {
                 w.static_sun.local_ready() && w.baked_sun_cache.as_ref().is_some_and(|c| c.active && c.has_composition())
             })
@@ -206,7 +239,10 @@ impl crate::renderer::Renderer {
         index < world.runtime_light_count
             && light.surface_lighting
             && if light.emitter_normal.iter().any(|v| v.abs() > 1e-6) {
-                self.static_area_light_enabled(light)
+                // Once the lamp lightmap is composed, map area emitters are
+                // already baked: drawing their runtime samples per pixel too
+                // double-counted them and cost every frame.
+                self.static_area_light_enabled(light) && !self.baked_local_lightmap_active()
             } else {
                 self.static_point_lighting_enabled()
             }

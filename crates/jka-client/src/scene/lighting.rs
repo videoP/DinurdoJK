@@ -483,6 +483,7 @@ pub(in crate::scene) fn prepare_static_light_grid(
                 grid.bounds[2] as u32,
             ],
             external_hdr: external_values.is_some(),
+            identity_light: if output_overbright_bits > 0 { 0.5 } else { 1.0 },
             cells: classic_cells,
             map_toward_sun: None,
             relit: None,
@@ -623,7 +624,12 @@ pub(in crate::scene) fn bsp_surface_lights(
         let Some(material) = materials.get(batch.shader) else {
             continue;
         };
-        if material.surface_light.is_none() && material.shader_light.is_none() { continue; }
+        // A sky shader's q3map_surfacelight (e.g. ffa3 h_tatsky 145) is the
+        // compiler's sky fill: q3map2 already baked it into the original
+        // lightmap from the sky faces. Re-emitting it as a fixture would add a
+        // huge point light at the sky centroid and fill the runtime pool.
+        let surface_light = material.surface_light.filter(|_| !material.sky);
+        if surface_light.is_none() && material.shader_light.is_none() { continue; }
         let two_sided = material.cull == CullMode::None;
         // A lamp is a connected fixture patch, not one cubemap per subdivided
         // triangle. Keep the original samples for the opt-in runtime/GI paths.
@@ -638,7 +644,7 @@ pub(in crate::scene) fn bsp_surface_lights(
                 .sum::<Vec3>()
                 .normalize_or_zero();
             patches.push((positions, normal));
-            if let Some(authored) = material.surface_light {
+            if let Some(authored) = surface_light {
                 append_surface_light_triangle(
                     &mut authored_candidates,
                     positions,
@@ -648,7 +654,7 @@ pub(in crate::scene) fn bsp_surface_lights(
                 );
             }
             if let Some(promoted) = material.shader_light {
-                let overlap = if material.surface_light.is_some() {
+                let overlap = if surface_light.is_some() {
                     materials::SHADER_LIGHT_AUTHORED_OVERLAP
                 } else {
                     0
@@ -665,14 +671,14 @@ pub(in crate::scene) fn bsp_surface_lights(
                 );
             }
         }
-        if let Some(authored) = material.surface_light {
+        if let Some(authored) = surface_light {
             append_emitting_patches(&mut static_authored_candidates, &patches,
-                authored.value, authored.color, authored.subdivide, two_sided, 0);
+                authored.value, authored.color, two_sided, 0);
         }
         if let Some(promoted) = material.shader_light.filter(|p| p.bake_reasons != 0) {
-            let overlap = if material.surface_light.is_some() { materials::SHADER_LIGHT_AUTHORED_OVERLAP } else { 0 };
+            let overlap = if surface_light.is_some() { materials::SHADER_LIGHT_AUTHORED_OVERLAP } else { 0 };
             append_emitting_patches(&mut static_promoted_candidates, &patches,
-                promoted.value, promoted.color, promoted.subdivide, two_sided, promoted.bake_reasons | overlap);
+                promoted.value, promoted.color, two_sided, promoted.bake_reasons | overlap);
         }
     }
 
@@ -721,7 +727,7 @@ pub(in crate::scene) fn bsp_surface_lights(
 fn append_emitting_patches(
     candidates: &mut Vec<SurfaceLightCandidate>,
     triangles: &[([Vec3; 3], Vec3)],
-    value: f32, color: [f32; 3], subdivide: f32, two_sided: bool, mask: u32,
+    value: f32, color: [f32; 3], two_sided: bool, mask: u32,
 ) {
     use std::collections::HashMap;
     fn root(parents: &mut [usize], mut i: usize) -> usize {
@@ -751,19 +757,36 @@ fn append_emitting_patches(
     }
     for (_, (centroid,normal,area)) in groups {
         let normal = normal.normalize_or_zero();
-        let intensity = (value/300.0*area/subdivide.max(16.0).powi(2)).clamp(0.0,8.0);
-        if normal.length_squared() < 1e-6 || intensity <= 1e-5 { continue; }
+        // q3map2 RadSubdivideDiffuseLight: photons = value * area * areaScale.
+        // Subdivision only splits that total across pieces; one fixture keeps it.
+        let photons = value * area * Q3MAP_AREA_SCALE;
+        let intensity = photons / 255.0;
+        if normal.length_squared() < 1e-6 || !intensity.is_finite() || intensity <= 1e-5 { continue; }
         candidates.push(SurfaceLightCandidate {
             light: DynamicLight {
                 position: (centroid/area + normal*8.0).to_array(), color,
-                radius: value.max(subdivide*2.0).clamp(64.0,4096.0), intensity,
+                radius: q3map_area_envelope(photons), intensity,
                 shadow_power: (value/300.0)*area*surface_light_luminance(color).max(0.0)*1.5,
-                falloff: DynamicLightFalloff::Smooth, surface_lighting: true,
+                falloff: DynamicLightFalloff::InverseSquare, surface_lighting: true,
                 emitter_normal: normal.to_array(), emitter_two_sided: two_sided,
-                angle_attenuation:true,angle_scale:0.0,extra_distance:0.0,shader_promotion_mask:mask,
+                angle_attenuation:true,angle_scale:0.0,
+                // The fixture is one point instead of q3map2's subdivided
+                // pieces. Spreading by its disc radius keeps a lamp's own wall
+                // from taking the whole fixture's energy at 16 units.
+                extra_distance:(area/std::f32::consts::PI).sqrt(),
+                shader_promotion_mask:mask,
             }, weight:area*surface_light_luminance(color).max(0.0)*value,
         });
     }
+}
+
+/// q3map2 `areaScale` default (q3map2.h).
+const Q3MAP_AREA_SCALE: f32 = 0.25;
+
+/// q3map2 -fast area-light envelope: the distance at which `photons / d^2`
+/// falls to `falloffTolerance` (1 photon). Beyond it q3map2 adds nothing.
+fn q3map_area_envelope(photons: f32) -> f32 {
+    photons.max(0.0).sqrt().clamp(64.0, 16384.0)
 }
 
 #[cfg(test)]
@@ -776,9 +799,11 @@ mod static_lamp_tests {
         let a=Vec3::ZERO; let b=Vec3::X*64.0; let c=Vec3::Z*32.0; let d=b+c;
         let triangles=vec![([a,b,c],n),([b,d,c],n),([a+Vec3::X*256.0,b+Vec3::X*256.0,c+Vec3::X*256.0],n)];
         let mut lamps=Vec::new();
-        append_emitting_patches(&mut lamps,&triangles,300.0,[1.0;3],120.0,false,materials::SHADER_LIGHT_GLOW);
+        append_emitting_patches(&mut lamps,&triangles,300.0,[1.0;3],false,materials::SHADER_LIGHT_GLOW);
         assert_eq!(lamps.len(),2);
-        assert!((lamps[0].light.intensity-2048.0/14400.0).abs()<1e-6);
+        // q3map2 photons = value * area * 0.25, stored as photons / 255.
+        assert!((lamps[0].light.intensity-300.0*2048.0*0.25/255.0).abs()<1e-3);
+        assert_eq!(lamps[0].light.falloff,DynamicLightFalloff::InverseSquare);
         assert_eq!(lamps[0].light.position,[32.0,8.0,16.0]);
     }
 

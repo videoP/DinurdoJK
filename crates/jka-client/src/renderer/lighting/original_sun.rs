@@ -54,14 +54,26 @@ fn compiler_sun_transmission(
 fn authored_sun_casters(
     vertices: &[crate::scene::GpuVertex],
     batches: &[crate::scene::DrawBatch],
+    surface_ids: &[u32],
+    surfaces: &[crate::scene::LegacyDlightSurface],
 ) -> (Vec<crate::renderer::StaticAoRenderTriangle>, Vec<Option<SunFilterTriangle>>) {
     let mut seen = std::collections::BTreeSet::new();
     let mut triangles = Vec::new();
     let mut filters = Vec::new();
+    // q3map2 game "ja" (from sof2) defaults patchShadows=false, as did Raven's
+    // q3map: the authored lightmap has no patch sun shadows. Predicting them
+    // left the surfaces under/behind curved patches unremoved (and room-
+    // protected), visible as unshaded brushes when patch LOD exposes them.
+    let is_patch = |vertex: usize| {
+        surface_ids.get(vertex / 3)
+            .and_then(|&id| surfaces.get(id as usize))
+            .is_some_and(|surface| surface.patch)
+    };
     for batch in batches {
         let filtered = batch.alpha_shadow || batch.light_filter;
         if batch.pipeline.class == DrawClass::Sky
             || (!filtered && batch.pipeline.class != DrawClass::Opaque)
+            || is_patch(batch.vertices.start as usize)
             || !seen.insert((batch.vertices.start, batch.vertices.end)) { continue; }
         for triangle in vertices[batch.vertices.start as usize..batch.vertices.end as usize].chunks_exact(3) {
             triangles.push(crate::renderer::StaticAoRenderTriangle {
@@ -87,6 +99,7 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     lightmaps: &mut [crate::materials::TextureData],
     surface_ids: &[u32],
     surface_count: usize,
+    surfaces_info: &[crate::scene::LegacyDlightSurface],
     sun: crate::scene::DirectionalSun,
     encoding: crate::scene::BakedSunEncoding,
     cancelled: &std::sync::atomic::AtomicBool,
@@ -99,7 +112,7 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    let (casters, filters) = authored_sun_casters(vertices, batches);
+    let (casters, filters) = authored_sun_casters(vertices, batches, surface_ids, surfaces_info);
     let filter_count = filters.iter().filter(|filter| filter.is_some()).count();
     let solid = StaticAoBvh::build(casters.into()).ok()?;
     println!(
@@ -126,8 +139,14 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     let sky = StaticAoBvh::build(sky_triangles.into()).ok()?;
     let triangles = collect_static_ao_lightmap_triangles(vertices, batches);
     let sizes: Vec<_> = lightmaps.iter().map(|lm| [lm.width, lm.height]).collect();
-    let samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(&triangles, &sizes, 1);
-    let owners = crate::renderer::static_ao::bvh::rasterize_lightmap_owners(&triangles, &sizes, 1);
+    // q3map2 lights the edge luxels just outside each surface, and bilinear
+    // sampling at the chart edge reads them. Trace them too (nearest surface,
+    // closest point on it) instead of averaging a neighbouring chart's mask
+    // into them: next to an occluder that neighbour is often in shadow, which
+    // left an unremoved sliver of baked sun along the junction.
+    let (samples, owners) = crate::renderer::static_ao::bvh::rasterize_lightmap_band(
+        &triangles, &sizes, 1.5,
+    );
     let color = Vec3::from_array(sun.color);
     let photons = color / color.max_element().max(0.00001) * sun.intensity * encoding.brightness;
     let sun_y = photons.dot(Vec3::new(0.2126, 0.7152, 0.0722));
@@ -238,26 +257,36 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     if traced == 0 || cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    // Fit BEFORE RGB-driven shadow-edge refinement. The refinement uses the
-    // authored sun magnitude, which may be exactly what needs calibration;
-    // allowing its edge reconstruction to influence the fit is circular.
-    let auto_strength = calibrate_authored_sun(lightmaps, &samples, &owners, sun_y, encoding, cancelled);
-    // Keep the unrefined visibility solely for independent contour *fitting*;
-    // synthesize the alternative removal from the final refined visibility.
+    // Fit BEFORE RGB-driven shadow-edge refinement. The refinement converts
+    // RGB into visibility with the fitted strength; fitting on refined flux
+    // would only return the strength it assumed.
     let unrefined_flux: Vec<Vec<u8>> = lightmaps.iter()
         .map(|image| image.rgba.chunks_exact(4).map(|pixel| pixel[3]).collect())
         .collect();
-    // Refine/extend only after the fitted coefficient is fixed, retaining
-    // the existing manually selected edge reconstruction behavior.
+    let zones = contours::fit_zones(lightmaps, &unrefined_flux, &samples, &owners, sun_y, encoding, cancelled);
+    if cancelled.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+    // Auto = one map-wide value, every world zone voting once. The legacy
+    // 4/8-luxel tile fit also measured ambient falloff beside occluders (the
+    // shadow side darkens toward the wall) and ran high; it is now only the
+    // fallback for maps with too few edge zones.
+    let auto_strength = zones.as_ref().and_then(|zones| zones.global())
+        .or_else(|| calibrate_authored_sun(lightmaps, &samples, &owners, sun_y, encoding, cancelled));
+    // Edge visibility is reconstructed with the strength that will be applied,
+    // so removal at a soft baked edge equals the observed excess over the local
+    // shadow baseline. Manual mode without a fit keeps the 1x assumption.
+    let edge_strength = auto_strength.unwrap_or(1.0);
     lightmaps.par_iter_mut().zip(samples.par_iter()).zip(owners.par_iter())
         .for_each(|((image, texels), owners)| {
             if image.rgba16f.is_some() || cancelled.load(std::sync::atomic::Ordering::Relaxed) { return; }
+            let mut alpha: Vec<u8> = image.rgba.chunks_exact(4).map(|p| p[3]).collect();
             refined.fetch_add(
                 refine_authored_sun_edges(
-                    image, texels, owners, toward, sun_y, encoding, cancelled,
+                    &image.rgba, &mut alpha, image.width as usize, texels, owners, toward, sun_y,
+                    &|_| edge_strength, encoding, cancelled,
                 ),
                 std::sync::atomic::Ordering::Relaxed,
             );
+            for (pixel, value) in image.rgba.chunks_exact_mut(4).zip(&alpha) { pixel[3] = *value; }
             // Clipped luxels hold less sun than predicted; cap BEFORE UV padding
             // so padded chart borders inherit the capped value.
             if let Some(strength) = auto_strength {
@@ -297,18 +326,30 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
             }
         });
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) { return None; }
-    let (mut contour_masks, contour_regions) = contours::build_contour_masks(
-        lightmaps, &unrefined_flux, &samples, &owners, photons, sun_y, auto_strength, encoding, cancelled)
-        .map_or((None, 0), |(masks, regions)| (Some(masks), regions));
-    if let Some(masks) = contour_masks.as_mut() {
-        let lowered: usize = masks.par_iter_mut().zip(lightmaps.par_iter()).zip(samples.par_iter()).zip(owners.par_iter())
-            .map(|(((mask, image), texels), owners)| {
-                if image.rgba16f.is_some() || mask.len() * 4 != image.rgba.len() { return 0; }
-                cap_clipped_removal(&image.rgba, mask, image.width as usize, texels, owners, sun_y, CONTOUR_MASK_SCALE, encoding)
+    // Zone mode: per-luxel strength field, its own edge refinement on the
+    // unrefined trace, then the clipped-luxel cap BEFORE chart padding.
+    let contour_regions = zones.as_ref().map_or(0, |zones| zones.len());
+    let contour_masks = zones.map(|zones| {
+        let strength = zones.strength_maps(&samples);
+        lightmaps.par_iter().zip(unrefined_flux.par_iter()).zip(samples.par_iter())
+            .zip(owners.par_iter()).zip(strength.par_iter())
+            .map(|((((image, flux), texels), owners), strength)| {
+                let count = image.width as usize * image.height as usize;
+                if image.rgba16f.is_some() || flux.len() != count || strength.len() != count {
+                    return vec![0; count];
+                }
+                let width = image.width as usize;
+                let mut flux = flux.clone();
+                refined.fetch_add(refine_authored_sun_edges(&image.rgba, &mut flux, width, texels, owners,
+                    toward, sun_y, &|i| strength[i], encoding, cancelled), std::sync::atomic::Ordering::Relaxed);
+                let mut mask = contours::encode_zone_mask(&flux, strength);
+                clip_capped.fetch_add(cap_clipped_removal(&image.rgba, &mut mask, width, texels, owners,
+                    sun_y, CONTOUR_MASK_SCALE, encoding), std::sync::atomic::Ordering::Relaxed);
+                contours::pad_chart_edges(&mut mask, width, image.height as usize, texels, owners);
+                mask
             })
-            .sum();
-        clip_capped.fetch_add(lowered, std::sync::atomic::Ordering::Relaxed);
-    }
+            .collect::<Vec<_>>()
+    });
     println!("[BAKED SUN] clipped-luxel cap lowered {} mask luxels (Auto + contour)",
         clip_capped.load(std::sync::atomic::Ordering::Relaxed));
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) { return None; }
@@ -471,30 +512,35 @@ fn compiled_lightmap_photons(pixel: &[u8], encoding: crate::scene::BakedSunEncod
 
 /// Recover the compiler's filtered visibility only near a traced shadow edge.
 /// Fully lit/shadowed neighboring luxels constrain the surviving light field;
-/// known authored sun energy converts the observed residual into visibility.
+/// the authored sun energy times the strength that will be APPLIED converts the
+/// observed residual into visibility, so removal there equals the measured
+/// excess over the shadow baseline (assuming 1x left a bright halo around an
+/// over-subtracted interior whenever the fitted strength was below 1).
 /// Atlas ownership and plane tests prevent borrowing a different surface/chart.
+#[allow(clippy::too_many_arguments)]
 fn refine_authored_sun_edges(
-    image: &mut crate::materials::TextureData,
+    rgba: &[u8],
+    flux: &mut [u8],
+    width: usize,
     texels: &[Option<crate::renderer::StaticAoTexelSample>],
     owners: &[u32],
     toward: Vec3,
     sun_y: f32,
+    strength: &(dyn Fn(usize) -> f32 + Sync),
     encoding: crate::scene::BakedSunEncoding,
     cancelled: &std::sync::atomic::AtomicBool,
 ) -> usize {
     use rayon::prelude::*;
-    if sun_y <= 0.0 {
+    if sun_y <= 0.0 || width == 0 || flux.len() * 4 != rgba.len() || texels.len() != flux.len() {
         return 0;
     }
-    let width = image.width as i32;
-    let height = image.height as i32;
-    let alpha: Vec<_> = image
-        .rgba
-        .chunks_exact(4)
-        .map(|p| p[3] as f32 / 255.0)
-        .collect();
-    let raw: Vec<_> = image
-        .rgba
+    let height = (flux.len() / width) as i32;
+    let width = width as i32;
+    let alpha: Vec<_> = flux.iter().map(|&p| p as f32 / 255.0).collect();
+    // Direct sun per unit flux at each luxel. A floor keeps zero-strength
+    // zones (no baked sun there) from dividing by ~0.
+    let scale = |i: usize| sun_y * strength(i).max(0.05);
+    let raw: Vec<_> = rgba
         .chunks_exact(4)
         .map(|p| compiled_lightmap_photons(p, encoding).dot(Vec3::new(0.2126, 0.7152, 0.0722)))
         .collect();
@@ -542,16 +588,15 @@ fn refine_authored_sun_edges(
         stable[index] = kind != 2 && matching >= 3 && !differs;
         edge[index] = differs;
     }
-    image
-        .rgba
-        .par_chunks_mut(256 * 4)
+    flux
+        .par_chunks_mut(256)
         .enumerate()
         .map(|(block, pixels)| {
             if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
                 return 0;
             }
             let mut refined = 0;
-            for (local, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+            for (local, pixel) in pixels.iter_mut().enumerate() {
                 let index = block * 256 + local;
                 let sample = &texels[index];
                 let Some(sample) = sample else {
@@ -592,7 +637,7 @@ fn refine_authored_sun_edges(
                         {
                             continue;
                         }
-                        let residual = raw[n] - sun_y * alpha[n];
+                        let residual = raw[n] - scale(n) * alpha[n];
                         if residual < 0.0 {
                             continue;
                         }
@@ -610,13 +655,13 @@ fn refine_authored_sun_edges(
                     continue;
                 }
                 baseline /= weights;
-                let flux =
-                    ((raw[index] - baseline) / sun_y).clamp(0.0, normal.dot(toward).max(0.0));
-                let value = (flux * 255.0).round() as u8;
-                if pixel[3] != value {
+                let visible =
+                    ((raw[index] - baseline) / scale(index)).clamp(0.0, normal.dot(toward).max(0.0));
+                let value = (visible * 255.0).round() as u8;
+                if *pixel != value {
                     refined += 1;
                 }
-                pixel[3] = value;
+                *pixel = value;
             }
             refined
         })
@@ -955,16 +1000,15 @@ mod calibration_tests {
             texels.push(Some(crate::renderer::StaticAoTexelSample { position: [x as f32 * 16.0, 0.0, y as f32 * 16.0], normal: [0.0, 1.0, 0.0] }));
         } }
         let original = rgba.clone();
-        let make_image = || crate::materials::TextureData { label: "inverse sun edge fixture".into(), source: None, width: 16, height: 16, rgba: (original.clone()).into(), rgba16f: None, mip_level_count: 1, clamp: true, srgb: true };
-        let mut image = make_image();
-        assert!(refine_authored_sun_edges(&mut image, &texels, &vec![1; 256], Vec3::Y, 500.0, encoding, &std::sync::atomic::AtomicBool::new(false)) > 0);
-        assert_eq!(image.rgba[(8 * 16 + 7) * 4 + 3], 0, "displaced edge must not subtract direct sun from baked shadow");
-        assert_eq!(image.rgba[(8 * 16 + 15) * 4 + 3], 255, "lit interior remains ray traced");
-        for (before, after) in original.chunks_exact(4).zip(image.rgba.chunks_exact(4)) { assert_eq!(&before[..3], &after[..3], "original lightmap RGB must be unchanged"); }
-        let mut image = make_image();
+        let make_flux = || original.chunks_exact(4).map(|p| p[3]).collect::<Vec<u8>>();
+        let mut flux = make_flux();
+        assert!(refine_authored_sun_edges(&original, &mut flux, 16, &texels, &vec![1; 256], Vec3::Y, 500.0, &|_| 1.0, encoding, &std::sync::atomic::AtomicBool::new(false)) > 0);
+        assert_eq!(flux[8 * 16 + 7], 0, "displaced edge must not subtract direct sun from baked shadow");
+        assert_eq!(flux[8 * 16 + 15], 255, "lit interior remains ray traced");
+        let mut flux = make_flux();
         let owners: Vec<_> = (0..256).map(|index| if index % 16 < 8 { 1 } else { 2 }).collect();
-        refine_authored_sun_edges(&mut image, &texels, &owners, Vec3::Y, 500.0, encoding, &std::sync::atomic::AtomicBool::new(false));
-        assert_eq!(image.rgba[(8 * 16 + 7) * 4 + 3], 255, "another packed chart cannot supply edge-fit anchors");
+        refine_authored_sun_edges(&original, &mut flux, 16, &texels, &owners, Vec3::Y, 500.0, &|_| 1.0, encoding, &std::sync::atomic::AtomicBool::new(false));
+        assert_eq!(flux[8 * 16 + 7], 255, "another packed chart cannot supply edge-fit anchors");
     }
 
     #[test]

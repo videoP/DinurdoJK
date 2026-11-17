@@ -324,6 +324,7 @@ impl PlayerPresenter {
             swim_tilt: 0.9,
             swim_turn_bank: 1.0,
             move_lean: 0.75,
+            jk2_lean_fix: false,
             saber_team_colors: true,
             saber_staff_multi_color: false,
             speed_trail: true,
@@ -441,6 +442,11 @@ impl PlayerPresenter {
         } else {
             0.0
         };
+    }
+
+    /// JK2 1.02-only cosmetic correction for Raven's world-axis velocity lean.
+    pub fn set_jk2_lean_fix(&mut self, enabled: bool) {
+        self.jk2_lean_fix = enabled;
     }
 
     /// Cosmetic air-only strafejump/bunnyhop lean (ground run/walk remains unchanged).

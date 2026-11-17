@@ -196,8 +196,8 @@ int jk2_bg_anim_flags(int version, int anim) {
 int jk2_cg_g2_player_angles(int version, const jka_player_angle_entity *es, int time,
                             const float *lerp_origin, const float *lerp_angles,
                             int frametime, int ci_legs, int ci_torso,
-                            const float *motion_matrix, jka_player_angle_state *state,
-                            jka_player_angle_result *out) {
+                            const float *motion_matrix, int player_relative_lean,
+                            jka_player_angle_state *state, jka_player_angle_result *out) {
     static const int movement_offsets[8] = {0, 22, 45, -22, 0, 22, -45, -22};
     vec3_t head, torso = {0,0,0}, legs = {0,0,0}, velocity;
     vec3_t angles, view, upper = {0,0,0}, lower = {0,0,0}, thoracic = {0,0,0};
@@ -231,7 +231,10 @@ int jk2_cg_g2_player_angles(int version, const jka_player_angle_entity *es, int 
                  &state->torso_pitching, frametime);
     torso[PITCH] = state->torso_pitch_angle;
 
-    if (speed != 0.0f) {
+    /* Preserve the exact original velocity lean for JK2 1.04, regardless
+     * of the cvar. JK2 1.02 also uses this legacy world-axis calculation
+     * when the correction is disabled. */
+    if (speed != 0.0f && (version == 4 || !player_relative_lean)) {
         float side;
         speed *= 0.05f;
         AnglesToAxis(legs, axis);
@@ -267,12 +270,27 @@ int jk2_cg_g2_player_angles(int version, const jka_player_angle_entity *es, int 
     jk2_cg_swing(legs[YAW], 40.0f, 90.0f, 0.3f,
                  &state->legs_yaw_angle, &state->legs_yawing, frametime);
     legs[YAW] = state->legs_yaw_angle;
+    /* JK2 1.02 opt-in fix only: apply the stock speed-based pitch after
+     * leg yaw is settled, using the player's rendered local axes. No new roll
+     * behavior is introduced (the original roll is still cleared below). */
+    if (version == 2 && player_relative_lean && speed != 0.0f) {
+        vec3_t lean_angles = {0.0f, 0.0f, 0.0f};
+        float side;
+        lean_angles[YAW] = legs[YAW];
+        AnglesToAxis(lean_angles, axis);
+        speed *= 0.05f;
+        side = speed * DotProduct(velocity, axis[1]);
+        legs[ROLL] -= side;
+        side = speed * DotProduct(velocity, axis[0]);
+        legs[PITCH] += side;
+    }
+    /* Both original versions discard the calculated roll. */
     legs[ROLL] = torso[ROLL] = 0.0f;
     VectorCopy(legs, out->tur_angles);
     /* CG_G2PlayerAngles: subtract head/torso hierarchy. */
     AnglesSubtract(head, torso, head);
     AnglesSubtract(torso, legs, torso);
-    /* 1.04 clears root pitch after saving turAngles; 1.02 retains it. */
+    /* JK2 1.04 always retains the stock root-pitch clearing behavior. */
     if (version == 4) legs[PITCH] = 0.0f;
     AnglesToAxis(legs, axis);
     memcpy(out->legs_axis, axis, sizeof(out->legs_axis));

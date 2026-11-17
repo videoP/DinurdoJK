@@ -984,6 +984,9 @@ pub(in crate::scene) fn prepare_internal(
     let invisible_render_culled_batches = AtomicUsize::new(0);
     let invisible_render_culled_triangles = AtomicUsize::new(0);
     let invisible_render_culled_vertices = AtomicUsize::new(0);
+    // JK2MV modulates vertex color bytes in encoded framebuffer space. The
+    // scene here is linear, so decode them: tex_lin * decode(vc) = decode(tex * vc).
+    let jk2_encoded_vertex_color = assets.jk2_version().is_some();
     // One BSP mesh batch -> its material/lightmap group and render vertices.
     // Shared by the world and inline models so a mover's surfaces resolve
     // lightmaps, vertex lighting and fog exactly like the world's.
@@ -1074,8 +1077,13 @@ pub(in crate::scene) fn prepare_internal(
                 };
                 let raw = vertex.color[color_slot as usize];
                 let shifted = overbright_rgb([raw[0], raw[1], raw[2]], options.map_overbright_bits, options.overbright_bits);
-                let color = [shifted[0], shifted[1], shifted[2], raw[3]]
+                let mut color = [shifted[0], shifted[1], shifted[2], raw[3]]
                     .map(|v| f32::from(v) / 255.0);
+                if jk2_encoded_vertex_color {
+                    for channel in 0..3 {
+                        color[channel] = super::vegetation::srgb_u8_to_linear(shifted[channel]);
+                    }
+                }
                 geometry.push(GpuVertex {
                     position: render_position(vertex.position),
                     uv: vertex.texcoord,
@@ -1211,6 +1219,7 @@ pub(in crate::scene) fn prepare_internal(
                 plane,
                 bounds_min,
                 bounds_max,
+                patch: surface.kind == SurfaceKind::Patch,
             }
         })
         .collect::<Vec<_>>();
@@ -1545,12 +1554,21 @@ pub(in crate::scene) fn prepare_internal(
         // OpenJK identityLight = 1 / (1 << overbrightBits). Scale only
         // rgbGen identityLighting, not rgbGen identity or authored vertex alpha.
         fn identity_scale(batch: &mut crate::scene::DrawBatch, scale: f32) {
-            if matches!(batch.rgb_gen, jka_assets::shader::RgbGen::IdentityLighting) {
+            // jk2mv/OpenJK tr_shade CGEN_VERTEX and CGEN_ONE_MINUS_VERTEX also
+            // multiply by identityLight (CGEN_EXACT_VERTEX does not).
+            if matches!(batch.rgb_gen, jka_assets::shader::RgbGen::IdentityLighting
+                | jka_assets::shader::RgbGen::Vertex | jka_assets::shader::RgbGen::OneMinusVertex) {
                 for channel in &mut batch.color[..3] { *channel *= scale; }
             }
             for companion in &mut batch.additive_companions { identity_scale(companion, scale); }
         }
-        let scale = 1.0 / f32::from(1u8 << options.overbright_bits.min(1));
+        let mut scale = 1.0 / f32::from(1u8 << options.overbright_bits.min(1));
+        if assets.jk2_version().is_some() {
+            // JK2MV multiplies identityLight into the encoded framebuffer color and
+            // doubles it in encoded space at output; the scene here is linear, so
+            // 0.5 encoded = sRGB-decode(0.5) linear (a linear 0.5 would end at ~1.46x).
+            scale = if scale < 1.0 { 0.214_041_14 } else { scale };
+        }
         for batch in batches.iter_mut().chain(pvs_batches.iter_mut()).chain(inline_batches.iter_mut()) {
             identity_scale(batch, scale);
         }

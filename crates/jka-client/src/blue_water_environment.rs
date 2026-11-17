@@ -105,7 +105,7 @@ impl Default for Settings {
             world_lighting: 0.0,
             filmic: true,
             aerial_perspective: true,
-            night_sky: 1.0,
+            night_sky: 0.0,
             sun_size: 1.0,
             moon_size: 1.0,
         }

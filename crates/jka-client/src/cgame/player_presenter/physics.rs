@@ -64,6 +64,21 @@ impl PlayerPresenter {
         let alt = state.field_i32("eFlags").unwrap_or(0) & EF_ALT_FIRING != 0;
         let explosive = impulse_weapon_is_explosive(weapon, alt);
 
+        // Breakables has its own physics mode: don't gate its impulses on
+        // r_ragdolls or the separate ragdoll weapon/explosion options.
+        if matches!(event.event,
+            EntityEvent::EV_MISSILE_HIT | EntityEvent::EV_MISSILE_MISS
+                | EntityEvent::EV_MISSILE_MISS_METAL | EntityEvent::EV_CONC_ALT_IMPACT)
+        {
+            let dir = if event.event == EntityEvent::EV_CONC_ALT_IMPACT {
+                crate::cgame::entity_vec3(state, "angles").unwrap_or([0.0; 3])
+            } else {
+                crate::cgame::entity_vec3(state, "pos.trDelta").unwrap_or([0.0; 3])
+            };
+            self.ragdolls.breakable_impact(
+                event.position, dir, explosive || event.event == EntityEvent::EV_CONC_ALT_IMPACT);
+        }
+
         match event.event {
             // EV_SABER_HIT means saber contact, not that G_Damage applied
             // knockback. A subsequent motion delta must not convert ordinary
@@ -632,7 +647,7 @@ impl PlayerPresenter {
     ) {
         use crate::cgame::ragdoll::PhysicsPlayer;
         let mut players = Vec::new();
-        if self.ragdolls.active() {
+        if self.ragdolls.wants_player_contacts() {
             for entity in entities.iter().filter(|entity| Some(entity.number) != local.map(|e| e.number))
                 .chain(local.into_iter().filter(|_| local_can_push)) {
                 if entity.entity_type != ET_PLAYER || entity.state.field_i32("eFlags").unwrap_or(0) & EF_DEAD != 0
@@ -659,6 +674,7 @@ impl PlayerPresenter {
             }
         }
         self.ragdolls.set_players(&players, current_time);
+        self.ragdolls.observe_breakable_missiles(entities, current_time);
     }
 
     /// Advance the visual physics world exactly once for this presentation frame.

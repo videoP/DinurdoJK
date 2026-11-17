@@ -78,7 +78,7 @@ struct LightingSettings {
     baked_indirect_adjust: vec4<f32>, // x residual exposure, y residual saturation, z shadow PCF softness, w removal budget
     baked_indirect_curve: vec4<f32>, // x gamma-like power in linear light, y highlight retention, zw reserved
     baked_sun_debug_mode: vec4<u32>, // x: 0 off, 1 removal amount, 2 old-sun visibility
-    runtime_sun_direction: vec4<f32>,
+    runtime_sun_direction: vec4<f32>, // xyz toward sun; w 0..1 vanilla sky night blend
     runtime_sun_radiance: vec4<f32>, // xyz radiance, w live BSP sunlight enabled
 };
 struct PbrSettings {
@@ -554,6 +554,28 @@ fn wave_value(func: u32, p: vec4<f32>, time: f32) -> f32 {
     }
     return p.x + v * p.y;
 }
+// jk2mv/OpenJK RB_CalcWaveColor: non-noise waves are scaled by tr.identityLight
+// before the 0..1 clamp (render_flags.y bits 17/18 = overbright output on).
+fn rgb_wave_glow(func: u32, p: vec4<f32>, time: f32) -> f32 {
+    var v = wave_value(func, p, time);
+    if (func < 5u && (camera.render_flags.y & (131072u | 262144u)) != 0u) {
+        v = v * 0.5;
+    }
+    return clamp(v, 0.0, 1.0);
+}
+// Bit 19: JK2 encoded color. The glow byte multiplies the encoded texel, so
+// with sRGB-decoded textures the equivalent linear multiplier is decode(glow).
+fn jk2_encoded_wave() -> bool {
+    return (camera.render_flags.y & 524288u) != 0u;
+}
+fn rgb_wave_color(func: u32, p: vec4<f32>, time: f32) -> f32 {
+    let g = rgb_wave_glow(func, p, time);
+    if (jk2_encoded_wave()) {
+        return select(pow((g + 0.055) / 1.055, 2.4), g / 12.92, g <= 0.04045);
+    }
+    return g;
+}
+
 
 // JaPro: subtract the remap offset, then apply a positive clampTime.
 // vector_t.w is reserved for the limit; zero leaves the clock unbounded.
@@ -566,7 +588,7 @@ fn apply_wave_gens(color: vec4<f32>) -> vec4<f32> {
     var out = color;
     let time = shader_stage_time();
     if ((material_flags() & MATERIAL_FLAG_RGB_WAVE) != 0u) {
-        let g = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, time), 0.0, 1.0);
+        let g = rgb_wave_color(material.wave_funcs.x, material.wave_rgb, time);
         out = vec4<f32>(vec3<f32>(g), out.a);
     }
     if ((material_flags() & MATERIAL_FLAG_ALPHA_WAVE) != 0u) {
@@ -4090,14 +4112,21 @@ fn remove_baked_sun(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f3
 fn light_bsp_surface(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f32> {
     // ONE shade_baked_local call site: under hardware RT its lamp loop inlines
     // ray queries, and the driver compiles every call site into each world PSO.
-    let static_receiver = static_sun_lightmap_receiver(input);
+    // Fully Realtime: the authored lightmap/vertex light is discarded. A flat
+    // ambient (Baked indirect brightness slider) stands in for indirect light;
+    // the live sun/moon below supplies direct light with CSM shadows.
+    let fully_realtime = (lighting_settings.baked_sun_debug_mode.w & (1u << 9u)) != 0u;
+    let static_receiver = !fully_realtime && static_sun_lightmap_receiver(input);
     var unshadowed: vec3<f32>;
-    if static_receiver {
+    if fully_realtime {
+        unshadowed = vec3<f32>(0.25 * lighting_settings.baked_indirect_adjust.x);
+    } else if static_receiver {
         unshadowed = shade_composed_sun(lightmap, flux, input);
     } else {
         unshadowed = select(remove_baked_sun(lightmap, flux, input), lightmap, composed_lightmap_receiver(input));
     }
-    let remaining = shade_baked_local(unshadowed, input);
+    var remaining = unshadowed;
+    if !fully_realtime { remaining = shade_baked_local(unshadowed, input); }
     if (static_receiver || lighting_settings.baked_sun_debug_mode.x != 0u
         || lighting_settings.runtime_sun_radiance.w < 0.5) {
         return remaining;
@@ -4525,6 +4554,10 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
     // Do not also add runtime sun/lamps, probes, emissive or wetness on the
     // second pass; the original depth-seeding style already evaluated those.
     if ((material_flags() & MATERIAL_FLAG_EXTRA_STATIC_LIGHTSTYLE) != 0u) {
+        // Fully Realtime has no authored lightmap, including extra styles.
+        if (ENABLE_BAKED_SUN_RELIGHT && (lighting_settings.baked_sun_debug_mode.w & (1u << 9u)) != 0u) {
+            return vec4<f32>(0.0, 0.0, 0.0, base.a);
+        }
         return base;
     }
 
@@ -4709,10 +4742,10 @@ fn encoded_world_output(color: vec4<f32>) -> vec4<f32> {
 }
 fn legacy_rgb_output(color: vec4<f32>) -> vec4<f32> {
     if ((material_flags() & MATERIAL_FLAG_LEGACY_SRGB) != 0u) {
-        let has_wave = (material_flags() & MATERIAL_FLAG_RGB_WAVE) != 0u;
+        let has_wave = (material_flags() & MATERIAL_FLAG_RGB_WAVE) != 0u && !jk2_encoded_wave();
         var wave = 1.0;
         if (has_wave) {
-            wave = clamp(wave_value(material.wave_funcs.x, material.wave_rgb, shader_stage_time()), 0.0, 1.0);
+            wave = rgb_wave_glow(material.wave_funcs.x, material.wave_rgb, shader_stage_time());
         }
         let source = legacy_additive_source(color, wave, has_wave);
         if (LEGACY_WORLD_ENCODED_BLEND) {
@@ -4918,7 +4951,7 @@ fn additive_stage_tint(m: Material, vertex_color: vec4<f32>) -> vec4<f32> {
         color.a *= (1.0 - vertex_color.a);
     }
     if ((m.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u) {
-        let wave = clamp(wave_value(m.wave_funcs.x, m.wave_rgb, additive_time(m)), 0.0, 1.0);
+        let wave = rgb_wave_color(m.wave_funcs.x, m.wave_rgb, additive_time(m));
         color = vec4<f32>(vec3<f32>(wave), color.a);
     }
     if ((m.header.z & MATERIAL_FLAG_ALPHA_WAVE) != 0u) {
@@ -4933,10 +4966,10 @@ fn additive_weighted_sample(texel: vec4<f32>, m: Material, vertex_color: vec4<f3
         sample = vec4<f32>(sample.rgb * sky_gain, sample.a);
     }
     if ((m.header.z & MATERIAL_FLAG_LEGACY_SRGB) != 0u) {
-        let has_wave = (m.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u;
+        let has_wave = (m.header.z & MATERIAL_FLAG_RGB_WAVE) != 0u && !jk2_encoded_wave();
         var wave = 1.0;
         if (has_wave) {
-            wave = clamp(wave_value(m.wave_funcs.x, m.wave_rgb, additive_time(m)), 0.0, 1.0);
+            wave = rgb_wave_glow(m.wave_funcs.x, m.wave_rgb, additive_time(m));
         }
         sample = legacy_additive_source(sample, wave, has_wave);
     }
@@ -5180,6 +5213,18 @@ fn sky_cloud_stage_color(vertex_color: vec4<f32>) -> vec4<f32> {
     return apply_wave_gens(stage_color);
 }
 
+// Preserve the map's original art in daylight. At night, gently suppress
+// chroma (rod-dominated viewing) and diminish red > green > blue in linear RGB.
+// Preserve alpha: authored sky cloud blends/alpha-tests must remain unchanged.
+fn vanilla_sky_night_tone(color: vec4<f32>) -> vec4<f32> {
+    let night = clamp(lighting_settings.runtime_sun_direction.w, 0.0, 1.0);
+    if (night <= 0.0) { return color; }
+    let luminance = dot(color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let muted = mix(color.rgb, vec3<f32>(luminance), night * 0.35);
+    let night_gain = mix(vec3<f32>(1.0), vec3<f32>(0.025, 0.0375, 0.06), vec3<f32>(night));
+    return vec4<f32>(muted * night_gain, color.a);
+}
+
 fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
     // The engine never draws clouds on the bottom face of the sky box.
     let a = abs(d);
@@ -5191,7 +5236,7 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
     if ((material.params.x > 0.0 && base.a < material.params.x || material.params.x < 0.0 && base.a >= -material.params.x)) {
         discard;
     }
-    return base;
+    return vanilla_sky_night_tone(base);
 }
 
 // The six Quake/JKA sky faces are projective: scaling the direction does
@@ -5201,7 +5246,22 @@ fn sky_cloud_color(input: VertexOut, d: vec3<f32>) -> vec4<f32> {
 // This retains the BSP sky brush as the visibility mask; unlike moving UVs to
 // the raw BSP vertices it cannot introduce cube-face seams when the camera
 // moves across a large sky polygon.
+// tr_sky.cpp draws the outer box with glColor3f(identityLight); pre-compensate the output
+// overbright gain. Bit 17: JK2 SDR (encoded-space halve), bit 18: linear halve.
+fn outer_sky_identity_light(color: vec4<f32>) -> vec4<f32> {
+    let sky_flags = camera.render_flags.y;
+    var compensated = color;
+    if ((sky_flags & 131072u) != 0u) {
+        compensated = vec4<f32>(jk2_fast_decode(jk2_fast_encode(color.rgb) * 0.5), color.a);
+    } else if ((sky_flags & 262144u) != 0u) {
+        compensated = vec4<f32>(color.rgb * 0.5, color.a);
+    }
+    return vanilla_sky_night_tone(compensated);
+}
 fn sample_outer_sky(d: vec3<f32>) -> vec4<f32> {
+    return outer_sky_identity_light(sample_outer_sky_raw(d));
+}
+fn sample_outer_sky_raw(d: vec3<f32>) -> vec4<f32> {
     let a = abs(d);
     if (a.x >= a.y && a.x >= a.z) {
         let inv = 1.0 / max(a.x, 0.0000001);
@@ -5409,7 +5469,7 @@ struct SkyCloudOut {
     if (material_alpha_rejects(base.a)) {
         discard;
     }
-    return base;
+    return vanilla_sky_night_tone(base);
 }
 
 @vertex fn vs_sky_box_rt(@builtin(vertex_index) i: u32) -> SkyBoxOut { return sky_box_vertex(0u, i); }
@@ -5427,7 +5487,9 @@ fn sky_box_color(input: SkyBoxOut, color: vec4<f32>) -> vec4<f32> {
     if (ocean_connected_sky_below_horizon(input.direction_z)) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
-    return color;
+    // Reuse the exact OpenJK/JK2 overbright compensation and vanilla sky tint
+    // of the world-sky path, including the authored cloud box.
+    return outer_sky_identity_light(color);
 }
 @fragment fn fs_sky_box_rt(input: SkyBoxOut) -> @location(0) vec4<f32> { return sky_box_color(input, textureSample(sky_rt, sky_sampler, sky_box_uv(input.uv))); }
 @fragment fn fs_sky_box_bk(input: SkyBoxOut) -> @location(0) vec4<f32> { return sky_box_color(input, textureSample(sky_bk, sky_sampler, sky_box_uv(input.uv))); }
