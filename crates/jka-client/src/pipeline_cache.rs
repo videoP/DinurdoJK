@@ -63,7 +63,7 @@ pub(crate) fn install(device: &wgpu::Device, info: &wgpu::AdapterInfo, base: &Pa
     }
     let Some(key) = wgpu::util::pipeline_cache_key(info) else { return; };
     // Default: the patched wgpu-hal keeps one small cache file per pipeline in
-    // DinurdoJK/cache/vk_pipelines/<adapter> and deletes the least recently used
+    // DinurdoJK/cache/vulkan/<adapter> and deletes the least recently used
     // ones past its size cap, instead of this single blob, which could only be
     // deleted whole (every pipeline then compiled cold, seconds each with RT).
     // Pipelines get `cache: None` (the slot stays empty) and the HAL picks the
@@ -72,7 +72,7 @@ pub(crate) fn install(device: &wgpu::Device, info: &wgpu::AdapterInfo, base: &Pa
     if info.backend == wgpu::Backend::Vulkan
         && std::env::var("JKA_PIPELINE_CACHE_BLOB").map_or(true, |value| value.trim() != "1")
     {
-        let dir = jka_assets::pk3::dinurdojk_cache_directory(base).join("vk_pipelines").join(&key);
+        let dir = jka_assets::pk3::dinurdojk_cache_directory(base).join("vulkan").join(&key);
         rverbose!(1, "[PIPELINE CACHE] per-pipeline files in {}", dir.display());
         std::env::set_var("DINURDOJK_VK_PIPELINE_CACHE", dir);
         *SLOT.write().unwrap_or_else(|e| e.into_inner()) = None;

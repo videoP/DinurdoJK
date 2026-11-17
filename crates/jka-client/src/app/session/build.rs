@@ -68,17 +68,20 @@ impl App {
             siege_catalog.classes.len(), siege_catalog.teams.len(), siege_catalog.maps.len()
         );
         if let Some(error) = cancelled() { return Err(error); }
+        // One authoritative VFS snapshot for all three presenters. A fork is
+        // cheap and preserves package order, override policy and pure rules.
+        let entity_assets = assets.fork();
+        let fx_assets = assets.fork();
         let mut player_presenter = PlayerPresenter::new(assets, pbr)
             .map_err(|error| format!("PLAYER ASSET ERROR: {error}"))?;
         if jka_assets::pk3::configured_filesystem_roots(base).active_jk2.is_some() {
             player_presenter.use_jk2_saber_defaults();
         }
         if let Some(error) = cancelled() { return Err(error); }
-        let entity_assets = open().map_err(|error| format!("ENTITY ASSET PATH ERROR: {error}"))?;
-        let entity_presenter = EntityPresenter::new(entity_assets, pbr)
+        let shaders = player_presenter.shader_definitions_for(pbr);
+        let entity_presenter = EntityPresenter::new_with_shared_shaders(entity_assets, pbr, shaders)
             .map_err(|error| format!("ENTITY ASSET ERROR: {error}"))?;
         if let Some(error) = cancelled() { return Err(error); }
-        let fx_assets = open().map_err(|error| format!("FX ASSET PATH ERROR: {error}"))?;
         Ok((siege_catalog, siege_classes, player_presenter, entity_presenter, fx_assets))
     }
 

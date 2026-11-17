@@ -175,10 +175,11 @@ impl Renderer {
                 u32::from(batch.surface_material) == MATERIAL_SNOW
                     && batch.pipeline.class != DrawClass::Sky
             });
-        // Before the world bind groups are built; a reused world is rebound below.
-        let snow_fields_changed = self
-            .surface_deformation
-            .set_field_enabled(&self.device, self.map_has_snow_surfaces);
+        // Before the world bind groups are built, so build_world binds the
+        // current field views; a restored world is rebound right after build.
+        // Only a map with snow AND r_footprints on samples the 2048^2 field.
+        let snow_field = self.surface_deformation_shader_needed();
+        self.surface_deformation.set_field_enabled(&self.device, snow_field);
         self.map_has_water = map
             .batches
             .iter()
@@ -234,6 +235,17 @@ impl Renderer {
             WorldShaderFamily::Enhanced => (&self.world_pipeline_layout, &self.world_shader),
             WorldShaderFamily::Lean => (&self.world_pipeline_layout_lean, &self.world_shader_lean),
         };
+        // Lightmap chart ids are only read when the baked-lightmap cache will
+        // be built (smoothing/signal, relighting, added lamps, or sun removal
+        // on a map with a baked-sun encoding). Otherwise the ~0.6 s background
+        // job is skipped; a later need still computes them inline.
+        let prefetch_lightmap_charts = self.lightmap_smoothing != 0
+            || self.lightmap_signal != 0
+            || self.sun_override
+            || self.added_map_light_sources() != 0
+            || (self.baked_sun_cache && map.baked_sun_encoding.is_some()
+                && (self.baked_sun_removal > 0.0 || self.baked_sun_removal_auto
+                    || self.baked_sun_removal_contour));
         let pre_build_ms = load_map_started.elapsed().as_secs_f64() * 1000.0;
         let shared_texture_count = map.textures.len();
         let (mut world, mut upload_timings) = if let Some(entry) = resident {
@@ -292,6 +304,7 @@ impl Renderer {
             map,
             if reuse.is_some() { self.world.as_ref() } else { shared },
             reuse.unwrap_or(if shared.is_some() { shared_texture_count } else { 0 }),
+            prefetch_lightmap_charts,
         ) };
         if restored {
             self.rebuild_world_surface_bind_groups(&mut world);
@@ -301,6 +314,8 @@ impl Renderer {
             &world.pipeline_variants, world.remap_scene_format, world.remap_msaa_samples,
         );
         upload_timings.pre_build_ms = pre_build_ms;
+        upload_timings.segments.laps.insert(0, ("load_map pre-build", pre_build_ms));
+        upload_timings.segments.lap("bind-group rebuild + PSO slots/catalog");
         let post_bind_started = Instant::now();
         world.cull_bind_group = Some(create_gpu_cull_bind_group(
             &self.device,
@@ -333,6 +348,7 @@ impl Renderer {
             &self.weather.rain.gpu.wind_noise_sampler,
         ));
         upload_timings.post_bind_groups_ms = post_bind_started.elapsed().as_secs_f64() * 1000.0;
+        upload_timings.segments.lap("cull+froxel bind groups");
         let post_misc_started = Instant::now();
         // A map reload can reuse the same content hash but replace the GPU
         // geometry/material bindings. Never sample a prior map's static depth.
@@ -345,12 +361,7 @@ impl Renderer {
         // volume. Rebind model materials only at map install (not each frame).
         self.dynamic_model_renderer.install_irradiance_volume(
             &self.device, self.world.as_ref().map(|world| &world._static_light_grid));
-        if snow_fields_changed {
-            if let Some(mut world) = self.world.take() {
-                self.rebuild_world_surface_bind_groups(&mut world);
-                self.world = Some(world);
-            }
-        }
+        upload_timings.segments.lap("install world + irradiance volume");
         // A map replaced while the A/B diagnostic was enabled must receive
         // the same forced-alpha upload as a live toggle.
         if self.debug_world_vertex_alpha_one {
@@ -372,6 +383,7 @@ impl Renderer {
                 );
             }
         }
+        upload_timings.segments.lap("flare textures");
         self.world_videos = retained_videos.unwrap_or_else(|| videos.into_iter().filter_map(|source| {
             let decoder = match source.data {
                 VideoSourceData::Roq(bytes) => {
@@ -400,10 +412,13 @@ impl Renderer {
                 }
             }
         }).collect());
+        upload_timings.segments.lap("video decoders");
         self.sync_baked_brightness_assets();
+        upload_timings.segments.lap("baked brightness assets");
         if self.hardware_rt_requested() {
             self.ensure_ray_traced_shadow_resources();
         }
+        upload_timings.segments.lap("RT shadow resources");
         // build_world allocates the fixed-capacity storage with every authored
         // light so the buffer exists before Renderer owns the WorldGpu. Rewrite
         // it immediately through the active source-class filter: source .map
@@ -411,6 +426,7 @@ impl Renderer {
         // normal Forward+/area toggles must also be correct on the first frame.
         self.upload_light_buffer();
         self.request_static_ao(false);
+        upload_timings.segments.lap("light buffer + static AO request");
         let sun = self.active_sun();
         self.grass_renderer.update_environment(
             &self.queue,
@@ -418,6 +434,7 @@ impl Renderer {
             self.weather_wind,
             self.pbr_enabled,
         );
+        upload_timings.segments.lap("grass environment");
         // The CPU solve is already running on the weather worker. Rain, snow and
         // cloud terrain interaction share this same heightfield, so any of them
         // may request the GPU upload during the map switch.
@@ -427,27 +444,32 @@ impl Renderer {
         {
             self.ensure_weather_occlusion();
         }
+        upload_timings.segments.lap("weather occlusion");
         self.rebuild_weather_surface_receiver_bind_group();
         self.update_weather_surface_uniform();
         self.weather.fog.write_legacy_control(&self.queue);
         self.sync_self_legacy_fog();
         upload_timings.post_misc_ms = post_misc_started.elapsed().as_secs_f64() * 1000.0;
+        upload_timings.segments.lap("weather receivers + fog sync");
         let frame_plan_started = Instant::now();
         self.rebuild_planar_reflection_resources();
         self.rebuild_frame_plan();
         upload_timings.frame_plan_ms = frame_plan_started.elapsed().as_secs_f64() * 1000.0;
+        upload_timings.segments.lap("planar reflections + frame plan");
         // Loading the world may discover authored/environment planar reflectors,
         // which changes the specialized BSP feature key after build_world had to
         // create its first variant. Activate (or lazily build) the final key now.
         let variant_started = Instant::now();
         self.activate_world_pipeline_variant();
         upload_timings.variant_ms = variant_started.elapsed().as_secs_f64() * 1000.0;
+        upload_timings.segments.lap("pipeline variant");
         let finalize_started = Instant::now();
         self.update_lighting_settings();
         if restored {
             println!("[STUDIO CACHE] GPU world restored; skipped geometry/texture upload");
         }
         upload_timings.finalize_ms = finalize_started.elapsed().as_secs_f64() * 1000.0;
+        upload_timings.segments.lap("finalize");
         upload_timings
     }
 

@@ -10,6 +10,9 @@ const BOUNCES: usize = 2;
 const REFLECTANCE: f32 = 0.6;
 const MAX_DISTANCE: f32 = 131072.0;
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Disk-cache identity of the transport math. Bump when `sample`,
+/// `filter_page` or the gutter band change.
+pub(super) const DISK_VERSION: &str = "sky-transport-v1 paths 64 bounces 2 reflectance 0.6 filter 5x5";
 
 pub(super) struct TransportBake {
     sizes: Vec<[u32; 2]>,
@@ -140,6 +143,7 @@ pub(super) fn bake(
     receivers: &[StaticAoLightmapTriangle], solid: Option<&StaticAoBvh>, sky: Option<&StaticAoBvh>,
     bounce_normals: &[Vec3], surface: &(impl Fn(usize, [f32; 3]) -> Option<f32> + Sync),
     cancel: &AtomicBool, progress: &BakeProgress, vertex_sky: &[VertexSkySample],
+    disk: Option<(&std::path::Path, u64, &str)>,
 ) -> Option<Arc<TransportBake>> {
     if !key.sky_transport || cancel.load(Ordering::Relaxed) { return None; }
     if let Some(cached) = cached.filter(|cached| cached.matches(key)) {
@@ -153,6 +157,22 @@ pub(super) fn bake(
         return None;
     }
     let started = std::time::Instant::now();
+    let mut vertices: Vec<_> = vertex_sky.iter().map(|v| (v.gpu_index, v.transport)).collect();
+    vertices.sort_by_key(|v| v.0);
+    vertices.dedup_by_key(|v| v.0);
+    let finish = |pages: Vec<Vec<[f32; 2]>>, vertices| Some(Arc::new(TransportBake {
+        sizes: key.sky_sizes.clone(), normals: key.normals, visibility: key.visibility,
+        models: key.models, tinted: key.tinted, pages, vertices,
+    }));
+    // Per-map disk cache: luxel pages only. Vertex responses come from the
+    // vertex sky stage and are rebuilt with it.
+    if let Some((path, disk_key, map)) = disk {
+        if let Some(pages) = crate::renderer::lighting::sky_openness_cache::read(path, disk_key, &key.sky_sizes, 2) {
+            crate::renderer::lighting::sky_openness_cache::prune(path, map, crate::renderer::lighting::sky_openness_cache::TRANSPORT);
+            println!("[SKY TRANSPORT] loaded from disk cache in {:.2}s", started.elapsed().as_secs_f64());
+            return finish(pages.into_iter().map(|page| page.chunks_exact(2).map(|c| [c[0], c[1]]).collect()).collect(), vertices);
+        }
+    }
     // Gutter luxels (just past each chart's edge, read by bilinear sampling)
     // get their own nearest-chart sample. Without them a seam had no transport,
     // fell back to the coarse packed sky openness, and could be room-protected
@@ -177,18 +197,23 @@ pub(super) fn bake(
         }).collect()
     }).collect();
     if cancel.load(Ordering::Relaxed) { return None; }
-    let pages = pages.into_par_iter().zip(&owners).zip(&key.sky_sizes)
+    let pages: Vec<Vec<[f32; 2]>> = pages.into_par_iter().zip(&owners).zip(&key.sky_sizes)
         .map(|((page, owners), &size)| filter_page(&page, owners, size)).collect();
     if cancel.load(Ordering::Relaxed) { return None; }
-    let mut vertices: Vec<_> = vertex_sky.iter().map(|v| (v.gpu_index, v.transport)).collect();
-    vertices.sort_by_key(|v| v.0);
-    vertices.dedup_by_key(|v| v.0);
+    if let Some((path, disk_key, map)) = disk {
+        let flat: Vec<&[f32]> = pages.iter().map(|page: &Vec<[f32; 2]>| bytemuck::cast_slice(page)).collect();
+        match crate::renderer::lighting::sky_openness_cache::write(path, disk_key, &key.sky_sizes, 2, &flat) {
+            Ok(bytes) => {
+                let pruned = crate::renderer::lighting::sky_openness_cache::prune(path, map, crate::renderer::lighting::sky_openness_cache::TRANSPORT);
+                println!("[SKY TRANSPORT] disk cache saved: {:.2} MiB {} ({pruned} superseded removed)",
+                    bytes as f64 / 1048576.0, path.display());
+            }
+            Err(error) => eprintln!("[SKY TRANSPORT] disk cache write failed: {error}"),
+        }
+    }
     println!("[SKY TRANSPORT] white sky, {PATHS} paths/luxel, {BOUNCES} bounces, reflectance {REFLECTANCE}, {:.2}s, {:.2} MiB; lightmaps and artificial emitters excluded",
         started.elapsed().as_secs_f64(), bytes as f64 / (1024.0 * 1024.0));
-    Some(Arc::new(TransportBake {
-        sizes: key.sky_sizes.clone(), normals: key.normals, visibility: key.visibility,
-        models: key.models, tinted: key.tinted, pages, vertices,
-    }))
+    finish(pages, vertices)
 }
 
 #[cfg(test)]

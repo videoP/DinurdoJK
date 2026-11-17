@@ -8,28 +8,27 @@ pub(in crate::renderer) fn visible_batches_by_cluster(
     batches: &[WorldBatch],
     vis: &jka_assets::bsp::Visibility,
 ) -> Vec<Vec<usize>> {
-    let mut by_cluster = vec![Vec::new(); vis.clusters];
-    for (batch_index, batch) in batches.iter().enumerate() {
-        if batch.source.pvs_signature.is_empty() {
-            for list in &mut by_cluster {
-                list.push(batch_index);
-            }
-            continue;
-        }
-        for (cluster, list) in by_cluster.iter_mut().enumerate() {
+    // Cluster-major on the rayon pool: each list is still in batch order, the
+    // same result as the batch-major loop, but 13k clusters x 25k batches no
+    // longer run on the render thread alone.
+    use rayon::prelude::*;
+    let signatures: Vec<&[u64]> = batches.iter().map(|batch| &*batch.source.pvs_signature).collect();
+    (0..vis.clusters)
+        .into_par_iter()
+        .map(|cluster| {
+            crate::thread_activity::label_rayon_worker();
             let word = cluster / 64;
-            let bit = cluster % 64;
-            if batch
-                .source
-                .pvs_signature
-                .get(word)
-                .is_none_or(|value| *value & (1_u64 << bit) != 0)
-            {
-                list.push(batch_index);
-            }
-        }
-    }
-    by_cluster
+            let mask = 1_u64 << (cluster % 64);
+            signatures
+                .iter()
+                .enumerate()
+                .filter(|(_, signature)| {
+                    signature.is_empty() || signature.get(word).is_none_or(|value| *value & mask != 0)
+                })
+                .map(|(batch_index, _)| batch_index)
+                .collect()
+        })
+        .collect()
 }
 
 /// Conservative main-view sky reachability, prepared at map upload / live shader remap.

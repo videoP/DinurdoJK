@@ -18,6 +18,33 @@ fn frontend_scene_camera(mut camera: crate::camera::Camera) -> crate::camera::Ca
 }
 
 impl App {
+    pub(in crate::app) fn frontend_scene_page_active(&self) -> bool {
+        self.front_end && !self.profile_preview_active && self.loading.is_none()
+            && self.game_session.is_none()
+            && !matches!(self.frontend_page, FrontendPage::RenderStudio | FrontendPage::Profile
+                | FrontendPage::AssetViewer | FrontendPage::MapViewer | FrontendPage::Screenshots)
+    }
+
+    pub(in crate::app) fn frontend_scene_token(&self) -> Option<crate::renderer::FrontendSceneToken> {
+        let cinematic = self.frontend_cinematic?;
+        if !self.frontend_scene_page_active() || !cinematic.scene_submitted
+            || (cinematic.fade_started.is_some() && self.frontend_scene_handoff(Instant::now()) >= 1.0)
+            || cinematic.request_id != self.latest_request_id
+        {
+            return None;
+        }
+        let size = self.window.as_ref()?.inner_size();
+        let camera = frontend_scene_camera(self.camera);
+        Some(crate::renderer::FrontendSceneToken {
+            request_id: self.latest_request_id,
+            generation: self.frontend_scene_cache_generation,
+            viewport: [size.width, size.height],
+            camera: [camera.position.x.to_bits(), camera.position.y.to_bits(),
+                camera.position.z.to_bits(), camera.yaw.to_bits(), camera.pitch.to_bits(),
+                camera.cg_fov().to_bits()],
+        })
+    }
+
     pub(in crate::app) fn subframe_input_view_rotation(&self) -> Option<[f32; 2]> {
         // cg_specHud 4 virtual free camera: mouse drives the camera directly.
         if self.spectator_broadcast.free_active() {
@@ -237,6 +264,7 @@ impl App {
             Arc::new(Vec::new())
         };
         RenderSnapshot {
+            frontend_scene: self.frontend_scene_token(),
             weather_server_time_ms: (!isolated_preview && !self.front_end).then(|| {
                 self.game_session.as_ref().and_then(|session| {
                     session.current_snapshot.as_ref().map(|_| session.cgame_time)

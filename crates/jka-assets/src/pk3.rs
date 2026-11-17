@@ -65,6 +65,13 @@ struct VfsIndex {
     /// Entry count of each archive when it was indexed, to detect an archive
     /// that was replaced on disk before a lazily opened handle reads from it.
     archive_lens: Vec<usize>,
+    /// File size and modification time of each archive when it was indexed.
+    /// A new handle reuses `archive_metadata` only while these still match.
+    archive_identity: Vec<ArchiveIdentity>,
+    /// Each archive's parsed central directory, shared by every handle opened
+    /// on it (see `open_shared_archive`). Holding it here also keeps the
+    /// process-wide metadata cache entry alive while this index is mounted.
+    archive_metadata: Vec<Arc<zip::read::ZipArchiveMetadata>>,
     /// Whether each archive is a retail `assets0..assets3.pk3`.
     archive_stock: Vec<bool>,
     /// Sorted by key, keys unique.
@@ -80,6 +87,72 @@ struct VfsIndex {
 /// Opening one parses the archive's whole central directory, so enough are kept
 /// for every map worker to read textures at once.
 const MAX_IDLE_ARCHIVE_HANDLES: usize = 16;
+
+/// `(file size, modification time)`: the identity a parsed central directory
+/// is valid for.
+type ArchiveIdentity = (u64, Option<SystemTime>);
+
+fn archive_identity(file: &File) -> std::io::Result<ArchiveIdentity> {
+    let metadata = file.metadata()?;
+    Ok((metadata.len(), metadata.modified().ok()))
+}
+
+/// Parsed central directories, shared by every handle and every index over the
+/// same unchanged file. Parsing a large PK3 costs tens of milliseconds; before
+/// this, each of the 16 texture readers and each fs_game index re-parsed every
+/// archive it touched (49 parses = 4.7 s of worker CPU for one menu map).
+/// Weak: an archive that no mounted index uses is not retained.
+type ArchiveMetadataCache =
+    HashMap<(PathBuf, ArchiveIdentity), std::sync::Weak<zip::read::ZipArchiveMetadata>>;
+
+fn archive_metadata_cache() -> &'static Mutex<ArchiveMetadataCache> {
+    static CACHE: std::sync::OnceLock<Mutex<ArchiveMetadataCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+/// Open `path`, parsing its central directory only if no live index or handle
+/// already parsed this exact file (same size and modification time). The
+/// parse reads through a buffer: the zip crate reads each entry header with
+/// several small reads, which on a bare `File` are separate syscalls.
+fn open_shared_archive(
+    path: &Path,
+) -> Result<(zip::ZipArchive<File>, ArchiveIdentity), Box<dyn Error>> {
+    let file = File::open(path)?;
+    let identity = archive_identity(&file)?;
+    let key = (path.to_path_buf(), identity);
+    let cached = archive_metadata_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+        .and_then(std::sync::Weak::upgrade);
+    let metadata = match cached {
+        Some(metadata) => metadata,
+        None => {
+            let parsed = zip::ZipArchive::new(std::io::BufReader::with_capacity(
+                64 * 1024,
+                File::open(path)?,
+            ))?
+            .metadata();
+            let mut cache = archive_metadata_cache().lock().unwrap_or_else(PoisonError::into_inner);
+            cache.retain(|_, weak| weak.strong_count() > 0);
+            cache.insert(key, Arc::downgrade(&parsed));
+            parsed
+        }
+    };
+    Ok((with_archive_metadata(file, metadata), identity))
+}
+
+/// A handle over `file` that reuses an already parsed central directory.
+fn with_archive_metadata(
+    file: File,
+    metadata: Arc<zip::read::ZipArchiveMetadata>,
+) -> zip::ZipArchive<File> {
+    // SAFETY (API contract, not memory safety): zip requires `metadata` to
+    // describe `file`. Every caller passes metadata parsed from the same path
+    // whose size and modification time it has just checked to be unchanged,
+    // and each read also verifies the entry name it finds at the indexed slot.
+    unsafe { zip::ZipArchive::unsafe_new_with_metadata(file, metadata) }
+}
 
 /// Process-wide count and total time of archive handles opened (as opposed to
 /// reused from an idle pool); see [`archive_open_stats`].
@@ -366,15 +439,71 @@ pub fn compare_package_mount_priority(a: &Path, b: &Path) -> std::cmp::Ordering 
 
 /// Set the package checksums referenced by the active server or demo. Empty
 /// references unmount every downloaded `dl_` package.
+///
+/// Returns whether the *mounted package set* changed, not merely the list.
+/// The list only gates installed `dl_` archives, so a new list that mounts and
+/// unmounts exactly the same archives in every indexed search directory leaves
+/// each VFS namespace byte-identical. Indexes, and work prepared against them,
+/// stay valid; no generation bump forces a rebuild.
 pub fn set_server_referenced_paks(checksums: &[i32]) -> bool {
     let new = checksums.iter().copied().collect::<HashSet<_>>();
+    let (old, disabled) = {
+        let state = package_policy().read().unwrap_or_else(PoisonError::into_inner);
+        if *state.server_referenced == new {
+            return false;
+        }
+        (Arc::clone(&state.server_referenced), state.disabled.clone())
+    };
+    let mounts_changed = referenced_mounts_differ(&old, &new, &disabled);
     let mut state = package_policy().write().unwrap_or_else(PoisonError::into_inner);
-    if *state.server_referenced == new {
-        return false;
-    }
     state.server_referenced = Arc::new(new);
-    state.generation = state.generation.wrapping_add(1);
-    true
+    if mounts_changed {
+        state.generation = state.generation.wrapping_add(1);
+    }
+    mounts_changed
+}
+
+/// Whether any installed `dl_` archive in an already-indexed search directory
+/// is mounted under exactly one of the two reference sets, using the same rule
+/// as `plan_sources`. Directories never indexed are built fresh with the new
+/// set anyway. Conservative (`true`) when indexes are not cached or a package
+/// cannot be inspected; the JK2 pure filter is deliberately not applied here
+/// (it is per index), which can only report extra changes, never miss one.
+fn referenced_mounts_differ(
+    old: &HashSet<i32>,
+    new: &HashSet<i32>,
+    disabled: &HashSet<PathBuf>,
+) -> bool {
+    if !index_cache_enabled() {
+        return true;
+    }
+    let dirs = {
+        let cache = index_cache().lock().unwrap_or_else(PoisonError::into_inner);
+        cache.keys().flat_map(|(dirs, _)| dirs.iter().cloned()).collect::<std::collections::BTreeSet<_>>()
+    };
+    for dir in dirs {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return true,
+        };
+        for entry in entries {
+            let Ok(entry) = entry else { return true };
+            let path = entry.path();
+            if !is_server_download(&path) || !is_archive_package(&path)
+                || !entry.file_type().is_ok_and(|kind| kind.is_file())
+                || disabled.contains(&path)
+            {
+                continue;
+            }
+            let Ok(checksum) = crate::pak_checksum::pk3_checksum(&path) else { return true };
+            let mounted = |set: &HashSet<i32>| !set.is_empty() && set.contains(&checksum);
+            if mounted(old) != mounted(new) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Force the next VFS lookup to rebuild its index after an autodownload.
@@ -1033,7 +1162,16 @@ impl AssetSearchPath {
                 None => {
                     let path = &self.shared.archive_paths[index];
                     let opened = std::time::Instant::now();
-                    let archive = zip::ZipArchive::new(File::open(path)?)?;
+                    let file = File::open(path)?;
+                    if archive_identity(&file)? != self.shared.archive_identity[index] {
+                        return Err(
+                            format!("{} changed on disk since it was indexed", path.display()).into(),
+                        );
+                    }
+                    let archive = with_archive_metadata(
+                        file,
+                        Arc::clone(&self.shared.archive_metadata[index]),
+                    );
                     ARCHIVE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     ARCHIVE_OPEN_MICROS
                         .fetch_add(opened.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1074,7 +1212,9 @@ impl AssetSearchPath {
                 if declared > limit as u64 {
                     return Err(format!("{name} exceeds asset size limit").into());
                 }
-                let mut bytes = Vec::new();
+                // Declared size is checked against `limit` above; one allocation
+                // instead of read_to_end's doubling growth and copies.
+                let mut bytes = Vec::with_capacity(declared as usize + 1);
                 let read_result = (&mut file).take(limit as u64 + 1).read_to_end(&mut bytes);
                 // Release the first ZipFile before reopening the same entry on
                 // the same archive handle. Ordinary reads keep CRC validation.
@@ -1158,7 +1298,7 @@ enum Source {
 enum Scanned {
     /// The opened archive and its `(normalized key, zip entry number)` pairs,
     /// sorted by key.
-    Archive(zip::ZipArchive<File>, Vec<(String, usize)>),
+    Archive(zip::ZipArchive<File>, Vec<(String, usize)>, ArchiveIdentity),
     /// `(normalized key, path)` pairs, sorted by key.
     Loose(Vec<(String, PathBuf)>),
 }
@@ -1215,8 +1355,7 @@ fn plan_sources(dirs: &[PathBuf], pure: &Option<Arc<crate::jk2_pure::Jk2PurePoli
 fn scan_source(source: &Source) -> Result<Scanned, String> {
     match source {
         Source::Archive { path, jk2_version, .. } => {
-            let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
-            let mut archive = zip::ZipArchive::new(file)
+            let (mut archive, identity) = open_shared_archive(path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
             let mut keys = Vec::with_capacity(archive.len());
             for index in 0..archive.len() {
@@ -1245,7 +1384,7 @@ fn scan_source(source: &Source) -> Result<Scanned, String> {
                 let compatibility = jk2_compatibility::PackageCompatibility::new(path, *version, &info);
                 keys.retain(|(key, _)| compatibility.allows(key));
             }
-            Ok(Scanned::Archive(archive, keys))
+            Ok(Scanned::Archive(archive, keys, identity))
         }
         Source::Loose(root, pure) => {
             let mut files = Vec::<(String, PathBuf)>::new();
@@ -1324,21 +1463,25 @@ fn build_index_for_game(dirs: &[PathBuf], pure: Option<Arc<crate::jk2_pure::Jk2P
     let total = scans
         .iter()
         .map(|scan| match scan {
-            Ok(Scanned::Archive(_, keys)) => keys.len(),
+            Ok(Scanned::Archive(_, keys, _)) => keys.len(),
             Ok(Scanned::Loose(files)) => files.len(),
             Err(_) => 0,
         })
         .sum();
     let mut archive_paths = Vec::new();
     let mut archive_lens = Vec::new();
+    let mut archive_identity = Vec::new();
+    let mut archive_metadata = Vec::new();
     let mut handles = ArchiveHandles::new();
     let mut flat = Vec::<(String, Provider)>::with_capacity(total);
     for (source, scan) in sources.iter().zip(scans) {
         match (source, scan?) {
-            (Source::Archive { path, .. }, Scanned::Archive(archive, keys)) => {
+            (Source::Archive { path, .. }, Scanned::Archive(archive, keys, identity)) => {
                 let archive_index = archive_paths.len();
                 archive_paths.push(path.clone());
                 archive_lens.push(archive.len());
+                archive_identity.push(identity);
+                archive_metadata.push(archive.metadata());
                 handles.push(Some(archive));
                 flat.extend(keys.into_iter().map(|(key, entry)| {
                     (
@@ -1386,6 +1529,8 @@ fn build_index_for_game(dirs: &[PathBuf], pure: Option<Arc<crate::jk2_pure::Jk2P
             jk2_pure: pure,
             archive_paths,
             archive_lens,
+            archive_identity,
+            archive_metadata,
             archive_stock,
             entries,
             search_dirs: dirs.to_vec(),

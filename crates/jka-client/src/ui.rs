@@ -1651,6 +1651,8 @@ pub struct MapLoadingUi {
     pub bars: Vec<MapLoadingBar>,
     /// Multiplayer join progress uses the same native panel as map loading.
     pub joining_server: bool,
+    /// Monotonic origin for the current join/map, not a time-based progress estimate.
+    pub started_at: Option<std::time::Instant>,
     /// Actual current operation, never a made-up overall phase percentage.
     pub status_line: Option<String>,
     /// During autodownload, the SERVER CONTENT row shows this file rather than

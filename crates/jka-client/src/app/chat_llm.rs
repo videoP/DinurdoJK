@@ -283,7 +283,7 @@ impl App {
         }
         let host = engine();
         if host.cache_dir().is_none() {
-            host.set_cache_dir(jka_assets::pk3::dinurdojk_cache_directory(&self.base).join("models"));
+            host.set_cache_dir(jka_assets::pk3::dinurdojk_cache_directory(&self.base).join("llm"));
         }
         host.set_threads(i32::from(settings.threads));
         let mut needed: Vec<&str> = Vec::new();
@@ -903,7 +903,7 @@ mod tests {
         std::fs::write(fixture.0.join("DinurdoJK.cfg"), "").unwrap();
         let mut app = App::new(fixture.0.clone(), None,
             crate::scene::MapSource::Bsp("mp/ffa3".into()), false, event_loop.create_proxy()).unwrap();
-        engine().set_cache_dir(fixture.0.join("models"));
+        engine().set_cache_dir(fixture.0.join("llm"));
         let first = "https://example.invalid/first.gguf";
         let selected = "https://example.invalid/selected.gguf";
         app.set_console_cvar("cg_chatLlmModel", first).unwrap();

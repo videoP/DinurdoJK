@@ -100,8 +100,56 @@ pub struct SurfaceInspectorInfo {
     pub hit_inline_model: Option<u32>,
 }
 
+/// Consecutive wall-clock laps for diagnosing one long, serial piece of work
+/// (map upload, first world frame). Each lap starts where the previous one
+/// ended, so the laps cover the measured span without gaps. A recorder that
+/// was not started never reads the clock or allocates.
+#[derive(Debug, Clone, Default)]
+pub struct LapRecorder {
+    pub laps: Vec<(&'static str, f64)>,
+    last: Option<Instant>,
+}
+
+impl LapRecorder {
+    pub fn started() -> Self {
+        Self { laps: Vec::with_capacity(64), last: Some(Instant::now()) }
+    }
+
+    pub fn started_if(enabled: bool) -> Self {
+        if enabled { Self::started() } else { Self::default() }
+    }
+
+    pub fn lap(&mut self, name: &'static str) {
+        if let Some(last) = self.last.as_mut() {
+            let now = Instant::now();
+            self.laps.push((name, now.duration_since(*last).as_secs_f64() * 1000.0));
+            *last = now;
+        }
+    }
+
+    pub fn total_ms(&self) -> f64 {
+        self.laps.iter().map(|(_, ms)| ms).sum()
+    }
+
+    /// Costliest laps first; laps below `min_ms` are folded into one entry.
+    pub fn summary(&self, min_ms: f64) -> String {
+        let mut sorted = self.laps.clone();
+        sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let (shown, small): (Vec<_>, Vec<_>) = sorted.into_iter().partition(|(_, ms)| *ms >= min_ms);
+        let mut parts = shown.iter().map(|(name, ms)| format!("{name} {ms:.1}")).collect::<Vec<_>>();
+        if !small.is_empty() {
+            let rest: f64 = small.iter().map(|(_, ms)| ms).sum();
+            parts.push(format!("{} other(s) {rest:.1}", small.len()));
+        }
+        parts.join(" | ")
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WorldUploadTimings {
+    /// Gap-free laps through `load_map`/`build_world`, for locating the cost
+    /// of the single blocking render-thread upload.
+    pub segments: LapRecorder,
     /// A Render Studio world swap reused resident geometry and textures.
     pub studio_world_reused: bool,
     /// A remap requested new geometry and required the compatibility full-world path.
@@ -244,6 +292,8 @@ pub enum UserEvent {
     /// The renderer presented a frame whose egui paint data carried this token.
     /// Sent once per distinct token; drives the menu stage fade clock.
     FrontendStagePresented(u64),
+    /// A successful present of the authored menu camera and its scene draws.
+    FrontendScenePresented(crate::renderer::FrontendSceneToken),
     /// WGPU main-menu effects are compositing (egui can stop painting its fallback still).
     NeonMenuCompositorReady,
     /// An asynchronously decoded placeholder (not the live 3D scene).

@@ -2443,14 +2443,14 @@ app_cvars! {
     }
 
     APP_R_LIGHTMAPSIGNAL {
-        runtime: CvarDef::new("r_lightmapSignal", "", "0..11", "Composed-lightmap diagnostic (use with r_lightmap 1): 0 off, 1 authored lightmap as compiled, 2 authored residual after old-sun removal + indirect tone, 3 authored-sun flux that was removed, 4 new sun incident flux, 5 new sun cosine (bake normal . sun), 6 new sun visibility (green lit, red shadowed, blue facing away), 7 lightmap charts + receiver triangle edges, 8 bake-normal change from smoothing (0..20 degrees) + triangle edges, 9 direct white-sky response, 10 bounced white-sky response, 11 total white-sky response. 9-11 require Protect authored room lighting, Relight map, CSM and sky bake; grayscale sqrt display, magenta unavailable. Transport is a fixed-white-sky estimate, not authored daylight fraction. 7/8 rebake; other views recompose only. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.lightmap_signal.to_string()), |app, value| App::cvar_set_r_lightmapsignal(app, APP_R_LIGHTMAPSIGNAL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lightmapsignal, None),
+        runtime: CvarDef::new("r_lightmapSignal", "", "0..14", "Composed-lightmap diagnostic (use with r_lightmap 1): 0 off, 1 authored lightmap as compiled, 2 authored residual after old-sun removal + indirect tone, 3 authored-sun flux that was removed, 4 new sun incident flux, 5 new sun cosine (bake normal . sun), 6 new sun visibility (green lit, red shadowed, blue facing away), 7 lightmap charts + receiver triangle edges, 8 bake-normal change from smoothing (0..20 degrees) + triangle edges, 9 direct white-sky response, 10 bounced white-sky response, 11 total white-sky response, 12 sky world gain multiplier, 13 sky gain direct (moon/sun) visibility, 14 sky gain ambient openness (12-14: magenta = luxel without a packed sky normal, gain neutral). 9-11 require Protect authored room lighting, Relight map, CSM and sky bake; grayscale sqrt display, magenta unavailable. Transport is a fixed-white-sky estimate, not authored daylight fraction. 7/8 rebake; other views recompose only. Session-only.", CvarType::String, CvarFlags::NONE, LatchScope::None, |app| CvarValue::String(app.video.lightmap_signal.to_string()), |app, value| App::cvar_set_r_lightmapsignal(app, APP_R_LIGHTMAPSIGNAL.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_lightmapsignal, None),
         config: CvarBinding::NONE,
         implementations: [ impl App {
             fn cvar_set_r_lightmapsignal(&mut self, name: &str, value: &str) -> Result<(), String> {
                 let mode = value.trim().parse::<u8>()
-                    .ok().filter(|mode| *mode <= 11)
-                    .ok_or_else(|| format!("{name}: expected 0..11"))?;
-                if mode >= 9 && (!self.video.sky_world_light_isolation || !self.video.sun_override) {
+                    .ok().filter(|mode| *mode <= 14)
+                    .ok_or_else(|| format!("{name}: expected 0..14"))?;
+                if (9..=11).contains(&mode) && (!self.video.sky_world_light_isolation || !self.video.sun_override) {
                     return Err(format!("{name}: sky transport views require Protect authored room lighting and Relight map"));
                 }
                 if self.video.lightmap_signal != mode {
@@ -2461,6 +2461,7 @@ app_cvars! {
                     "off", "authored as compiled", "authored residual", "authored sun removed",
                     "new sun flux", "new sun cosine", "new sun visibility", "charts + triangles",
                     "normal smoothing", "direct white sky", "bounced white sky", "total white sky",
+                    "sky gain", "sky gain direct visibility", "sky gain ambient openness",
                 ][mode as usize]);
                 Ok(())
             }

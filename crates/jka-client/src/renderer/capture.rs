@@ -511,6 +511,12 @@ impl Renderer {
         }
     }
 
+    pub(in crate::renderer) fn cancel_frontend_scene_capture(&mut self) {
+        if matches!(self.screenshot_requested, Some(ScreenshotDestination::FrontendScene { .. })) {
+            self.screenshot_requested = None;
+        }
+    }
+
     pub(in crate::renderer) fn request_clipboard_capture(&mut self) {
         self.request_screenshot_capture(ScreenshotDestination::Clipboard);
     }

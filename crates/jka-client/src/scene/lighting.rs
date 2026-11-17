@@ -659,16 +659,20 @@ pub(in crate::scene) fn bsp_surface_lights(
                 } else {
                     0
                 };
-                append_emitting_triangle(
-                    &mut promoted_candidates,
-                    positions,
-                    normal,
-                    promoted.value,
-                    promoted.color,
-                    promoted.subdivide,
-                    two_sided,
-                    promoted.reasons | overlap,
-                );
+                // One emitter per evidence part: each toggle adds only its
+                // own stages' light, and enabled parts sum.
+                for part in promoted.parts.iter().flatten() {
+                    append_emitting_triangle(
+                        &mut promoted_candidates,
+                        positions,
+                        normal,
+                        part.value,
+                        part.color,
+                        promoted.subdivide,
+                        two_sided,
+                        part.reasons | overlap,
+                    );
+                }
             }
         }
         if let Some(authored) = surface_light {
@@ -677,8 +681,11 @@ pub(in crate::scene) fn bsp_surface_lights(
         }
         if let Some(promoted) = material.shader_light.filter(|p| p.bake_reasons != 0) {
             let overlap = if surface_light.is_some() { materials::SHADER_LIGHT_AUTHORED_OVERLAP } else { 0 };
-            append_emitting_patches(&mut static_promoted_candidates, &patches,
-                promoted.value, promoted.color, two_sided, promoted.bake_reasons | overlap);
+            // Time-independent stages only, one static lamp per evidence part.
+            for part in promoted.parts.iter().flatten().filter(|part| part.bake_value > 0.0) {
+                append_emitting_patches(&mut static_promoted_candidates, &patches,
+                    part.bake_value, part.bake_color, two_sided, part.reasons | overlap);
+            }
         }
     }
 

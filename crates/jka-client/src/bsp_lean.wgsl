@@ -3801,7 +3801,7 @@ fn vanilla_sky_night_tone(color: vec4<f32>) -> vec4<f32> {
     if (night <= 0.0) { return color; }
     let luminance = dot(color.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
     let muted = mix(color.rgb, vec3<f32>(luminance), night * 0.35);
-    let night_gain = mix(vec3<f32>(1.0), vec3<f32>(0.025, 0.0375, 0.06), vec3<f32>(night));
+    let night_gain = mix(vec3<f32>(1.0), vec3<f32>(0.0125, 0.01875, 0.03), vec3<f32>(night));
     return vec4<f32>(muted * night_gain, color.a);
 }
 

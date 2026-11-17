@@ -56,25 +56,38 @@ impl App {
             ))
             .as_secs_f32()
         });
-        let sway = crate::scene::menu_stage(super::constants::FRONTEND_BACKGROUND_MAP)
-            .is_none_or(|stage| stage.camera_sway);
+        let sway = cinematic.stage.is_none_or(|stage| stage.camera_sway);
         let phase = if sway { frontend_motion_phase(seconds) } else { 0.0 };
         self.camera.position = glam::Vec3::from_array(cinematic.position);
         self.camera.position.y += (phase * 0.32).sin() * 0.65;
         self.camera.yaw = cinematic.yaw + (phase * 0.115).sin() * 0.28;
         self.camera.pitch = cinematic.pitch + (phase * 0.09).sin() * 0.025;
 
-        // A broken/missing model must not leave a cold first-run menu black
-        // indefinitely; never persist a snapshot without a settled model.
-        if cinematic.fade_started.is_none()
-            && cinematic.world_ready_at.is_some_and(|ready| {
-                now.saturating_duration_since(ready) >= Duration::from_secs(5)
-            })
+        if cinematic.fade_started.is_some() && !cinematic.reveal_logged
+            && self.frontend_scene_handoff(now) >= 1.0
         {
             if let Some(active) = self.frontend_cinematic.as_mut() {
-                active.fade_started = Some(now);
+                active.reveal_logged = true;
             }
-            self.egui_repaint_requested = true;
+            crate::startup_timeline::mark(crate::startup_timeline::Milestone::MenuLiveRevealed);
+            crate::startup_timeline::report("menu_live_revealed");
+        }
+
+        // A broken/missing model must not leave a cold first-run menu black
+        // indefinitely; never persist a snapshot without a settled model.
+        // A preview may stay open for minutes. Its time must not exhaust this
+        // budget and bypass the real scene-present ack immediately on return.
+        let scene_active = self.frontend_scene_page_active();
+        if let Some(active) = self.frontend_cinematic.as_mut() {
+            if !scene_active {
+                active.readiness_started = None;
+            } else if active.fade_started.is_none() && active.world_ready_at.is_some() {
+                let started = *active.readiness_started.get_or_insert(now);
+                if now.saturating_duration_since(started) >= Duration::from_secs(5) {
+                    active.fade_started = Some(now);
+                    self.egui_repaint_requested = true;
+                }
+            }
         }
     }
 

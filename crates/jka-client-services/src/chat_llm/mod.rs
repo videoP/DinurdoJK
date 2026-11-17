@@ -521,7 +521,7 @@ pub fn read_summary(answer: &str) -> Vec<String> {
 
 /// Runs the real models on sample chat and prints what they answer. Needs
 /// the model files and a build with the model runtime:
-/// `DJK_MODEL_CACHE=<...>/DinurdoJK/cache/models cargo test -p jka-client-services
+/// `DJK_MODEL_CACHE=<...>/DinurdoJK/cache/llm cargo test -p jka-client-services
 /// --features jka-llm/llama live_ -- --ignored --nocapture`
 #[cfg(test)]
 mod live {

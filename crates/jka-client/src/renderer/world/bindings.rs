@@ -479,6 +479,89 @@ pub(in crate::renderer) fn create_world_bind_group(
     })
 }
 
+/// Everything a batch's full, fast and authored-glow surface bind groups read
+/// from that batch (`create_world_bind_group`, `create_fast_world_bind_group`).
+/// Every other input is shared by all batches of one build, so batches with
+/// equal keys get identical bind groups. PVS pieces of one material (21k FULL
+/// pieces from 1.4k materials on racepack8) then share one set instead of each
+/// creating their own; wgpu bind group creation does not scale across threads.
+#[derive(PartialEq, Eq, Hash)]
+pub(in crate::renderer) struct WorldBindKey {
+    lightmap: Option<usize>,
+    texture: Option<usize>,
+    texture_is_lightmap: bool,
+    texture_is_white: bool,
+    /// normal, roughness, height, metallic, specular, emissive.
+    pbr: [Option<usize>; 6],
+    reflection_probe: Option<usize>,
+    overlay: Option<usize>,
+    /// Sky slots 0..6 read additive companion textures before the skybox.
+    companion_textures: [Option<Option<usize>>; 6],
+    skybox: Option<[usize; 6]>,
+    detail: wgpu::TextureView,
+    /// Which lightmap/local/sun-aux page set the caller binds for this batch.
+    lighting_set: u8,
+    material: (wgpu::Buffer, u64),
+    additive: [(wgpu::Buffer, u64); 2],
+    fog: (wgpu::Buffer, u64),
+    glow_fog: Option<(wgpu::Buffer, u64)>,
+}
+
+impl WorldBindKey {
+    /// `None` for animated stages: their per-frame bind groups stay per batch.
+    pub(in crate::renderer) fn new(
+        source: &DrawBatch,
+        detail: &GpuImage,
+        lighting_set: u8,
+        material: &UniformSlot,
+        additive: &[UniformSlot; 2],
+        fog: &UniformSlot,
+        glow_fog: Option<&UniformSlot>,
+    ) -> Option<Self> {
+        if source.animation.as_ref().is_some_and(|animation| animation.frames.len() > 1) {
+            return None;
+        }
+        let slot = |slot: &UniformSlot| (slot.buffer.clone(), slot.offset);
+        Some(Self {
+            lightmap: source.lightmap,
+            texture: source.texture,
+            texture_is_lightmap: source.texture_is_lightmap,
+            texture_is_white: source.texture_is_white,
+            pbr: [
+                source.normal_texture,
+                source.roughness_texture,
+                source.height_texture,
+                source.metallic_texture,
+                source.specular_texture,
+                source.emissive_texture,
+            ],
+            reflection_probe: source.reflection_probe,
+            overlay: source.legacy_srgb_overlay,
+            companion_textures: std::array::from_fn(|face| {
+                source.additive_companions.get(face).map(|companion| companion.texture)
+            }),
+            skybox: source.skybox,
+            detail: detail.view.clone(),
+            lighting_set,
+            material: slot(material),
+            additive: [slot(&additive[0]), slot(&additive[1])],
+            fog: slot(fog),
+            glow_fog: glow_fog.map(slot),
+        })
+    }
+}
+
+/// For each item, the index of the first item with an equal key (itself when
+/// it has no key or is the first): only those create bind groups.
+pub(in crate::renderer) fn bind_group_representatives<'a>(
+    keys: impl Iterator<Item = Option<&'a WorldBindKey>>,
+) -> Vec<usize> {
+    let mut first = HashMap::<&WorldBindKey, usize>::new();
+    keys.enumerate()
+        .map(|(index, key)| key.map_or(index, |key| *first.entry(key).or_insert(index)))
+        .collect()
+}
+
 /// AUTO 4 batches share FULL's GPU resources: the first `auto4_variant_base`
 /// entries alias FULL 1:1 and each recipe uses its representative piece's
 /// bind state. Copy handles instead of creating a bind group per recipe.
@@ -553,17 +636,58 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
             .and_then(|index| textures.get(index))
             .unwrap_or(white)
     });
-    for batch in coarse_batches.iter_mut().chain(full_batches.iter_mut()) {
-        let local_lightmaps = if (!batch.is_inline_entity || batch.inline_baked_lightmap)
-            && baked_sun_cache.as_ref().is_some_and(|c| c.active && c.has_composition())
-            && static_sun.local_ready() { static_sun.local_flux.as_slice() } else { &[] };
-        let sun_aux = baked_sun_cache.as_ref().filter(|c| c.active).map_or(&[][..], |c| c.sun_aux());
+    // Resolve the cache/sun state once; the per-batch work below then only
+    // reads shared wgpu handles and writes its own batch, so it runs on the
+    // rayon pool. wgpu bind group creation is thread-safe, and a full rebuild
+    // (lightmap composition, snow field, AO) is ~25k batches on large maps.
+    let composed_local_flux = if baked_sun_cache.as_ref().is_some_and(|c| c.active && c.has_composition())
+        && static_sun.local_ready() { static_sun.local_flux.as_slice() } else { &[] };
+    let sun_aux = baked_sun_cache.as_ref().filter(|c| c.active).map_or(&[][..], |c| c.sun_aux());
+    let world_lightmaps = lightmaps.as_slice();
+    let unbaked_inline_lightmaps = baked_sun_cache.as_ref().filter(|c| c.active)
+        .map_or(world_lightmaps, |c| c.original.as_slice());
+    let textures = textures.as_slice();
+    let deluxemaps = deluxemaps.as_slice();
+    let texture_clamp = texture_clamp.as_slice();
+    let reflection_probes = &*reflection_probes;
+    let detail_texture_by_base = &*detail_texture_by_base;
+    let primary_skybox = &*primary_skybox;
+    let footprint_marks = &footprint_marks;
+    use rayon::prelude::*;
+    // Batches with an equal WorldBindKey get identical bind groups: create one
+    // set per distinct key (in parallel) and share the handles.
+    let lighting_set = |batch: &crate::renderer::WorldBatch| {
+        u8::from(batch.is_inline_entity && !batch.inline_baked_lightmap)
+    };
+    let keys: Vec<Option<WorldBindKey>> = coarse_batches.iter().chain(full_batches.iter())
+        .map(|batch| {
+            let detail = detail_texture_for_source(
+                &batch.source, detail_texture, detail_texture_auto,
+                detail_auto_textures, detail_texture_by_base,
+            );
+            WorldBindKey::new(
+                &batch.source, detail, lighting_set(batch), &batch._material_buffer,
+                &batch.additive_uniforms, &batch._fog_buffer,
+                batch._authored_glow_fog_buffer.as_ref(),
+            )
+        })
+        .collect();
+    let representatives = bind_group_representatives(keys.iter().map(Option::as_ref));
+    drop(keys);
+    let created: Vec<Option<(wgpu::BindGroup, wgpu::BindGroup, Option<wgpu::BindGroup>, Option<WorldBatchAnimation>)>> =
+        coarse_batches.par_iter().chain(full_batches.par_iter()).enumerate().map(|(index, batch)| {
+        if representatives[index] != index {
+            return None;
+        }
+        crate::thread_activity::label_rayon_worker();
+        let local_lightmaps = if !batch.is_inline_entity || batch.inline_baked_lightmap {
+            composed_local_flux
+        } else { &[] };
         // Only model surfaces with original BSP lightmap charts use the
         // composed bake; vertex-lit/no-chart surfaces retain authored pages.
         let lightmaps = if batch.is_inline_entity && !batch.inline_baked_lightmap {
-            baked_sun_cache.as_ref().filter(|c| c.active)
-                .map_or(lightmaps.as_slice(), |c| c.original.as_slice())
-        } else { lightmaps.as_slice() };
+            unbaked_inline_lightmaps
+        } else { world_lightmaps };
         let selected_detail_texture = detail_texture_for_source(
             &batch.source,
             detail_texture,
@@ -571,7 +695,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
             detail_auto_textures,
             detail_texture_by_base,
         );
-        batch.bind_group = create_world_bind_group(
+        let bind_group = create_world_bind_group(
             device,
             surface_layout,
             white,
@@ -589,7 +713,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
             deluxemaps,
             texture_clamp,
             *primary_skybox,
-            &footprint_marks,
+            footprint_marks,
             reflection_probes,
             &batch.source,
             &batch._material_buffer,
@@ -599,7 +723,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
             deformation_field_views,
             deformation_field_sampler,
         );
-        batch.fast_bind_group = create_fast_world_bind_group(
+        let fast_bind_group = create_fast_world_bind_group(
             device,
             fast_surface_layout,
             white,
@@ -612,7 +736,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
             lightmaps, local_lightmaps, sun_aux,
             texture_clamp,
             *primary_skybox,
-            &footprint_marks,
+            footprint_marks,
             &batch.source,
             &batch._material_buffer,
             &batch.additive_uniforms,
@@ -620,34 +744,34 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
             deformation_field_views,
             deformation_field_sampler,
         );
-        batch.authored_glow_bind_group = batch._authored_glow_fog_buffer.as_ref().map(|glow_fog| {
+        let authored_glow_bind_group = batch._authored_glow_fog_buffer.as_ref().map(|glow_fog| {
             create_world_bind_group(
                 device, surface_layout, white, missing, flat_normal,
                 repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
                 lightmap_sampler, sky_sampler, selected_detail_texture,
                 textures, lightmaps, local_lightmaps, sun_aux, deluxemaps, texture_clamp, *primary_skybox,
-                &footprint_marks, reflection_probes, &batch.source,
+                footprint_marks, reflection_probes, &batch.source,
                 &batch._material_buffer, &batch.additive_uniforms, glow_fog, surface_deformation_buffer,
                 deformation_field_views, deformation_field_sampler,
             )
         });
-        batch.animation = build_world_animation(
-            &batch.source, &batch.bind_group, &batch.fast_bind_group,
-            &batch.authored_glow_bind_group,
+        let animation = build_world_animation(
+            &batch.source, &bind_group, &fast_bind_group,
+            &authored_glow_bind_group,
             |alternate| WorldAnimationFrame {
                 full: create_world_bind_group(
                     device, surface_layout, white, missing, flat_normal,
                     repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
                     lightmap_sampler, sky_sampler, selected_detail_texture,
                     textures, lightmaps, local_lightmaps, sun_aux, deluxemaps, texture_clamp, *primary_skybox,
-                    &footprint_marks, reflection_probes, alternate,
+                    footprint_marks, reflection_probes, alternate,
                     &batch._material_buffer, &batch.additive_uniforms, &batch._fog_buffer, surface_deformation_buffer,
                     deformation_field_views, deformation_field_sampler,
                 ),
                 fast: create_fast_world_bind_group(
                     device, fast_surface_layout, white, missing, repeat_sampler, clamp_sampler,
                     lightmap_sampler, sky_sampler, textures, lightmaps, local_lightmaps, sun_aux, texture_clamp,
-                    *primary_skybox, &footprint_marks, alternate, &batch._material_buffer,
+                    *primary_skybox, footprint_marks, alternate, &batch._material_buffer,
             &batch.additive_uniforms,
                     surface_deformation_buffer, deformation_field_views, deformation_field_sampler,
                 ),
@@ -657,14 +781,37 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
                         repeat_sampler, clamp_sampler, pbr_repeat_sampler, pbr_clamp_sampler,
                         lightmap_sampler, sky_sampler, selected_detail_texture,
                         textures, lightmaps, local_lightmaps, sun_aux, deluxemaps, texture_clamp, *primary_skybox,
-                        &footprint_marks, reflection_probes, alternate,
+                        footprint_marks, reflection_probes, alternate,
                         &batch._material_buffer, &batch.additive_uniforms, glow_fog, surface_deformation_buffer,
                         deformation_field_views, deformation_field_sampler,
                     )
                 }),
             },
         );
+        Some((bind_group, fast_bind_group, authored_glow_bind_group, animation))
+    }).collect();
+    let mut created = created;
+    for (index, batch) in coarse_batches.iter_mut().chain(full_batches.iter_mut()).enumerate() {
+        let representative = representatives[index];
+        if representative == index {
+            let (bind_group, fast_bind_group, glow, animation) =
+                created[index].clone().expect("representative bind groups were created");
+            batch.bind_group = bind_group;
+            batch.fast_bind_group = fast_bind_group;
+            batch.authored_glow_bind_group = glow;
+            batch.animation = animation;
+        } else {
+            let (bind_group, fast_bind_group, glow, _) = created[representative]
+                .as_ref()
+                .expect("representative precedes its sharers");
+            batch.bind_group = bind_group.clone();
+            batch.fast_bind_group = fast_bind_group.clone();
+            batch.authored_glow_bind_group = glow.clone();
+            // Keyed batches are never animated.
+            batch.animation = None;
+        }
     }
+    created.clear();
     sync_auto4_bind_groups(world);
 }
 

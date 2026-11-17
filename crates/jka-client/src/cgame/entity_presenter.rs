@@ -585,13 +585,13 @@ impl EntityPresenter {
         } else {
             let mut shader_warnings = Vec::new();
             let (shaders, diagnostics) =
-                materials::shader_library(&mut assets, &mut shader_warnings, pbr)?;
+                materials::shared_shader_library(&mut assets, &mut shader_warnings, None, pbr)?;
             devprintln!(1, "ENTITY ASSETS: shaderDefs={} mtrDefs={}",
                 diagnostics.shader_definitions, diagnostics.mtr_definitions);
             for warning in shader_warnings {
-                rverbose!(1, "ENTITY MATERIAL WARNING: {warning}");
+                rverbose!(3, "ENTITY MATERIAL WARNING: {warning}");
             }
-            Arc::new(shaders)
+            shaders
         };
         Ok(Self {
             assets,

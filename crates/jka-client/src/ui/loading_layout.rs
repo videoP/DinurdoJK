@@ -49,6 +49,7 @@ pub(crate) struct LoadingLayout {
     pub heading: Bounds,
     pub percentage: Bounds,
     pub overall_track: Bounds,
+    pub operation_status: Option<Bounds>,
     /// Four fixed dependency columns. Individual tasks remain parallel.
     pub phases: Vec<PhaseLayout>,
     pub cancel: Option<Bounds>,
@@ -95,7 +96,7 @@ pub(crate) fn layout(loading: &MapLoadingUi, width: u32, height: u32) -> Loading
     let bottom_safe = (70.0 * s).max(52.0).min(h * 0.16);
     let panel_w = (830.0 * s).min(w - margin * 2.0).max(1.0);
     let inner = (panel_w - pad * 2.0).max(1.0);
-    let head_h = 76.0 * s;
+    let head_h = if loading.status_line.is_some() { 98.0 * s } else { 76.0 * s };
     let gap = 11.0 * s;
     let phase_groups = MapLoadingPhase::ALL.map(|phase| loading.bars.iter()
         .filter(|b| !b.skipped && b.phase == phase).collect::<Vec<_>>());
@@ -116,7 +117,7 @@ pub(crate) fn layout(loading: &MapLoadingUi, width: u32, height: u32) -> Loading
     let bar_h = target_bar_h.min(((stack_h - bar_gap * (max_bars - 1) as f32)
         / max_bars as f32).max(0.0));
     let phases_h = stack_h + label_h + state_h;
-    // The active task is now named inside its own bar; no redundant footer.
+    // Reserve a real status cell for the current operation; keep task rails stable.
     let panel_h = (pad * 2.0 + head_h + phases_h + gap)
         .min((h - margin - bottom_safe).max(1.0));
 
@@ -134,8 +135,11 @@ pub(crate) fn layout(loading: &MapLoadingUi, width: u32, height: u32) -> Loading
     let title_row = f.node(Container::row().width(inner).height(34.0 * s)
         .justify(JustifyContent::SPACE_BETWEEN), &[title, pct]);
     let track = f.leaf(inner, 6.0 * s);
+    let status_node = loading.status_line.as_ref().map(|_| f.leaf(inner, 18.0 * s));
+    let mut header_nodes = vec![top, title_row, track];
+    if let Some(status) = status_node { header_nodes.push(status); }
     let header = f.node(Container::column().width(inner).height(head_h).gap(4.0 * s),
-        &[top, title_row, track]);
+        &header_nodes);
 
     let col_gap = 12.0 * s;
     let col_w = ((inner - 3.0 * col_gap) / 4.0).max(1.0);
@@ -165,6 +169,7 @@ pub(crate) fn layout(loading: &MapLoadingUi, width: u32, height: u32) -> Loading
     LoadingLayout {
         panel: f.bounds(panel), kicker: f.bounds(kicker), heading: f.bounds(title),
         percentage: f.bounds(pct), overall_track: f.bounds(track),
+        operation_status: status_node.map(|id| f.bounds(id)),
         phases: part_nodes.into_iter().map(|(bars, heading, state)| PhaseLayout {
             heading: f.bounds(heading), status: f.bounds(state),
             bars: bars.into_iter().map(|id| f.bounds(id)).collect(),
@@ -228,7 +233,7 @@ mod tests {
             bars: (0..rows).map(|i| MapLoadingBar {
                 phase: MapLoadingPhase::ALL[i % 4], label: "TEST", completed: 0, total: 1,
                 skipped: false, no_work: false }).collect(),
-            joining_server: true, status_line: Some("Downloading a very long map name".into()),
+            joining_server: true, started_at: None, status_line: Some("Downloading a very long map name".into()),
             download_file_name: None, download_overall_fraction: None,
             connection_prompt: None, pointer: None,
         }
@@ -240,6 +245,9 @@ mod tests {
         for (w,h) in [(1920,1080), (1280,720), (854,480)] {
             let l = layout(&loading,w,h);
             assert_eq!(l.phases.len(), 4);
+            let status = l.operation_status.unwrap();
+            assert!(status[1] >= l.overall_track[1] + l.overall_track[3] - 1.0);
+            assert!(status[1] + status[3] <= l.panel[1] + l.panel[3] + 1.0);
             for stage in &l.phases {
                 assert_eq!(stage.bars.len(), 4);
                 assert!(stage.bars.iter().all(|bar|

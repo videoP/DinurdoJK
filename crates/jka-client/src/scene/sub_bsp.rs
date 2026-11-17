@@ -67,11 +67,29 @@ pub(crate) fn prepare_source_with_sub_bsps(
     seed: Option<&Arc<PreparedMap>>,
     names: &[String],
 ) -> Result<PreparedMap, String> {
+    prepare_source_with_sub_bsps_and_shader_hook(root, game, source, jobs, options, seed, names, None)
+}
+
+pub(crate) fn prepare_source_with_sub_bsps_and_shader_hook(
+    root: &Path,
+    game: Option<&Path>,
+    source: &MapSource,
+    jobs: &MapJobPool,
+    options: MapPrepareOptions,
+    seed: Option<&Arc<PreparedMap>>,
+    names: &[String],
+    shader_ready: Option<&mut super::prepare::ShaderReadyHook<'_>>,
+) -> Result<PreparedMap, String> {
     let started = std::time::Instant::now();
     // An aggregate preparation must never lend appended textures/geometry or
     // collision to the main-map-only pipeline on a later join/restart.
     let seed = seed.filter(|map| map.sub_bsp_names.is_empty());
-    let mut map = super::prepare_source_with_jobs(root, game, source, jobs, options, seed)?;
+    let mut map = match source {
+        MapSource::Bsp(name) => super::prepare::prepare_internal(
+            root, game, name, Some(jobs), options, seed, shader_ready,
+        )?,
+        _ => super::prepare_source_with_jobs(root, game, source, jobs, options, seed)?,
+    };
     if jobs.is_superseded() {
         return Err("superseded map preparation".into());
     }
@@ -275,7 +293,7 @@ fn remap_batch(
         batch.material_debug_index += debug_offset;
     }
     batch.bsp_shader_index = u32::MAX; // The main BSP's inspector table has different indices.
-    batch.pvs_signature.clear();
+    batch.pvs_signature = Vec::new().into();
     batch.area_signature = [0; 4];
     batch.planar_reflection = false;
     batch.planar_environment_candidate = false;

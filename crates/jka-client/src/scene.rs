@@ -16,11 +16,11 @@ mod cache;
 mod collision;
 mod sub_bsp;
 mod inline_instances;
-pub(crate) use sub_bsp::{prepare_source_with_sub_bsps, server_bsp_names, sub_bsp_configstring_command};
+pub(crate) use sub_bsp::{prepare_source_with_sub_bsps, prepare_source_with_sub_bsps_and_shader_hook, server_bsp_names, sub_bsp_configstring_command};
 mod entities;
 mod environment;
 mod menu_look;
-pub(crate) use menu_look::{default_fx_placements, default_prop_placements, menu_stage};
+pub(crate) use menu_look::{default_fx_placements, default_prop_placements, menu_stage, menu_props_dependency, MenuStage};
 mod geometry;
 mod lighting;
 mod memory;
@@ -527,7 +527,9 @@ pub struct DrawBatch {
     pub reflection_roughness_hint: f32,
     /// Camera-cluster visibility signature. Bit N is set when this batch may be
     /// visible from BSP cluster N. Empty for sources without compiled PVS.
-    pub pvs_signature: Vec<u64>,
+    /// Shared: one bit per cluster (1.6 KB on 13k-cluster maps), and batches
+    /// are cloned ~100k times per large-map upload (AUTO 4 recipes, caches).
+    pub pvs_signature: std::sync::Arc<[u64]>,
     /// Portal-area membership. Bit N means some geometry in this batch belongs
     /// to BSP area N. All-zero means unknown/not-applicable and is therefore
     /// treated conservatively as visible.
@@ -1581,10 +1583,6 @@ pub struct LegacyDlightSurface {
     pub plane: [f32; 4],
     pub bounds_min: [f32; 3],
     pub bounds_max: [f32; 3],
-    /// Bezier patch surface. q3map2's Jedi Academy profile (and Raven's q3map)
-    /// cast no sun shadows from patches unless -patchshadows was given, so the
-    /// authored-sun reconstruction must not treat them as occluders.
-    pub patch: bool,
 }
 
 #[derive(Clone)]
@@ -1712,6 +1710,9 @@ pub struct PreparedMap {
     /// R_RemapShader-style redirects can resolve a replacement material
     /// without reparsing every .shader/.mtr file or taxing the render loop.
     pub shader_library: Arc<BTreeMap<String, Shader>>,
+    /// Namespace revision and game variant used to parse this exact table.
+    /// Source previews do not publish a reusable identity.
+    pub shader_vfs: Option<(jka_assets::pk3::VfsIndexToken, Option<u8>)>,
     /// Definition provenance paired with `shader_library`; needed by the
     /// existing material resolver for package-scoped PBR overrides.
     pub shader_origins: Arc<BTreeMap<String, materials::ShaderDefinitionOrigin>>,

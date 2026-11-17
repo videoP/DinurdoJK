@@ -387,7 +387,7 @@ impl RenderThread {
         if backend == RendererBackend::Dx12 {
             // wgpu has no DX12 pipeline cache and DXC takes ~120 ms per large
             // shader, so the patched wgpu-hal keeps compiled bytecode here.
-            std::env::set_var("DINURDOJK_DX12_SHADER_CACHE", jka_assets::pk3::dinurdojk_cache_directory(&base).join("dx12_shaders"));
+            std::env::set_var("DINURDOJK_DX12_SHADER_CACHE", jka_assets::pk3::dinurdojk_cache_directory(&base).join("dx12"));
             instance_desc.backend_options.dx12.shader_compiler = match &dxc_path {
                 Some(path) => wgpu::Dx12Compiler::DynamicDxc {
                     dxc_path: path.to_string_lossy().into_owned(),
@@ -1034,6 +1034,10 @@ pub(in crate::renderer) fn render_thread_main(
     let mut input_latch_to_present_call_sum_ms = 0.0_f64;
     let mut input_event_to_present_call_sum_ms = 0.0_f64;
     let mut input_event_to_present_call_max_ms = 0.0_f64;
+    let mut world_request_id = None;
+    let mut last_frontend_scene_presented = None;
+    let mut frontend_capture: Option<(PathBuf, bool, crate::renderer::FrontendSceneToken)> = None;
+    let mut frontend_capture_token = None;
     let mut pending_world_uploaded: Option<(
         u64,
         Instant,
@@ -1302,6 +1306,7 @@ pub(in crate::renderer) fn render_thread_main(
                 let upload_started = Instant::now();
                 let received_at = load_map_received_at.take().unwrap_or(upload_started);
                 let upload_timings = renderer.load_studio_map(*map, studio_world);
+                world_request_id = Some(request_id);
                 // A new world must emit its own status even if the previous
                 // map happened to have the same calibrated coefficient.
                 last_baked_sun_auto_status = None;
@@ -1320,6 +1325,7 @@ pub(in crate::renderer) fn render_thread_main(
                 let bsp_stats = plan.base.bsp_stats.clone();
                 let upload_started = Instant::now();
                 let upload_timings = renderer.load_remapped_map(*plan, base_texture_count, studio_world);
+                world_request_id = Some(request_id);
                 last_baked_sun_auto_status = None;
                 let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
                 pending_world_uploaded = Some((
@@ -1669,7 +1675,7 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.set_post_effects(settings)
                     }
                     Ok(RenderCommand::SetFootprintMode(mode)) => {
-                        renderer.surface_deformation.set_mode(&renderer.queue, mode)
+                        renderer.set_footprint_mode(mode)
                     }
                     Ok(RenderCommand::SetGrassEnabled(enabled)) => {
                         renderer.set_grass_enabled(enabled)
@@ -2064,7 +2070,9 @@ pub(in crate::renderer) fn render_thread_main(
                         renderer.request_screenshot(directory, metadata, format)
                     }
                     Ok(RenderCommand::CopyFrameToClipboard) => renderer.request_clipboard_capture(),
-                    Ok(RenderCommand::CaptureFrontendScene { path, neutral_gamma }) => renderer.request_frontend_scene_capture(path, neutral_gamma),
+                    Ok(RenderCommand::CaptureFrontendScene { path, neutral_gamma, token }) => {
+                        frontend_capture = Some((path, neutral_gamma, token));
+                    },
                     Ok(RenderCommand::CaptureVideoFrame { frame_index, depth, alpha }) => renderer.request_video_frame_capture(frame_index, depth, alpha),
                     Ok(RenderCommand::SetUi(ui)) => renderer.set_ui(ui),
                     Ok(RenderCommand::ReloadChatEmojis) => renderer.reload_ui_chat_emojis(),
@@ -2277,6 +2285,7 @@ pub(in crate::renderer) fn render_thread_main(
                     ),
                     Ok(RenderCommand::UnloadMap) => {
                         renderer.unload_map();
+                        world_request_id = None;
                         last_baked_sun_auto_status = None;
                     },
                     Ok(RenderCommand::GrowInlineInstances { map }) => {
@@ -2427,6 +2436,26 @@ pub(in crate::renderer) fn render_thread_main(
             thread::sleep(Duration::from_millis(8));
             continue;
         }
+        // Validate against the mailbox AFTER commands and resize have been
+        // applied. A queued capture must never read a later preview page/map.
+        let frontend_scene = snapshot.frontend_scene.filter(|token| {
+            Some(token.request_id) == world_request_id && renderer.world.is_some()
+                && token.viewport == [renderer.size.width, renderer.size.height]
+                && snapshot.studio_scene.is_none()
+        });
+        if frontend_scene.is_none() {
+            last_frontend_scene_presented = None;
+        }
+        if frontend_capture_token.is_some() && frontend_capture_token != frontend_scene {
+            renderer.cancel_frontend_scene_capture();
+            frontend_capture_token = None;
+        }
+        if let Some((path, neutral, token)) = frontend_capture.take() {
+            if frontend_scene == Some(token) {
+                renderer.request_frontend_scene_capture(path, neutral);
+                frontend_capture_token = Some(token);
+            }
+        }
 
         // Every settings command for this frame has been drained, so a burst that
         // asked for the scene rebuild several times over pays for it once.
@@ -2558,6 +2587,11 @@ pub(in crate::renderer) fn render_thread_main(
                     shader_progress_polled_at = Instant::now();
                     renderer.refresh_shader_compile_progress();
                     renderer.poll_unicode_fonts();
+                    // Loading text/elapsed clock refresh at the existing 90 ms
+                    // diagnostic cadence; no retained UI rebuild in gameplay.
+                    if renderer.ui_state.loading.as_ref().is_some_and(|loading| loading.started_at.is_some()) {
+                        renderer.rebuild_retained_ui();
+                    }
                 }
                 // One queued export capture per loop: it delivers this iteration.
                 if let Some(capture) = renderer.studio_capture_queue.pop_front() {
@@ -2856,6 +2890,12 @@ pub(in crate::renderer) fn render_thread_main(
                     first_frame_notified = true;
                     let _ = proxy.send_event(UserEvent::RendererFirstFrame);
                 }
+                if let Some(token) = frontend_scene {
+                    if last_frontend_scene_presented != Some(token) {
+                        last_frontend_scene_presented = Some(token);
+                        let _ = proxy.send_event(UserEvent::FrontendScenePresented(token));
+                    }
+                }
                 if !first_menu_frame_notified && renderer.egui_active {
                     first_menu_frame_notified = true;
                     let _ = proxy.send_event(UserEvent::RendererFirstMenuFrame);
@@ -3014,7 +3054,12 @@ pub(in crate::renderer) fn render_thread_main(
                         rverbose!(2, "[MAP FIRST RENDER CPU] frame {:.1} | prepare {:.1} | acquire {:.1} | encode {:.1} | submit {:.1} | present {:.1} ms (CPU timings; no GPU wait inference)",
                             last_info.frame_ms, last_info.cpu_prepare_ms, last_info.cpu_acquire_ms,
                             last_info.cpu_encode_ms, last_info.cpu_submit_ms, last_info.cpu_present_ms);
-                        let known_encode_ms = last_info.perf_encode_setup_ms
+                        if !last_info.prepare_laps.laps.is_empty() {
+                            rverbose!(2, "[MAP FIRST PREPARE LAPS] {:.1} ms in {} laps | {}",
+                                last_info.prepare_laps.total_ms(), last_info.prepare_laps.laps.len(),
+                                last_info.prepare_laps.summary(2.0));
+                        }
+                        let known_encode_ms =last_info.perf_encode_setup_ms
                             + last_info.perf_encode_pre_world_ms
                             + last_info.perf_encode_scene_ms
                             + last_info.perf_encode_post_ui_ms

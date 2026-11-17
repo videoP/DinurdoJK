@@ -67,11 +67,24 @@ impl UniformSlot {
 }
 
 /// Hands out fixed-size, offset-aligned `UniformSlot`s from chunked buffers.
+///
+/// Contents are staged in a CPU mirror of the current chunk and written with
+/// ONE `write_buffer` per chunk (when it fills, on `flush`, or on drop). A
+/// large map pushes tens of thousands of uniforms; one wgpu staging write per
+/// uniform dominated world upload. Bind groups only need the buffer handle,
+/// and queued writes land before the next submit, so deferral is invisible.
 pub(in crate::renderer) struct UniformArena {
     pub(in crate::renderer) label: &'static str,
     pub(in crate::renderer) stride: u64,
     pub(in crate::renderer) chunk: Option<(wgpu::Buffer, u64)>,
     pub(in crate::renderer) chunk_bytes: u64,
+    /// Bytes of the current chunk not yet written, from offset 0.
+    pending: Vec<u8>,
+    queue: Option<wgpu::Queue>,
+    /// `deduplicated()` arenas hand out one shared slot per distinct content.
+    /// World upload uses this: PVS pieces of one material have identical
+    /// uniforms, and shared slots let their bind groups be shared too.
+    dedup: Option<std::collections::HashMap<Vec<u8>, UniformSlot>>,
 }
 
 impl UniformArena {
@@ -88,7 +101,17 @@ impl UniformArena {
             stride: uniform_size.div_ceil(alignment) * alignment,
             chunk: None,
             chunk_bytes: Self::CHUNK_BYTES.max(uniform_size.div_ceil(alignment) * alignment),
+            pending: Vec::new(),
+            queue: None,
+            dedup: None,
         }
+    }
+
+    /// Return the existing slot for byte-identical contents. Only for arenas
+    /// whose slots are never rewritten individually after upload.
+    pub(in crate::renderer) fn deduplicated(mut self) -> Self {
+        self.dedup = Some(std::collections::HashMap::new());
+        self
     }
 
     pub(in crate::renderer) fn push(
@@ -97,11 +120,18 @@ impl UniformArena {
         queue: &wgpu::Queue,
         contents: &[u8],
     ) -> UniformSlot {
+        if let Some(slot) = self.dedup.as_ref().and_then(|dedup| dedup.get(contents)) {
+            return slot.clone();
+        }
+        if self.queue.is_none() {
+            self.queue = Some(queue.clone());
+        }
         let needs_chunk = self
             .chunk
             .as_ref()
             .is_none_or(|(_, used)| used + self.stride > self.chunk_bytes);
         if needs_chunk {
+            self.flush();
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(self.label),
                 size: self.chunk_bytes,
@@ -113,12 +143,39 @@ impl UniformArena {
         let (buffer, used) = self.chunk.as_mut().expect("chunk was just created");
         let offset = *used;
         *used += self.stride;
-        queue.write_buffer(buffer, offset, contents);
-        UniformSlot {
+        // Alignment padding between slots stays zero, as in a fresh buffer.
+        self.pending.resize(offset as usize, 0);
+        self.pending.extend_from_slice(contents);
+        let slot = UniformSlot {
             buffer: buffer.clone(),
             offset,
             size: contents.len() as u64,
+        };
+        if let Some(dedup) = self.dedup.as_mut() {
+            dedup.insert(contents.to_vec(), slot.clone());
         }
+        slot
+    }
+
+    /// Write the staged bytes of the current chunk. Idempotent.
+    pub(in crate::renderer) fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        if let (Some((buffer, _)), Some(queue)) = (self.chunk.as_ref(), self.queue.as_ref()) {
+            // COPY_BUFFER_ALIGNMENT: slot sizes are multiples of 16 bytes, but
+            // never rely on it for the final partial write.
+            let aligned = self.pending.len().next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT as usize);
+            self.pending.resize(aligned, 0);
+            queue.write_buffer(buffer, 0, &self.pending);
+        }
+        self.pending.clear();
+    }
+}
+
+impl Drop for UniformArena {
+    fn drop(&mut self) {
+        self.flush();
     }
 }
 

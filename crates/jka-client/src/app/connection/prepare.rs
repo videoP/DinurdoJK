@@ -18,6 +18,9 @@ impl App {
     pub(in crate::app) fn start_live_cgame_prep(&mut self) {
         self.cancel_live_cgame_prep();
         self.pending_live_gamestate = false;
+        if let Some(timing) = self.live_join_timing.as_mut() {
+            timing.cgame_ready_ms = None;
+        }
 
         let base = self.base.clone();
         let game = self.game.clone();
@@ -130,6 +133,7 @@ impl App {
                     prepared.elapsed_ms
                 );
                 self.live_cgame_prepared = Some(prepared);
+                self.publish_ui();
             }
             Ok(Err(error)) => {
                 self.live_cgame_prep_rx = None;
@@ -276,6 +280,9 @@ impl App {
             return;
         };
         let map_name = String::from_utf8_lossy(map_bytes).into_owned();
+        if let Some(timing) = self.live_join_timing.as_mut() {
+            timing.advertised_map = Some(map_name.clone());
+        }
         devprintln!(
             1,
             "[JOIN] infoResponse protocol={} map={} at +{:.1} ms",
@@ -288,6 +295,12 @@ impl App {
                 net.resume_connect();
             }
             return;
+        }
+        // Everything below (fs_game switch, VFS open, speculative CGame/map
+        // prefetch) is local speculation the handshake does not depend on.
+        // Send the challenge now so the server round trip overlaps it.
+        if let Some(net) = self.net.as_mut() {
+            net.resume_connect();
         }
 
         // Some compatible servers advertise `fs_game` instead of `game`.
@@ -316,9 +329,6 @@ impl App {
                 1,
                 "[JOIN] map {map_name} already loaded/in flight; no prefetch restart"
             );
-            if let Some(net) = self.net.as_mut() {
-                net.resume_connect();
-            }
             return;
         }
 
@@ -334,18 +344,17 @@ impl App {
                     ));
                 }
                 self.prefetch_live_map(source);
-                if let Some(net) = self.net.as_mut() {
-                    net.resume_connect();
-                }
             }
             Err(error) => {
-                devprintln!(1, "[JOIN] map preflight blocked: {error}");
-                self.console_status = format!("MAP NOT FOUND: {map_name}");
-                self.push_console_line(format!("^3[JOIN]^7 map not found locally: {map_name}"));
-                self.show_missing_map_prompt(&map_name, error);
-                // Intentionally leave ClientSession's preflight pause engaged.
-                // The dialog explicitly chooses abort, connect-anyway, or
-                // autodownload before the gameplay connect packet is sent.
+                // getinfo does not contain authoritative sv_referencedPaks.
+                // Installed dl_*.pk3 files deliberately remain unmounted until
+                // gamestate systeminfo authorizes their checksums. A VFS miss
+                // here is not evidence that the map is absent from disk.
+                // Do not bypass that policy or pause for a false missing-map
+                // prompt. The authoritative gamestate path checks downloads
+                // and BSP availability before starting CGame / priming.
+                println!("[JOIN] {map_name}: early BSP lookup unavailable; deferring to gamestate package verification ({error})");
+                self.console_status = format!("CHECKING SERVER CONTENT: {map_name}...");
             }
         }
     }
@@ -360,6 +369,8 @@ impl App {
 
     pub(in crate::app) fn choose_missing_map_connect_anyway(&mut self) {
         let map = self.missing_map_prompt.take().map(|prompt| prompt.map_name);
+        let at = self.live_join_timing.as_ref().map_or(0.0, LiveJoinTiming::elapsed_ms);
+        println!("[JOIN] missing-content dialog answered: connect anyway (+{at:.1} ms)");
         self.live_missing_map_authorized = true;
         self.live_auto_download_requested = false;
         self.console_status = map.as_deref().map_or_else(
@@ -435,9 +446,14 @@ impl App {
         map_name: &str,
         reason: impl Into<String>,
     ) {
+        let reason = reason.into();
+        // The join stalls on this dialog until the user answers; keep that
+        // wait visible in the log next to the [JOIN] timings.
+        let at = self.live_join_timing.as_ref().map_or(0.0, LiveJoinTiming::elapsed_ms);
+        println!("[JOIN] {map_name}: waiting for user at missing-content dialog (+{at:.1} ms): {reason}");
         self.missing_map_prompt = Some(MissingMapPrompt {
             map_name: map_name.to_owned(),
-            reason: reason.into(),
+            reason,
         });
         // Map changes keep OverlayMode::None from the previous gameplay map.
         // Explicitly return raw-input ownership to the OS before presenting

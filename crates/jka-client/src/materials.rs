@@ -234,6 +234,23 @@ pub struct ShaderLightPromotion {
     pub reasons: u32,
     /// Emission evidence that is independent of time, camera and entity lighting.
     pub bake_reasons: u32,
+    /// The same light split by evidence: every light stage counts ONCE, in
+    /// the part for its exact tag set (glow, additive, glow+additive, emissive
+    /// map). A part's value is the SUM of its stages, so the lamps of any mix
+    /// of source toggles add up exactly; `value` above is their total.
+    pub parts: [Option<ShaderLightPart>; 4],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShaderLightPart {
+    /// SHADER_LIGHT_* tag set; the part is on when any of its bits is enabled.
+    pub reasons: u32,
+    /// All stages (runtime pool).
+    pub value: f32,
+    pub color: [f32; 3],
+    /// Time-independent stages only (static lamp bake); 0 = none.
+    pub bake_value: f32,
+    pub bake_color: [f32; 3],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -627,6 +644,73 @@ pub fn shader_library_with_jobs(
     enable_mtr: bool,
 ) -> Result<(BTreeMap<String, Shader>, ShaderLibraryDiagnostics), String> {
     shader_library_internal(assets, warnings, Some(jobs), enable_mtr)
+}
+
+/// Immutable definitions shared by the world and CGame on an identical VFS
+/// snapshot. Loose shader files remain live-editable and bypass this cache.
+/// Package replacement/refresh creates a new VFS index token. Retain at most
+/// three library snapshots, not archive handles or per-map GPU resources.
+#[derive(Clone, PartialEq, Eq)]
+struct SharedShaderKey {
+    index: jka_assets::pk3::VfsIndexToken,
+    overrides: bool,
+    enable_mtr: bool,
+}
+struct SharedShaderEntry {
+    key: SharedShaderKey,
+    library: Arc<BTreeMap<String, Shader>>,
+    diagnostics: ShaderLibraryDiagnostics,
+    warnings: Vec<String>,
+}
+static SHARED_SHADER_LIBRARIES: std::sync::OnceLock<std::sync::Mutex<Vec<SharedShaderEntry>>> = std::sync::OnceLock::new();
+
+pub(crate) fn shared_shader_library(
+    assets: &mut AssetSearchPath,
+    warnings: &mut Vec<String>,
+    jobs: Option<&MapJobPool>,
+    enable_mtr: bool,
+) -> Result<(Arc<BTreeMap<String, Shader>>, ShaderLibraryDiagnostics), String> {
+    let key = SharedShaderKey { index: assets.index_token(), overrides: assets.asset_overrides_allowed(), enable_mtr };
+    let cache = SHARED_SHADER_LIBRARIES.get_or_init(Default::default);
+    {
+        let mut entries = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pos) = entries.iter().position(|entry| entry.key == key) {
+            let entry = entries.remove(pos);
+            let library = Arc::clone(&entry.library);
+            let mut diagnostics = entry.diagnostics.clone();
+            diagnostics.read_ms = 0.0;
+            diagnostics.parse_cpu_ms = 0.0;
+            diagnostics.parse_wall_ms = 0.0;
+            warnings.extend(entry.warnings.iter().cloned());
+            entries.push(entry);
+            drop(entries);
+            if let Some(jobs) = jobs { jobs.mark_reused(Task::MapShaderParse); }
+            rverbose!(1, "[SHADER LIBRARY] reused {} parsed definitions", library.len());
+            return Ok((library, diagnostics));
+        }
+    }
+    // The index token intentionally does not change when the contents of an
+    // existing loose file are edited. Do not publish such libraries into the
+    // index-keyed cache (including .oshader and enabled .mtr overrides).
+    let cacheable = !assets.names().any(|name| {
+        name.starts_with("shaders/") && (name.ends_with(".shader") || name.ends_with(".oshader")
+            || (enable_mtr && name.ends_with(".mtr"))) && assets.loose_file_path(name).is_some()
+    });
+    let mut parse_warnings = Vec::new();
+    let (library, diagnostics) = shader_library_internal(assets, &mut parse_warnings, jobs, enable_mtr)?;
+    let library = Arc::new(library);
+    warnings.extend(parse_warnings.iter().cloned());
+    if cacheable && !jobs.is_some_and(MapJobPool::is_superseded) {
+        let mut entries = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Concurrent cold misses may parse independently; never block a map
+        // worker waiting for another loader whose jobs need that worker pool.
+        // Publish only complete immutable results.
+        if !entries.iter().any(|entry| entry.key == key) {
+            if entries.len() >= 3 { entries.remove(0); }
+            entries.push(SharedShaderEntry { key, library: Arc::clone(&library), diagnostics: diagnostics.clone(), warnings: parse_warnings });
+        }
+    }
+    Ok((library, diagnostics))
 }
 
 fn shader_library_internal(
@@ -1714,15 +1798,10 @@ fn decode_texture_data_profiled(
         ext => return Err(format!("{name}: unsupported image extension {ext}")),
     };
     let decode_started = Instant::now();
-    let image = image::load_from_memory_with_format(bytes, format)
+    let (width, height, mut base) = decode_rgba8_for_mip_chain(bytes, format, mipmaps)
         .map_err(|e| format!("{name}: {e}"))?
-        .to_rgba8();
+        .ok_or_else(|| format!("{name}: texture dimensions outside 1..8192"))?;
     let decode_ms = decode_started.elapsed().as_secs_f64() * 1000.0;
-    let (width, height) = image.dimensions();
-    if width == 0 || height == 0 || width > 8192 || height > 8192 {
-        return Err(format!("{name}: texture dimensions outside 1..8192"));
-    }
-    let mut base = image.into_raw();
     // Inferno's smoke1.tga stores white RGB under fully transparent texels,
     // while every visible texel is black. Linear FX sampling blends those
     // hidden white RGB values into the cloud edge before alpha blending,
@@ -1751,6 +1830,50 @@ fn decode_texture_data_profiled(
         decode_ms,
         mip_ms,
     ))
+}
+
+/// Decode straight into one RGBA8 buffer whose capacity already covers the
+/// whole mip chain. `load_from_memory(..).to_rgba8()` copied RGBA images once
+/// more and `build_mip_chain` then reallocated (copied) the base again; with
+/// many workers decoding large maps those fresh allocations and page faults
+/// dominated. Same decoder and `read_image` as `load_from_memory_with_format`,
+/// so pixels are identical. `Ok(None)` = dimensions outside 1..8192.
+fn decode_rgba8_for_mip_chain(
+    bytes: &[u8],
+    format: ImageFormat,
+    mipmaps: bool,
+) -> image::ImageResult<Option<(u32, u32, Vec<u8>)>> {
+    use image::ImageDecoder;
+    let decoder = image::ImageReader::with_format(std::io::Cursor::new(bytes), format)
+        .into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        return Ok(None);
+    }
+    let pixels = width as usize * height as usize;
+    let capacity = if mipmaps { mip_chain_byte_len(width, height) } else { pixels * 4 };
+    let rgba = match decoder.color_type() {
+        image::ColorType::Rgba8 => {
+            let mut out = Vec::with_capacity(capacity);
+            out.resize(pixels * 4, 0);
+            decoder.read_image(&mut out)?;
+            out
+        }
+        image::ColorType::Rgb8 => {
+            let mut rgb = vec![0_u8; pixels * 3];
+            decoder.read_image(&mut rgb)?;
+            let mut out = Vec::with_capacity(capacity);
+            out.resize(pixels * 4, 0);
+            for (texel, source) in out.chunks_exact_mut(4).zip(rgb.chunks_exact(3)) {
+                texel[..3].copy_from_slice(source);
+                texel[3] = 255;
+            }
+            out
+        }
+        // Grey, 16-bit and other layouts: the library's own conversion.
+        _ => image::DynamicImage::from_decoder(decoder)?.into_rgba8().into_raw(),
+    };
+    Ok(Some((width, height, rgba)))
 }
 
 /// Fix the invalid hidden RGB in the Inferno smoke sprite without changing
@@ -1872,6 +1995,36 @@ fn build_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec<u8>, u32) {
         all.resize(next_offset + width * height * 4, 0);
         let (done, next) = all.split_at_mut(next_offset);
         let previous = &done[previous_offset..];
+        if previous_width >= 2 && previous_height >= 2 {
+            // Both source texels of every pair exist (2 * width <= previous
+            // width, likewise rows), so no edge clamping is needed. Same
+            // truncating 2x2 average as the general path below, written over
+            // whole row pairs so the compiler can vectorize it.
+            let source_row = previous_width * 4;
+            for (y, row) in next.chunks_exact_mut(width * 4).enumerate() {
+                let top_start = y * 2 * source_row;
+                let top = &previous[top_start..top_start + width * 8];
+                let bottom = &previous[top_start + source_row..top_start + source_row + width * 8];
+                for ((texel, top), bottom) in row
+                    .chunks_exact_mut(4)
+                    .zip(top.chunks_exact(8))
+                    .zip(bottom.chunks_exact(8))
+                {
+                    for channel in 0..4 {
+                        let sum = u16::from(top[channel])
+                            + u16::from(top[channel + 4])
+                            + u16::from(bottom[channel])
+                            + u16::from(bottom[channel + 4]);
+                        texel[channel] = (sum >> 2) as u8;
+                    }
+                }
+            }
+            previous_offset = next_offset;
+            previous_width = width;
+            previous_height = height;
+            levels += 1;
+            continue;
+        }
         for (y, row) in next.chunks_exact_mut(width * 4).enumerate() {
             let top = &previous[(y * 2).min(previous_height - 1) * previous_width * 4..];
             let bottom = &previous[(y * 2 + 1).min(previous_height - 1) * previous_width * 4..];
@@ -1951,6 +2104,96 @@ fn companion_stem(label: &str) -> &str {
         })
         .map(|(stem, _)| stem)
         .unwrap_or(label)
+}
+
+const NORMAL_HEIGHT_SUFFIXES: &[&str] = &["_nh"];
+const NORMAL_SUFFIXES: &[&str] = &["_normal", "_norm", "_n"];
+const RMO_SUFFIXES: &[&str] = &["_rmo"];
+const ROUGHNESS_SUFFIXES: &[&str] = &["_roughness", "_rough", "_r"];
+const METALLIC_SUFFIXES: &[&str] = &["_metallic", "_metalness", "_metal"];
+const HEIGHT_SUFFIXES: &[&str] = &["_height", "_disp", "_displacement", "_h"];
+const SPECULAR_SUFFIXES: &[&str] = &["_specular", "_spec"];
+const EMISSIVE_SUFFIXES: &[&str] = &["_emissive", "_emission", "_emit", "_glow"];
+
+impl Textures {
+    /// Primary images reveal the actual resolved stems for automatic companion
+    /// maps. Queue only the first indexed candidate in each consumed family on
+    /// the existing loader pool. describe remains authoritative: corrupt images
+    /// and source-affine MTR materials retain its normal fallback path.
+    pub fn preload_material_companions(
+        &mut self,
+        assets: &AssetSearchPath,
+        materials: &[(String, u32)],
+        library: &BTreeMap<String, Shader>,
+        origins: &BTreeMap<String, ShaderDefinitionOrigin>,
+        omit_environment_stages: bool,
+        jobs: &MapJobPool,
+    ) -> Result<(), String> {
+        let mut requests = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        let cached = |path: &str, clamp, srgb| {
+            self.cache.get(&(path.replace('\\', "/").to_ascii_lowercase(), clamp, srgb))
+                .copied().flatten()
+        };
+        let mut plan_stage = |source: Option<&shader::Stage>, path: &str, clamp| {
+            let Some(base) = cached(path, clamp, true).and_then(|index| self.images.get(index)) else { return; };
+            let stem = companion_stem(&base.label);
+            let explicit = |path: Option<&String>| path.and_then(|path| cached(path, false, false)).is_some();
+            let mut plan = |suffixes: &[&str], srgb| {
+                let selected = suffixes.iter().find_map(|suffix| {
+                    let path = format!("{stem}{suffix}");
+                    texture_lookup_candidates(&path).iter().any(|candidate| {
+                        assets.indexed_provider_path(candidate, false).is_some()
+                            || (!assets.asset_overrides_allowed()
+                                && assets.indexed_provider_path(candidate, true).is_some())
+                    }).then_some(path)
+                });
+                let Some(path) = selected else { return false; };
+                let key = (path, base.clamp, srgb);
+                if seen.insert(key.clone()) { requests.push(key); }
+                true
+            };
+            let normal_height = explicit(source.and_then(|s| s.normal_height_map.as_ref()))
+                || plan(NORMAL_HEIGHT_SUFFIXES, false);
+            if !normal_height && !explicit(source.and_then(|s| s.normal_map.as_ref())) {
+                plan(NORMAL_SUFFIXES, false);
+            }
+            let rmo = explicit(source.and_then(|s| s.rmo_map.as_ref())) || plan(RMO_SUFFIXES, false);
+            if !rmo {
+                plan(ROUGHNESS_SUFFIXES, false);
+                plan(METALLIC_SUFFIXES, false);
+            }
+            if !normal_height { plan(HEIGHT_SUFFIXES, false); }
+            if !explicit(source.and_then(|s| s.specular_map.as_ref())) { plan(SPECULAR_SUFFIXES, false); }
+            plan(EMISSIVE_SUFFIXES, true);
+        };
+        for (name, flags) in materials {
+            // Source-affine resolution has a distinct cache and precedence.
+            if origins.get(name).is_some_and(|origin| origin.mtr_override) { continue; }
+            let definition = library.get(name);
+            if flags & (SURF_SKY | SURF_NODRAW) != 0
+                || definition.is_some_and(|s| s.sky || s.nodraw || (s.fog && s.stages.is_empty()))
+            { continue; }
+            if let Some(shader) = definition.filter(|s| !s.stages.is_empty()) {
+                let keep_env = flags & MATERIAL_MASK == MATERIAL_GLASS || keeps_authored_environment_stages(shader);
+                for stage in &shader.stages {
+                    if stage.video || stage.surface_sprite.is_some() || stage.image.is_empty()
+                        || stage.image.starts_with('$') || stage.image == "*white"
+                        || (stage.detail && !legacy_detail_textures_enabled())
+                        || (omit_environment_stages && !keep_env && matches!(stage.tc_gen, TcGen::Environment))
+                    { continue; }
+                    plan_stage(Some(stage), &stage.image, stage.clamp);
+                }
+            } else {
+                plan_stage(None, name, false);
+            }
+        }
+        let started = Instant::now();
+        self.preload(assets, &requests, jobs)?;
+        rverbose!(2, "[MAP COMPANIONS] {} selected request(s), {:.1} ms wall on loader workers",
+            requests.len(), started.elapsed().as_secs_f64() * 1000.0);
+        Ok(())
+    }
 }
 
 fn optional_companion(
@@ -2267,7 +2510,7 @@ fn stage_enhancements(
     let explicit_normal_height = source
         .and_then(|stage| explicit_linear(stage.normal_height_map.as_ref(), assets, textures));
     let autoload_normal_height = if explicit_normal_height.is_none() {
-        base_index.and_then(|index| optional_companion(assets, textures, index, &["_nh"], preferred_source))
+        base_index.and_then(|index| optional_companion(assets, textures, index, NORMAL_HEIGHT_SUFFIXES, preferred_source))
     } else {
         None
     };
@@ -2279,7 +2522,7 @@ fn stage_enhancements(
                 .and_then(|stage| explicit_linear(stage.normal_map.as_ref(), assets, textures))
                 .or_else(|| {
                     base_index.and_then(|index| {
-                        optional_companion(assets, textures, index, &["_normal", "_norm", "_n"], preferred_source)
+                        optional_companion(assets, textures, index, NORMAL_SUFFIXES, preferred_source)
                     })
                 })
         })
@@ -2290,7 +2533,7 @@ fn stage_enhancements(
     let explicit_rmo =
         source.and_then(|stage| explicit_linear(stage.rmo_map.as_ref(), assets, textures));
     let autoload_rmo = if explicit_rmo.is_none() {
-        base_index.and_then(|index| optional_companion(assets, textures, index, &["_rmo"], preferred_source))
+        base_index.and_then(|index| optional_companion(assets, textures, index, RMO_SUFFIXES, preferred_source))
     } else {
         None
     };
@@ -2298,7 +2541,7 @@ fn stage_enhancements(
 
     let roughness_texture = rmo.or_else(|| {
         base_index.and_then(|index| {
-            optional_companion(assets, textures, index, &["_roughness", "_rough", "_r"], preferred_source)
+            optional_companion(assets, textures, index, ROUGHNESS_SUFFIXES, preferred_source)
         })
     });
     let metallic_texture = rmo.or_else(|| {
@@ -2307,7 +2550,7 @@ fn stage_enhancements(
                 assets,
                 textures,
                 index,
-                &["_metallic", "_metalness", "_metal"],
+                METALLIC_SUFFIXES,
                 preferred_source,
             )
         })
@@ -2318,7 +2561,7 @@ fn stage_enhancements(
                 assets,
                 textures,
                 index,
-                &["_height", "_disp", "_displacement", "_h"],
+                HEIGHT_SUFFIXES,
                 preferred_source,
             )
         })
@@ -2327,7 +2570,7 @@ fn stage_enhancements(
         .and_then(|stage| explicit_linear(stage.specular_map.as_ref(), assets, textures))
         .or_else(|| {
             base_index.and_then(|index| {
-                optional_companion(assets, textures, index, &["_specular", "_spec"], preferred_source)
+                optional_companion(assets, textures, index, SPECULAR_SUFFIXES, preferred_source)
             })
         });
     let emissive_texture = base_index.and_then(|index| {
@@ -2335,7 +2578,7 @@ fn stage_enhancements(
             assets,
             textures,
             index,
-            &["_emissive", "_emission", "_emit", "_glow"],
+            EMISSIVE_SUFFIXES,
             preferred_source,
         )
     });
@@ -2540,23 +2783,27 @@ fn shader_stage_light_stats(stage: &MaterialStage, textures: &Textures) -> Optio
 }
 
 fn shader_light_promotion(stages: &[MaterialStage], textures: &Textures) -> Option<ShaderLightPromotion> {
-    let mut reasons = 0_u32;
-    let mut bake_reasons = 0_u32;
-    let mut weighted = [0.0_f32; 3];
-    let mut total_weight = 0.0_f32;
-    let mut strongest = 0.0_f32;
-
-    let mut add_candidate = |reason: u32, color: [f32; 3], value: f32| {
+    // Per part: [value, weighted rgb] for all stages and for fixed stages.
+    #[derive(Default, Clone, Copy)]
+    struct Sum { value: f32, rgb: [f32; 3], bake_value: f32, bake_rgb: [f32; 3] }
+    const TAGS: [u32; 4] = [
+        SHADER_LIGHT_GLOW,
+        SHADER_LIGHT_ADDITIVE,
+        SHADER_LIGHT_GLOW | SHADER_LIGHT_ADDITIVE,
+        SHADER_LIGHT_EMISSIVE_COMPANION,
+    ];
+    let mut sums = [Sum::default(); 4];
+    let mut add = |part: usize, color: [f32; 3], value: f32, fixed: bool| {
         if !value.is_finite() || value <= 0.0 || color.iter().any(|c| !c.is_finite()) {
             return;
         }
-        reasons |= reason;
-        let weight = value.max(1.0);
-        for channel in 0..3 {
-            weighted[channel] += color[channel].max(0.0) * weight;
+        let sum = &mut sums[part];
+        sum.value += value;
+        for channel in 0..3 { sum.rgb[channel] += color[channel].max(0.0) * value; }
+        if fixed {
+            sum.bake_value += value;
+            for channel in 0..3 { sum.bake_rgb[channel] += color[channel].max(0.0) * value; }
         }
-        total_weight += weight;
-        strongest = strongest.max(value);
     };
 
     for stage in stages {
@@ -2565,22 +2812,20 @@ fn shader_light_promotion(stages: &[MaterialStage], textures: &Textures) -> Opti
             && matches!(stage.alpha_gen, AlphaGen::Identity | AlphaGen::Const)
             && matches!(stage.tc_gen, TcGen::Base | TcGen::Lightmap | TcGen::Vector(..))
             && stage.tc_mods.iter().all(|m|matches!(m,TcMod::Scale(..)|TcMod::Transform(..)));
-        if stage.glow {
-            if let Some((color, value)) = shader_stage_light_stats(stage, textures) {
-                add_candidate(SHADER_LIGHT_GLOW, color, value * 1.15);
-                if fixed { bake_reasons |= SHADER_LIGHT_GLOW; }
-            }
-        }
-
         let additive = matches!(
             stage.blend,
             Some(BlendFunc { src: BlendFactor::One, dst: BlendFactor::One })
                 | Some(BlendFunc { src: BlendFactor::SrcAlpha, dst: BlendFactor::One })
         );
-        if additive {
+        // One stage is one light: a glow stage that also blends additively is
+        // counted once, in the glow+additive part (on with either toggle).
+        if stage.glow || additive {
             if let Some((color, value)) = shader_stage_light_stats(stage, textures) {
-                add_candidate(SHADER_LIGHT_ADDITIVE, color, value);
-                if fixed { bake_reasons |= SHADER_LIGHT_ADDITIVE; }
+                match (stage.glow, additive) {
+                    (true, false) => add(0, color, value * 1.15, fixed),
+                    (false, true) => add(1, color, value, fixed),
+                    _ => add(2, color, value * 1.15, fixed),
+                }
             }
         }
 
@@ -2590,28 +2835,42 @@ fn shader_light_promotion(stages: &[MaterialStage], textures: &Textures) -> Opti
                 .get(index)
                 .and_then(emissive_surface_light_stats)
             {
-                add_candidate(SHADER_LIGHT_EMISSIVE_COMPANION, color, value);
-                if fixed { bake_reasons |= SHADER_LIGHT_EMISSIVE_COMPANION; }
+                add(3, color, value, fixed);
             }
         }
     }
 
-    if reasons == 0 || total_weight <= 0.0 {
+    let unit = |rgb: [f32; 3]| {
+        let length = (rgb[0] * rgb[0] + rgb[1] * rgb[1] + rgb[2] * rgb[2]).sqrt();
+        if length > 1.0e-6 { rgb.map(|channel| channel / length) } else { [1.0; 3] }
+    };
+    let mut parts = [None; 4];
+    let (mut reasons, mut bake_reasons) = (0_u32, 0_u32);
+    let (mut total, mut total_rgb) = (0.0_f32, [0.0_f32; 3]);
+    for (part, (sum, tags)) in parts.iter_mut().zip(sums.iter().zip(TAGS)) {
+        if sum.value <= 0.0 { continue; }
+        reasons |= tags;
+        if sum.bake_value > 0.0 { bake_reasons |= tags; }
+        total += sum.value;
+        for channel in 0..3 { total_rgb[channel] += sum.rgb[channel]; }
+        *part = Some(ShaderLightPart {
+            reasons: tags,
+            value: sum.value.max(48.0),
+            color: unit(sum.rgb),
+            bake_value: if sum.bake_value > 0.0 { sum.bake_value.max(48.0) } else { 0.0 },
+            bake_color: unit(sum.bake_rgb),
+        });
+    }
+    if reasons == 0 || total <= 0.0 {
         return None;
     }
-    let average = weighted.map(|channel| channel / total_weight);
-    let length = (average[0] * average[0] + average[1] * average[1] + average[2] * average[2]).sqrt();
-    let color = if length > 1.0e-6 {
-        average.map(|channel| channel / length)
-    } else {
-        [1.0; 3]
-    };
     Some(ShaderLightPromotion {
-        value: strongest.clamp(48.0, 1000.0),
-        color,
+        value: total.max(48.0),
+        color: unit(total_rgb),
         subdivide: 120.0,
         reasons,
         bake_reasons,
+        parts,
     })
 }
 

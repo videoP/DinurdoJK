@@ -210,6 +210,7 @@ fn task_bar_caption(txt: &UiText<'_>, bar: &MapLoadingBar,
     let label = match bar.label {
         "SERVER SNAPSHOT" if bar.total == 0 || bar.completed < bar.total => "AWAIT FIRST SNAPSHOT",
         "VIDEO" => "RESTART VIDEO",
+        "RENDERER SETUP" => "GPU UPLOAD + PSOS",
         other => other,
     };
     ellipsize(txt, label, px, max_w)
@@ -444,6 +445,35 @@ pub(in crate::ui) fn build_loading_screen(
         txt.baseline_in(g.percentage, 14.0*s), 14.0*s, LOAD_AMBER);
     progress_track(out, g.overall_track[0],g.overall_track[1],g.overall_track[2],
         g.overall_track[3],overall,LOAD_CYAN,LOAD_MAGENTA,w,h);
+    if let (Some(status), Some(bounds)) = (loading.status_line.as_deref(), g.operation_status) {
+        let px = 12.0*s;
+        let mut x = bounds[0];
+        if let Some(started) = loading.started_at {
+            // Tabular clock: every digit gets the widest digit's advance and
+            // the slot reserves three integer digits, so neither the clock nor
+            // the status text after it shifts as the value ticks.
+            let baseline = txt.baseline_in(bounds, px);
+            let digit_w = (b'0'..=b'9')
+                .map(|d| txt.width(std::str::from_utf8(&[d]).unwrap_or("0"), px))
+                .fold(0.0_f32, f32::max);
+            let time = format!("{:.1}s", started.elapsed().as_secs_f64());
+            let int_digits = time.find('.').unwrap_or(1).max(3);
+            let slot = digit_w * (int_digits + 1) as f32 + txt.width(".", px) + txt.width("s", px);
+            let mut cx = x + slot;
+            for ch in time.chars().rev() {
+                let glyph = ch.to_string();
+                let glyph_w = txt.width(&glyph, px);
+                let cell = if ch.is_ascii_digit() { digit_w } else { glyph_w };
+                cx -= cell;
+                txt.draw(out, &glyph, cx + (cell - glyph_w) * 0.5, baseline, px, LOAD_LABEL);
+            }
+            let separator = "  |  ";
+            txt.draw(out, separator, x + slot, baseline, px, LOAD_LABEL);
+            x += slot + txt.width(separator, px);
+        }
+        let rest = [x, bounds[1], (bounds[0] + bounds[2] - x).max(1.0), bounds[3]];
+        draw_line(&txt, out, status, rest, px, LOAD_LABEL, w, h);
+    }
 
     for (idx, phase) in MapLoadingPhase::ALL.iter().copied().enumerate() {
         let group: Vec<_> = visible.iter().copied().filter(|bar| bar.phase == phase).collect();

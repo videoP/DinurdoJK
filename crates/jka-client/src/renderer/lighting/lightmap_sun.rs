@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
-    mpsc,
+    mpsc, OnceLock,
 };
 
 #[path = "sky_transport.rs"]
@@ -56,8 +56,10 @@ pub(in crate::renderer) struct Geometry {
     batches: Vec<DrawBatch>,
     textures: Arc<Vec<TextureData>>,
     receivers: Arc<Vec<crate::renderer::StaticAoLightmapTriangle>>,
-    sun_receivers: Arc<Vec<crate::renderer::StaticAoLightmapTriangle>>,
-    auto_receivers: Arc<Vec<crate::renderer::StaticAoLightmapTriangle>>,
+    // Each immutable geometry revision shares its lazy receiver variants with
+    // cloned bake jobs. World upload never smooths unused receiver modes.
+    sun_receivers: Arc<OnceLock<Vec<crate::renderer::StaticAoLightmapTriangle>>>,
+    auto_receivers: Arc<OnceLock<Vec<crate::renderer::StaticAoLightmapTriangle>>>,
     model_materials: Vec<bool>,
     /// The original world prefix has complete material stage lists. Inline
     /// instances currently copy only their selected lightmap/vertex receivers.
@@ -65,6 +67,60 @@ pub(in crate::renderer) struct Geometry {
     /// For each immutable sun receiver vertex, the actual indexed draw vertex.
     /// Inline *N vertices live after the static-AO prefix.
     vertex_gpu_indices: Arc<Vec<u32>>,
+    /// Map identity and cache folder for the per-map sky-openness file.
+    /// None (tests, source maps) traces every time.
+    disk_cache: Option<scene::StaticBspAoCacheInfo>,
+    /// `lightmap_charts` started on a background thread during world upload,
+    /// so the first frame's lightmap cache does not compute it inline.
+    chart_prefetch: Arc<std::sync::Mutex<Option<ChartPrefetch>>>,
+}
+
+/// Background computation of `Geometry::lightmap_charts` for one size set.
+pub(in crate::renderer) struct ChartPrefetch {
+    sizes: Vec<[u32; 2]>,
+    handle: std::thread::JoinHandle<Vec<Vec<u32>>>,
+}
+
+impl ChartPrefetch {
+    /// `receivers` must be the same triangles `Geometry::new` collects for this
+    /// geometry; a size mismatch at use simply recomputes inline.
+    pub(in crate::renderer) fn spawn(
+        receivers: Vec<crate::renderer::StaticAoLightmapTriangle>,
+        sizes: Vec<[u32; 2]>,
+    ) -> Option<Self> {
+        let worker_sizes = sizes.clone();
+        std::thread::Builder::new()
+            .name("jka-lightmap-charts".into())
+            .spawn(move || {
+                let started = Instant::now();
+                let charts = lightmap_charts_for(&receivers, &worker_sizes);
+                rverbose!(2, "[SUN LIGHTMAP] lightmap charts prefetched: {} triangles, {} page(s), {:.1} ms",
+                    receivers.len(), worker_sizes.len(), started.elapsed().as_secs_f64() * 1000.0);
+                charts
+            })
+            .ok()
+            .map(|handle| Self { sizes, handle })
+    }
+}
+
+fn lightmap_charts_for(
+    receivers: &[crate::renderer::StaticAoLightmapTriangle],
+    sizes: &[[u32; 2]],
+) -> Vec<Vec<u32>> {
+    crate::renderer::static_ao::bvh::rasterize_lightmap_band(
+        &charted_receivers(receivers), sizes, LIGHTMAP_GUTTER_REACH,
+    ).1
+}
+
+/// Receivers with `owner` = 1-based lightmap chart (UV island).
+fn charted_receivers(
+    receivers: &[crate::renderer::StaticAoLightmapTriangle],
+) -> Vec<crate::renderer::StaticAoLightmapTriangle> {
+    let mut charted = receivers.to_vec();
+    for (triangle, chart) in charted.iter_mut().zip(triangle_charts(receivers)) {
+        triangle.owner = chart;
+    }
+    charted
 }
 
 impl Geometry {
@@ -80,20 +136,6 @@ impl Geometry {
         let receivers = Arc::new(crate::renderer::collect_static_ao_lightmap_triangles(
             &vertices, &batches,
         ));
-        // Curved BSP walls are frequently tessellated into hard-normal faces.
-        // Only the static sun's receiver normals are reconstructed. Preserve
-        // true polygon geometry for BVH visibility and preserve original AO,
-        // map-light and authored lightmap inputs.
-        let mut sun_receivers = (*receivers).clone();
-        let smoothed_corners = smooth_sun_receiver_normals(&mut sun_receivers);
-        let mut auto_receivers = (*receivers).clone();
-        let auto_corners = auto_smooth_sun_receiver_normals(&mut auto_receivers);
-        println!(
-            "[SUN LIGHTMAP] receiver normals smoothed: shared-edge {smoothed_corners} corners, vertex auto-smooth {auto_corners} corners (r_bakedSunNormals 1/2), {} triangles",
-            receivers.len()
-        );
-        let sun_receivers = Arc::new(sun_receivers);
-        let auto_receivers = Arc::new(auto_receivers);
         let model_materials = batches
             .iter().enumerate()
             .map(|(index, b)| {
@@ -111,22 +153,47 @@ impl Geometry {
             batches,
             textures,
             receivers,
-            sun_receivers,
-            auto_receivers,
+            sun_receivers: Arc::new(OnceLock::new()),
+            auto_receivers: Arc::new(OnceLock::new()),
             model_materials,
             world_batch_count,
             vertex_gpu_indices: Arc::new(vertex_gpu_indices),
+            disk_cache: None,
+            chart_prefetch: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    pub(in crate::renderer) fn with_chart_prefetch(self, prefetch: Option<ChartPrefetch>) -> Self {
+        if let Ok(mut slot) = self.chart_prefetch.lock() {
+            *slot = prefetch;
+        }
+        self
+    }
+
+    pub(in crate::renderer) fn with_disk_cache(mut self, cache: Option<scene::StaticBspAoCacheInfo>) -> Self {
+        self.disk_cache = cache;
+        self
     }
 
     /// r_bakedSunNormals: 0 authored vertex normals, 1 shared-edge smoothing,
     /// 2 vertex-position auto-smooth. Casters always use the real triangles.
     fn sun_receivers(&self, mode: u8) -> &[crate::renderer::StaticAoLightmapTriangle] {
-        match mode {
-            0 => &self.receivers,
-            1 => &self.sun_receivers,
-            _ => &self.auto_receivers,
-        }
+        let (cache, smooth): (_, fn(&mut [crate::renderer::StaticAoLightmapTriangle]) -> usize) =
+            match mode {
+                0 => return self.receivers.as_slice(),
+                1 => (&self.sun_receivers, smooth_sun_receiver_normals),
+                _ => (&self.auto_receivers, auto_smooth_sun_receiver_normals),
+            };
+        // Called by the sunlight/sky bake, rather than Geometry::new on the
+        // render thread. Keep authored normals untouched for other consumers.
+        cache.get_or_init(|| {
+            let started = Instant::now();
+            let mut receivers = self.receivers.as_ref().clone();
+            let corners = smooth(&mut receivers);
+            rverbose!(1, "[SUN LIGHTMAP] receiver normals mode={mode}: {corners} corners, {} triangles, {:.1} ms",
+                receivers.len(), started.elapsed().as_secs_f64() * 1000.0);
+            receivers
+        }).as_slice()
     }
 
     /// Per-luxel lightmap chart IDs at the ORIGINAL lightmap resolution, for
@@ -134,18 +201,19 @@ impl Geometry {
     /// luxels belong to the NEAREST chart (not a dilation tie-break), matching
     /// the local lamp-sum bake's gutter samples exactly.
     pub(in crate::renderer) fn lightmap_charts(&self, sizes: &[[u32; 2]]) -> Vec<Vec<u32>> {
-        crate::renderer::static_ao::bvh::rasterize_lightmap_band(
-            &self.charted_receivers(), sizes, LIGHTMAP_GUTTER_REACH,
-        ).1
+        // A prefetch is consumed once; later calls (other sizes) compute inline.
+        let prefetch = self.chart_prefetch.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(prefetch) = prefetch.filter(|prefetch| prefetch.sizes == sizes) {
+            if let Ok(charts) = prefetch.handle.join() {
+                return charts;
+            }
+        }
+        lightmap_charts_for(&self.receivers, sizes)
     }
 
     /// Receivers with `owner` = 1-based lightmap chart (UV island).
     fn charted_receivers(&self) -> Vec<crate::renderer::StaticAoLightmapTriangle> {
-        let mut charted = (*self.receivers).clone();
-        for (triangle, chart) in charted.iter_mut().zip(triangle_charts(&self.receivers)) {
-            triangle.owner = chart;
-        }
-        charted
+        charted_receivers(&self.receivers)
     }
 }
 
@@ -506,6 +574,7 @@ impl BakeProgress {
 
 struct Pending {
     key: Key,
+    reuse: Reuse,
     progress: Arc<BakeProgress>,
     rx: mpsc::Receiver<Result<BakeOutput, String>>,
     cancel: Arc<AtomicBool>,
@@ -533,6 +602,10 @@ pub(in crate::renderer) struct StaticSun {
     transport: Option<Arc<TransportBake>>,
     pub sky_transport: Vec<GpuImage>,
     pub local_lights: Vec<(usize, scene::DynamicLight)>,
+    /// Keys whose bake produced the installed lamp / sky-normal pages. A
+    /// later bake with the same inputs for those pages reuses them.
+    local_from: Option<Key>,
+    sky_from: Option<Key>,
     pub generation: u64,
     failed: Option<Key>,
     source_sizes: Vec<[u32; 2]>,
@@ -853,11 +926,41 @@ fn sun_edge_indices(
     out
 }
 
+/// Results already on the GPU whose inputs are unchanged. Only the sun/moon
+/// direction (and other sun-only settings) moved: lamps and the packed sky
+/// normals/openness are fixed in map space, so the worker skips them and the
+/// install keeps the existing pages.
+#[derive(Clone, Copy, Debug, Default)]
+struct Reuse {
+    local: bool,
+    sky: bool,
+}
+
+/// Inputs of the local lamp pages (`BakeOutput::local`, `local_totals`).
+fn same_local_inputs(a: &Key, b: &Key) -> bool {
+    a.locals == b.locals && a.local_sizes == b.local_sizes && a.local_total_sizes == b.local_total_sizes
+        && a.visibility == b.visibility && a.models == b.models && a.tinted == b.tinted
+}
+
+/// Inputs of the packed sky normal + openness pages (`BakeOutput::sky`).
+/// Their direct-visibility bits are always 0; vertex sky (which does read
+/// the sun) is not covered and is always rebuilt.
+fn same_sky_inputs(a: &Key, b: &Key) -> bool {
+    a.sky == b.sky && a.sizes == b.sizes && a.sky_sizes == b.sky_sizes && a.normals == b.normals
+        && a.visibility == b.visibility && a.models == b.models && a.tinted == b.tinted
+}
+
 fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakeProgress,
     cached_transport: Option<&Arc<TransportBake>>) -> Result<BakeOutput, String> {
+    trace_reusing(geometry, key, cancel, progress, cached_transport, Reuse::default())
+}
+
+fn trace_reusing(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakeProgress,
+    cached_transport: Option<&Arc<TransportBake>>, reuse: Reuse) -> Result<BakeOutput, String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }
+    let mut stage_marks: Vec<(&'static str, Instant)> = vec![("", Instant::now())];
     progress.set(1, 5);
     let cached_transport = cached_transport.filter(|c| key.sky_transport && c.matches(key));
     let mut triangles = Vec::new();
@@ -920,6 +1023,25 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
             }
         }
     }
+    // Sky-openness disk-cache inputs: occluders, sky surfaces and the alpha /
+    // translucent filters. Receivers and normals are hashed from the samples.
+    let openness_inputs = (key.sky == 2 && geometry.disk_cache.is_some()).then(|| {
+        use std::hash::Hasher;
+        let mut hash = scene::FoldHasher::default();
+        hash.write(&(triangles.len() as u64).to_le_bytes());
+        for triangle in triangles.iter().chain(&sky) {
+            hash.write(bytemuck::cast_slice(&triangle.positions));
+        }
+        for filter in &filters {
+            let Some((index, v, translucent)) = filter else { hash.write_u8(0); continue; };
+            let batch = &geometry.batches[*index];
+            hash.write_u8(1 + u8::from(*translucent));
+            hash.write(&batch.alpha_cutoff.to_bits().to_le_bytes());
+            hash.write(batch.texture.and_then(|t| geometry.textures.get(t)).map_or("", |i| i.label.as_str()).as_bytes());
+            hash.write(bytemuck::cast_slice(&v[..]));
+        }
+        hash.finish()
+    });
     let solid = (!triangles.is_empty())
         .then(|| StaticAoBvh::build(Arc::new(triangles)))
         .transpose()?;
@@ -953,6 +1075,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
             .is_some();
         if blocked { 0.0 } else { transmission }
     };
+    stage_marks.push(("casters+bvh", Instant::now()));
     progress.set(1, 25);
     let transport_surface = |index: usize, bary| {
         let Some((batch, v, translucent)) = &filters[index] else { return Some(0.0); };
@@ -1049,6 +1172,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
         }
         facing * (transmission / sun_directions.len() as f32).clamp(0.0, 1.0)
     };
+    stage_marks.push(("receiver raster+ids", Instant::now()));
     progress.set(2, 40);
     let sun_total: u32 = samples.iter().map(|v| v.len() as u32).sum::<u32>().max(1);
     let sun_done = AtomicU32::new(0);
@@ -1077,6 +1201,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
             flux
         })
         .collect() } else { Vec::new() };
+    stage_marks.push(("sun flux", Instant::now()));
     progress.set(2, 600);
     if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
 
@@ -1156,6 +1281,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
     // authoritative: a vertex-colored sibling must not receive another sky
     // multiplier over an already composed lightmap. Stages share a geometry
     // range, so classify that range once before tracing any vertex.
+    stage_marks.push(("sun AA/terminator", Instant::now()));
     let vertex_sky: Vec<VertexSkySample> = if key.sky == 2 {
         let lightmap_lit_ranges: std::collections::BTreeSet<(u32, u32)> = geometry.batches.iter()
             .flat_map(|batch| std::iter::once(batch).chain(batch.additive_companions.iter()))
@@ -1248,6 +1374,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
     } else { Vec::new() };
     if cancel.load(Ordering::Relaxed) { return Err("cancelled".into()); }
 
+    stage_marks.push(("vertex sky", Instant::now()));
     let mut transport = None;
     let sky_pages = if key.sky != 0 {
         // The previous 87% "EDGE AA" state hid all sky tracing time. Reserve
@@ -1260,15 +1387,31 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
         // The compositor reads direct visibility from the antialiased sun flux.
         // Sky openness uses the same gutter band as the chart map and
         // transport: seam luxels are traced for their own (nearest) chart.
-        let (base_samples, base_band_charts) = if key.sky == 2 {
+        let (base_samples, base_band_charts) = if key.sky == 2 && !reuse.sky {
             let mut charted = receivers.to_vec();
             for (triangle, &chart) in charted.iter_mut().zip(&charts) { triangle.owner = chart; }
             crate::renderer::static_ao::bvh::rasterize_lightmap_band(&charted, &key.sky_sizes, LIGHTMAP_GUTTER_REACH)
         } else {
             (Vec::new(), Vec::new())
         };
-        let base_visibility: Vec<Vec<f32>> = if key.sky == 2 {
-            const RAYS: usize = 16;
+        const RAYS: usize = 16;
+        // Openness never depends on the sun/moon direction: one file per map.
+        let openness_cache = openness_inputs.zip(geometry.disk_cache.as_ref()).map(|(inputs, cache)| {
+            use std::hash::Hasher;
+            let mut hash = scene::FoldHasher::default();
+            hash.write(b"sky-openness-v1");
+            hash.write(&cache.map_hash.to_le_bytes());
+            hash.write(&inputs.to_le_bytes());
+            hash.write(format!("{RAYS} {:?} {} {} {} {:?}", key.visibility, key.models, key.tinted, key.normals, key.sky_sizes).as_bytes());
+            for sample in base_samples.iter().flatten() {
+                let Some(sample) = sample else { hash.write_u8(0); continue; };
+                hash.write(bytemuck::cast_slice(&sample.position));
+                hash.write(bytemuck::cast_slice(&sample.normal));
+            }
+            let disk_key = hash.finish();
+            (super::sky_openness_cache::path(cache, super::sky_openness_cache::OPENNESS, disk_key), disk_key, cache.map_name.clone())
+        });
+        let traced_visibility = || -> Vec<Vec<f32>> {
             let sky_total = base_samples.iter().map(|texels| texels.len() as u32).sum::<u32>().max(1);
             let sky_done = AtomicU32::new(0);
             base_samples.par_iter().map(|texels| texels.par_iter().enumerate().map(|(ordinal, sample)| {
@@ -1301,18 +1444,69 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                 }
                 open / RAYS as f32
             }).collect()).collect()
-        } else {
-            Vec::new()
         };
+        let openness_started = Instant::now();
+        let cached_visibility = openness_cache.as_ref()
+            .and_then(|(path, disk_key, _)| super::sky_openness_cache::read(path, *disk_key, &key.sky_sizes, 1));
+        let openness_hit = cached_visibility.is_some();
+        if let (true, Some((path, _, map))) = (openness_hit, openness_cache.as_ref()) {
+            super::sky_openness_cache::prune(path, map, super::sky_openness_cache::OPENNESS);
+        }
+        let base_visibility: Vec<Vec<f32>> = if key.sky != 2 || reuse.sky {
+            Vec::new()
+        } else if let Some(cached) = cached_visibility {
+            cached
+        } else {
+            traced_visibility()
+        };
+        if key.sky == 2 && !reuse.sky {
+            println!("[SUN LIGHTMAP] sky openness {} in {:.2}s",
+                if openness_hit { "loaded from disk cache" } else { "traced" },
+                openness_started.elapsed().as_secs_f64());
+        }
+        if key.sky == 2 && !reuse.sky && !openness_hit && !cancel.load(Ordering::Relaxed) {
+            if let Some((path, disk_key, map)) = openness_cache.as_ref() {
+                match super::sky_openness_cache::write(path, *disk_key, &key.sky_sizes, 1,
+                    &base_visibility.iter().map(Vec::as_slice).collect::<Vec<_>>()) {
+                    Ok(bytes) => {
+                        let pruned = super::sky_openness_cache::prune(path, map, super::sky_openness_cache::OPENNESS);
+                        println!("[SUN LIGHTMAP] sky openness cache saved: {:.2} MiB {} ({pruned} superseded removed)",
+                            bytes as f64 / 1048576.0, path.display());
+                    }
+                    Err(error) => eprintln!("[SUN LIGHTMAP] sky openness cache write failed: {error}"),
+                }
+            }
+        }
+        stage_marks.push(("sky band+openness", Instant::now()));
+        // Sun-independent like openness: same geometry/filter inputs, keyed on
+        // the receivers themselves (their gutter-band samples are derived).
+        let transport_disk = openness_inputs.zip(geometry.disk_cache.as_ref()).map(|(inputs, cache)| {
+            use std::hash::Hasher;
+            let mut hash = scene::FoldHasher::default();
+            hash.write(sky_transport::DISK_VERSION.as_bytes());
+            hash.write(&cache.map_hash.to_le_bytes());
+            hash.write(&inputs.to_le_bytes());
+            hash.write(format!("{:?} {} {} {} {:?}", key.visibility, key.models, key.tinted, key.normals, key.sky_sizes).as_bytes());
+            for triangle in receivers {
+                hash.write(&(triangle.texture as u64).to_le_bytes());
+                hash.write(bytemuck::cast_slice(&triangle.positions));
+                hash.write(bytemuck::cast_slice(&triangle.normals));
+                hash.write(bytemuck::cast_slice(&triangle.uvs));
+            }
+            let disk_key = hash.finish();
+            (super::sky_openness_cache::path(cache, super::sky_openness_cache::TRANSPORT, disk_key), disk_key, cache.map_name.clone())
+        });
         transport = sky_transport::bake(
             key, cached_transport, receivers, solid.as_ref(), sky.as_ref(), &bounce_normals,
             &transport_surface, cancel, progress, &vertex_sky,
+            transport_disk.as_ref().map(|(path, disk_key, map)| (path.as_path(), *disk_key, map.as_str())),
         );
+        stage_marks.push(("sky transport", Instant::now()));
         progress.set(4, 885);
         let base_charts: Vec<Vec<u32>> = base_band_charts;
         let pack_done = AtomicU32::new(0);
         let pack_total = samples.len() as u32;
-        samples.par_iter().zip(&page_ids).zip(&key.sizes).enumerate()
+        if reuse.sky { Vec::new() } else { samples.par_iter().zip(&page_ids).zip(&key.sizes).enumerate()
             .map(|(page, ((texels, ids), &[w, h]))| {
                 let mut packed: Vec<u32> = texels.iter().enumerate().map(|(i, sample)| {
                     let Some(sample) = sample else { return 0; };
@@ -1345,11 +1539,15 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                     pack_sky_normal(normal, exposure, 0.0)
                 }).collect();
                 // Border luxels take a covered neighbour so bilinear world
-                // sampling at chart edges never sees an ungained texel.
+                // sampling at chart edges never sees an ungained texel. Edge
+                // neighbours first; the diagonal one is the only covered
+                // neighbour of the luxel outside a chart CORNER, which the
+                // bilinear footprint there still reads (an unset luxel keeps
+                // neutral gain: a full-daylight dot at night).
                 let original = packed.clone();
                 for (i, value) in packed.iter_mut().enumerate().filter(|(_, v)| **v == 0) {
                     let (x, y) = ((i % w as usize) as i32, (i / w as usize) as i32);
-                    *value = [(-1, 0), (1, 0), (0, -1), (0, 1)].into_iter()
+                    *value = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)].into_iter()
                         .filter(|(dx, dy)| x + dx >= 0 && y + dy >= 0 && x + dx < w as i32 && y + dy < h as i32)
                         .map(|(dx, dy)| original[(y + dy) as usize * w as usize + (x + dx) as usize])
                         .find(|v| *v != 0)
@@ -1359,11 +1557,13 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
                 progress.fraction(885, 30, completed, pack_total);
                 packed
             })
-            .collect()
+            .collect() }
     } else {
         Vec::new()
     };
+    stage_marks.push(("sky pack", Instant::now()));
     progress.set(5, 915);
+    let (local, local_totals): (Vec<_>, Vec<_>) = if reuse.local { (Vec::new(), Vec::new()) } else {
     let local_samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(
         &geometry.receivers,
         &key.local_sizes,
@@ -1394,7 +1594,7 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
     };
     let local_done=AtomicU32::new(0);
     let local_total=key.local_sizes.len() as u32;
-    let (local, local_totals): (Vec<_>, Vec<_>) = local_samples
+    local_samples
         .par_iter()
         .zip(&key.local_sizes)
         .zip(&local_charts)
@@ -1500,11 +1700,16 @@ fn trace(geometry: &Geometry, key: &Key, cancel: &AtomicBool, progress: &BakePro
             progress.fraction(930, 20, done, local_total);
             (page, full_page)
         })
-        .unzip();
+        .unzip()
+    };
+    stage_marks.push(("local lamps", Instant::now()));
     progress.set(6, 955);
     if cancel.load(Ordering::Relaxed) {
         Err("cancelled".into())
     } else {
+        println!("[SUN LIGHTMAP] bake stages: {}", stage_marks.windows(2)
+            .map(|w| format!("{} {:.2}s", w[1].0, (w[1].1 - w[0].1).as_secs_f64()))
+            .collect::<Vec<_>>().join(", "));
         Ok(BakeOutput { sun: pages, local, local_totals, sky: sky_pages, vertex_sky, transport })
     }
 }
@@ -1565,6 +1770,8 @@ impl Renderer {
             state.local_flux.clear();
             state.local_totals.clear();
             state.sky_normals.clear();
+            state.local_from = None;
+            state.sky_from = None;
             state.vertex_sky.clear();
             state.local_lights.clear();
             return;
@@ -1702,6 +1909,7 @@ impl Renderer {
         state.key = None;
         state.local_lights.clear();
         if let Some(outcome) = outcome {
+            let reuse = state.pending.as_ref().map_or_else(Reuse::default, |p| p.reuse);
             state.pending = None;
             match outcome {
                 Ok(pages) => {
@@ -1761,6 +1969,8 @@ impl Renderer {
                             GpuImage::new(texture, view)
                         })
                         .collect();
+                    // Reused pages stay installed (their inputs are unchanged).
+                    if !reuse.local {
                     state.local_flux = pages
                         .local
                         .iter()
@@ -1827,6 +2037,9 @@ impl Renderer {
                             GpuImage::new(texture, view)
                         })
                         .collect();
+                    state.local_from = Some(key.clone());
+                    }
+                    if !reuse.sky {
                     state.sky_normals = pages.sky.iter().zip(&key.sizes).map(|(packed, size)| {
                         use wgpu::util::DeviceExt;
                         let texture = self.device.create_texture_with_data(
@@ -1847,6 +2060,8 @@ impl Renderer {
                         let view = texture.create_view(&Default::default());
                         GpuImage::new(texture, view)
                     }).collect();
+                    state.sky_from = Some(key.clone());
+                    }
                     state.vertex_sky = pages.vertex_sky;
                     state.local_lights = key.locals.clone();
                     if key.sky == 2 {
@@ -1859,7 +2074,8 @@ impl Renderer {
                         );
                     }
                     println!(
-                        "[LOCAL LIGHTMAP] baked {} static emitters into {} page(s), per-light sizes {:?}, RGB sum sizes {:?}",
+                        "[LOCAL LIGHTMAP] {} {} static emitters into {} page(s), per-light sizes {:?}, RGB sum sizes {:?}",
+                        if reuse.local { "reused" } else { "baked" },
                         key.locals.len(),
                         state.local_flux.len(),
                         key.local_sizes,
@@ -1896,6 +2112,12 @@ impl Renderer {
             }
             let geometry = state.geometry.clone().unwrap();
             let transport = state.transport.as_ref().map(Arc::clone);
+            let reuse = Reuse {
+                local: key.debug_layers == 0 && !key.locals.is_empty() && !state.local_flux.is_empty()
+                    && state.local_from.as_ref().is_some_and(|from| same_local_inputs(from, &key)),
+                sky: key.debug_layers == 0 && key.sky != 0 && !state.sky_normals.is_empty()
+                    && state.sky_from.as_ref().is_some_and(|from| same_sky_inputs(from, &key)),
+            };
             let worker_key = key.clone();
             let cancel = Arc::new(AtomicBool::new(false));
             let worker_cancel = Arc::clone(&cancel);
@@ -1911,15 +2133,15 @@ impl Renderer {
                         .num_threads(workers)
                         .build();
                     let result = pool.map_err(|e| e.to_string()).and_then(|pool| {
-                        pool.install(|| trace(&geometry, &worker_key, &worker_cancel, &worker_progress, transport.as_ref()))
+                        pool.install(|| trace_reusing(&geometry, &worker_key, &worker_cancel, &worker_progress, transport.as_ref(), reuse))
                     });
                     let _ = tx.send(result);
                 }) {
                 Ok(_) => {
                     state.bake_started = Some(started);
                     state.bake_workers = workers;
-                    println!("[SUN LIGHTMAP] bake started: {} workers, AA {}, normals {}, terminator {}, debug layers {}, sky {}", workers, key.aa, key.normals, u8::from(key.terminator), key.debug_layers, key.sky);
-                    state.pending = Some(Pending { key, rx, cancel, progress });
+                    println!("[SUN LIGHTMAP] bake started: {} workers, AA {}, normals {}, terminator {}, debug layers {}, sky {}, reusing lamps {} sky normals {}", workers, key.aa, key.normals, u8::from(key.terminator), key.debug_layers, key.sky, reuse.local, reuse.sky);
+                    state.pending = Some(Pending { key, reuse, rx, cancel, progress });
                 }
                 Err(e) => {
                     state.bake_started = None;
@@ -2237,7 +2459,18 @@ mod tests {
         assert!(bake_worker_count(0, 2) >= 1);
         let cancel = AtomicBool::new(false);
         let progress = BakeProgress::default();
+        assert!(geometry.sun_receivers.get().is_none());
+        assert!(geometry.auto_receivers.get().is_none());
+        let _ = geometry.sun_receivers(0);
+        assert!(geometry.sun_receivers.get().is_none());
         let pages = trace(&geometry, &key, &cancel, &progress, None).unwrap().sun;
+        assert!(geometry.sun_receivers.get().is_some());
+        assert!(geometry.auto_receivers.get().is_none());
+        let shared_geometry = geometry.clone();
+        assert!(std::ptr::eq(geometry.sun_receivers(1), shared_geometry.sun_receivers(1)));
+        let _ = shared_geometry.sun_receivers(2);
+        assert!(geometry.auto_receivers.get().is_some());
+        assert!(std::ptr::eq(geometry.sun_receivers(2), shared_geometry.sun_receivers(2)));
         let realtime_key = Key {
             direction: static_trace_direction(false, [0.5, -0.5, 0.7]),
             bake_sun: false, sky: 2, sky_sizes: vec![[32, 32]],
@@ -2267,12 +2500,18 @@ mod tests {
         let mut sky_geometry = geometry.clone();
         let edge_normal = Vec3::new(0.5, 0.866_025_4, 0.0).normalize();
         let auto_normal = Vec3::new(-0.5, 0.866_025_4, 0.0).normalize();
-        for triangle in Arc::make_mut(&mut sky_geometry.sun_receivers) {
+        // Inject independent variants for this synthetic geometry only; do
+        // not mutate the shared immutable caches of the original fixture.
+        let mut edge_receivers = sky_geometry.sun_receivers(1).to_vec();
+        for triangle in &mut edge_receivers {
             triangle.normals = [edge_normal.to_array(); 3];
         }
-        for triangle in Arc::make_mut(&mut sky_geometry.auto_receivers) {
+        sky_geometry.sun_receivers = Arc::new(OnceLock::from(edge_receivers));
+        let mut auto_receivers = sky_geometry.sun_receivers(2).to_vec();
+        for triangle in &mut auto_receivers {
             triangle.normals = [auto_normal.to_array(); 3];
         }
+        sky_geometry.auto_receivers = Arc::new(OnceLock::from(auto_receivers));
         // A vertex-lit curved patch has its own authored smooth normals.
         let vertex_batch = &mut sky_geometry.batches[1];
         vertex_batch.rgb_gen = jka_assets::shader::RgbGen::Vertex;
@@ -2320,7 +2559,7 @@ mod tests {
         let reused = trace(&geometry, &moved_sun, &cancel, &progress, Some(transport)).unwrap();
         assert!(Arc::ptr_eq(transport, reused.transport.as_ref().unwrap()));
         assert!(sky_transport::bake(&legacy_key, Some(transport), &[], None, None, &[],
-            &|_, _| Some(0.0), &cancel, &progress, &[]).is_none(), "OFF never reuses transport");
+            &|_, _| Some(0.0), &cancel, &progress, &[], None).is_none(), "OFF never reuses transport");
         assert!(
             pages[0][..32 * 32]
                 .iter()

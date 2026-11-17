@@ -794,8 +794,18 @@ pub struct SpectatorHighlight {
     pub team: SpectatorHighlightTeam,
 }
 
+/// Identity of an authored menu view, carried with its actual draw snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrontendSceneToken {
+    pub request_id: u64,
+    pub generation: u64,
+    pub viewport: [u32; 2],
+    pub camera: [u32; 6],
+}
+
 #[derive(Clone)]
 pub struct RenderSnapshot {
+    pub frontend_scene: Option<FrontendSceneToken>,
     /// Presented JKA serverTime, absent outside a live/demo game session.
     pub weather_server_time_ms: Option<i32>,
     pub studio_lens: Option<StudioLens>,
@@ -1412,7 +1422,7 @@ pub enum RenderCommand {
     /// Write the Hybrid wave-classification log and a settings summary to `path`.
     HybridWaveDump { path: PathBuf },
     /// One-shot scene-only readback, before egui/HUD layers.
-    CaptureFrontendScene { path: PathBuf, neutral_gamma: bool },
+    CaptureFrontendScene { path: PathBuf, neutral_gamma: bool, token: FrontendSceneToken },
     CaptureVideoFrame { frame_index: u64, depth: bool, alpha: bool },
     SetUi(UiSnapshot),
     /// Reindex newly mounted gfx/emoji PNGs after fs_restart without vid_restart.
@@ -1591,6 +1601,8 @@ pub(in crate::renderer) struct FrameInfo {
     pub(in crate::renderer) patch_lod: super::world::patch_lod::PatchLodStats,
     pub(in crate::renderer) frame_ms: f64,
     pub(in crate::renderer) cpu_prepare_ms: f64,
+    /// First world frame of a new map only: gap-free laps through prepare.
+    pub(in crate::renderer) prepare_laps: crate::runtime::LapRecorder,
     pub(in crate::renderer) cpu_acquire_ms: f64,
     pub(in crate::renderer) cpu_encode_ms: f64,
     pub(in crate::renderer) cpu_submit_ms: f64,

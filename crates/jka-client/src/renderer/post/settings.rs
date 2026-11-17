@@ -174,7 +174,7 @@ impl Renderer {
         self.baked_sun_cache = effects.baked_sun_cache;
         self.lightmap_smoothing = effects.lightmap_smoothing.min(2);
         self.baked_sun_aa = effects.baked_sun_aa.min(3);
-        self.lightmap_signal = effects.lightmap_signal.min(11);
+        self.lightmap_signal = effects.lightmap_signal.min(14);
         self.sun_receiver_normals = effects.sun_receiver_normals.min(2);
         self.sun_terminator = effects.sun_terminator;
         self.sky_world_bake_ab = effects.sky_world_bake_ab.min(1);

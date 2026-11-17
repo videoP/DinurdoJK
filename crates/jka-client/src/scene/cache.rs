@@ -122,7 +122,7 @@ impl StageFingerprint {
         use std::hash::Hasher;
         self.0.write_usize(batches.len());
         for batch in batches {
-            let signature = std::mem::take(&mut batch.pvs_signature);
+            let signature = std::mem::replace(&mut batch.pvs_signature, Vec::new().into());
             self.debug(&*batch);
             self.pod(&signature);
             batch.pvs_signature = signature;

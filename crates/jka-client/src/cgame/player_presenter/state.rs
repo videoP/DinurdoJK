@@ -236,7 +236,7 @@ impl PlayerPresenter {
         } else {
             let mut shader_warnings = Vec::new();
             let (definitions, diagnostics) =
-                materials::shader_library(&mut assets, &mut shader_warnings, pbr)?;
+                materials::shared_shader_library(&mut assets, &mut shader_warnings, None, pbr)?;
             devprintln!(
                 1,
                 "PLAYER ASSETS: humanoid animations={} saberDefs={} vehicleDefs={} shaderDefs={} mtrDefs={}",
@@ -247,9 +247,9 @@ impl PlayerPresenter {
                 diagnostics.mtr_definitions,
             );
             for warning in shader_warnings {
-                rverbose!(1, "PLAYER MATERIAL WARNING: {warning}");
+                rverbose!(3, "PLAYER MATERIAL WARNING: {warning}");
             }
-            Arc::new(definitions)
+            definitions
         };
         let asset_source = AssetSource::from_search_path(&assets);
         let shader_remaps = crate::scene::ShaderRemapState::default();

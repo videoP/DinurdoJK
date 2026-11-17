@@ -57,7 +57,7 @@ fn legacy_dlight_cull_plane(points: impl Iterator<Item = Vec3> + Clone) -> [f32;
 }
 
 pub fn prepare(root: &Path, game: Option<&Path>, name: &str) -> Result<PreparedMap, String> {
-    prepare_internal(root, game, name, None, MapPrepareOptions::default(), None)
+    prepare_internal(root, game, name, None, MapPrepareOptions::default(), None, None)
 }
 
 pub fn prepare_with_options(
@@ -66,7 +66,7 @@ pub fn prepare_with_options(
     name: &str,
     options: MapPrepareOptions,
 ) -> Result<PreparedMap, String> {
-    prepare_internal(root, game, name, None, options, None)
+    prepare_internal(root, game, name, None, options, None, None)
 }
 
 /// `prepare_with_options` that reuses unchanged stages of an earlier preparation.
@@ -78,7 +78,7 @@ pub fn prepare_with_seed(
     options: MapPrepareOptions,
     seed: &Arc<PreparedMap>,
 ) -> Result<PreparedMap, String> {
-    prepare_internal(root, game, name, None, options, Some(seed))
+    prepare_internal(root, game, name, None, options, Some(seed), None)
 }
 
 pub fn prepare_with_jobs_options(
@@ -89,7 +89,7 @@ pub fn prepare_with_jobs_options(
     options: MapPrepareOptions,
     seed: Option<&Arc<PreparedMap>>,
 ) -> Result<PreparedMap, String> {
-    prepare_internal(root, game, name, Some(jobs), options, seed)
+    prepare_internal(root, game, name, Some(jobs), options, seed, None)
 }
 
 /// Prepare only the Steam Audio data for an already-running BSP. This is the
@@ -152,6 +152,12 @@ pub(in crate::scene) fn note_reused_stage(
     }
 }
 
+/// Invoked on the map loader, once the *main* BSP's exact immutable shader
+/// table is available, before texture/material/geometry preparation finishes.
+pub(crate) type ShaderReadyHook<'a> = dyn FnMut(
+    &AssetSearchPath, &Arc<BTreeMap<String, jka_assets::shader::Shader>>,
+) + 'a;
+
 pub(in crate::scene) fn prepare_internal(
     root: &Path,
     game: Option<&Path>,
@@ -159,6 +165,7 @@ pub(in crate::scene) fn prepare_internal(
     jobs: Option<&MapJobPool>,
     options: MapPrepareOptions,
     seed: Option<&Arc<PreparedMap>>,
+    shader_ready: Option<&mut ShaderReadyHook<'_>>,
 ) -> Result<PreparedMap, String> {
     let prepare_started = Instant::now();
     let mut load_timings = MapLoadTimings {
@@ -250,15 +257,18 @@ pub(in crate::scene) fn prepare_internal(
         let movement_stage = Instant::now();
         let movement = (!options.visual_only).then(|| load_movement(&mut assets, &mut warnings)).flatten();
         load_timings.movement_ms = movement_stage.elapsed().as_secs_f64() * 1000.0;
-        let (library, library_debug) = materials::shader_library_with_jobs(
+        let (library, library_debug) = materials::shared_shader_library(
             &mut assets,
             &mut warnings,
-            jobs,
+            Some(jobs),
             options.pbr_materials,
         )?;
         load_timings.shader_read_ms = library_debug.read_ms;
         load_timings.shader_parse_wall_ms = library_debug.parse_wall_ms;
         load_timings.shader_parse_cpu_ms = library_debug.parse_cpu_ms;
+        if !jobs.is_superseded() {
+            if let Some(ready) = shader_ready { ready(&assets, &library); }
+        }
 
         // Workers idle while the parse finishes. Have a few open the retail
         // archives so the parallel texture reads that follow find ready handles
@@ -335,7 +345,7 @@ pub(in crate::scene) fn prepare_internal(
         let movement = (!options.visual_only).then(|| load_movement(&mut assets, &mut warnings)).flatten();
         load_timings.movement_ms = stage.elapsed().as_secs_f64() * 1000.0;
         let (library, library_debug) =
-            materials::shader_library(&mut assets, &mut warnings, options.pbr_materials)?;
+            materials::shared_shader_library(&mut assets, &mut warnings, None, options.pbr_materials)?;
         load_timings.shader_read_ms = library_debug.read_ms;
         load_timings.shader_parse_wall_ms = library_debug.parse_wall_ms;
         load_timings.shader_parse_cpu_ms = library_debug.parse_cpu_ms;
@@ -708,6 +718,28 @@ pub(in crate::scene) fn prepare_internal(
         // Everything above overlapped the workers; this is only the remainder.
         textures.preload_finish(preload)?;
     }
+    // A superseded request (e.g. a getinfo prefetch invalidated by the
+    // authoritative referenced-package list) must not hold the single map
+    // loader thread through the multi-second material stage below.
+    if jobs.is_some_and(MapJobPool::is_superseded) {
+        return Err("superseded map preparation".into());
+    }
+    // Decode the automatic companion images describe will resolve (same
+    // suffix precedence) on the worker pool instead of serially inside
+    // describe. Applies to every map, not only the menu scene.
+    if let Some(jobs) = jobs {
+        let materials: Vec<_> = used.iter().filter_map(|&index| {
+            let shader = bsp.shaders.get(index)?;
+            let shader_name = String::from_utf8_lossy(&shader.name).to_ascii_lowercase();
+            let shader_name = if options.menu_look {
+                super::menu_look::material_swap(name, &shader_name)
+                    .map(str::to_owned).unwrap_or(shader_name)
+            } else { shader_name };
+            Some((shader_name, shader.surface_flags))
+        }).collect();
+        textures.preload_material_companions(&assets, &materials, &library,
+            &library_debug.origins, options.omit_environment_stages, jobs)?;
+    }
     phase_lap(&mut load_timings, 4, &mut phase_clock);
     let material_stage = Instant::now();
     if let Some(jobs) = jobs {
@@ -837,7 +869,7 @@ pub(in crate::scene) fn prepare_internal(
         &assets,
     );
     load_timings.material_ms = material_stage.elapsed().as_secs_f64() * 1000.0;
-    devprintln!(
+    rverbose!(
         2,
         "[MAP MATERIALS] total {:.1} ms | describe {:.1} (of which texture read/probe {:.1}, decode {:.1}, mip {:.1}; {} decoded, {} new image slot(s); light-image averaging {:.1}) | grass tints {:.1} | surface lights {:.1} | material debug {:.1}",
         load_timings.material_ms,
@@ -1219,7 +1251,6 @@ pub(in crate::scene) fn prepare_internal(
                 plane,
                 bounds_min,
                 bounds_max,
-                patch: surface.kind == SurfaceKind::Patch,
             }
         })
         .collect::<Vec<_>>();
@@ -2158,7 +2189,8 @@ pub(in crate::scene) fn prepare_internal(
         inline_patch_draws,
         coastal_bathymetry,
         world_flares,
-        shader_library: Arc::new(library),
+        shader_library: library,
+        shader_vfs: Some((assets.index_token(), assets.jk2_version())),
         shader_origins: Arc::new(library_debug.origins.clone()),
         sub_bsp_names: Vec::new(),
         sub_bsp_boundary: None,

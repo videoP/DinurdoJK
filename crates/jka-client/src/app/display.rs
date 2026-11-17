@@ -88,6 +88,14 @@ pub(in crate::app) enum MapLoadPurpose {
 
 #[derive(Debug, Clone, Copy)]
 pub(in crate::app) struct FrontendCinematic {
+    pub(in crate::app) request_id: u64,
+    /// Authored staging for the actual loaded map (not the default menu map).
+    pub(in crate::app) stage: Option<scene::MenuStage>,
+    pub(in crate::app) scene_submitted: bool,
+    pub(in crate::app) scene_presented: Option<crate::renderer::FrontendSceneToken>,
+    /// Fallback budget counts time on the authored scene, excluding previews.
+    pub(in crate::app) readiness_started: Option<Instant>,
+    pub(in crate::app) reveal_logged: bool,
     pub(in crate::app) position: [f32; 3],
     pub(in crate::app) yaw: f32,
     /// Camera pitch in radians (App::camera convention).

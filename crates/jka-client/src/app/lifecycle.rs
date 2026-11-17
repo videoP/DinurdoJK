@@ -236,6 +236,13 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             UserEvent::FrontendStagePresented(token) => self.on_frontend_stage_presented(token),
+            UserEvent::FrontendScenePresented(token) => {
+                if self.frontend_scene_token() == Some(token) {
+                    if let Some(cinematic) = self.frontend_cinematic.as_mut() {
+                        cinematic.scene_presented = Some(token);
+                    }
+                }
+            }
             UserEvent::NeonMenuCompositorReady => {
                 self.neon_menu.renderer_ready = true;
                 self.egui_repaint_requested = true;
@@ -929,6 +936,11 @@ impl ApplicationHandler<UserEvent> for App {
                 if request_id != self.latest_request_id {
                     return;
                 }
+                // Main-thread work between the worker's MapPrepared and the
+                // LoadMap hand-off; the render thread is idle until then.
+                let prepared_received_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let mut prepared_laps = crate::runtime::LapRecorder::started_if(
+                    crate::logging::renderer_verbose_enabled(2));
                 let frontend_background =
                     self.front_end && self.frontend_background_request_id == Some(request_id);
                 if frontend_background {
@@ -999,6 +1011,7 @@ impl ApplicationHandler<UserEvent> for App {
                         map.authored_oceans = oceans;
                     }
                 }
+                prepared_laps.lap("FX catalog + authored oceans");
                 if map_edit_preview {
                     // Source-map preparation rebuilt movement collision from the
                     // same text revision as this render world. Hold it until the
@@ -1092,6 +1105,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.consume_server_shader_remaps();
                 }
 
+                prepared_laps.lap("loading rows + baselines + remap state");
                 let cache_started = Instant::now();
                     self.prepared_map_cache = Some(PreparedMapCache {
                         label: name.clone(),
@@ -1106,6 +1120,7 @@ impl ApplicationHandler<UserEvent> for App {
                     "Map restart cache: retained prepared CPU map in {:.1} ms",
                     cache_started.elapsed().as_secs_f64() * 1000.0
                 );
+                prepared_laps.lap("restart cache clone");
 
                 if shader_remap_map_matches_session && !self.shader_remaps.is_empty() {
                     if let Err(error) = scene::apply_shader_remaps_in_place(
@@ -1118,17 +1133,28 @@ impl ApplicationHandler<UserEvent> for App {
                         self.push_console_line(format!("^1shader remap: {error}"));
                     }
                 }
+                prepared_laps.lap("server shader remaps");
                 // The unmodified cache was captured above. Only transform the
                 // derived render copy; toggling the cvar later recovers the
                 // authored two-pass recipe without BSP/asset re-preparation.
                 if self.video.stage_collapse_extra {
                     scene::apply_reverse_lightmap_collapse_in_place(map.as_mut());
                 }
-                if self.video.additive_stage_fusion {
-                    scene::fuse_additive_stage_fusion_in_place(map.as_mut());
+                prepared_laps.lap("reverse lightmap collapse");
+                // Normally a no-op (the worker already fused); a nonzero count
+                // means this rebuilt batches and the AUTO 4 plan on the main thread.
+                let fusion_changed = if self.video.additive_stage_fusion {
+                    scene::fuse_additive_stage_fusion_in_place(map.as_mut())
                 } else {
-                    scene::expand_additive_stage_fusion_in_place(map.as_mut());
-                }
+                    scene::expand_additive_stage_fusion_in_place(map.as_mut())
+                };
+                prepared_laps.lap(if fusion_changed == 0 {
+                    "additive fusion check (no-op)"
+                } else if self.video.additive_stage_fusion {
+                    "additive fusion REBUILD"
+                } else {
+                    "additive expansion REBUILD"
+                });
                 if shader_remap_map_matches_session {
                     // This upload now represents the complete remap/reset state
                     // observed at MapPrepared. Later server commands can set the
@@ -1247,6 +1273,7 @@ impl ApplicationHandler<UserEvent> for App {
                         rverbose!(1, "Material: {warning}");
                     }
                 }
+                prepared_laps.lap("editor + map logs");
                 self.live_without_world = false;
                 self.demo_without_world = false;
                 if self.map_name != name {
@@ -1295,6 +1322,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.steam_audio_bake = map.steam_audio_bake.clone();
                 self.steam_audio_bake_progress = None;
                 self.steam_audio_bake_error = None;
+                prepared_laps.lap("relighting/sun + map state copies");
                 let acoustic_mesh = self.steam_audio_acoustic_mesh.clone();
                 let bake = self.steam_audio_bake.clone();
                 if let Some(session) = self.game_session.as_mut() {
@@ -1325,6 +1353,7 @@ impl ApplicationHandler<UserEvent> for App {
                         sound.set_eal_map(&name);
                     }
                 }
+                prepared_laps.lap("session collision/physics/audio");
                 self.third_person_camera.reset();
                 self.solo_dynamic_models = Arc::new(Vec::new());
                 if frontend_background {
@@ -1351,6 +1380,12 @@ impl ApplicationHandler<UserEvent> for App {
                         self.camera =
                             Camera::new_with_fov(position, yaw, self.camera.cg_fov());
                         self.frontend_cinematic = Some(FrontendCinematic {
+                            request_id,
+                            stage,
+                            scene_submitted: false,
+                            scene_presented: None,
+                            readiness_started: None,
+                            reveal_logged: false,
                             position,
                             yaw,
                             pitch,
@@ -1379,11 +1414,17 @@ impl ApplicationHandler<UserEvent> for App {
                     self.previous_tick = Instant::now();
                     self.console_status = format!("MAIN MENU BACKGROUND: {name}");
                     println!("Frontend cinematic: loaded {name} with no local player/session");
+                    rverbose!(1, "[MENU SCENE] map={name} player={} static_placements={} fx_runners={}",
+                        stage.is_none_or(|stage| stage.player),
+                        map.static_models.placements.len(), map.fx_runners.len());
                 } else if self.preserve_game_state_on_next_map_upload {
                     self.preserve_game_state_on_next_map_upload = false;
-                } else if self.game_session.is_some() {
+                } else if self.game_session.is_some() || self.net.is_some() {
                     // Demo/network sessions already own their authoritative state.
                     // Never create a second local authority while their map uploads.
+                    // A live join's prefetched map can finish before the
+                    // gamestate session exists; building a throwaway local
+                    // server + CGame + collision for it only delays the join.
                     self.local_server = None;
                     self.spawns = map.spawns.clone();
                     self.spawn_index = 0;
@@ -1507,6 +1548,7 @@ impl ApplicationHandler<UserEvent> for App {
                         self.previous_tick = Instant::now();
                     }
                 }
+                prepared_laps.lap("frontend/local game setup");
                 if self.pending_frontend_map_launch {
                     self.pending_frontend_map_launch = false;
                     self.frontend_background_request_id = None;
@@ -1545,6 +1587,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // Apply the configured effects before upload so the world is
                 // compiled for their scene format on its first upload.
                 self.sync_post_effects();
+                prepared_laps.lap("UI publish + render settings");
                 let studio_world = None;
                 self.render_command(RenderCommand::LoadMap {
                     request_id,
@@ -1553,6 +1596,11 @@ impl ApplicationHandler<UserEvent> for App {
                     map,
                     studio_world,
                 });
+                prepared_laps.lap("LoadMap send");
+                if !prepared_laps.laps.is_empty() {
+                    rverbose!(2, "[MAP PREPARED HANDLER] request->handler {:.1} ms | main thread {:.1} ms before LoadMap | {}",
+                        prepared_received_ms, prepared_laps.total_ms(), prepared_laps.summary(2.0));
+                }
                 self.publish_snapshot();
             }
             UserEvent::PhysicsMeshReady { label, result } => {
@@ -2020,6 +2068,21 @@ impl ApplicationHandler<UserEvent> for App {
                         upload_timings.grass_upload_ms,
                         upload_timings.finalize_ms,
                         upload_other_ms,
+                    ));
+                }
+                if (crate::logging::renderer_verbose_enabled(2) || self.vote_map_preload_mode == 3)
+                    && !upload_timings.segments.laps.is_empty()
+                {
+                    // Gap-free laps through the blocking render-thread upload.
+                    // The remainder is render-thread work outside load_map
+                    // (studio cache eviction, dropping the previous world).
+                    let segments = &upload_timings.segments;
+                    self.push_console_line(format!(
+                        "^6[MAP UPLOAD SEGMENTS]^7 {:.1} ms in {} laps, {:.1} outside load_map | {}",
+                        segments.total_ms(),
+                        segments.laps.len(),
+                        (upload_ms - segments.total_ms()).max(0.0),
+                        segments.summary(5.0),
                     ));
                 }
                 if let (Some(stats), Some(sound)) = (

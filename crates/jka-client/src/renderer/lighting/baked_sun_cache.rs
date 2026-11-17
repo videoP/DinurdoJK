@@ -1003,10 +1003,10 @@ impl Renderer {
         // Smoothing is also available without relighting, including vanilla maps.
         let smoothing = self.lightmap_smoothing.min(2);
         // Transport diagnostics require the isolated relighting path.
-        let signal = if self.lightmap_signal >= 9
+        let signal = if (9..=11).contains(&self.lightmap_signal)
             && (!self.sky_world_light_isolation || !self.sun_override) {
             0
-        } else { self.lightmap_signal.min(11) };
+        } else { self.lightmap_signal.min(14) };
         let desired = removal || composition.is_some()
             || ((smoothing != 0 || signal != 0) && !world.source_map && !world.lightmaps.is_empty());
         let strength = if removal { requested_removal } else { 0.0 };
@@ -1033,15 +1033,21 @@ impl Renderer {
         }
         let mut world = self.world.take().unwrap();
         let mut rebound = false;
+        // Map-load cost breakdown (first world frame or r_verbose 2 only).
+        let mut laps = crate::runtime::LapRecorder::started_if(
+            crate::renderer::first_world_frame_trace() || crate::logging::renderer_verbose_enabled(2));
         if desired {
+            let created = world.baked_sun_cache.is_none();
             let c = world.baked_sun_cache.get_or_insert_with(|| {
                 let sizes: Vec<_> = world.lightmaps.iter().take(world.baked_sun_lightmap_count)
                     .map(|i| [i._texture.width(), i._texture.height()])
                     .collect();
                 let charts = world.static_sun.geometry.as_ref()
                     .map_or_else(Vec::new, |g| g.lightmap_charts(&sizes));
+                laps.lap("lightmap charts");
                 LightmapCache::new(&self.device, &self.queue, &world.lightmaps, &charts, world.baked_sun_lightmap_count)
             });
+            laps.lap(if created { "cache create (pipeline + chart textures)" } else { "cache reuse" });
             c.compose(
                 &self.device,
                 &self.queue,
@@ -1081,6 +1087,7 @@ impl Renderer {
                     vanilla_toward_sun: None,
                 }),
             );
+            laps.lap("compose");
             let environment = self.blue_water_sky.as_ref().map(|atmosphere| atmosphere.sky.environment());
             c.compose_vertex_sky(
                 &self.device, &self.queue, &world.vertex_buffer,
@@ -1096,6 +1103,7 @@ impl Renderer {
                 environment, self.debug_world_vertex_alpha_one,
             );
             c.sky_composed_at = sky_light.map(|_| std::time::Instant::now());
+            laps.lap("vertex sky");
             if sky_only {
                 self.world = Some(world);
                 return;
@@ -1127,13 +1135,21 @@ impl Renderer {
             world.local_shadows.selection_position = None;
             self.rebuild_world_surface_bind_groups(&mut world);
         }
+        laps.lap("world bind-group rebuild");
         self.world = Some(world);
         self.upload_light_buffer();
+        laps.lap("light buffer");
         self.update_lighting_settings();
         self.rebuild_frame_plan();
+        laps.lap("lighting settings + frame plan");
         self.activate_world_pipeline_variant();
+        laps.lap("world pipeline variant");
         self.sync_runtime_variant_flags();
         self.history_valid = false;
+        laps.lap("variant flags");
+        if laps.total_ms() >= 20.0 {
+            rverbose!(2, "[SUN LIGHTMAP CACHE SYNC] {:.1} ms | {}", laps.total_ms(), laps.summary(1.0));
+        }
     }
 }
 

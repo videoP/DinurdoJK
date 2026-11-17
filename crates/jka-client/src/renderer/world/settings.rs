@@ -630,6 +630,20 @@ impl Renderer {
         self.map_has_snow_surfaces && self.surface_deformation.mode() != FootprintMode::Off
     }
 
+    /// r_footprints. The persistent Snowflow field is only allocated while
+    /// the shader can sample it; growing/shrinking it replaces the views the
+    /// world bind groups hold, so rebind once on that change only.
+    pub(in crate::renderer) fn set_footprint_mode(&mut self, mode: FootprintMode) {
+        self.surface_deformation.set_mode(&self.queue, mode);
+        let snow_field = self.surface_deformation_shader_needed();
+        if self.surface_deformation.set_field_enabled(&self.device, snow_field) {
+            if let Some(mut world) = self.world.take() {
+                self.rebuild_world_surface_bind_groups(&mut world);
+                self.world = Some(world);
+            }
+        }
+    }
+
     /// Deluxe needs the PBR material path; the shader override is what removes its
     /// cost, so this must match the key, not just the `pbr_settings.deluxe` uniform.
     pub(in crate::renderer) fn deluxe_shader_enabled(&self) -> bool {
@@ -891,7 +905,7 @@ impl Renderer {
                         key,
                         &plan,
                         &reusable_pipelines,
-                        cancel,
+                        cancel, false,
                     )
                 });
         if queued {

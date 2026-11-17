@@ -9,6 +9,7 @@ pub(in crate::renderer) mod original_sun;
 pub(in crate::renderer) mod sun_bake;
 mod sun_direction_fit;
 mod sun_bake_cache;
+mod sky_openness_cache;
 mod sun_bake_upload;
 pub(in crate::renderer) mod baked_sun_cache;
 pub(in crate::renderer) mod lightmap_sun;

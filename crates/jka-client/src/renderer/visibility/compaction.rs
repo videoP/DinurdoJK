@@ -466,7 +466,7 @@ pub(in crate::renderer) fn instantiate_portal_draw_plans(
         batch.indexed_range = geometry_ranges[variant.geometry].clone().unwrap_or(0..0);
         batch.full_indexed_range = batch.indexed_range.clone();
         batch.patch_geometry = None;
-        batch.source.pvs_signature.clear();
+        batch.source.pvs_signature = Vec::new().into();
         batch.source.area_signature = variant.area_signature;
         batch.is_inline_entity = false;
         batch.ocean_clipmap = None;

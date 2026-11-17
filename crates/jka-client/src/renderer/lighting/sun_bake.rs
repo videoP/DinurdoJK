@@ -221,7 +221,7 @@ fn fingerprint(source: &Source, sun: scene::DirectionalSun, encoding: Option<sce
     // Same deterministic FoldHasher on disk and across runs. Bump the cache
     // magic/version whenever reconstruction math changes.
     let mut hash = scene::FoldHasher::default();
-    hash.write(b"baked-sun-v9-no-patch-casters");
+    hash.write(b"baked-sun-v7-zone-field");
     hash.write(&source.cache.map_hash.to_le_bytes());
     hash.write(bytemuck::cast_slice(&source.vertices));
     hash.write(bytemuck::cast_slice(&source.surface_ids));
@@ -272,7 +272,7 @@ fn cache_path(source: &Source, key: u64) -> PathBuf {
         .directory
         .parent()
         .unwrap_or(&source.cache.directory)
-        .join("baked-sun")
+        .join("relighting")
         .join(format!(
             "{name}-{:016x}-{key:016x}.sunpng",
             source.cache.map_hash
@@ -311,6 +311,16 @@ fn run(
     }
     let cached = cache::read(&path, key, source.surfaces.len(), &sizes);
     let cache_hit = cached.is_some();
+    if cache_hit {
+        let pruned = super::sky_openness_cache::prune_map_siblings(
+            &path,
+            &super::sky_openness_cache::safe_map_name(&source.cache.map_name),
+            "sunpng",
+        );
+        if pruned != 0 {
+            println!("[BAKED SUN] removed {pruned} superseded cache file(s) for {}", source.cache.map_name);
+        }
+    }
     let data = if let Some(data) = cached {
         Some(data)
     } else {
@@ -343,7 +353,6 @@ fn run(
                     &mut images,
                     &source.surface_ids,
                     source.surfaces.len(),
-                    &source.surfaces,
                     sun,
                     encoding,
                     cancelled,
@@ -376,11 +385,19 @@ fn run(
         }
         if let Some(data) = data.as_ref() {
             match cache::write(&path, key, data) {
-                Ok(bytes) => println!(
-                    "[BAKED SUN] lossless cache saved: {:.2} MiB {}",
-                    bytes as f64 / 1048576.0,
-                    path.display()
-                ),
+                Ok(bytes) => {
+                    // One removal result per map: drop superseded keys.
+                    let pruned = super::sky_openness_cache::prune_map_siblings(
+                        &path,
+                        &super::sky_openness_cache::safe_map_name(&source.cache.map_name),
+                        "sunpng",
+                    );
+                    println!(
+                        "[BAKED SUN] lossless cache saved: {:.2} MiB {} ({pruned} superseded removed)",
+                        bytes as f64 / 1048576.0,
+                        path.display()
+                    )
+                }
                 Err(error) => {
                     eprintln!("[BAKED SUN] cache write failed (using completed result): {error}")
                 }

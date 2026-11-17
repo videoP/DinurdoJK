@@ -290,6 +290,9 @@ pub(in crate::app) struct LiveJoinTiming {
     pub(in crate::app) cgame_ready_ms: Option<f64>,
     pub(in crate::app) gamestate_ms: Option<f64>,
     pub(in crate::app) first_world_frame_ms: Option<f64>,
+    /// Name advertised by getinfo; not proof that the BSP has been mounted.
+    pub(in crate::app) advertised_map: Option<String>,
+    pub(in crate::app) active_ms: Option<f64>,
     pub(in crate::app) prefetched_map: Option<String>,
 }
 
@@ -301,6 +304,8 @@ impl LiveJoinTiming {
             cgame_ready_ms: None,
             gamestate_ms: None,
             first_world_frame_ms: None,
+            advertised_map: None,
+            active_ms: None,
             prefetched_map: None,
         }
     }

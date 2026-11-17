@@ -255,7 +255,7 @@ impl UiExtImageLoader {
                 rverbose!(1, "UI extension shader library parsed on asset worker in {:.1} ms",
                     started.elapsed().as_secs_f64() * 1000.0);
                 for warning in warnings {
-                    rverbose!(2, "Extension HUD shader library: {warning}");
+                    rverbose!(3, "Extension HUD shader library: {warning}");
                 }
             }
             let (images, shader_flags, source_dimensions) = decode_ui_extension_images(
@@ -1017,6 +1017,12 @@ impl Renderer {
             return;
         };
         if self.ui_loading_image_key.as_deref() != Some(pending.key.as_str()) {
+            return;
+        }
+        // Before infoResponse the join screen is named after the server address
+        // ("host:port"), which is never a map qpath. Keep the unknown-map art
+        // without eight failed VFS lookups.
+        if pending.map_name.contains(':') {
             return;
         }
 
@@ -3494,7 +3500,7 @@ fn load_ui_proportional_font_origin(
                     let baseline = i32::from(font.height) - i32::from(descender >> 1);
                     for glyph in &mut font.glyphs { glyph.baseline -= baseline; }
                 }
-                if crate::logging::renderer_verbose_enabled(2) {
+                if crate::logging::renderer_verbose_enabled(3) {
                     crate::logging::write_line_with_path(
                         crate::logging::Level::Info,
                         format_args!(

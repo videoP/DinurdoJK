@@ -150,6 +150,12 @@ pub fn lower_vote_prewarm_thread_priority() {
     }
 }
 
+/// Upper bound on map worker threads. Each worker needs its own
+/// `ThreadSlot::WorkerN`; raising this without adding slots fails the build
+/// instead of aborting the map loader at runtime.
+const MAX_MAP_WORKERS: usize = 16;
+const _: () = assert!(ThreadSlot::worker(MAX_MAP_WORKERS - 1).is_some());
+
 pub struct MapJobPool {
     sender: Option<mpsc::Sender<Job>>,
     workers: Vec<JoinHandle<()>>,
@@ -230,12 +236,14 @@ impl MapJobPool {
         // Keep MAIN and RENDER responsive, then use the remaining hardware
         // parallelism for CPU-heavy map preparation. The map-loader coordinator
         // spends most of its time waiting on workers, so it does not need a
-        // dedicated reserved hardware thread. Cap at eight so a large machine
-        // cannot stampede PK3 IO or create excessive transient work.
+        // dedicated reserved hardware thread. Texture decode + mip generation
+        // is CPU-bound and dominated the prep wall on large maps with 8
+        // workers (racepack8: 5.9 s decode + 3.2 s mip CPU for 1351 images),
+        // so allow up to sixteen; the cap still bounds PK3 IO and transient work.
         let worker_count = if throttle.as_ref().is_some_and(|t| t.mode != 3) {
             1
         } else {
-            logical.saturating_sub(2).clamp(1, 8)
+            logical.saturating_sub(2).clamp(1, MAX_MAP_WORKERS)
         };
         let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(Mutex::new(receiver));
@@ -244,6 +252,8 @@ impl MapJobPool {
         for index in 0..worker_count {
             let receiver = Arc::clone(&receiver);
             let worker_throttle = throttle.clone();
+            // One thread-activity slot per worker (sun-bake sizing counts the
+            // busy ones); ThreadSlot has as many worker slots as the cap above.
             let slot = if worker_throttle.is_some() {
                 ThreadSlot::BackgroundCpu
             } else {

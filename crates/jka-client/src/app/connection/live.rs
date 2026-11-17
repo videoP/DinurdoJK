@@ -580,7 +580,10 @@ impl App {
                     ConnectionState::Disconnected => "Disconnected.",
                 };
                 self.console_status = text.to_ascii_uppercase();
-                println!("NET: {state:?} - {text}");
+                match self.live_join_timing.as_ref().filter(|timing| timing.active_ms.is_none()) {
+                    Some(timing) => println!("NET: {state:?} - {text} (+{:.1} ms)", timing.elapsed_ms()),
+                    None => println!("NET: {state:?} - {text}"),
+                }
                 self.push_console_line(format!("^5{text}"));
                 // History means a server we actually made it into, not merely a
                 // socket that accepted connectResponse. Stamp it once the first
@@ -632,7 +635,7 @@ impl App {
                 if let (Some(timing), Some(elapsed)) = (self.live_join_timing.as_mut(), elapsed) {
                     if timing.gamestate_ms.is_none() {
                         timing.gamestate_ms = Some(elapsed);
-                        devprintln!(1, "[JOIN] gamestate received at +{elapsed:.1} ms");
+                        println!("[JOIN] gamestate received at +{elapsed:.1} ms");
                     }
                 }
                 self.start_live_gamestate();
@@ -1034,23 +1037,42 @@ impl App {
         }
 
         let source = scene::MapSource::Bsp(map_name.clone());
-        if let Err(error) =
-            scene::verify_map_source_exists(&self.base, self.game.as_deref(), &source)
-        {
-            if self.live_auto_download_requested {
-                self.begin_live_autodownload(&map_name, &configstrings);
-                return;
+        let map_available = match scene::verify_map_source_exists(&self.base, self.game.as_deref(), &source) {
+            Ok(()) => {
+                self.live_auto_download_requested = false;
+                true
             }
-            if !self.live_missing_map_authorized {
-                self.show_missing_map_prompt(&map_name, error);
-                return;
+            Err(error) => {
+                if self.live_auto_download_requested {
+                    self.begin_live_autodownload(&map_name, &configstrings);
+                    return;
+                }
+                if !self.live_missing_map_authorized {
+                    self.show_missing_map_prompt(&map_name, error);
+                    return;
+                }
+                false
             }
-        } else {
-            self.live_auto_download_requested = false;
-        }
+        };
 
         self.poll_live_cgame_prep();
         if self.live_cgame_prepared.is_none() && self.live_cgame_prep_rx.is_some() {
+            // The verified gamestate now supplies the actual mod, referenced
+            // packages and sub-BSPs. Reuse the existing speculative request /
+            // adoption path instead of sitting idle until CGame assets finish.
+            // Restrict this to initial joins; active map-change sessions keep
+            // their existing sequencing and state preservation.
+            if map_available && self.game_session.is_none()
+                && self.live_join_timing.as_ref().is_some_and(|timing| timing.active_ms.is_none())
+                && !self.loaded_map_matches(&map_name) && !self.loading_map_matches(&map_name)
+                && !self.pending_live_gamestate
+            {
+                if let Some(timing) = self.live_join_timing.as_mut() {
+                    timing.prefetched_map = Some(map_name.clone());
+                }
+                println!("[JOIN] {map_name}: verified BSP; overlapping map and CGame preparation");
+                self.prefetch_live_map(source.clone());
+            }
             if !self.pending_live_gamestate {
                 devprintln!(
                     1,
@@ -1379,6 +1401,7 @@ impl App {
                 let summary = if !is_local {
                     self.live_join_timing.as_mut().map(|timing| {
                         let active_ms = timing.elapsed_ms();
+                        timing.active_ms.get_or_insert(active_ms);
                         format!(
                             "[JOIN] active +{active_ms:.1} ms | info {} | cgame {} | gamestate {} | first-world {}",
                             timing.server_info_ms.map_or_else(|| "n/a".into(), |v| format!("{v:.1}")),
@@ -1391,7 +1414,7 @@ impl App {
                     None
                 };
                 if let Some(summary) = summary {
-                    devprintln!(1, "{summary}");
+                    println!("{summary}");
                     if crate::logging::developer_enabled(1) {
                         self.push_console_line(format!("^5{}", summary));
                     }

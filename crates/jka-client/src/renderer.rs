@@ -255,7 +255,7 @@ pub use api::{
     FxGpuSpriteInstance, FxGpuSprites, FxGpuResidentSprites, FxGpuResidentFrame, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
     InlineModelInstance, InspectorEntityHint, PostEffects, RayTracedRigidInstance, RenderCommand, SunBakeStage,
     BakedSunAutoStatus, BakedSunDirectionStatus,
-    RenderSnapshot, TileCostCommand, ScreenshotFormat, SourceMaterialParams, SpectatorHighlight,
+    RenderSnapshot, FrontendSceneToken, TileCostCommand, ScreenshotFormat, SourceMaterialParams, SpectatorHighlight,
     StudioSourceFrame, StudioSceneFrame, StudioSceneLighting,
     SpectatorHighlightTeam, TransientLight, PBR_PROFILE_COMPANION_COMPRESSION,
     PBR_PROFILE_COMPANION_SAMPLER_TRILINEAR, PBR_PROFILE_MATERIALS, PBR_PROFILE_PARALLAX_OCCLUSION,

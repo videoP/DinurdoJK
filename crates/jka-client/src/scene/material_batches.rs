@@ -535,7 +535,7 @@ pub(in crate::scene) fn stage_batch(
         reflection_probe_position_radius: [0.0; 4],
         reflection_cache_flags: 0,
         reflection_roughness_hint: 1.0,
-        pvs_signature: pvs_signature.to_vec(),
+        pvs_signature: pvs_signature.into(),
         area_signature,
     }
 }
@@ -912,6 +912,12 @@ pub(in crate::scene) fn build_material_debug_entry(
             promoted.color[2],
             promoted.subdivide,
         ));
+        for part in promoted.parts.iter().flatten() {
+            lines.push(format!(
+                "  part mask={:#x} value={:.1} bake_value={:.1} color={:.3},{:.3},{:.3}",
+                part.reasons, part.value, part.bake_value, part.color[0], part.color[1], part.color[2],
+            ));
+        }
     }
 
     if material.stages.len() >= 2

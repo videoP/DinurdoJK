@@ -7,7 +7,7 @@ use crate::renderer::{
     advance_world_animations,
     aabb_screen_rect,
     active_batch_selection, ActiveBatchSelection, batch_area_visible, batch_face_plane_rejected, face_plane_selection, selection_stats, draw_partial_face_batch, FacePlaneSelection, RunCull, bevy_cascade_shadow_matrices, block_on,
-    camera_depth_clear, claim_ocean_clipmap, draw_snow_shell, draw_world_batch, draw_world_batch_secondary, secondary_batch_range, fast_sky_clear_color,
+    camera_depth_clear, claim_ocean_clipmap, draw_snow_shell, draw_world_batch, draw_world_batch_secondary, secondary_batch_range,
     effective_area_mask, hidden_bsp_model_surface, hidden_inline_batch, inline_run_fog_depth, inline_stage_info, inspector_index_range,
     ocean_pipeline_key,
     ocean_suppresses_batch, pack_inline_draws, refresh_auto4_lazy_collapse, same_world_surface,
@@ -172,6 +172,9 @@ impl Renderer {
         latest_view: Option<&LatestViewState>,
     ) -> Result<FrameInfo, RenderError> {
         let frame_started = Instant::now();
+        // Gap-free laps for the first frame of a new map only (see render_thread).
+        let mut prepare_laps = crate::runtime::LapRecorder::started_if(
+            crate::renderer::diagnostics::perf_capture::first_world_frame_trace());
         let perf_early_checks_started = crate::renderer::diagnostics::perf_capture::enabled()
             .then(Instant::now);
         // World and screen-space targets use this size; post, HUD and
@@ -254,17 +257,23 @@ impl Renderer {
 
         // Late-latch authored HUD icon animation at presentation rate (including
         // the ordinary in-main UI pass and the streamer composition path).
+        prepare_laps.lap("frame entry + early state");
         self.prepare_enemy_icon_shader();
+        prepare_laps.lap("enemy icon shader");
         if competitive_mask & probe::SUN_BAKE_SYNC == 0 {
             self.sync_sun_bake();
+            prepare_laps.lap("sun bake sync");
             self.sync_static_sun_lightmaps();
+            prepare_laps.lap("static sun lightmaps sync");
             self.sync_baked_sun_lightmap_cache();
+            prepare_laps.lap("baked-sun lightmap cache sync");
         }
 
         if self.baked_brightness.busy {
             self.tick_baked_brightness();
         }
 
+        prepare_laps.lap("baked brightness tick");
         if self.asset_preview_mode {
             self.dynamic_model_renderer.set_studio_environment(studio_environment,&self.queue);
             self.dynamic_model_renderer.set_studio_lights(transient_lights,&self.queue);
@@ -302,6 +311,7 @@ impl Renderer {
         // Structural render decisions must therefore follow the active variant,
         // not the desired settings. Mixing an Enhanced bind group with an active
         // Lean pipeline is a wgpu validation error because bindings 10..14 differ.
+        prepare_laps.lap("model env + early checks");
         let perf_early_checks_ms = perf_early_checks_started
             .map_or(0.0, |started| started.elapsed().as_secs_f64() * 1000.0);
         let active_world_variant = self
@@ -413,6 +423,7 @@ impl Renderer {
                 camera.position.to_array(), prepare_godot_geometry,
             );
         }
+        prepare_laps.lap("world variant + ocean topology");
         let ocean_topology_ms=topology_started.map_or(0.0,|s|s.elapsed().as_secs_f64()*1000.0);
 
         let menu_backdrop_requested = self.menu_backdrop_requested();
@@ -453,6 +464,7 @@ impl Renderer {
         // CGame/FX submits the original lights. Add at most three true opaque
         // BSP hit lights from the same lightning sources; ordinary FX and maps
         // without a compute BVH retain the original fast path.
+        prepare_laps.lap("menu backdrop/CRT/lightning");
         let impact_lights = if self.runtime_transient_lights_enabled() {
             self.dynamic_model_renderer.lightning_gpu.as_mut()
                 .map(|gpu| gpu.impact_lights(dynamic_models)).unwrap_or_default()
@@ -470,16 +482,21 @@ impl Renderer {
         // require it. This is deliberately before the fast-path early return.
         // Its 2048^2 relax pass only ever shades authored snow, so maps without
         // snow surfaces skip it entirely.
-        if self.map_has_snow_surfaces {
+        prepare_laps.lap("transient lights");
+        if self.surface_deformation_shader_needed() {
             self.surface_deformation
                 .prepare_frame(&self.device, &self.queue);
         }
+        prepare_laps.lap("snow");
         self.update_world_videos();
+        prepare_laps.lap("world videos");
         if let Some(world) = self.world.as_mut() {
             advance_world_animations(world, self.scene_time.unwrap_or_else(||self.started.elapsed().as_secs_f32()));
         }
+        prepare_laps.lap("world pre-update");
         self.ensure_lazy_scene_pipelines();
         // Compile only on demand; the normal world rendering path is untouched.
+        prepare_laps.lap("lazy scene pipelines");
         if collision_world_only {
             self.ensure_collision_world_pipeline();
         }
@@ -488,11 +505,13 @@ impl Renderer {
         // shader remains for the optional companion spectator POV only.
 
         // Keep glow pipeline polling entirely outside the maximum-FPS path.
+        prepare_laps.lap("collision-only setup");
         self.ensure_bloom_pipelines();
 
         // Underwater mode uses the existing per-frame, wave-aware camera/water
         // classification. The resources stay resident across the waterline, but
         // its expensive separable blur is skipped whenever we are above water.
+        prepare_laps.lap("bloom pipelines");
         let dof_frame_active = self.depth_of_field_strength > 0.001
             && match self.dof_mode {
                 DofMode::Off => false,
@@ -539,6 +558,7 @@ impl Renderer {
                 }),
             );
         }
+        prepare_laps.lap("DoF setup");
         self.gpu_profiler.begin_frame(&self.device);
         self.frame_time_graph.begin_stats_frame(&self.device);
         if self.cull_debug_mode != CullDebugMode::Off {
@@ -547,6 +567,7 @@ impl Renderer {
         if render_ocean {
             self.ocean_visibility.begin_frame(&self.device);
         }
+        prepare_laps.lap("GPU profiler begin + ocean");
         self.ensure_realtime_sky_normals();
         let sky_normals_active = self.realtime_sky_normals_active();
         let mut plan = self.frame_plan;
@@ -555,6 +576,7 @@ impl Renderer {
             plan.rain_only_linear_depth = false;
             plan.hiz_early = false;
         }
+        prepare_laps.lap("sky normals");
         if self.thermal_vision != 0 { self.ensure_thermal_post_pipeline(); }
         let rt_taa_active = self.thermal_vision == 0 && self.rt_taa_active();
         if self.video_depth_capture_requested() {
@@ -568,6 +590,7 @@ impl Renderer {
         // DLSS also jitters (dlss_active excludes thermal), with NVIDIA's
         // phase count for its upscale ratio. Latched here: later passes hold
         // long borrows of `self`.
+        prepare_laps.lap("thermal/RT-TAA/video depth");
         let dlss_active = self.dlss_active();
         self.dynamic_model_renderer.object_motion = dlss_active;
         let dlss_scene_format = self.scene_format();
@@ -582,6 +605,7 @@ impl Renderer {
         // Full/advanced rendering has many camera-derived CPU uniforms and
         // reflection/visibility decisions. Latch once immediately before the
         // first of those so every dependent pass sees one coherent view.
+        prepare_laps.lap("DLSS + jitter");
         let mut render_camera = *camera;
         let late_view_sample = latest_view
             .and_then(|state| sample_view_rotation(&mut render_camera, state, view_latch));
@@ -711,7 +735,9 @@ impl Renderer {
         {
             self.ensure_post_pipeline(true);
         }
+        prepare_laps.lap("camera/glass/legacy-blend gates");
         self.refresh_water_boxes(camera.position);
+        prepare_laps.lap("water boxes");
         let mut optical_volumes = None;
         // Godot receiver caustics only exist within `caustic_max_distance_m` of
         // a water volume. Out of range the receiver target, its capture pass
@@ -874,6 +900,7 @@ impl Renderer {
             }
             optical_volumes = Some(uniform);
         }
+        prepare_laps.lap("ocean optics/receivers");
         let cloud_view_proj = if self.clouds_enabled {
             camera.view_projection(render_width, render_height)
         } else {
@@ -959,11 +986,13 @@ impl Renderer {
             jump_shade: self.jump_shade.uniform(),
             foliage_wind: crate::foliage::wind_uniform(self.weather_wind, frame_time, self.foliage_wind_enabled),
         };
+        prepare_laps.lap("camera matrices");
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
         // `misc_skyportal`: the same view re-anchored at the sky camera. Only the
         // translation differs from the main view, so shifting the (possibly
         // jittered) main matrix keeps TAA jitter and projection identical.
+        prepare_laps.lap("camera uniform write");
         let sky_portal_view =
             self.world
                 .as_ref()
@@ -1037,12 +1066,15 @@ impl Renderer {
             self.portal_depth.pass_uses_target = portal_pass_uses_target;
             self.world_flares_sky.invalidate_depth_binding();
         }
+        prepare_laps.lap("sky portal depth");
         self.ensure_wireframe_pipelines();
         self.ensure_shader_complexity_target();
         self.ensure_shader_complexity_pipelines();
+        prepare_laps.lap("wireframe/complexity pipelines");
         self.update_sun_ray_preview(camera, player_position);
         self.prepare_rt_local_rate(view_proj, camera.position);
         self.prepare_rt_receiver_flags();
+        prepare_laps.lap("sun ray + RT prep");
         if self.blue_water_environment.weather_backend == 1 || native_sky_visible
             || (self.ocean_enabled && self.ocean_settings.backend != 0) {
             self.ensure_weather_occlusion();
@@ -1070,6 +1102,7 @@ impl Renderer {
         if update_weather_surface {
             self.update_weather_surface_uniform();
         }
+        prepare_laps.lap("weather/ocean/atmosphere update");
         let previous_view_proj =
             if !plan.gamma_only_post && plan.use_post && self.camera_history_valid {
                 self.previous_view_proj
@@ -1077,6 +1110,7 @@ impl Renderer {
                 view_proj
             };
         // r_postSpecialize: the POST_FEATURES mask of this frame's uniform.
+        prepare_laps.lap("previous view proj");
         let mut post_feature_mask = None;
         if plan.use_post && !plan.gamma_only_post {
             let mask = self.write_post_uniform(
@@ -1101,6 +1135,7 @@ impl Renderer {
             self.write_ssr_temporal_uniform(view_proj, inv_view_proj, camera_pos_time);
         }
 
+        prepare_laps.lap("post features/SSAO/SSR");
         let prep_shadow_started = Instant::now();
         let prep_camera_ms = prep_shadow_started
             .duration_since(frame_started)
@@ -1178,10 +1213,12 @@ impl Renderer {
         } else {
             None
         };
+        prepare_laps.lap("shadow matrices");
         if self.weather_froxels_needed() {
             self.write_froxel_uniform(inv_view_proj, camera_pos_time, shadow_matrices.as_ref());
         }
 
+        prepare_laps.lap("weather froxels");
         let prep_world_started = Instant::now();
         let mut prep_shadow_ms = prep_world_started
             .duration_since(prep_shadow_started)
@@ -1223,6 +1260,7 @@ impl Renderer {
             info.cull_frustum_rejected = self.cull_diagnostics_readback.latest[1];
             info.cull_hiz_rejected = self.cull_diagnostics_readback.latest[2];
         }
+        prepare_laps.lap("frame info setup");
         let mut active_selection_changed = false;
         let mut prepared_grass = None;
         let mut prepared_surface_sprite_effects = None;
@@ -1423,6 +1461,7 @@ impl Renderer {
         if active_selection_changed {
             self.update_gpu_cull_settings();
         }
+        prepare_laps.lap("world prepare (PVS/cull/grass)");
         let prep_reflection_started = Instant::now();
         info.prep_world_ms = prep_reflection_started
             .duration_since(prep_world_started)
@@ -1606,6 +1645,7 @@ impl Renderer {
             );
         }
 
+        prepare_laps.lap("planar reflections");
         let prep_local_shadow_started = Instant::now();
         info.prep_reflection_ms = prep_local_shadow_started
             .duration_since(prep_reflection_started)
@@ -1622,6 +1662,7 @@ impl Renderer {
         // Prepare dynamic geometry before command encoding. With RT Shadows enabled,
         // Ghoul2 is compute-skinned once into the shared raster/BLAS buffer; the
         // ordinary RT-off vertex-shader skinning path remains unchanged.
+        prepare_laps.lap("local shadows + fixture lighting");
         let dynamic_prepare_started = Instant::now();
         self.ensure_rt_model_receivers();
         self.dynamic_model_renderer.install_celestial_shadows(&self.device,
@@ -1649,6 +1690,7 @@ impl Renderer {
             .as_ref()
             .and_then(|world| world.entity_light_grid.as_ref());
         let split_dynamic_wireframe = self.wireframe_requires_dynamic_class_split();
+        prepare_laps.lap("model receivers/lights/lightgrid");
         self.dynamic_model_renderer.prepare(
             &mut self.baked_brightness,
             &mut self.pipeline_jobs,
@@ -1668,6 +1710,7 @@ impl Renderer {
                 planar_views.iter().flatten().any(|view| view.kind == PlanarReflectorKind::Authored),
                 planar_views.iter().flatten().any(|view| view.camera_portal));
         }
+        prepare_laps.lap("dynamic model prepare");
         let glass_capture_needed = world_glass_possible
             || self.dynamic_model_renderer.draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass)
             || self.dynamic_model_renderer.skin_draws.iter().any(|draw| draw.alpha_mode == crate::renderer::DynamicModelAlphaMode::Glass);
@@ -1714,11 +1757,14 @@ impl Renderer {
         }
         self.dynamic_model_renderer.glass_bind_group =
             glass_capture_needed.then(|| self.ocean_optics.bind_group.clone());
+        prepare_laps.lap("glass capture");
         self.ensure_prepared_wireframe_pipelines(
             prepared_grass.as_ref(),
             prepared_surface_sprite_effects.as_ref(),
         );
+        prepare_laps.lap("prepared wireframe pipelines");
         self.dynamic_model_renderer.prepare_model_bundles(&self.device, &self.camera_bind_group);
+        prepare_laps.lap("model bundles");
         info.dynamic_model_prepare_ms = dynamic_prepare_started.elapsed().as_secs_f64() * 1000.0;
         let (ghoul2_gpu_instances, ghoul2_gpu_draw_calls) =
             self.dynamic_model_renderer.ghoul2_draw_stats();
@@ -1734,6 +1780,8 @@ impl Renderer {
             .map(|surface| surface.index_count() as u64)
             .sum();
 
+        prepare_laps.lap("model stats");
+        info.prepare_laps = std::mem::take(&mut prepare_laps);
         info.cpu_prepare_ms = frame_started.elapsed().as_secs_f64() * 1000.0;
         // r_earlySubmit: record into an offscreen frame and acquire the
         // swapchain image only after the main submit (see early_submit.rs).
@@ -3230,7 +3278,7 @@ impl Renderer {
                                     a: 1.0,
                                 }
                             } else if self.fast_sky != 0 {
-                                fast_sky_clear_color(self.fast_sky)
+                                self.fast_sky_clear()
                             } else if lake_sky {
                                 wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: -1.0 }
                             } else {
@@ -3709,6 +3757,9 @@ impl Renderer {
                 capture
             })
         } else { None };
+        // Night-toned fastsky clear, taken before `smaa_frame` mutably borrows
+        // `self.smaa_target` for the rest of the frame.
+        let fast_sky_color = self.fast_sky_clear();
         let mut smaa_frame = if self.smaa_enabled {
             self.smaa_target
                 .as_mut()
@@ -4182,7 +4233,7 @@ impl Renderer {
                                 wgpu::LoadOp::Load
                             } else {
                                 wgpu::LoadOp::Clear(if self.fast_sky != 0 {
-                                    fast_sky_clear_color(self.fast_sky)
+                                    fast_sky_color
                                 } else {
                                     self.weather.fog.clear_color()
                                 })
@@ -4450,7 +4501,7 @@ impl Renderer {
                             wgpu::LoadOp::Load
                         } else {
                             wgpu::LoadOp::Clear(if self.fast_sky != 0 {
-                                fast_sky_clear_color(self.fast_sky)
+                                fast_sky_color
                             } else {
                                 self.weather.fog.clear_color()
                             })
@@ -7974,7 +8025,7 @@ impl Renderer {
                             wgpu::LoadOp::Load
                         } else {
                             wgpu::LoadOp::Clear(if self.fast_sky != 0 {
-                                fast_sky_clear_color(self.fast_sky)
+                                fast_sky_color
                             } else {
                                 self.weather.fog.clear_color()
                             })

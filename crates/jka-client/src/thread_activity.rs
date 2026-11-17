@@ -4,7 +4,7 @@ use std::sync::{
 };
 use std::time::Instant;
 
-pub const SLOT_COUNT: usize = 24;
+pub const SLOT_COUNT: usize = 32;
 
 #[cfg(windows)]
 mod windows;
@@ -23,19 +23,27 @@ pub enum ThreadSlot {
     Worker5 = 8,
     Worker6 = 9,
     Worker7 = 10,
-    Event0 = 11,
-    Event1 = 12,
-    Event2 = 13,
-    Event3 = 14,
-    Event4 = 15,
-    Event5 = 16,
-    Event6 = 17,
-    Event7 = 18,
-    Asset0 = 19,
-    Asset1 = 20,
-    UiCatalog = 21,
-    BackgroundIo = 22,
-    BackgroundCpu = 23,
+    Worker8 = 11,
+    Worker9 = 12,
+    Worker10 = 13,
+    Worker11 = 14,
+    Worker12 = 15,
+    Worker13 = 16,
+    Worker14 = 17,
+    Worker15 = 18,
+    Event0 = 19,
+    Event1 = 20,
+    Event2 = 21,
+    Event3 = 22,
+    Event4 = 23,
+    Event5 = 24,
+    Event6 = 25,
+    Event7 = 26,
+    Asset0 = 27,
+    Asset1 = 28,
+    UiCatalog = 29,
+    BackgroundIo = 30,
+    BackgroundCpu = 31,
 }
 
 impl ThreadSlot {
@@ -49,6 +57,14 @@ impl ThreadSlot {
             5 => Some(Self::Worker5),
             6 => Some(Self::Worker6),
             7 => Some(Self::Worker7),
+            8 => Some(Self::Worker8),
+            9 => Some(Self::Worker9),
+            10 => Some(Self::Worker10),
+            11 => Some(Self::Worker11),
+            12 => Some(Self::Worker12),
+            13 => Some(Self::Worker13),
+            14 => Some(Self::Worker14),
+            15 => Some(Self::Worker15),
             _ => None,
         }
     }
@@ -229,6 +245,14 @@ static SLOTS: [SlotState; SLOT_COUNT] = [
     SlotState::new(),
     SlotState::new(),
     SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
+    SlotState::new(),
 ];
 
 fn now_ns() -> u64 {
@@ -327,6 +351,14 @@ pub fn snapshot() -> [RawThreadActivity; SLOT_COUNT] {
         ThreadSlot::Worker5,
         ThreadSlot::Worker6,
         ThreadSlot::Worker7,
+        ThreadSlot::Worker8,
+        ThreadSlot::Worker9,
+        ThreadSlot::Worker10,
+        ThreadSlot::Worker11,
+        ThreadSlot::Worker12,
+        ThreadSlot::Worker13,
+        ThreadSlot::Worker14,
+        ThreadSlot::Worker15,
         ThreadSlot::Event0,
         ThreadSlot::Event1,
         ThreadSlot::Event2,
@@ -381,6 +413,14 @@ pub const fn slot_label(slot: ThreadSlot) -> &'static str {
         ThreadSlot::Worker5 => "WORKER 5",
         ThreadSlot::Worker6 => "WORKER 6",
         ThreadSlot::Worker7 => "WORKER 7",
+        ThreadSlot::Worker8 => "WORKER 8",
+        ThreadSlot::Worker9 => "WORKER 9",
+        ThreadSlot::Worker10 => "WORKER 10",
+        ThreadSlot::Worker11 => "WORKER 11",
+        ThreadSlot::Worker12 => "WORKER 12",
+        ThreadSlot::Worker13 => "WORKER 13",
+        ThreadSlot::Worker14 => "WORKER 14",
+        ThreadSlot::Worker15 => "WORKER 15",
         ThreadSlot::Event0 => "EVENT 0",
         ThreadSlot::Event1 => "EVENT 1",
         ThreadSlot::Event2 => "EVENT 2",
@@ -401,6 +441,14 @@ pub const fn slot_label(slot: ThreadSlot) -> &'static str {
 static SAMPLE_LAST_NS: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(windows))]
 static SAMPLE_BUSY_NS: [AtomicU64; SLOT_COUNT] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

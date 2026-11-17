@@ -122,7 +122,7 @@ impl Renderer {
         let compiled = create_world_pipeline_variant_from_plan(
             &self.device, layout, shader, &self.world_shader_lean,
             scene_format, samples, key, &plan, &self.world_pipeline_catalog,
-            &never_cancel,
+            &never_cancel, false,
         ).expect("uncancelled BSP format/MSAA rebuild must create a complete variant");
         if let Some(world) = &mut self.world {
             world.pipeline_variants.clear();
@@ -1382,7 +1382,7 @@ fn log_material_specialization(
 /// holds native handles, not material textures or world bind groups.
 const MAX_RESIDENT_WORLD_PSOS: usize = 384;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(in crate::renderer) struct WorldPipelineReuseCatalog {
     pipelines: std::collections::HashMap<WorldPassPipelineIdentity, wgpu::RenderPipeline>,
     insertion_order: std::collections::VecDeque<WorldPassPipelineIdentity>,
@@ -1506,9 +1506,50 @@ fn compile_cached_world_pass<K: Sync + std::fmt::Debug>(
     catalog: &WorldPipelineReuseCatalog,
     cancelled: &std::sync::atomic::AtomicBool,
     identity: impl Fn(&K) -> WorldPassPipelineIdentity,
-    create: impl Fn(&K) -> wgpu::RenderPipeline,
+    create: impl Fn(&K) -> wgpu::RenderPipeline + Sync,
+    parallel_load: bool,
 ) -> Option<Vec<wgpu::RenderPipeline>> {
     let start = Instant::now();
+    if parallel_load {
+        // Resolve hits and coalesce identical misses before any native calls.
+        // Preserve input order, including multiple logical jobs sharing a PSO.
+        let mut outputs = Vec::with_capacity(jobs.len());
+        let mut missing = Vec::new();
+        let mut missing_slots = std::collections::HashMap::new();
+        let mut slots = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            if cancelled.load(Ordering::Acquire) { return None; }
+            let key = identity(job);
+            if let Some(existing) = catalog.pipelines.get(&key) {
+                outputs.push(Some(existing.clone()));
+                slots.push(None);
+            } else {
+                let slot = *missing_slots.entry(key).or_insert_with(|| {
+                    let slot = missing.len();
+                    missing.push(job);
+                    slot
+                });
+                outputs.push(None);
+                slots.push(Some(slot));
+            }
+        }
+        let new_count = missing.len();
+        let compiled = compile_pipeline_jobs(label, missing, |job| {
+            if cancelled.load(Ordering::Acquire) { None } else { Some(create(*job)) }
+        });
+        if cancelled.load(Ordering::Acquire) { return None; }
+        let mut result = Vec::with_capacity(jobs.len());
+        for (output, slot) in outputs.into_iter().zip(slots) {
+            result.push(match (output, slot) {
+                (Some(pipeline), _) => pipeline,
+                (None, Some(i)) => compiled.get(i)?.as_ref()?.clone(),
+                _ => return None,
+            });
+        }
+        rverbose!(1, "[WORLD PSO LOAD] {label}: {new_count} new / {} reused (resident or deduplicated) in {:.1} ms wall",
+            jobs.len().saturating_sub(new_count), start.elapsed().as_secs_f64() * 1000.0);
+        return Some(result);
+    }
     let mut reused = 0usize;
     let mut created = 0usize;
     let mut outputs = Vec::with_capacity(jobs.len());
@@ -1563,6 +1604,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
     plan: &WorldPipelineCompilePlan,
     reusable: &WorldPipelineReuseCatalog,
     cancelled: &std::sync::atomic::AtomicBool,
+    parallel_load: bool,
 ) -> Option<WorldPipelineVariant> {
     // Every eligible material has a specialized PSO in this complete variant.
     // The general base PSO is never selected for such a key; retain general
@@ -1582,7 +1624,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
             key, surface_format, msaa_samples),
         |&(key, fog)| create_world_pipeline(
             device, layout, shader, surface_format, key, msaa_samples,
-            fog, false, Some(shader_variant.base_pass_key()), false, None))?
+            fog, false, Some(shader_variant.base_pass_key()), false, None), parallel_load)?
         .into_iter().zip(base_jobs).map(|(pipeline,(key,_))| (key,pipeline)).collect();
 
     let legacy_dlight_pipelines = if shader_variant.legacy_dlights {
@@ -1601,7 +1643,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
                 key.depth_equal = true;
                 create_world_pipeline(device, layout, shader, surface_format,
                     key, msaa_samples, false, false, Some(shader_variant), true, None)
-            })?.into_iter().zip(originals.iter().copied())
+            }, parallel_load)?.into_iter().zip(originals.iter().copied())
             .map(|(pipeline,key)| (key,pipeline)).collect()
     } else { BTreeMap::new() };
 
@@ -1614,7 +1656,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
             |&(original, writes_depth)| create_world_pipeline(
                 device, layout, shader, surface_format,
                 legacy_fog_pass_pipeline_key(original, writes_depth),
-                msaa_samples, true, true, Some(shader_variant), false, None))?
+                msaa_samples, true, true, Some(shader_variant), false, None), parallel_load)?
             .into_iter().zip(jobs.iter().copied())
             .map(|(pipeline,key)| (key,pipeline)).collect()
     } else { BTreeMap::new() };
@@ -1627,7 +1669,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
                 reflected_pipeline_key(original), PLANAR_COLOR_FORMAT, 1),
             |&original| create_reflection_world_pipeline(
                 device, layout, shader, reflected_pipeline_key(original),
-                shader_variant.legacy_fog, shader_variant))?
+                shader_variant.legacy_fog, shader_variant), parallel_load)?
             .into_iter().zip(originals.iter().copied())
             .map(|(pipeline,key)| (key,pipeline)).collect()
     } else { BTreeMap::new() };
@@ -1643,7 +1685,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
             |&(original, writes_depth)| create_world_pipeline(
                 device, layout, shader, PLANAR_COLOR_FORMAT,
                 reflected_pipeline_key(legacy_fog_pass_pipeline_key(original, writes_depth)),
-                1, true, true, Some(shader_variant), false, None))?
+                1, true, true, Some(shader_variant), false, None), parallel_load)?
             .into_iter().zip(jobs.iter().copied())
             .map(|(pipeline,key)| (key,pipeline)).collect()
     } else { BTreeMap::new() };
@@ -1658,7 +1700,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
                 WorldPipelinePass::Reflection { authored_fog: shader_variant.legacy_fog },
                 original, PLANAR_COLOR_FORMAT, 1),
             |&original| create_reflection_world_pipeline(device, layout, shader,
-                original, shader_variant.legacy_fog, shader_variant))?
+                original, shader_variant.legacy_fog, shader_variant), parallel_load)?
             .into_iter().zip(originals.iter().copied()).map(|(p,k)| (k,p)).collect()
     } else { BTreeMap::new() };
 
@@ -1671,7 +1713,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
                 legacy_fog_pass_pipeline_key(original, writes_depth), PLANAR_COLOR_FORMAT, 1),
             |&(original, writes_depth)| create_world_pipeline(device, layout, shader,
                 PLANAR_COLOR_FORMAT, legacy_fog_pass_pipeline_key(original, writes_depth),
-                1, true, true, Some(shader_variant), false, None))?
+                1, true, true, Some(shader_variant), false, None), parallel_load)?
             .into_iter().zip(jobs.iter().copied()).map(|(p,k)| (k,p)).collect()
     } else { BTreeMap::new() };
 
@@ -1685,7 +1727,7 @@ pub(in crate::renderer) fn create_world_pipeline_variant_from_plan(
                 shader_variant, shader_variant.legacy_fog, key, material,
                 super::programs::uses_minimal_entry(material), surface_format, msaa_samples),
             |&(key, material)| modules.pipeline(
-                device, layout, shader, lean_shader, surface_format, msaa_samples, shader_variant, key, material))?;
+                device, layout, shader, lean_shader, surface_format, msaa_samples, shader_variant, key, material), parallel_load)?;
         log_material_specialization(&plan.material_jobs, &unique, shader_variant, started);
         if matches!(shader_variant.program_mode, super::programs::WorldProgramMode::Generated | super::programs::WorldProgramMode::Hybrid) {
             let (shapes, modules_count) = modules.module_count();

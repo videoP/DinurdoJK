@@ -47,6 +47,31 @@ use bytemuck::Zeroable;
 use wgpu::util::DeviceExt;
 use super::textures::upload_cached_texture;
 
+/// CPU-only assets for the first UI. Decode while the same renderer requests
+/// its adapter/device; GPU ownership and upload stay on the render thread.
+struct StartupUiAssets {
+    font: TextureData,
+    hud: (TextureData, Option<ui::ProportionalFont>, Option<ui::ProportionalFont>),
+    clean: (TextureData, Option<ui::ProportionalFont>),
+    splash: (TextureData, Option<[u32; 2]>),
+    unknown: (TextureData, Option<[u32; 2]>),
+}
+
+impl StartupUiAssets {
+    fn load(base: &Path, game: Option<&Path>, wide: bool) -> Self {
+        let started = Instant::now();
+        let result = Self {
+            font: load_ui_font_texture(base, game),
+            hud: super::overlay::load_ui_hud_fonts(base, game),
+            clean: load_ui_clean_font(base, game),
+            splash: load_ui_loading_texture(base, game, None, wide),
+            unknown: load_ui_unknown_map_texture(base, game, wide),
+        };
+        rverbose!(1, "[RENDER INIT] CPU UI assets {:.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+        result
+    }
+}
+
 impl Renderer {
     pub(in crate::renderer) async fn new(
         window: Arc<Window>,
@@ -90,6 +115,13 @@ impl Renderer {
         let offscreen = shared.is_some();
         let size = shared.as_ref().map_or_else(|| window.inner_size(), |(_,_,_,c)|
             winit::dpi::PhysicalSize::new(c.width, c.height));
+        let wide_ui = size.width as f32 / size.height.max(1) as f32 >= 1.5;
+        let ui_assets = if offscreen { None } else {
+            let base = base.to_path_buf();
+            let game = game.map(Path::to_path_buf);
+            thread::Builder::new().name("startup-ui-assets".into())
+                .spawn(move || StartupUiAssets::load(&base, game.as_deref(), wide_ui)).ok()
+        };
         // Per-phase wall times for the "[RENDER INIT] phases" line, so startup
         // regressions show which section grew instead of one opaque total.
         let mut init_phase = Instant::now();
@@ -1299,12 +1331,14 @@ impl Renderer {
             mapped_at_creation: false,
         });
         init_mark!("detail/wireframe/UI pipelines");
-        let ui_font_data = load_ui_font_texture(base, game);
+        let ui_assets = ui_assets.and_then(|worker| worker.join().ok())
+            .unwrap_or_else(|| StartupUiAssets::load(base, game, wide_ui));
+        let ui_font_data = ui_assets.font;
         let ui_font = upload_cached_texture(&device, &queue, &ui_font_data);
         let (ui_small_font_data, ui_small_font_metrics, ui_enemy_info_font_metrics) =
-            super::overlay::load_ui_hud_fonts(base, game);
+            ui_assets.hud;
         let ui_small_font = upload_cached_texture(&device, &queue, &ui_small_font_data);
-        let (ui_clean_font_data, ui_clean_font_metrics) = load_ui_clean_font(base, game);
+        let (ui_clean_font_data, ui_clean_font_metrics) = ui_assets.clean;
         let ui_clean_font = upload_cached_texture(&device, &queue, &ui_clean_font_data);
         // The fallback slot is a transparent 1x1 until the first non-JKA
         // character is seen. No Jura/Noto file or atlas is opened at startup.
@@ -1320,7 +1354,7 @@ impl Renderer {
         // Filled in the background the first time a scoreboard is shown.
         let ui_avatars = upload_cached_texture(&device, &queue, &empty_ui_font_texture("JKA UI avatar atlas (not loaded)"));
         let ui_remap_thumbs = upload_cached_texture(&device, &queue, &empty_ui_font_texture("Shader Remaps thumbnails (not loaded)"));
-        let (ui_splash_data, ui_splash_size) = load_ui_loading_texture(base, game, None, size.width as f32 / size.height.max(1) as f32 >= 1.5);
+        let (ui_splash_data, ui_splash_size) = ui_assets.splash;
         let ui_splash = upload_cached_texture(&device, &queue, &ui_splash_data);
         // The movement key atlas (27 TGAs) is only drawn while cg_movementKeys is
         // on; set_ui loads it the first time that happens.
@@ -1352,7 +1386,7 @@ impl Renderer {
         // Keep the MP unknown-map art resident from renderer startup. Map-load UI
         // can bind this immediately, present it once, and only then resolve the
         // real levelshot. Slow PK3/image I/O can no longer expose the clear color.
-        let (ui_unknown_map_data, ui_unknown_map_size) = load_ui_unknown_map_texture(base, game, size.width as f32 / size.height.max(1) as f32 >= 1.5);
+        let (ui_unknown_map_data, ui_unknown_map_size) = ui_assets.unknown;
         let ui_unknown_map = upload_cached_texture(&device, &queue, &ui_unknown_map_data);
         init_mark!("UI textures");
         let ui_font_sampler = device.create_sampler(&wgpu::SamplerDescriptor {

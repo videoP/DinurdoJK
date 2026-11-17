@@ -140,7 +140,7 @@ impl App {
                 ui.separator();
                 ui.label(egui::RichText::new(format!("Download this model? {size}.")).color(theme::WARNING()));
                 ui.add(egui::Label::new(egui::RichText::new(&active).small()).wrap());
-                ui.label("The file is saved in DinurdoJK/cache/models. A partial file is resumed when the server supports it.");
+                ui.label("The file is saved in DinurdoJK/cache/llm. A partial file is resumed when the server supports it.");
                 ui.horizontal_wrapped(|ui| {
                     if ui.button(action).clicked() {
                         self.confirm_chat_model_download();

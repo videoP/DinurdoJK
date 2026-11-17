@@ -864,7 +864,8 @@ impl Renderer {
         world.inspector_textures.extend(map.replacement_textures.iter().map(inspector_texture_meta));
         let mut sun_textures=map.base.textures.as_ref().clone();
         sun_textures.extend(map.replacement_textures.iter().cloned());
-        let new_sun_geometry = remapped_sun_geometry(world, map, Arc::new(sun_textures));
+        let new_sun_geometry = remapped_sun_geometry(world, map, Arc::new(sun_textures))
+            .with_disk_cache(world.static_ao_source.as_ref().map(|source| source.cache.clone()));
         world.static_sun.replace_geometry(new_sun_geometry);
         // Remaps can change which static stages establish depth and therefore
         // contribute to the live sky normal field. Rebuild it on next use.
@@ -887,7 +888,8 @@ impl Renderer {
         self.map_has_water = self.world.as_ref().is_some_and(|w| w.coarse_batches.iter().any(|b| b.source.water));
         self.map_has_snow_surfaces = self.world.as_ref().is_some_and(|w| w.coarse_batches.iter().any(|b|
             u32::from(b.source.surface_material) == crate::renderer::MATERIAL_SNOW && b.source.pipeline.class != DrawClass::Sky));
-        if self.surface_deformation.set_field_enabled(&self.device, self.map_has_snow_surfaces) {
+        let snow_field = self.surface_deformation_shader_needed();
+        if self.surface_deformation.set_field_enabled(&self.device, snow_field) {
             if let Some(mut world) = self.world.take() {
                 self.rebuild_world_surface_bind_groups(&mut world);
                 self.world = Some(world);

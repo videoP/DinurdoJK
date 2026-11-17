@@ -82,6 +82,7 @@ pub(in crate::app) struct PerfSample {
 
 pub(in crate::app) struct MapLoadingState {
     pub(in crate::app) request_id: u64,
+    started_at: Instant,
     pub(in crate::app) name: String,
     pub(in crate::app) sub_bsp_names: Vec<String>,
     pub(in crate::app) active_game_dir: Option<String>,
@@ -94,6 +95,7 @@ impl MapLoadingState {
         use crate::thread_activity::Task;
         Self {
             request_id,
+            started_at: Instant::now(),
             name,
             sub_bsp_names: Vec::new(),
             active_game_dir: active_game.map(|path| path.display().to_string()),
@@ -321,6 +323,26 @@ impl MapLoadingState {
         (sum / count as f32).min(0.99)
     }
 
+    /// Only name work whose producer has reported a nonzero total and an
+    /// incomplete result. Never infer active tasks from a percentage or phase.
+    fn active_operations(&self) -> String {
+        let mut active = self.bars.iter().filter(|bar| !bar.skipped && !bar.no_work
+            && bar.total > 0 && bar.completed < bar.total);
+        let mut names = active.by_ref().take(2).map(|bar| bar.label).collect::<Vec<_>>().join(" + ");
+        let more = active.count();
+        if more > 0 { names.push_str(&format!(" + {more} more")); }
+        names
+    }
+
+    fn operation(&self) -> String {
+        if self.preparation_finished {
+            return "Uploading world resources + preparing shader pipelines...".to_owned();
+        }
+        let active = self.active_operations();
+        if active.is_empty() { "Preparing map assets...".to_owned() }
+        else { format!("Preparing: {active}") }
+    }
+
     pub(in crate::app) fn ui(&self) -> MapLoadingUi {
         let mut bars: Vec<MapLoadingBar> = self
             .bars
@@ -362,7 +384,8 @@ impl MapLoadingState {
             preparation_finished: self.preparation_finished,
             bars,
             joining_server: false,
-            status_line: None,
+            started_at: Some(self.started_at),
+            status_line: Some(self.operation()),
             download_file_name: None,
             download_overall_fraction: None,
             connection_prompt: None,
@@ -425,11 +448,12 @@ fn download_content_progress(download: &LiveDownloadState) -> (MapLoadingBar, f3
 }
 
 fn with_join_rows(mut ui: MapLoadingUi, connection: MapLoadingBar,
-    content: MapLoadingBar, snapshot: MapLoadingBar) -> MapLoadingUi
+    content: MapLoadingBar, cgame: MapLoadingBar, snapshot: MapLoadingBar) -> MapLoadingUi
 {
     ui.joining_server = true;
     ui.bars.insert(0, connection);
     ui.bars.insert(1, content);
+    ui.bars.insert(2, cgame);
     ui.bars.push(snapshot);
     ui
 }
@@ -453,6 +477,7 @@ impl App {
                 phase: crate::ui::MapLoadingPhase::Gpu,
                 label: "VIDEO", completed: 0, total: 1, skipped: false, no_work: false,
             }];
+            ui.started_at = self.renderer_restart_started;
             ui.status_line = Some("RESTARTING VIDEO...".to_owned());
             return Some(ui);
         }
@@ -479,6 +504,7 @@ impl App {
         let has_gamestate = net.is_some_and(|net| net.session().has_gamestate());
         let map_name = net.and_then(|net| net.session().decoder().map_name())
             .or_else(|| self.loading.as_ref().map(|loading| loading.name.clone()))
+            .or_else(|| self.live_join_timing.as_ref().and_then(|timing| timing.advertised_map.clone()))
             .or_else(|| self.live_join_timing.as_ref().and_then(|timing| timing.prefetched_map.clone()))
             .or_else(|| self.live_download.as_ref().map(|download| download.map_name.clone()))
             .or_else(|| self.live_join_ui.as_ref().map(|join| join.map_name.clone()))
@@ -511,6 +537,8 @@ impl App {
                 pending.begin_upload();
             }
             let mut ui = pending.ui();
+            // Synthetic rows do not start a new timer every snapshot.
+            ui.started_at = None;
             if ready_map || self.live_without_world {
                 for bar in ui.bars.iter_mut().filter(|bar|
                     bar.label == "RENDERER SETUP" || bar.label == "FIRST WORLD FRAME") {
@@ -529,6 +557,11 @@ impl App {
             ui
         };
         ui.map_name = map_name;
+        // Initial join measures command-to-active. Once connected, a later
+        // map change uses its own request clock, not the server session age.
+        if let Some(timing) = self.live_join_timing.as_ref().filter(|t| t.active_ms.is_none()) {
+            ui.started_at = Some(timing.started);
+        }
 
         // Connection progress denotes protocol transitions, never an elapsed
         // time estimate. Connected+gamestate is the end of the handshake.
@@ -563,7 +596,15 @@ impl App {
         });
         let snapshot = join_bar(crate::ui::MapLoadingPhase::Ready,
             "SERVER SNAPSHOT", 0, u32::from(primed));
-        ui = with_join_rows(ui, connection, content, snapshot);
+        let cgame_complete = self.live_cgame_prepared.is_some() || (has_gamestate
+            && self.game_session.as_ref().is_some_and(|session| session.live
+                && session.map_name.as_deref().is_some_and(|name|
+                    Self::normalized_bsp_name(name) == Self::normalized_bsp_name(&ui.map_name))));
+        let cgame_started = cgame_complete || self.live_cgame_prep_rx.is_some()
+            || self.pending_live_gamestate;
+        let cgame = join_bar(crate::ui::MapLoadingPhase::Assets, "CGAME ASSETS",
+            u32::from(cgame_complete), u32::from(cgame_started));
+        ui = with_join_rows(ui, connection, content, cgame, snapshot);
         ui.connection_prompt = if let Some(prompt) = self.missing_map_prompt.as_ref() {
             Some(crate::ui::loading_layout::ConnectionPromptUi::MissingMap {
                 map_name: prompt.map_name.clone(), reason: prompt.reason.clone(),
@@ -601,17 +642,21 @@ impl App {
         } else if self.server_password_prompt.is_some() {
             "Server password required - enter it to continue connecting.".to_owned()
         } else if !has_gamestate {
-            net.map(|net| match net.state() {
-                ConnectionState::Connecting => "Waiting for server challenge...",
-                ConnectionState::Challenging => "Waiting for connection acknowledgement...",
-                _ => "Waiting for server gamestate...",
-            }).unwrap_or("Connecting to server...").to_owned()
-        } else if let Some(loading) = self.loading.as_ref() {
-            if loading.preparation_finished {
-                "Preparing the renderer and first world frame...".to_owned()
-            } else {
-                "Preparing map and client assets...".to_owned()
+            let mut status = net.map(|net| match net.state() {
+                ConnectionState::Connecting => "Waiting for server challenge",
+                ConnectionState::Challenging => "Waiting for connection acknowledgement",
+                _ => "Waiting for server gamestate",
+            }).unwrap_or("Connecting to server").to_owned();
+            if self.live_cgame_prep_rx.is_some() { status.push_str(" + CGame assets"); }
+            if let Some(loading) = self.loading.as_ref() {
+                let active = loading.active_operations();
+                if !active.is_empty() { status.push_str(&format!(" + {active}")); }
             }
+            status
+        } else if let Some(loading) = self.loading.as_ref() {
+            let mut status = loading.operation();
+            if self.live_cgame_prep_rx.is_some() { status.push_str(" + CGame assets"); }
+            status
         } else if self.pending_live_gamestate || self.game_session.is_none() {
             "Initializing the game client and verifying server assets...".to_owned()
         } else if ready_map || self.live_without_world {
@@ -879,23 +924,9 @@ impl App {
     pub(in crate::app) fn request_frontend_background(&mut self) {
         // Back at the menu: a following gameplay load is stock again.
         self.menu_look_play = false;
-        // The exported props file is part of the cache identity, so an edited
-        // layout never shows a still of the previous one.
-        let props_stamp = std::fs::metadata(
-            self.game_write_path("mapmods").join("mp").join("duel9.ent"),
-        )
-        .ok()
-        .map(|meta| {
-            let seconds = meta
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |duration| duration.as_secs());
-            format!("{:x}-{:x}", meta.len(), seconds)
-        })
-        .unwrap_or_else(|| "0".to_owned());
-        let scene_id = format!("{}-{props_stamp}", super::constants::FRONTEND_BACKGROUND_SCENE_ID);
-        self.request_frontend_background_scene(&scene_id, FRONTEND_BACKGROUND_MAP);
+        self.request_frontend_background_scene(
+            super::constants::FRONTEND_BACKGROUND_SCENE_ID, FRONTEND_BACKGROUND_MAP,
+        );
     }
 
     /// Scene selection entry point: future UI/config can select any map *and*
@@ -903,7 +934,18 @@ impl App {
     /// The snapshot belongs to the authored scene, not specifically duel3.
     pub(in crate::app) fn request_frontend_background_scene(&mut self, scene_id: &str, map: &str) {
         crate::startup_timeline::mark(crate::startup_timeline::Milestone::MapRequested);
-        self.select_frontend_scene(scene_id);
+        // Mirror the actual scene preparation dependency, including alternate
+        // scene selection. CTF4 never consumes duel9's exported layout.
+        let props_stamp = scene::menu_props_dependency(map).map(|dependency| {
+            std::fs::metadata(self.game.as_deref().unwrap_or(&self.base).join("mapmods").join(dependency)).ok()
+                .map(|meta| {
+                    let nanos = meta.modified().ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |duration| duration.as_nanos());
+                    format!("{:x}-{nanos:x}", meta.len())
+                }).unwrap_or_else(|| "missing".to_owned())
+        }).unwrap_or_else(|| "none".to_owned());
+        self.select_frontend_scene(&format!("{scene_id}-props-{props_stamp}"));
         self.request_map_internal(
             scene::MapSource::Bsp(map.to_owned()),
             MapLoadPurpose::FrontendBackground,
@@ -1569,6 +1611,11 @@ pub(in crate::app) fn spawn_map_loader(
                             }
                         }
                     });
+                // Start the exact same full catalog as soon as the main BSP
+                // shader table is ready. It must still be joined before static
+                // runner lights are appended and MapPrepared is published.
+                // Keep the exact VFS identity and shader Arc for adoption.
+                let mut early_fx = None;
                 let prepared = if fast_adopt {
                     let seed = request.seed.take().expect("validated vote seed exists");
                     let mut map = Arc::try_unwrap(seed)
@@ -1584,7 +1631,32 @@ pub(in crate::app) fn spawn_map_loader(
                     if request.vote_fast_adopt {
                         println!("[VOTE PREWARM] fast adoption rejected for {name}: VFS, BSP hash or sub-BSP mismatch; validating individual seed stages");
                     }
-                    scene::prepare_source_with_sub_bsps(
+                    let mut shader_ready = |assets: &jka_assets::pk3::AssetSearchPath,
+                        shaders: &Arc<std::collections::BTreeMap<String, jka_assets::shader::Shader>>| {
+                        if !request.analyze_fx_light_profiles || jobs.is_superseded() { return; }
+                        let key = FxCatalogKey {
+                            game: request.game.clone(),
+                            allow_asset_overrides: request.prepare_options.allow_asset_overrides,
+                            pbr_materials: request.prepare_options.pbr_materials,
+                            index: assets.index_token(),
+                        };
+                        if fx_catalog_cache.as_ref().is_some_and(|(cached, _)| *cached == key) { return; }
+                        let mut fx_assets = assets.fork();
+                        let effect_names = crate::fx::light_promotion::effect_asset_names(&fx_assets);
+                        let total = effect_names.len().max(1).min(u32::MAX as usize) as u32;
+                        let worker_shaders = Arc::clone(shaders);
+                        let started = Instant::now();
+                        if let Ok(job) = jobs.submit_progress(
+                            crate::thread_activity::Task::MapFxLightProfiles, total,
+                            move |progress| crate::fx::light_promotion::build_catalog(
+                                &mut fx_assets, worker_shaders.as_ref(), &effect_names,
+                                |completed, _total| progress.set_completed(completed),
+                            ),
+                        ) {
+                            early_fx = Some((key, Arc::clone(shaders), started, job));
+                        }
+                    };
+                    scene::prepare_source_with_sub_bsps_and_shader_hook(
                         &base,
                         request.game.as_deref(),
                         &request.source,
@@ -1592,6 +1664,7 @@ pub(in crate::app) fn spawn_map_loader(
                         request.prepare_options,
                         request.seed.as_ref(),
                         &request.sub_bsp_names,
+                        Some(&mut shader_ready),
                     )
                 };
                 match prepared {
@@ -1623,6 +1696,24 @@ pub(in crate::app) fn spawn_map_loader(
                                         pbr_materials: request.prepare_options.pbr_materials,
                                         index: fx_assets.index_token(),
                                     };
+                                    if let Some((early_key, shaders, started, job)) = early_fx.take() {
+                                        // An authoritative mount or shader-table replacement
+                                        // invalidates the early result; normal profiling below
+                                        // remains the fallback. Never attach stale baked lights.
+                                        if early_key == key && Arc::ptr_eq(&shaders, &map.shader_library) {
+                                            let wait = Instant::now();
+                                            match job.join() {
+                                                Ok(catalog) => {
+                                                    println!("{name}: [FX PROFILE OVERLAP] {} EFX / {} material(s), early span {:.1} ms, remaining wait {:.1} ms",
+                                                        catalog.scanned_effects(), catalog.analyzed_materials(),
+                                                        started.elapsed().as_secs_f64() * 1000.0,
+                                                        wait.elapsed().as_secs_f64() * 1000.0);
+                                                    fx_catalog_cache = Some((early_key, Arc::new(catalog)));
+                                                }
+                                                Err(error) => eprintln!("{name}: early FX profile failed ({error}); retrying normal path"),
+                                            }
+                                        }
+                                    }
                                     let cached = fx_catalog_cache
                                         .as_ref()
                                         .filter(|(cached, _)| *cached == key)
@@ -2119,6 +2210,7 @@ mod loading_row_tests {
         let build = |ui, connected, content, snapshot| {
             with_join_rows(ui, join_bar(crate::ui::MapLoadingPhase::Assets, "SERVER CONNECTION", connected, 3),
                 join_bar(crate::ui::MapLoadingPhase::Assets, "SERVER CONTENT", content, 1),
+                join_bar(crate::ui::MapLoadingPhase::Assets, "CGAME ASSETS", content, 1),
                 join_bar(crate::ui::MapLoadingPhase::Ready, "SERVER SNAPSHOT", 0, snapshot))
         };
         let before = build(loading.ui(), 0, 0, 0);
@@ -2137,6 +2229,9 @@ mod loading_row_tests {
         assert_eq!(before.bars.last().unwrap().total, 0);
         assert_eq!(awaiting_snapshot.bars.last().unwrap().total, 1);
         assert_eq!(labels(&before).last(), Some(&"SERVER SNAPSHOT"));
+        assert_eq!(labels(&before)[2], "CGAME ASSETS");
+        assert_eq!(before.bars[2].completed, 0);
+        assert_eq!(awaiting_snapshot.bars[2].completed, 1);
         assert!(before.bars.iter().find(|bar| bar.label == "OCEAN MESH").unwrap().skipped);
     }
 

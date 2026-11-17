@@ -288,7 +288,7 @@ pub(crate) fn append_authored_ocean_planes(
             depth_equal: false,
         depth_test_disabled: false,
         };
-        b.pvs_signature.clear();
+        b.pvs_signature = Vec::new().into();
         b.area_signature = [0; 4];
         b.planar_reflection = false;
         b.planar_environment_candidate = false;

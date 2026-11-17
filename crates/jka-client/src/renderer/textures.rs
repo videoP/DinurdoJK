@@ -162,7 +162,7 @@ pub(in crate::renderer) fn try_load_ui_font_asset(
         match crate::materials::decode_texture_data(&name, &asset.bytes, true, false) {
             Ok(data) => {
                 let data = normalize_ui_font(data);
-                if crate::logging::renderer_verbose_enabled(2) {
+                if crate::logging::renderer_verbose_enabled(3) {
                     crate::logging::write_line_with_path(
                         crate::logging::Level::Info,
                         format_args!(
@@ -221,7 +221,7 @@ pub(in crate::renderer) fn try_load_texture_asset_from_search_path(
             srgb,
         ) {
             Ok(data) => {
-                if crate::logging::renderer_verbose_enabled(2) {
+                if crate::logging::renderer_verbose_enabled(3) {
                     crate::logging::write_line_with_path(
                         crate::logging::Level::Info,
                         format_args!(

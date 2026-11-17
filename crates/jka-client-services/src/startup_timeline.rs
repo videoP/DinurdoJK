@@ -10,9 +10,10 @@ pub enum Milestone {
     FirstMenuPresent, MapRequested, MapPrepared, FirstMapPresent,
     LoggingReady, GammaReady, OptionsReady, EventLoopReady, AppBegin,
     LutScanReady, ConfigReady, WorkersReady, CredentialsReady, WindowShown,
+    MenuSceneReady, MenuLiveRevealed,
 }
 static ORIGIN: OnceLock<Instant> = OnceLock::new();
-static TIMES: [AtomicU64; 19] = [const { AtomicU64::new(0) }; 19];
+static TIMES: [AtomicU64; 21] = [const { AtomicU64::new(0) }; 21];
 
 pub fn start() { let _ = ORIGIN.set(Instant::now()); }
 pub fn mark(phase: Milestone) {
@@ -37,4 +38,10 @@ pub fn report(label: &str) {
         ms(AppReady), ms(WindowCreated), ms(WindowShown), ms(RendererReady), ms(MenuBuilt),
         ms(FirstPresent), ms(FirstMenuPresent), ms(MapRequested),
         ms(MapPrepared), ms(FirstMapPresent));
+    if TIMES[MenuSceneReady as usize].load(Ordering::Relaxed) != 0
+        || TIMES[MenuLiveRevealed as usize].load(Ordering::Relaxed) != 0
+    {
+        println!("[STARTUP TIMELINE] {label} menu_scene_ready={} menu_live_revealed={} (ms from main entry)",
+            ms(MenuSceneReady), ms(MenuLiveRevealed));
+    }
 }

@@ -121,6 +121,12 @@ pub(crate) fn menu_stage(map: &str) -> Option<MenuStage> {
     (map_key(map) == "mp/ctf4").then_some(CTF4_STAGE)
 }
 
+/// Only duel9 consumes an exported menu layout. Keep screenshot dependencies
+/// aligned with apply_scene rather than invalidating every menu for this file.
+pub(crate) fn menu_props_dependency(map: &str) -> Option<&'static str> {
+    is_duel9(map).then_some("mp/duel9.ent")
+}
+
 const WATER_HEIGHT: f32 = 186.0;
 
 /// Nothing is planted below the water (JKA z / render y), with a little margin

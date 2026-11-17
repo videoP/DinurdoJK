@@ -299,11 +299,29 @@ impl App {
             jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref())
                 .map_err(|error| format!("SOLO PLAYER ASSET PATH ERROR: {error}"))?;
         assets.set_allow_asset_overrides(self.video.allow_asset_overrides);
+        let shaders = self.prepared_frontend_shaders(&assets);
         self.local_player_presenter = Some(
-            PlayerPresenter::new(assets, self.video.pbr)
+            PlayerPresenter::new_with_shared_shaders(assets, self.video.pbr, shaders)
                 .map_err(|error| format!("SOLO PLAYER ASSET ERROR: {error}"))?,
         );
         Ok(())
+    }
+
+    fn prepared_frontend_shaders(&self, assets: &jka_assets::pk3::AssetSearchPath)
+        -> Option<Arc<std::collections::BTreeMap<String, jka_assets::shader::Shader>>>
+    {
+        if !self.front_end { return None; }
+        let cache = self.prepared_map_cache.as_ref()?;
+        let (token, variant) = cache.map.shader_vfs.as_ref()?;
+        if *token != assets.index_token() || *variant != assets.jk2_version()
+            || cache.prepare_options.pbr_materials != self.video.pbr
+            || cache.prepare_options.allow_asset_overrides != assets.asset_overrides_allowed()
+        {
+            return None;
+        }
+        rverbose!(1, "[MENU SHADERS] reusing {} definitions from matching prepared VFS, variant, PBR and override policy",
+            cache.map.shader_library.len());
+        Some(Arc::clone(&cache.map.shader_library))
     }
 
     pub(in crate::app) fn asset_preview_camera(&self) -> Camera {
@@ -1356,11 +1374,13 @@ impl App {
         self.solo_dynamic_models = Arc::new(surfaces);
     }
 
-    /// Only capture a reusable menu frame after the actual player model has
-    /// settled AND its held idle animation has been submitted for multiple frames.
-    /// WorldUploaded alone is insufficient because Ghoul2 models stream later.
-    fn advance_frontend_scene_readiness(&mut self, model_ready: bool, current_time: i32) {
+    /// A player/streamed-prop capture needs the original settling grace period;
+    /// a playerless, world-only scene can reveal after the first presented BSP.
+    fn advance_frontend_scene_readiness(
+        &mut self, model_ready: bool, current_time: i32, needs_settle: bool,
+    ) {
         let now = Instant::now();
+        let scene_token = self.frontend_scene_token();
         let Some(cinematic) = self.frontend_cinematic.as_mut() else { return; };
         if cinematic.world_ready_at.is_none() || cinematic.fade_started.is_some() {
             return;
@@ -1371,25 +1391,37 @@ impl App {
             cinematic.pose_locked_at = None;
             return;
         }
-        let first_visible = *cinematic.model_visible_since.get_or_insert(now);
-        // Let initial Ghoul2 anim transitions settle, without recording a
-        // transient bind/landing pose or the fallback model from a cold load.
-        if now.saturating_duration_since(first_visible) < Duration::from_millis(850) {
+        if !needs_settle && (scene_token.is_none() || cinematic.scene_presented != scene_token) {
             return;
         }
-        if cinematic.pose_locked_at.is_none() {
-            cinematic.pose_hold_ms = Some(current_time);
-            cinematic.pose_locked_at = Some(now);
-            return;
+        if needs_settle {
+            let first_visible = *cinematic.model_visible_since.get_or_insert(now);
+            // Let initial Ghoul2 transitions settle; for a streamed prop scene retain
+            // the existing grace period until there is a real prop-ready ack.
+            if now.saturating_duration_since(first_visible) < Duration::from_millis(850) {
+                return;
+            }
+            if cinematic.pose_locked_at.is_none() {
+                cinematic.pose_hold_ms = Some(current_time);
+                cinematic.pose_locked_at = Some(now);
+                return;
+            }
+            // Let the held pose traverse app snapshots and the render thread.
+            if now.saturating_duration_since(cinematic.pose_locked_at.unwrap())
+                < Duration::from_millis(200)
+            {
+                return;
+            }
         }
-        // The held pose must have passed through the app snapshot and actual
-        // render thread several times before the scene-only GPU readback.
-        if now.saturating_duration_since(cinematic.pose_locked_at.unwrap())
-            < Duration::from_millis(200)
-        {
-            return;
-        }
+        // Defer both capture and reveal on preview pages. The next authored
+        // scene snapshot must be presented before starting its camera clock.
+        let Some(token) = scene_token else { return; };
         cinematic.fade_started = Some(now);
+        crate::startup_timeline::mark(crate::startup_timeline::Milestone::MenuSceneReady);
+        crate::startup_timeline::report("menu_ready");
+        rverbose!(1, "[MENU READY] has_player={} settle={} world-present->ready {:.1} ms",
+            cinematic.stage.is_none_or(|stage| stage.player), needs_settle,
+            now.saturating_duration_since(cinematic.world_ready_at.unwrap()).as_secs_f64() * 1000.0);
         // Pages with a renderer-owned viewport (e.g. `uipage renderstudio` at
         // launch) replace the menu scene; capturing then would cache that page
         // as the next launch's menu backdrop.
@@ -1399,6 +1431,7 @@ impl App {
             self.render_command(RenderCommand::CaptureFrontendScene {
                 path: path.clone(),
                 neutral_gamma: super::frontend_scene_cache::shader_gamma_reusable(&self.video),
+                token,
             });
         }
         self.egui_repaint_requested = true;
@@ -1432,7 +1465,8 @@ impl App {
                     }
                 };
             assets.set_allow_asset_overrides(self.video.allow_asset_overrides);
-            let mut presenter = match EntityPresenter::new(assets, self.video.pbr) {
+            let shaders = self.prepared_frontend_shaders(&assets);
+            let mut presenter = match EntityPresenter::new_with_shared_shaders(assets, self.video.pbr, shaders) {
                 Ok(presenter) => presenter,
                 Err(error) => {
                     eprintln!("MENU PROPS MD3 ERROR: {error}");
@@ -1532,20 +1566,28 @@ impl App {
             self.solo_dynamic_models = Arc::new(Vec::new());
             return;
         };
+        let stage = cinematic.stage;
+        if stage.is_some_and(|stage| !stage.player) {
+            // Do not open a player VFS, parse player/animation assets, or spawn
+            // the Ghoul2 worker pool for a scene without a foreground player.
+            let has_props = !self.map_static_models.placements.is_empty()
+                || self.prepared_map_cache.as_ref().is_some_and(|cache| !cache.map.fx_runners.is_empty());
+            self.solo_dynamic_models = Arc::new(self.menu_scene_props());
+            if let Some(active) = self.frontend_cinematic.as_mut() {
+                active.scene_submitted = true;
+            }
+            // World-only scenes need no settle. A scene with streamed props/FX
+            // still needs a real prop-ready acknowledgement before its grace
+            // period can safely be removed, even on a PNG cache hit.
+            self.advance_frontend_scene_readiness(true, 0, has_props);
+            return;
+        }
         if let Err(error) = self.ensure_local_player_presenter() {
             if self.console_status != error {
                 self.console_status = error.clone();
                 self.push_console_line(format!("^1{error}"));
             }
             self.solo_dynamic_models = Arc::new(Vec::new());
-            return;
-        }
-
-        let stage = scene::menu_stage(super::constants::FRONTEND_BACKGROUND_MAP);
-        if stage.is_some_and(|stage| !stage.player) {
-            // An empty stage: nothing to wait for before the handoff.
-            self.solo_dynamic_models = Arc::new(self.menu_scene_props());
-            self.advance_frontend_scene_readiness(true, 0);
             return;
         }
         let Some(idle_anim) = jka_assets::animation::animation_index(
@@ -1641,11 +1683,14 @@ impl App {
                 let mut draws = draws;
                 draws.extend(self.menu_scene_props());
                 self.solo_dynamic_models = Arc::new(draws);
-                self.advance_frontend_scene_readiness(model_ready, current_time);
+                if let Some(active) = self.frontend_cinematic.as_mut() {
+                    active.scene_submitted = true;
+                }
+                self.advance_frontend_scene_readiness(model_ready, current_time, true);
             }
             Err(error) => {
                 self.solo_dynamic_models = Arc::new(Vec::new());
-                self.advance_frontend_scene_readiness(false, current_time);
+                self.advance_frontend_scene_readiness(false, current_time, true);
                 if self.console_status != error {
                     self.console_status = error.clone();
                     self.push_console_line(format!("^1FRONTEND PLAYER PRESENTATION: {error}"));

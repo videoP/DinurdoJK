@@ -24,6 +24,33 @@ pub(super) fn vanilla_sky_night_fraction(sun_travel_y: f32) -> f32 {
 }
 
 impl Renderer {
+    /// r_fastsky flat color with the same night tone as the vanilla sky shader
+    /// (`vanilla_sky_night_tone` in bsp*.wgsl: 35% desaturation, then the
+    /// 0.0125/0.01875/0.03 gain at full night). Keep the constants identical.
+    /// Gated on Relight world only: fastsky wins over the Blue Water display, so
+    /// `sky_backend` is irrelevant here. Plain clear-color math, no extra pass.
+    pub(in crate::renderer) fn fast_sky_clear(&self) -> wgpu::Color {
+        let color = crate::renderer::fast_sky_clear_color(self.fast_sky);
+        if !self.sun_override {
+            return color;
+        }
+        let night = vanilla_sky_night_fraction(self.active_sun().direction[1]);
+        if night <= 0.0 {
+            return color;
+        }
+        let luminance = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+        let night = f64::from(night);
+        let tone = |c: f64, gain: f64| {
+            (c + (luminance - c) * night * 0.35) * (1.0 + (gain - 1.0) * night)
+        };
+        wgpu::Color {
+            r: tone(color.r, 0.0125),
+            g: tone(color.g, 0.01875),
+            b: tone(color.b, 0.03),
+            a: color.a,
+        }
+    }
+
     /// This affects authored vanilla sky only while Relight world is enabled.
     /// With relighting off, JKA sky retains its authored RGB output.
     pub(in crate::renderer) fn vanilla_sky_night_strength(&self) -> f32 {

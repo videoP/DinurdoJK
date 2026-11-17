@@ -54,26 +54,14 @@ fn compiler_sun_transmission(
 fn authored_sun_casters(
     vertices: &[crate::scene::GpuVertex],
     batches: &[crate::scene::DrawBatch],
-    surface_ids: &[u32],
-    surfaces: &[crate::scene::LegacyDlightSurface],
 ) -> (Vec<crate::renderer::StaticAoRenderTriangle>, Vec<Option<SunFilterTriangle>>) {
     let mut seen = std::collections::BTreeSet::new();
     let mut triangles = Vec::new();
     let mut filters = Vec::new();
-    // q3map2 game "ja" (from sof2) defaults patchShadows=false, as did Raven's
-    // q3map: the authored lightmap has no patch sun shadows. Predicting them
-    // left the surfaces under/behind curved patches unremoved (and room-
-    // protected), visible as unshaded brushes when patch LOD exposes them.
-    let is_patch = |vertex: usize| {
-        surface_ids.get(vertex / 3)
-            .and_then(|&id| surfaces.get(id as usize))
-            .is_some_and(|surface| surface.patch)
-    };
     for batch in batches {
         let filtered = batch.alpha_shadow || batch.light_filter;
         if batch.pipeline.class == DrawClass::Sky
             || (!filtered && batch.pipeline.class != DrawClass::Opaque)
-            || is_patch(batch.vertices.start as usize)
             || !seen.insert((batch.vertices.start, batch.vertices.end)) { continue; }
         for triangle in vertices[batch.vertices.start as usize..batch.vertices.end as usize].chunks_exact(3) {
             triangles.push(crate::renderer::StaticAoRenderTriangle {
@@ -99,7 +87,6 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     lightmaps: &mut [crate::materials::TextureData],
     surface_ids: &[u32],
     surface_count: usize,
-    surfaces_info: &[crate::scene::LegacyDlightSurface],
     sun: crate::scene::DirectionalSun,
     encoding: crate::scene::BakedSunEncoding,
     cancelled: &std::sync::atomic::AtomicBool,
@@ -112,7 +99,7 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    let (casters, filters) = authored_sun_casters(vertices, batches, surface_ids, surfaces_info);
+    let (casters, filters) = authored_sun_casters(vertices, batches);
     let filter_count = filters.iter().filter(|filter| filter.is_some()).count();
     let solid = StaticAoBvh::build(casters.into()).ok()?;
     println!(
@@ -139,14 +126,8 @@ pub(in crate::renderer) fn bake_authored_sun_masks(
     let sky = StaticAoBvh::build(sky_triangles.into()).ok()?;
     let triangles = collect_static_ao_lightmap_triangles(vertices, batches);
     let sizes: Vec<_> = lightmaps.iter().map(|lm| [lm.width, lm.height]).collect();
-    // q3map2 lights the edge luxels just outside each surface, and bilinear
-    // sampling at the chart edge reads them. Trace them too (nearest surface,
-    // closest point on it) instead of averaging a neighbouring chart's mask
-    // into them: next to an occluder that neighbour is often in shadow, which
-    // left an unremoved sliver of baked sun along the junction.
-    let (samples, owners) = crate::renderer::static_ao::bvh::rasterize_lightmap_band(
-        &triangles, &sizes, 1.5,
-    );
+    let samples = crate::renderer::static_ao::bvh::rasterize_lightmap_texels(&triangles, &sizes, 1);
+    let owners = crate::renderer::static_ao::bvh::rasterize_lightmap_owners(&triangles, &sizes, 1);
     let color = Vec3::from_array(sun.color);
     let photons = color / color.max_element().max(0.00001) * sun.intensity * encoding.brightness;
     let sun_y = photons.dot(Vec3::new(0.2126, 0.7152, 0.0722));

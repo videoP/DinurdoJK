@@ -285,11 +285,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
     let mut static_entity_indices = Vec::with_capacity(1 + grouped_world_indices.len());
     static_entity_indices.push(world_index);
     static_entity_indices.extend(grouped_world_indices.iter().copied());
-    let (library, library_debug) = if let Some(jobs) = jobs {
-        materials::shader_library_with_jobs(assets, &mut warnings, jobs, options.pbr_materials)?
-    } else {
-        materials::shader_library(assets, &mut warnings, options.pbr_materials)?
-    };
+    let (library, library_debug) = materials::shared_shader_library(assets, &mut warnings, jobs, options.pbr_materials)?;
     let mut textures = Textures::new();
     let mut material_lookup = BTreeMap::<String, usize>::new();
     let mut map_materials = Vec::<MapMaterial>::new();
@@ -671,7 +667,8 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         inline_patch_draws: Vec::new(),
         coastal_bathymetry: None,
         world_flares: Vec::new(),
-        shader_library: Arc::new(library),
+        shader_library: library,
+        shader_vfs: None,
         shader_origins: Arc::new(library_debug.origins.clone()),
         sub_bsp_names: Vec::new(),
         sub_bsp_boundary: None,
