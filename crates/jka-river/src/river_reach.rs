@@ -626,11 +626,30 @@ pub fn classify(geometry: &CaptureGeometry, region: Region, seed: [f32; 3], leve
     let mut landscape = Vec::new();
     let mut actors = Vec::new();
     let quad = |q: [[f32; 3]; 4]| [[q[0], q[1], q[2]], [q[0], q[2], q[3]]];
-    for (i, item) in context.items.iter().enumerate() {
-        if item.zmin > cap {
-            continue; // water never reaches it: as if absent
+    // Everything starting above the reach cap is an Actor, never absent. A
+    // flood (discharge) rises past the source level; with the upper brushes
+    // of a stacked wall absent, the wall ended at the lower brush's top and
+    // the water poured over it out of the map. As actors, stage 6 still
+    // passes water under roofs/decks over reached floors, while a brush
+    // resting on solid (capture clearance) or over unreached columns blocks.
+    // Skybox shells (any sky face) stay absent: as actors their ceiling would
+    // make every unreached open-sky column a solid tower and fill the void.
+    let sky_shell = |item: &Item| match item.shape {
+        Shape::Brush(b) => {
+            let faces = geometry.brushes[b as usize].faces.clone();
+            geometry.brush_faces[faces.start as usize..faces.end as usize].iter().any(|f| f.sky)
         }
-        let actor = above[i];
+        _ => false,
+    };
+    let high = items(geometry, region, f32::INFINITY);
+    let entries = context
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| item.zmin <= cap || !sky_shell(item))
+        .map(|(i, item)| (item, above[i] || item.zmin > cap))
+        .chain(high.iter().filter(|item| item.zmin > cap + PASSAGE && !sky_shell(item)).map(|item| (item, true)));
+    for (item, actor) in entries {
         stats.actor_items += usize::from(actor);
         match item.shape {
             Shape::Brush(b) => {

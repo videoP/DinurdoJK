@@ -274,13 +274,14 @@ fn update_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
     var speed = length(velocity);
     if speed > eps {
         let depth = select(input.yy, vec2<f32>(left.y, down.y), velocity >= vec2<f32>(0.0));
-        var force = -velocity * params.limits.x * speed
+        // Not Unreal: semi-implicit Manning friction, v / (1 + dt*n*|v|/R).
+        // Unreal's explicit force clamped at |v|/dt cancels the whole face
+        // velocity once dt*n*|v|/R >= 1, so a large pressure jump over a
+        // steep lip yielded zero runoff for thin water (more drop, less flow).
+        // Identical to first order wherever friction is weak (deep or slow flow).
+        let resistance = dt * params.limits.x * speed
             / max(vec2<f32>(eps), pow(depth / 100.0, vec2<f32>(4.0 / 3.0)));
-        let magnitude = length(force);
-        if magnitude > eps {
-            force = clamp(magnitude, 0.0, speed / dt) * force / magnitude;
-        }
-        velocity += dt * force;
+        velocity /= vec2<f32>(1.0) + resistance;
     }
     velocity *= params.limits.y;
     speed = length(velocity);

@@ -275,7 +275,11 @@ impl super::Renderer {
             }
             let path = directory.join(format!("river-dump-{}-{number:03}.png", river.id));
             match image.save(&path) {
-                Ok(()) => eprintln!("[RIVER DUMP]   wrote {} ({}x{} cells, {scale}px/cell, north up)", path.display(), size[0], size[1]),
+                Ok(()) => crate::logging::write_line_with_path(
+                    crate::logging::Level::Info,
+                    format_args!("[RIVER DUMP]   wrote {} ({}x{} cells, {scale}px/cell, north up)", path.display(), size[0], size[1]),
+                    path.clone(),
+                ),
                 Err(error) => eprintln!("[RIVER DUMP]   PNG write failed: {error}"),
             }
             if let (Some(p), Some(diff)) = (previous, diff) {
@@ -287,7 +291,11 @@ impl super::Renderer {
                 );
                 let path = directory.join(format!("river-diff-{}-{number:03}.png", river.id));
                 match diff.save(&path) {
-                    Ok(()) => eprintln!("[RIVER DUMP]   wrote {} (red = water left, green = water arrived, blue = source)", path.display()),
+                    Ok(()) => crate::logging::write_line_with_path(
+                        crate::logging::Level::Info,
+                        format_args!("[RIVER DUMP]   wrote {} (red = water left, green = water arrived, blue = source)", path.display()),
+                        path.clone(),
+                    ),
                     Err(error) => eprintln!("[RIVER DUMP]   diff PNG write failed: {error}"),
                 }
             }

@@ -208,6 +208,23 @@ fn overhead_only_ground_stays_void() {
 }
 
 #[test]
+fn stacked_wall_above_the_cap_stays_a_wall_and_high_roof_is_passed_under() {
+    let mut g = CaptureGeometry::default();
+    slab(&mut g, [0.0, 768.0], [0.0, 256.0], [-64.0, 400.0]);
+    // A wall of two stacked brushes; the upper one starts above the cap (416).
+    slab(&mut g, [320.0, 352.0], [0.0, 256.0], [400.0, 440.0]);
+    slab(&mut g, [320.0, 352.0], [0.0, 256.0], [440.0, 900.0]);
+    // A roof over the reached floor, also entirely above the cap.
+    slab(&mut g, [128.0, 192.0], [0.0, 256.0], [600.0, 640.0]);
+    let s = run(&g, [24, 8], [2, 4], 400.0, 400.0);
+    for y in 0..8 {
+        assert_eq!(s.bed(10, y), 900.0, "stacked wall at row {y}");
+        assert_eq!(s.bed(4, y), 400.0, "under the roof at row {y}");
+        assert_eq!(s.bed(5, y), 400.0, "under the roof at row {y}");
+    }
+}
+
+#[test]
 fn brush_only_floor_is_landscape() {
     let mut g = CaptureGeometry::default();
     slab(&mut g, [0.0, 768.0], [0.0, 256.0], [-64.0, 400.0]);

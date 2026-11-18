@@ -64,17 +64,12 @@ pub fn velocity(s: VelocityStencil, p: Parameters) -> [f32; 2] {
                 s.water.depth
             },
         ];
-        let mut force = std::array::from_fn(|axis| {
-            -output[axis] * p.friction * speed / (depth[axis] / 100.0).powf(4.0 / 3.0).max(eps)
-        });
-        let magnitude = length(force);
-        if magnitude > eps {
-            for component in &mut force {
-                *component = magnitude.clamp(0.0, speed / p.dt) * *component / magnitude;
-            }
-        }
+        // Not Unreal: semi-implicit Manning friction (see shallow.wgsl). The
+        // explicit force clamped at speed/dt zeroed steep-lip runoff.
         for axis in 0..2 {
-            output[axis] += p.dt * force[axis];
+            let resistance =
+                p.dt * p.friction * speed / (depth[axis] / 100.0).powf(4.0 / 3.0).max(eps);
+            output[axis] /= 1.0 + resistance;
         }
     }
     for component in &mut output {
@@ -271,7 +266,32 @@ mod tests {
             },
             p,
         );
-        assert!(v[0].abs() < 1e-5);
+        assert!(v[0] > 0.0 && v[0] < 1e-3);
+        assert_eq!(v[1], 0.0);
+    }
+
+    #[test]
+    fn thin_water_over_steep_lip_keeps_downhill_velocity() {
+        // 1 cm of water on a 12 m lip, starting at rest. Unreal's explicit
+        // friction clamp cancelled the whole pressure acceleration here.
+        let p = Parameters::cached_river_variant(40.0, 1.0 / 60.0, 980.0, 2400.0, 6000.0);
+        let high_geo = Geometry { bottom: 1200.0, ..Geometry::default() };
+        let high = Water { height: 1201.0, depth: 1.0, velocity: [0.0; 2] };
+        let low = Water::default();
+        let predicted = p.dt_over_dx() * p.gravity * high.height;
+        assert!(p.dt * p.friction * predicted / (high.depth / 100.0).powf(4.0 / 3.0) > 1.0);
+        let v = velocity(
+            VelocityStencil {
+                water: low,
+                geometry: Geometry::default(),
+                left_water: high,
+                left_geometry: high_geo,
+                down_water: low,
+                down_geometry: Geometry::default(),
+            },
+            p,
+        );
+        assert!(v[0] > 50.0 && v[0] < predicted);
         assert_eq!(v[1], 0.0);
     }
 

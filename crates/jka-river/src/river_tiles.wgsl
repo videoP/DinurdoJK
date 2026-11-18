@@ -65,7 +65,14 @@ fn commit_tile(@builtin(global_invocation_id) id: vec3<u32>) {
     var under = max(-100000.0, values[4]);
     top = max(top, values[1]);
     under = min(under, values[2]);
-    if reference - under <= 0.0 && under > values[0] && top > under && top > values[0] {
+    // Not Unreal, mode 1 only: an actor is passed under only with a real
+    // opening over the landscape (river_reach CLEARANCE, 2 units). A wall
+    // built from stacked brushes puts the upper brush's underside exactly on
+    // the lower one's top; its columns are unreached, so they borrow the
+    // floor's dilated reference, and `under > landscape` by capture noise
+    // turned the wall into a zero-height pass-under shelf that floods hold.
+    let clearance = select(0.0, 5.0, commit.contour_floor.z != 0.0);
+    if reference - under <= 0.0 && under > values[0] + clearance && top > under && top > values[0] {
         top = values[0];
     }
     let at = commit.cells.xy + vec2<i32>(id.xy);
