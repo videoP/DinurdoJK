@@ -61,7 +61,9 @@ fn river_map_radiance(d:vec3<f32>,roughness:f32)->vec3<f32> {
     if masks.material_mask < 0.3333 {
         discard;
     }
-    return river_composite_pass(input.clip, input.world, front, graph_normal, foam, pixel_depth, slope);
+    let reflection = river_composite_pass(input.clip, input.world, front, graph_normal, foam, pixel_depth, slope);
+    if reflection.a == 0.0 { discard; }
+    return reflection;
 }
 
 // SingleLayerWaterComposite after the material graph, shared by the camera
@@ -88,7 +90,8 @@ fn river_composite_pass(clip: vec4<f32>, world: vec3<f32>, front: bool, graph_no
     let uv=clamp(clip.xy/size,0.55/size,(size-0.55)/size);
     let behind=river_gather_behind(uv,size,pixel_depth,slope);
     let delta_depth=behind.scene_depth-pixel_depth;
-    if delta_depth<=0.0 {discard;}
+    // The legacy wrapper discards; a fused base pass must keep its base color.
+    if delta_depth<=0.0 {return vec4<f32>(0.0);}
     let roughness=attributes.roughness;
     let mirror=reflect(-v,n);
     let a=roughness*roughness;

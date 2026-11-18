@@ -112,7 +112,8 @@ pub struct ViewUniform {
     pub sun_illuminance: [f32; 4],
     /// Material Time, foam detail present (1/0), Engine.DeltaTime, bed clamp.
     pub time: [f32; 4],
-    /// Runtime fragment material LOD (x = 0 original, 1 wave, 2 wave + foam; y = mip cutoff).
+    /// Runtime fragment material LOD (x = 0 original, 1 wave, 2 wave + foam; y = mip cutoff;
+    /// z = r_riverAdaptiveSSR; w = r_underwaterReflections).
     pub material_lod: [f32; 4],
 }
 
@@ -172,6 +173,13 @@ impl ViewUniform {
 /// detail and the shader are built once; the pipeline per scene (format,
 /// samples); the scene copy per target size. Per-frame work is the FFT, one
 /// uniform write and the copy pass.
+/// Per-live-body output; separate read and write layouts prevent a buffer
+/// read/write alias in the classification dispatch.
+pub(super) struct EyeState {
+    pub(super) classify: wgpu::BindGroup,
+    pub(super) read: wgpu::BindGroup,
+}
+
 pub struct RiverSurface {
     pub(super) module: wgpu::ShaderModule,
     pub(super) body_layout: wgpu::BindGroupLayout,
@@ -186,7 +194,12 @@ pub struct RiverSurface {
     pub(super) env_layout: wgpu::BindGroupLayout,
     pipeline: Option<((wgpu::TextureFormat, u32), wgpu::RenderPipeline)>,
     composite: Option<wgpu::RenderPipeline>,
+    fused: bool,
     submerged: Option<wgpu::RenderPipeline>,
+    eye_pipeline: wgpu::ComputePipeline,
+    eye_write_layout: wgpu::BindGroupLayout,
+    eye_read_layout: wgpu::BindGroupLayout,
+    submerged_args: wgpu::Buffer,
     audio_probe: Option<crate::river_audio_probe::AudioProbe>,
     /// r_riverWire 0: the live window blocks, masked as the water draws.
     wire: Option<wgpu::RenderPipeline>,
@@ -213,6 +226,7 @@ pub struct RiverSurface {
     /// Bilinear clamp for FoamRT's cubic reconstruction edge fallback.
     foam_rt_sampler: wgpu::Sampler,
     view: wgpu::Buffer,
+    cpu_view: ViewUniform,
     copy: Option<SceneCopy>,
     pub(super) frame: Option<wgpu::BindGroup>,
     /// Bound when Blue Water is off; the shader reads the classic field then.
@@ -264,19 +278,25 @@ impl RiverSurface {
             source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(compose()?)),
         });
         use wgpu::SamplerBindingType::{Filtering, NonFiltering};
+        // Only the inputs reachable from river_eye_water_at are compute-visible.
+        let compute_entry = |binding, ty| {
+            let mut e = entry(binding, ty);
+            e.visibility |= wgpu::ShaderStages::COMPUTE;
+            e
+        };
         let body_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("river water body"),
             entries: &[
-                entry(0, uniform()),
-                entry(1, texture(true)),
-                entry(2, texture(true)),
-                entry(3, sampler(Filtering)),
+                compute_entry(0, uniform()),
+                compute_entry(1, texture(true)),
+                compute_entry(2, texture(true)),
+                compute_entry(3, sampler(Filtering)),
                 entry(4, texture(true)),
                 entry(5, texture(true)),
                 entry(6, sampler(Filtering)),
                 entry(7, texture(true)),
                 entry(8, sampler(Filtering)),
-                entry(9, uniform()),
+                compute_entry(9, uniform()),
                 // vs_block's live block list (river_blocks).
                 entry(15, wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -304,7 +324,7 @@ impl RiverSurface {
         let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("river water frame"),
             entries: &[
-                entry(0, uniform()),
+                compute_entry(0, uniform()),
                 entry(1, texture(true)),
                 entry(
                     2,
@@ -317,12 +337,45 @@ impl RiverSurface {
                 entry(3, sampler(NonFiltering)),
                 entry(4, texture(true)),
                 entry(5, sampler(Filtering)),
-                entry(6, texture(true)),
-                entry(7, sampler(Filtering)),
+                compute_entry(6, texture(true)),
+                compute_entry(7, sampler(Filtering)),
                 entry(8, texture(true)),
                 entry(9, sampler(Filtering)),
                 entry(11, texture(false)),
             ],
+        });
+        let eye_write_entry = |binding| wgpu::BindGroupLayoutEntry {
+            binding, visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false, min_binding_size: None,
+            }, count: None,
+        };
+        let eye_write_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("river eye classifier outputs"),
+            entries: &[eye_write_entry(1), eye_write_entry(2)],
+        });
+        let eye_read_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("river eye classification uniform"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 5, visibility: wgpu::ShaderStages::VERTEX,
+                ty: uniform(), count: None,
+            }],
+        });
+        let eye_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("river eye classifier"),
+            bind_group_layouts: &[Some(&eye_write_layout), Some(&body_layout), None, Some(&frame_layout)],
+            immediate_size: 0,
+        });
+        let eye_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("river eye classifier"), layout: Some(&eye_pipeline_layout),
+            module: &module, entry_point: Some("classify_river_eye"),
+            compilation_options: Default::default(), cache: None,
+        });
+        let submerged_args = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("river submerged capture indirect"), size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let sky_layout = crate::river_composite::sky_layout(device);
         let sky_group = crate::river_composite::sky_group(device, &sky_layout, None);
@@ -442,7 +495,12 @@ impl RiverSurface {
             env_layout,
             pipeline: None,
             composite: None,
+            fused: false,
             submerged: None,
+            eye_pipeline,
+            eye_write_layout,
+            eye_read_layout,
+            submerged_args,
             audio_probe: None,
             wire: None,
             wire_full: None,
@@ -459,6 +517,7 @@ impl RiverSurface {
             inert_detail,
             foam_rt_sampler,
             view,
+            cpu_view: ViewUniform::default(),
             copy: None,
             frame: None,
             inert_env,
@@ -482,11 +541,12 @@ impl RiverSurface {
         samples: u32,
         depth_format: wgpu::TextureFormat,
         depth_compare: wgpu::CompareFunction,
+        fused: bool,
     ) {
         if self
             .pipeline
             .as_ref()
-            .is_some_and(|(key, _)| *key == (format, samples))
+            .is_some_and(|(key, _)| *key == (format, samples)) && self.fused == fused
         {
             return;
         }
@@ -499,6 +559,7 @@ impl RiverSurface {
                 Some(&self.frame_layout),
                 Some(&self.env_layout),
                 Some(&self.sky_layout),
+                Some(&self.eye_read_layout),
             ],
             immediate_size: 0,
         });
@@ -513,7 +574,7 @@ impl RiverSurface {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &self.module,
-                entry_point: Some("fs"),
+                entry_point: Some(if fused { "fs_fused" } else { "fs" }),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
@@ -660,7 +721,7 @@ impl RiverSurface {
                 cache: None,
             })
         };
-        self.far_pipeline = Some(far("fs_far", None, wgpu::ColorWrites::ALL, true, depth_compare));
+        self.far_pipeline = Some(far(if fused { "fs_far_fused" } else { "fs_far" }, None, wgpu::ColorWrites::ALL, true, depth_compare));
         self.far_composite = Some(far(
             "fs_composite_far",
             Some(wgpu::BlendState {
@@ -730,6 +791,7 @@ impl RiverSurface {
             multiview_mask: None,
             cache: None,
         }));
+        self.fused = fused;
         self.pipeline = Some(((format, samples), pipeline));
     }
 
@@ -790,6 +852,7 @@ impl RiverSurface {
 
     /// SingleLayerWaterComposite over the water-mesh quadtree tiles.
     pub fn draw_composite_far<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
+        if self.fused { return; }
         if let Some(pipeline) = &self.far_composite {
             self.draw_far_with(pass, pipeline, camera, shadow_receiver, environment, river);
         }
@@ -934,7 +997,47 @@ impl RiverSurface {
                 ],
             }));
         }
+        self.cpu_view = *view;
         queue.write_buffer(&self.view, 0, bytemuck::bytes_of(view));
+    }
+
+    pub(super) fn eye_state(&self, device: &wgpu::Device) -> EyeState {
+        let result = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("river eye result"), size: 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::UNIFORM,
+            mapped_at_creation: false,
+        });
+        EyeState {
+            classify: device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("river eye classifier outputs"), layout: &self.eye_write_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 1, resource: self.submerged_args.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: result.as_entire_binding() },
+                ],
+            }),
+            read: device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("river eye result"), layout: &self.eye_read_layout,
+                entries: &[wgpu::BindGroupEntry { binding: 5, resource: result.as_entire_binding() }],
+            }),
+        }
+    }
+
+    /// Current-frame camera classification, after solver/presentation/FFT and
+    /// before any water draw. Do not substitute the asynchronous audio probe.
+    pub fn classify_eyes(&self, encoder: &mut wgpu::CommandEncoder, rivers: &[crate::river_runtime::LiveRiver]) {
+        encoder.clear_buffer(&self.submerged_args, 0, None);
+        let Some(frame) = &self.frame else { return; };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("river eye classification"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.eye_pipeline);
+        pass.set_bind_group(3, frame, &[]);
+        for river in rivers {
+            let (Some(body), Some(eye)) = (river.body_group(), river.eye_state()) else { continue; };
+            pass.set_bind_group(0, &eye.classify, &[]);
+            pass.set_bind_group(1, body, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
     }
 
     /// Copy the scene without the river (colour + reversed depth, MSAA
@@ -954,7 +1057,7 @@ impl RiverSurface {
 
     /// Capture completed river surfaces for the submerged medium. No second HZB.
     pub fn capture_submerged(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, color: &wgpu::TextureView, depth: &wgpu::TextureView) {
-        if let Some(copy) = &self.copy { copy.capture(device, encoder, color, depth); }
+        if let Some(copy) = &self.copy { copy.capture_indirect(device, encoder, color, depth, &self.submerged_args); }
     }
 
     /// The per-river group: SimGridRT, NormalsRT, the classic indirect field
@@ -1050,8 +1153,8 @@ impl RiverSurface {
         environment: Option<&'a wgpu::BindGroup>,
         river: &'a crate::river_runtime::LiveRiver,
     ) {
-        let (Some((_, pipeline)), Some(frame), Some(body)) =
-            (&self.pipeline, &self.frame, river.body_group())
+        let (Some((_, pipeline)), Some(frame), Some(body), Some(eye)) =
+            (&self.pipeline, &self.frame, river.body_group(), river.eye_state())
         else {
             return;
         };
@@ -1062,6 +1165,7 @@ impl RiverSurface {
         pass.set_bind_group(3, frame, &[]);
         pass.set_bind_group(4, environment.unwrap_or(&self.inert_env), &[]);
         pass.set_bind_group(5, &self.sky_group, &[]);
+        pass.set_bind_group(6, &eye.read, &[]);
         self.draw_blocks(pass, river);
     }
     pub fn draw_composite<'a>(
@@ -1072,8 +1176,9 @@ impl RiverSurface {
         environment: Option<&'a wgpu::BindGroup>,
         river: &'a crate::river_runtime::LiveRiver,
     ) {
-        let (Some(pipeline), Some(frame), Some(body)) =
-            (&self.composite, &self.frame, river.body_group())
+        if self.fused { return; }
+        let (Some(pipeline), Some(frame), Some(body), Some(eye)) =
+            (&self.composite, &self.frame, river.body_group(), river.eye_state())
         else {
             return;
         };
@@ -1084,13 +1189,15 @@ impl RiverSurface {
         pass.set_bind_group(3, frame, &[]);
         pass.set_bind_group(4, environment.unwrap_or(&self.inert_env), &[]);
         pass.set_bind_group(5, &self.sky_group, &[]);
+        pass.set_bind_group(6, &eye.read, &[]);
         self.draw_blocks(pass, river);
     }
 
     pub fn draw_submerged<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
-        let (Some(pipeline), Some(frame), Some(body)) = (&self.submerged, &self.frame, river.body_group()) else { return; };
+        let (Some(pipeline), Some(frame), Some(body), Some(eye)) = (&self.submerged, &self.frame, river.body_group(), river.eye_state()) else { return; };
         pass.set_pipeline(pipeline);
         self.bind_patch(pass, camera, shadow_receiver, environment, frame, body);
+        pass.set_bind_group(6, &eye.read, &[]);
         pass.draw(0..3, 0..1);
     }
 
@@ -1121,9 +1228,10 @@ impl RiverSurface {
     /// water draws; 1: the whole grid mesh, unmasked.
     pub fn draw_wire<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
         let full = crate::river_blocks::wire_mode() == 1;
-        let (Some(pipeline), Some(frame), Some(body)) = (if full { &self.wire_full } else { &self.wire }, &self.frame, river.body_group()) else { return; };
+        let (Some(pipeline), Some(frame), Some(body), Some(eye)) = (if full { &self.wire_full } else { &self.wire }, &self.frame, river.body_group(), river.eye_state()) else { return; };
         pass.set_pipeline(pipeline);
         self.bind_patch(pass, camera, shadow_receiver, environment, frame, body);
+        pass.set_bind_group(6, &eye.read, &[]);
         if full {
             pass.set_vertex_buffer(0, river.mesh.vertices.slice(..));
             pass.set_index_buffer(river.mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
@@ -1141,6 +1249,11 @@ impl RiverSurface {
         for record in 0..cull.records() {
             pass.draw_indexed_indirect(&cull.args, record * 5 * std::mem::size_of::<u32>() as u64);
         }
+    }
+
+    pub fn block_frustum(&self, origin: [f64; 3], size: [f32; 2], cells: [u32; 2]) -> [[f32; 4]; 2] {
+        if !crate::river_blocks::frustum_enabled() { return [[0.0; 4]; 2]; }
+        crate::river_blocks::view_wedge(&self.cpu_view, origin, size, cells)
     }
 
     pub fn block_pipelines(&self) -> &crate::river_blocks::Pipelines {

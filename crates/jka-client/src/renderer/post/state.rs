@@ -664,9 +664,7 @@ impl Renderer {
                     0.0
                 },
                 0.0,
-                if self.jk2_legacy_color && !self.hdr_enabled {
-                    if self.jk2_gamma_baked { 2.0 } else { 1.0 }
-                } else { 0.0 }, // .z: legacy SDR (2 = 3D grade contains output gamma)
+                self.jk2_output_lut_mode(), // .z: legacy SDR (2 = 3D grade contains output gamma)
                 f32::from(self.overbright_bits), // .w: output overbright
             ],
             // The optics only exist with the GPU ocean; a plain BSP water

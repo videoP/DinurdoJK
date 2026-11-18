@@ -431,7 +431,7 @@ impl Renderer {
                     if self.vignette_enabled { 1.0 } else { 0.0 },
                     self.color_grade.exposure_ev,
                 ],
-                flags: [if self.hdr_enabled { 1.0 } else { 0.0 }, if self.hdr_output.is_some() { 1.0 } else { 0.0 }, f32::from(self.overbright_bits), if self.jk2_gamma_baked { 2.0 } else { f32::from(u8::from(self.jk2_legacy_color)) }],
+                flags: [if self.hdr_enabled { 1.0 } else { 0.0 }, if self.hdr_output.is_some() { 1.0 } else { 0.0 }, f32::from(self.overbright_bits), self.jk2_output_lut_mode()],
             }),
         );
         self.rebuild_frame_plan();

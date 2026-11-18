@@ -89,7 +89,7 @@ fn output_dither_srgb8(color: vec3<f32>, pixel_position: vec2<f32>) -> vec3<f32>
 }
 
 // Both post paths consume the same JK2MV-style encoded gamma/overbright LUT.
-// Unaffected JKA/HDR frames retain exactly their original color transfer.
+// JK2 HDR Math Only also uses this transfer; JKA/native HDR remain linear.
 fn output_gamma_color(linear: vec3<f32>, gamma: f32) -> vec3<f32> {
     if (settings.snow_haze.z > 1.5) {
         // The single grading cube already contains JK2 output gamma.

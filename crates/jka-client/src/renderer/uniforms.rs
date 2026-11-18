@@ -418,6 +418,7 @@ pub(in crate::renderer) struct GammaPostUniform {
     pub(in crate::renderer) values: [f32; 4],
     // x: HDR scene. HDR already removes the fog quantization that motivated the
     // legacy output dither, so the compact presentation shader skips it.
+    // y: native HDR LUT headroom, z: overbright bits, w: JK2 SDR LUT mode.
     pub(in crate::renderer) flags: [f32; 4],
 }
 

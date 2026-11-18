@@ -138,8 +138,9 @@ impl App {
     /// Push the FX sampling rate/scope into the active presentation session.
     pub(in crate::app) fn apply_fx_fps_settings(&mut self) {
         if let Some(session) = self.game_session.as_mut() {
-            session.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
-            session.weapon_fx.set_fx_fps_scope(self.video.fx_fps_scope);
+            session.weapon_fx.set_fx_fps_settings(
+                self.video.fx_fps, self.video.fx_fps_scope, self.video.fx_fps_game,
+            );
         }
     }
 

@@ -10,6 +10,30 @@ pub const FX_FPS_DEFAULT: u32 = 90;
 pub const FX_FPS_MIN: u32 = 15;
 pub const FX_FPS_MAX: u32 = 250;
 
+/// Game selection for the optional DinurdoJK fixed FX cadence.
+pub const FX_FPS_GAME_BOTH: u32 = 0;
+pub const FX_FPS_GAME_JKA: u32 = 1;
+pub const FX_FPS_GAME_JK2: u32 = 2;
+
+pub fn fx_fps_game_enabled(game: u32, jk2: bool) -> bool {
+    match game {
+        FX_FPS_GAME_JKA => !jk2,
+        FX_FPS_GAME_JK2 => jk2,
+        _ => true,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn fx_fps_game_selection() {
+    assert!(fx_fps_game_enabled(FX_FPS_GAME_BOTH, false));
+    assert!(fx_fps_game_enabled(FX_FPS_GAME_BOTH, true));
+    assert!(fx_fps_game_enabled(FX_FPS_GAME_JKA, false));
+    assert!(!fx_fps_game_enabled(FX_FPS_GAME_JKA, true));
+    assert!(!fx_fps_game_enabled(FX_FPS_GAME_JK2, false));
+    assert!(fx_fps_game_enabled(FX_FPS_GAME_JK2, true));
+}
+
 /// Which presentation-frame-driven effects are resampled by `cg_fxFPS`.
 ///
 /// * `0` keeps the original DinurdoJK scope: continuous projectile/trail EFX only.

@@ -222,6 +222,36 @@ app_cvars! {
         ]
     }
 
+    APP_CG_FXFPSGAME {
+        runtime: CvarDef::new("cg_fxFPSGame", "", "0..2", "Apply cg_fxFPS and its scope to 0 both games, 1 JKA only, 2 JK2 only. Excluded games use the existing synchronous per-frame FX cadence; the saved rate is retained.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(app.video.fx_fps_game.to_string()), |app, value| App::cvar_set_cg_fxfpsgame(app, APP_CG_FXFPSGAME.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_fxfpsgame, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(game) = value.trim().parse::<u32>() {
+                    if game <= crate::fx::FX_FPS_GAME_JK2 { settings.fx_fps_game = game; }
+                }
+            }),
+            archive: Some((17001, |state| state.video.fx_fps_game.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_cg_fxfpsgame(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                let game = value.trim().parse::<u32>().ok()
+                    .filter(|&game| game <= crate::fx::FX_FPS_GAME_JK2)
+                    .ok_or_else(|| "cg_fxFPSGame expects 0 (Both), 1 (JKA), or 2 (JK2)".to_owned())?;
+                self.video.fx_fps_game = game;
+                self.apply_fx_fps_settings();
+                self.mark_config_dirty();
+                self.publish_ui();
+                self.console_status = format!("FX FPS GAME: {}", match game {
+                    crate::fx::FX_FPS_GAME_JKA => "JKA",
+                    crate::fx::FX_FPS_GAME_JK2 => "JK2",
+                    _ => "BOTH",
+                });
+                Ok(())
+            }
+        }]
+    }
+
     APP_CG_FXFPSSCOPE {
         runtime: CvarDef::new("cg_fxFPSScope", "", "0..1", "Which render-frame-driven effects cg_fxFPS resamples: 0 continuous projectile/trail EFX only, 1 also eligible stock frame-driven effects such as saber/world sparks and wall marks.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_fxfpsscope(app)), |app, value| App::cvar_set_cg_fxfpsscope(app, APP_CG_FXFPSSCOPE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_fxfpsscope, None),
         config: CvarBinding {

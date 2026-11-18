@@ -172,8 +172,9 @@ impl App {
         session.weapon_fx.set_saber_trail(self.saber_trail);
         session.player_presenter.set_speed_trail(self.speed_trail);
         session.weapon_fx.set_simulated_projectiles(self.simulated_projectiles);
-        session.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
-        session.weapon_fx.set_fx_fps_scope(self.video.fx_fps_scope);
+        session.weapon_fx.set_fx_fps_settings(
+            self.video.fx_fps, self.video.fx_fps_scope, self.video.fx_fps_game,
+        );
         session.weapon_fx.set_fx_physics(self.video.fx_physics);
         session.weapon_fx.set_fx_lod(
             self.video.fx_lod,

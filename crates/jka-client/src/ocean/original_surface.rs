@@ -1227,6 +1227,8 @@ impl OceanGpu {
             }
             // High tier's original 16-step reflection trace reads the same
             // opaque color and reversed depth as surface transmission.
+            // Upstream leaves shadows.yzw unused: y is r_underwaterReflections.
+            prefix[21][1] = if super::underwater_reflections() { 1.0 } else { 0.0 };
             prefix[22] = [
                 if self.settings.blue_water_ssr { 1.0 } else { 0.0 },
                 400.0,

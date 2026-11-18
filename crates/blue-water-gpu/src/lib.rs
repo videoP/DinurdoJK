@@ -779,6 +779,36 @@ impl WaveField {
         foam_coverage: f64,
         foam_lifetime: f64,
     ) -> bool {
+        if !self.begin_update(queue, encoder, params, realistic, time, dt, foam_coverage, foam_lifetime) {
+            return false;
+        }
+        self.encode_transform_passes(encoder, 0..self.transform_pass_count());
+        self.finish_update(encoder);
+        true
+    }
+
+    /// FFT transform passes of one update (`encode_transform_passes`).
+    pub fn transform_pass_count(&self) -> usize {
+        self.passes.len()
+    }
+
+    /// An update split over rendered frames: `begin_update` (spectrum and
+    /// field controls for `time`), the transform passes in order in any
+    /// slices, then `finish_update` (resolve, mips, crest limits, publish).
+    /// The published field stays the previous one until `finish_update`:
+    /// resolve writes the other half of the output ping-pong. Same passes and
+    /// inputs as `update`. Returns false when there is nothing to update.
+    pub fn begin_update(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        params: WaveParameters,
+        realistic: bool,
+        time: f64,
+        dt: f64,
+        foam_coverage: f64,
+        foam_lifetime: f64,
+    ) -> bool {
         self.rebuild_spectrum(queue, params, realistic);
         if self.spectrum_fresh && self.crest_limits.enabled { self.crest_limits.reset(encoder); }
         let phase = time.rem_euclid(spectrum::FOLD_PERIOD) / spectrum::FOLD_PERIOD;
@@ -864,16 +894,35 @@ impl WaveField {
             };
         }
         queue.write_buffer(&self.field_params, 0, bytemuck::bytes_of(&field));
-        let next = 1 - self.current;
+        true
+    }
+
+    /// Transform passes `range` of the update begun last, in order.
+    pub fn encode_transform_passes(&self, encoder: &mut wgpu::CommandEncoder, range: std::ops::Range<usize>) {
+        let range = range.start.min(self.passes.len())..range.end.min(self.passes.len());
+        if range.is_empty() {
+            return;
+        }
+        let n = self.n;
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Blue Water waves"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.transform);
-        for group in &self.passes {
+        for group in &self.passes[range] {
             pass.set_bind_group(0, group, &[]);
             pass.dispatch_workgroups((n * self.count).div_ceil(16), n.div_ceil(16), 1);
         }
+    }
+
+    /// Resolve, mips and crest limits into the other output half; publish it.
+    pub fn finish_update(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let n = self.n;
+        let next = 1 - self.current;
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Blue Water resolve"),
+            timestamp_writes: None,
+        });
         pass.set_pipeline(&self.resolve);
         pass.set_bind_group(0, &self.resolves[next], &[]);
         pass.dispatch_workgroups(n.div_ceil(8), n.div_ceil(8), self.count);
@@ -886,7 +935,6 @@ impl WaveField {
         drop(pass);
         self.crest_limits.encode(encoder, next, n, self.count);
         self.current = next;
-        true
     }
 }
 

@@ -24,15 +24,24 @@ fn river_ssr(origin:vec3<f32>,direction:vec3<f32>,scene_depth_cm:f32,roughness:f
     if length(ray.xy)<1e-8 {return vec4<f32>(0.0);}
     ray*=river_clip_ray(start.xy,ray.xy);
     let depth_clip=river_project_cm(origin+river_view.forward.xyz*distance_cm);
-    let tolerance=max(abs(ray.z),(start.z-depth_clip.z/depth_clip.w)*4.0)/16.0;
-    let step=vec3<f32>(ray.xy*vec2<f32>(0.5,-0.5),ray.z)/16.0;
+    // Use the native budget unless the clipped ray covers very few pixels.
+    // This is a render-only quality tradeoff; preserve the native mip
+    // progression in normalized ray distance, not in iteration count.
+    var steps=16u;
+    if river_view.material_lod.z>0.5 {
+        let pixels=length(ray.xy*vec2<f32>(textureDimensions(scene_depth))*0.5);
+        steps=u32(clamp(ceil(pixels/2.0),4.0,16.0));
+    }
+    let tolerance=max(abs(ray.z),(start.z-depth_clip.z/depth_clip.w)*4.0)/f32(steps);
+    let step=vec3<f32>(ray.xy*vec2<f32>(0.5,-0.5),ray.z)/f32(steps);
     let jitter=fract(52.9829189*fract(dot(pixel,vec2<f32>(0.06711056,0.00583715))))-0.5;
     let uvz=vec3<f32>(start.xy*vec2<f32>(0.5,-0.5)+0.5,start.z)+step*jitter;
     let hzb_factor=vec2<f32>(textureDimensions(scene_depth))/(vec2<f32>(textureDimensions(reflection_hzb))*2.0);
     var last_diff=0.0;
-    for(var i=0u;i<16u;i++) {
+    for(var i=0u;i<steps;i++) {
         let sample=uvz+step*f32(i+1u);
-        let level=1.0+f32(i/2u)*(8.0/16.0)*roughness;
+        let native_i=i*16u/steps;
+        let level=1.0+f32(native_i/2u)*(8.0/16.0)*roughness;
         let depth=textureSampleLevel(reflection_hzb,scene_sampler,sample.xy*hzb_factor,level).r;
         let diff=sample.z-depth;
         if abs(diff+tolerance)<tolerance&&depth!=0.0 {

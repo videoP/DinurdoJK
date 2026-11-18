@@ -22,6 +22,14 @@ pub mod interaction;
 pub mod surfaces;
 pub mod bathymetry;
 mod blue_water;
+pub(crate) use blue_water::{set_update_spread, update_spread};
+
+// r_underwaterReflections (live): seen from below, the Hybrid/Blue Water ocean
+// and the rivers mirror the submerged scene (screen traced) where the surface
+// reflects: totally past Snell's window. 0 keeps the water's own color there.
+static UNDERWATER_REFLECTIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub(crate) fn underwater_reflections() -> bool { UNDERWATER_REFLECTIONS.load(std::sync::atomic::Ordering::Relaxed) }
+pub(crate) fn set_underwater_reflections(enabled: bool) { UNDERWATER_REFLECTIONS.store(enabled, std::sync::atomic::Ordering::Relaxed); }
 mod blue_wake;
 pub use blue_wake::{ShipClass, StrikeKind, WakeCommand};
 pub mod eye_wave;
@@ -2782,7 +2790,8 @@ impl OceanGpu {
                 .and_then(|probe| probe.latest(surface.descriptor.index))
                 .and_then(|sample| sample.mesh_shift())
             {
-                local.hybrid_eye = [shift / OCEAN_UNITS_PER_METER, 1.0, 0.0, 0.0];
+                local.hybrid_eye[0] = shift / OCEAN_UNITS_PER_METER;
+                local.hybrid_eye[1] = 1.0;
             }
             if self.sky_extend_enabled {
                 if let Some(region) = self.sky_extend_regions[surface.descriptor.index] {
@@ -3724,7 +3733,8 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
                     && settings.hybrid_waterline_debug == 2 { 8.0 } else { 0.0 }],
         appearance_c: [settings.visual_fixes as f32, 0.0,
             if settings.mesh_quality > 0 { OCEAN_HIGH_MESH_SPACING_UNITS } else { OCEAN_LOW_MESH_SPACING_UNITS }, 0.0],
-        hybrid_eye: [0.0; 4],
+        // z: r_underwaterReflections for the world shader's submerged surface.
+        hybrid_eye: [0.0, 0.0, if underwater_reflections() { 1.0 } else { 0.0 }, 0.0],
         native_mesh: NativeOceanMesh::zeroed(),
         mask_fine_tiles: [[0; 4]; OCEAN_FINE_TILE_VEC4S * OCEAN_MAX_SURFACES],
     };

@@ -118,10 +118,15 @@ CvarDef::new("r_riverBlockCull", "1", "0|1", "River camera window A/B (not Unrea
     app.push_console_line(format!("^3r_riverBlockCull:^7 {}", if enabled { "ON (wet blocks only)" } else { "OFF (full window grid)" }));
     Ok(())
 }),
-CvarDef::new("r_riverAdaptiveMesh", "0", "0|1", "River mesh A/B (renderer only; the solver and riverbed do not change): 0 one vertex per solver cell everywhere; 1 fewer triangles for calm water: per 16x16-cell block, from the water's turbulence (surface curvature and flow speed), no distance term. Turbulent water keeps the tile resolution (the maximum); calmer water drops to 2/4/8-cell triangles; banks stay at least 4-cell. Each block holds its score (fast rise, ~0.5 s fall) and coarsens only past a margin, so it does not flicker. Block borders keep one vertex per cell (no cracks). Tune with r_riverMeshTurbulence; inspect with r_showtris 128.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(jka_river::river_blocks::adaptive()), |app, value| {
+CvarDef::new("r_riverAdaptiveMesh", "1", "0|1", "River mesh A/B (renderer only; the solver and riverbed do not change): 0 one vertex per solver cell everywhere; 1 fewer triangles for calm water: per 16x16-cell block, from the water's turbulence (surface curvature and flow speed), no distance term. Turbulent water keeps the tile resolution (the maximum); calmer water drops to 2/4/8-cell triangles; banks stay at least 4-cell. Each block holds its score (fast rise, ~0.5 s fall) and coarsens only past a margin, so it does not flicker. Block borders keep one vertex per cell (no cracks). Tune with r_riverMeshTurbulence; inspect with r_showtris 128.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(jka_river::river_blocks::adaptive()), |app, value| {
     let CvarValue::Bool(enabled) = value else { unreachable!() };
     jka_river::river_blocks::set_adaptive(enabled);
     app.push_console_line(format!("^3r_riverAdaptiveMesh:^7 {} (renderer only, solver unchanged)", if enabled { "B by turbulence" } else { "A fixed" }));
+    Ok(())
+}),
+CvarDef::new("r_riverBlockFrustum", "0", "0|1", "River near-window draw A/B: reject wet blocks outside a conservative horizontal view wedge before vertex work. Does not assume a water height, affect foam/physics, or cull when the view includes the vertical axis. Requires r_riverBlockCull 1.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(jka_river::river_blocks::frustum_enabled()), |_app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    jka_river::river_blocks::set_frustum_enabled(enabled);
     Ok(())
 }),
 CvarDef::new("r_riverMeshTurbulence", "1", "0..8", "r_riverAdaptiveMesh 1 sensitivity: multiplies the measured turbulence. Higher keeps more blocks at the tile resolution; lower lets more water use the coarse meshes. 0 makes all wet water the coarsest mesh (banks 4-cell).", CvarType::Float { min: 0.0, max: 8.0 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Float(jka_river::river_blocks::sensitivity()), |app, value| {
@@ -130,10 +135,20 @@ CvarDef::new("r_riverMeshTurbulence", "1", "0..8", "r_riverAdaptiveMesh 1 sensit
     app.push_console_line(format!("^3r_riverMeshTurbulence:^7 {sensitivity}"));
     Ok(())
 }),
-CvarDef::new("r_riverMaterialLOD", "0", "0|1|2", "River fragment shading A/B (session only): 0 native 12-sample advection and bicubic foam; 1 screen-space filtered 3-sample advection at coarse pixel footprints; 2 also switches subpixel foam-field filtering to bilinear. Applies to window and distant water, base and reflection composite. Simulation, WPO, and SSR unchanged.", CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(i32::from(crate::river_runtime::material_lod())), |app, value| {
+CvarDef::new("r_riverMaterialLOD", "1", "0|1|2", "River fragment shading A/B (session only): 0 native 12-sample advection and bicubic foam; 1 screen-space filtered 3-sample advection at coarse pixel footprints; 2 also switches subpixel foam-field filtering to bilinear. Applies to window and distant water, base and reflection composite. Simulation, WPO, and SSR unchanged.", CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(i32::from(crate::river_runtime::material_lod())), |app, value| {
     let CvarValue::Int(mode) = value else { unreachable!() };
     crate::river_runtime::set_material_lod(mode as u8);
     app.push_console_line(format!("^3r_riverMaterialLOD:^7 {}", match mode { 0 => "0 native (A)", 1 => "1 adaptive advected wave sampling", _ => "2 adaptive waves and foam filtering" }));
+    Ok(())
+}),
+CvarDef::new("r_riverFusedMaterial", "1", "0|1", "River render A/B: 1 evaluates base water and its additive SSR/environment reflection in a single draw for a single live river; 0 retains the two-pass reference. Multiple live rivers always use the reference ordering. No solver or SSR quality change. May differ at coplanar edges, MSAA silhouettes and intermediate color rounding.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::river_runtime::fused_material()), |_app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    crate::river_runtime::set_fused_material(enabled);
+    Ok(())
+}),
+CvarDef::new("r_riverAdaptiveSSR", "0", "0|1", "River reflection A/B: reduce the native 16 SSR steps to 4..16 for short projected rays. Long rays retain native quality; short-ray hit positions may differ. Render only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::river_runtime::adaptive_ssr()), |_app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    crate::river_runtime::set_adaptive_ssr(enabled);
     Ok(())
 }),
 CvarDef::new("r_riverMaterialLODCutoff", "2", "0..8", "r_riverMaterialLOD 1/2 cutoff in texture mips (bias included): pixels at or past it take the cheap 3-sample wave path. Lower = cheap path reaches nearer water (0 = everywhere). Foam (mode 2) shifts with it (4 = 1.5 foam cells per pixel, never below 1). Session only.", CvarType::Float { min: 0.0, max: 8.0 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Float(crate::river_runtime::material_lod_cutoff()), |app, value| {
@@ -182,6 +197,31 @@ CvarDef::new("r_riverTileGuard", "2", "1..4", "Sparse river guard ring in tiles 
     let CvarValue::Int(tiles) = value else { unreachable!() };
     jka_river::river_tiles::set_guard_tiles(tiles as u32);
     app.push_console_line(format!("^3r_riverTileGuard:^7 {} tiles", jka_river::river_tiles::guard_tiles()));
+    Ok(())
+}),
+CvarDef::new("r_underwaterReflections", "1", "0|1", "Underwater surface reflections (live), Hybrid/Blue Water ocean and rivers: 1 the surface seen from below mirrors the submerged scene (screen traced) where it reflects, fully past Snell's window; 0 shows the water's own color there (cheaper: no trace).", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::ocean::underwater_reflections()), |app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    crate::ocean::set_underwater_reflections(enabled);
+    app.push_console_line(format!("^3r_underwaterReflections:^7 {}", if enabled { "1 mirror the submerged scene" } else { "0 water color" }));
+    Ok(())
+}),
+CvarDef::new("r_oceanUpdateSpread", "1", "0|1", "Blue Water ocean FFT pacing (live): 1 spreads each throttled update (r_oceanUpdates > 0) over the rendered frames of its period, computing it for the time it publishes; 0 encodes the whole update on its tick. The original/Hybrid ocean FFT already spreads its phases.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::ocean::update_spread()), |app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    crate::ocean::set_update_spread(enabled);
+    app.push_console_line(format!("^3r_oceanUpdateSpread:^7 {}", if enabled { "1 spread over rendered frames" } else { "0 whole update on its tick" }));
+    Ok(())
+}),
+CvarDef::new("r_riverSolverSpread", "1", "0|1", "River solver pacing (live, same results): 1 encodes each 1/60 s solver frame's substeps as their time comes due, spreading its GPU cost evenly over the rendered frames; 0 encodes whole frames, a burst every 1/60 s (the native reference).", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::river_runtime::solver_spread()), |app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    crate::river_runtime::set_solver_spread(enabled);
+    app.push_console_line(format!("^3r_riverSolverSpread:^7 {}", if enabled { "1 spread over rendered frames" } else { "0 whole frames (native burst)" }));
+    Ok(())
+}),
+CvarDef::new("r_riverSimRate", "60", "12..60", "River hydraulic rate in Hz (live, not Unreal). 60 native: 10 substeps of 1/600 s per 1/60 s solver frame. Lower rates keep the 1/60 s frame (surface updates, sources, drains, inlet) and run fewer, longer substeps: 30 = 5 substeps of 1/300 s, half the solver cost. Rounded to whole substeps (6 Hz each). Changes the flow slightly; the CFL velocity clamp scales with the rate.", CvarType::Int { min: 12, max: 60 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(i32::from(crate::river_runtime::sim_rate())), |app, value| {
+    let CvarValue::Int(rate) = value else { unreachable!() };
+    crate::river_runtime::set_sim_rate(rate.clamp(12, 60) as u8);
+    let substeps = crate::river_runtime::sim_rate_substeps(10);
+    app.push_console_line(format!("^3r_riverSimRate:^7 {} Hz -> {} substeps per solver frame (effective {} Hz)", rate, substeps, substeps * 6));
     Ok(())
 }),
 CvarDef::new("r_riverTileSchedule", "0", "0|1|2", "Sparse river solver tile scheduling A/B (live, exact at any solver frame): 0 native, every stage over every resident tile; 1 the same through a GPU slot worklist and indirect dispatch (parity check); 2 dormant-dry: skip resident tiles that are completely dry and still with no water, source or body within the halo. Every tile that runs still takes every native substep; this is not local time stepping. r_riverDebug 1 prints scheduled/resident tiles.", CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(i32::from(jka_river::river_tiles::tile_schedule())), |app, value| {

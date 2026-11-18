@@ -328,6 +328,9 @@ impl App {
                 self.mark_config_dirty();
                 self.console_status = format!("FX FPS: {} HZ", self.video.fx_fps);
             }
+            ui::VIDEO_ROW_FX_FPS_GAME => {
+                let _ = self.set_console_cvar("cg_fxFPSGame", &defaults.fx_fps_game.to_string());
+            }
             ui::VIDEO_ROW_FX_FPS_SCOPE => {
                 self.video.fx_fps_scope = defaults.fx_fps_scope;
                 self.apply_fx_fps_settings();

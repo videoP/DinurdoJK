@@ -192,6 +192,18 @@ impl App {
                     }
                 },
             );
+            theme::row(
+                ui,
+                "Spread FFT updates",
+                "On: each capped update's work is spread over the frames of its period (computed for the time it appears), so the FFT costs about the same every frame. Off: the whole update on its tick. Uncapped (0) is unaffected. This session. Console: r_oceanUpdateSpread.",
+                theme::Reset::None,
+                |ui| {
+                    let mut spread = crate::ocean::update_spread();
+                    if ui.checkbox(&mut spread, "Spread over frames").changed() {
+                        crate::ocean::set_update_spread(spread);
+                    }
+                },
+            );
             theme::section(ui,"COASTAL WAVES & SURF (A/B)","Blue Water's original coast model. Your separate JKA shallow-bank solver remains available through r_coastal.");
             theme::row(ui,"Upstream coastal waves","Builds per-pool shore depth and wind-fetch maps in the background. Waves shrink in shallow water and behind land; moving surf bands follow the bank. Off restores open-ocean waves. Native / Hybrid only.",theme::Reset::None,|ui| {
                 if ui.checkbox(&mut ocean.blue_water_coast,"Blue Water coast & surf").changed() {changed=true;}
@@ -222,6 +234,12 @@ impl App {
                 if theme::chip(ui, name, (if hybrid { ocean.hybrid_refraction_mode } else { ocean.blue_water_refraction_mode }) == mode).clicked() {
                     if hybrid { ocean.hybrid_refraction_mode = mode; } else { ocean.blue_water_refraction_mode = mode; } changed = true;
                 }
+            }
+        });
+        theme::row(ui, "Underwater reflections", "Seen from below, the surface mirrors the submerged scene (screen traced) outside Snell's window. Every underwater mode, including Godot submerged. Shared with rivers; this session. Console: r_underwaterReflections.", theme::Reset::None, |ui| {
+            let mut mirror = crate::ocean::underwater_reflections();
+            if ui.checkbox(&mut mirror, "Mirror the submerged scene").changed() {
+                crate::ocean::set_underwater_reflections(mirror);
             }
         });
         theme::row(ui, "Underwater effects", "Hybrid uses the Godot surface and underwater optics while submerged; native modes keep Blue Water scattering and waterline. Above water, Hybrid keeps the Blue Water surface.", theme::Reset::None, |ui| {

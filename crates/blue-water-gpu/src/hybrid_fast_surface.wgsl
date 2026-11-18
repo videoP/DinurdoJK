@@ -286,6 +286,8 @@ fn fragment(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0
     if !front && submerged {
         let pigment = select(surface.pigment.rgb, water_pigment(optics, surface.absorption.rgb, surface.pigment.rgb), surface.water.absorption.w > 0.5);
         color = underside(view, -up, pigment, select(absorption, water_beam(optics), surface.water.absorption.w > 0.5), sun_direction, sky_env.light_color);
+        let mirror = jka_underwater_reflection(input.world, view, up);
+        color = mix(color, mirror.rgb, mirror.a);
         let window_scene = jka_refracted_scene(input.world, -view, up, 1.333, 100.0, false);
         let window_ray = refract(-view, up, 1.333);
         if window_scene.a >= 0.0 {

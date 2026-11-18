@@ -200,7 +200,18 @@ pub fn set_bed_clamp(enabled: bool) {
 // Render-only fragment detail control; independent of the solver and r_riverAdaptiveMesh.
 // 0: native wave/foam (A), 1: screen-space advected-wave sampling,
 // 2: also screen-space bicubic-to-bilinear foam field reconstruction.
-static MATERIAL_LOD: AtomicU8 = AtomicU8::new(0);
+static MATERIAL_LOD: AtomicU8 = AtomicU8::new(1);
+
+// Default on (faster): the opaque base and additive reflection share a material evaluation.
+// The renderer uses it only for a single live body (overlapping rivers retain A).
+static FUSED_MATERIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub fn fused_material() -> bool { FUSED_MATERIAL.load(Ordering::Relaxed) }
+pub fn set_fused_material(enabled: bool) { FUSED_MATERIAL.store(enabled, Ordering::Relaxed); }
+
+// Opt-in ray-budget LOD: full native quality for long projected rays.
+static ADAPTIVE_SSR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn adaptive_ssr() -> bool { ADAPTIVE_SSR.load(Ordering::Relaxed) }
+pub fn set_adaptive_ssr(enabled: bool) { ADAPTIVE_SSR.store(enabled, Ordering::Relaxed); }
 
 pub fn material_lod() -> u8 {
     MATERIAL_LOD.load(Ordering::Relaxed)
@@ -387,6 +398,32 @@ impl LocalDrain {
 /// instead of snowballing.
 const MAX_STEPS_PER_FRAME: u32 = 32;
 
+// r_riverSolverSpread (live): 1 encodes each solver frame's substeps as their
+// time comes due, so a frame's GPU work spreads over the rendered frames that
+// cover it; 0 encodes whole frames (the native burst every 1/60 s). The kernel
+// sequence is identical either way; a split frame's head runs with its first
+// substeps and its surface/normals tail with its last.
+static SOLVER_SPREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub fn solver_spread() -> bool { SOLVER_SPREAD.load(Ordering::Relaxed) }
+pub fn set_solver_spread(enabled: bool) { SOLVER_SPREAD.store(enabled, Ordering::Relaxed); }
+
+// r_riverSimRate (live, not Unreal): the hydraulic update rate in Hz, where
+// 60 is native (10 substeps per 1/60 s solver frame, dt 1/600 s). Lower rates
+// keep the 1/60 s frame (surface, sources, drains and inlet unchanged) and run
+// fewer, longer substeps: 30 Hz = 5 substeps of 1/300 s, half the solver cost.
+// The CFL velocity clamp (dx/dt) halves with the rate; ordinary rivers stay
+// far inside it. At least 2 substeps keep the native 1/60 s frame duration.
+pub const SIM_RATE_MIN: u8 = 12;
+static SIM_RATE: AtomicU8 = AtomicU8::new(60);
+pub fn sim_rate() -> u8 { SIM_RATE.load(Ordering::Relaxed) }
+pub fn set_sim_rate(rate: u8) { SIM_RATE.store(rate.clamp(SIM_RATE_MIN, 60), Ordering::Relaxed); }
+/// Substeps per solver frame at the current r_riverSimRate for a river whose
+/// native count is `native`.
+pub fn sim_rate_substeps(native: u32) -> u32 {
+    let scaled = (native as f32 * f32::from(sim_rate()) / 60.0).round() as u32;
+    scaled.clamp(native.min(2), native)
+}
+
 impl LocalSource {
     pub fn validate(self) -> Result<(), String> {
         let finite = self
@@ -474,6 +511,9 @@ pub struct LiveRiver {
     pub simulated_seconds: f64,
     /// Scaled real time not yet simulated (less than one solver frame).
     pending_seconds: f64,
+    /// r_riverSolverSpread: the solver frame in progress and its encoded
+    /// substeps. Its begin is encoded; its end follows its last substep.
+    slice: Option<(Frame, u32)>,
     /// DiffuseIndirectLighting under the classic sky, built once at spawn.
     ambient: crate::river_slw::ClassicAmbient,
     /// Native FoamGrid (stages 4/16), created with the material fields.
@@ -482,6 +522,7 @@ pub struct LiveRiver {
     blocks: Option<crate::river_blocks::Cull>,
     /// The water body's group for each FoamRT parity.
     body_groups: Option<[wgpu::BindGroup; 2]>,
+    eye_state: Option<crate::river_surface::EyeState>,
     /// Whitewater (SW_River_Secondary_Emitter) particles, while r_riverWhitewater.
     spray: Option<crate::river_secondary::Emitter>,
     /// This frame's camera for the ViewRecycler; None skips the emitter.
@@ -717,8 +758,8 @@ impl LiveRiver {
                 let classified = crate::river_reach::classify(geometry, region, seed, source.water_level)?;
                 if debug > 0 {
                     let s = classified.stats;
-                    eprintln!("[RIVER DBG CAPTURE MODE 1] dense items={} columns={} reached={} void={} stacked={} actors={} landscape_tris={} actor_tris={} classify_cpu={:.2}ms",
-                        s.items, s.columns, s.reached, s.voids, s.stacked, s.actor_items, s.landscape_triangles, s.actor_triangles, s.millis);
+                    eprintln!("[RIVER DBG CAPTURE MODE 1] dense items={} columns={} reached={} void={} stacked={} actors={} opened={} landscape_tris={} actor_tris={} classify_cpu={:.2}ms",
+                        s.items, s.columns, s.reached, s.voids, s.stacked, s.actor_items, s.opened, s.landscape_triangles, s.actor_triangles, s.millis);
                 }
                 Some(classified)
             }
@@ -965,10 +1006,12 @@ impl LiveRiver {
             mesh,
             simulated_seconds: 0.0,
             pending_seconds: 0.0,
+            slice: None,
             ambient,
             foam: None,
             blocks: None,
             body_groups: None,
+            eye_state: None,
             spray: None,
             spray_view: None,
             spray_group: None,
@@ -1008,8 +1051,8 @@ impl LiveRiver {
                 let seed = [source.center[0], source.center[1], source.center[2] + 2.0];
                 let (bins, s) = Bins::new_classified(geometry, seed, source.water_level, f64::from(dx_cm) / cm, tile, [cx, cy])?;
                 if debug > 0 {
-                    eprintln!("[RIVER DBG CAPTURE MODE 1] sparse items={} columns={} reached={} void={} stacked={} actors={} landscape_tris={} actor_tris={} classify_cpu={:.2}ms",
-                        s.items, s.columns, s.reached, s.voids, s.stacked, s.actor_items, s.landscape_triangles, s.actor_triangles, s.millis);
+                    eprintln!("[RIVER DBG CAPTURE MODE 1] sparse items={} columns={} reached={} void={} stacked={} actors={} opened={} landscape_tris={} actor_tris={} classify_cpu={:.2}ms",
+                        s.items, s.columns, s.reached, s.voids, s.stacked, s.actor_items, s.opened, s.landscape_triangles, s.actor_triangles, s.millis);
                 }
                 bins
             }
@@ -1137,10 +1180,12 @@ impl LiveRiver {
             mesh,
             simulated_seconds: 0.0,
             pending_seconds: 0.0,
+            slice: None,
             ambient,
             foam: None,
             blocks: None,
             body_groups: None,
+            eye_state: None,
             spray: None,
             spray_view: None,
             spray_group: None,
@@ -1320,8 +1365,10 @@ impl LiveRiver {
         let effective_rate = if self.settled { 1.0 } else { self.source.rate };
         let scaled = engine_delta.min(0.1) * effective_rate;
         // Sinks read the engine delta: give each solver frame its own span.
-        let step = Frame::new(self.grid, self.controls, scaled)?.hydraulic_duration();
-        let frame = Frame::new(self.grid, self.controls, step as f32)?;
+        let controls = self.solver_controls();
+        let step = Frame::new(self.grid, controls, scaled)?.hydraulic_duration();
+        let frame = Frame::new(self.grid, controls, step as f32)?;
+        let spread = solver_spread();
         // Paused: no solver frames and no simulated time; presentation below
         // still runs on the last solved state.
         let paused = paused();
@@ -1331,28 +1378,63 @@ impl LiveRiver {
         self.pending_seconds = available.min(limit);
         let mut moved = false;
         let mut steps = 0u32;
-        if let Solver::Sparse(sparse) = &mut self.solver {
-            // Completed occupancy samples grow residency before any new frame.
-            sparse.simulation.update_residency(device, encoder)?;
-            // r_riverTileSchedule A/B, live: exact at any solver-frame boundary.
-            let mode = sparse.schedule_override.unwrap_or_else(crate::river_tiles::tile_schedule);
-            sparse.simulation.set_tile_schedule(device, mode);
-        }
         solve_timestamp(encoder, false);
-        while !paused && self.pending_seconds >= step {
-            match &mut self.solver {
-                Solver::Dense(simulation) => simulation.encode_reference_frame(device, encoder, frame)?,
-                Solver::Sparse(sparse) => {
-                    // Never outrun the proven guard margin; wait for residency.
-                    if sparse.simulation.frames_available() == 0 {
-                        sparse.throttled_frames += 1;
+        // Solver frames, whole (spread 0) or as substeps come due (spread 1).
+        // Between a frame's begin and end nothing else touches the hydraulic
+        // state: residency, the tile schedule and the controls upload happen
+        // only at a begin; a frame in progress keeps its own Frame.
+        while !paused {
+            let (current, done) = match self.slice.take() {
+                Some(slice) => slice,
+                None => {
+                    let due = if spread { step / f64::from(frame.substeps()) } else { step };
+                    if self.pending_seconds < due {
                         break;
                     }
-                    sparse.simulation.encode_reference_frame(device, encoder, frame)?;
+                    match &mut self.solver {
+                        Solver::Dense(simulation) => simulation.encode_frame_begin(device, encoder, frame)?,
+                        Solver::Sparse(sparse) => {
+                            // Completed occupancy samples grow residency before any new frame.
+                            sparse.simulation.update_residency(device, encoder)?;
+                            // r_riverTileSchedule A/B, live: exact at any solver-frame boundary.
+                            let mode = sparse.schedule_override.unwrap_or_else(crate::river_tiles::tile_schedule);
+                            sparse.simulation.set_tile_schedule(device, mode);
+                            // Never outrun the proven guard margin; wait for residency.
+                            if sparse.simulation.frames_available() == 0 {
+                                sparse.throttled_frames += 1;
+                                break;
+                            }
+                            sparse.simulation.encode_frame_begin(device, encoder, frame)?;
+                        }
+                    }
+                    (frame, 0)
                 }
+            };
+            let substep = current.hydraulic_duration() / f64::from(current.substeps());
+            let remaining = current.substeps() - done;
+            let count = if spread {
+                ((self.pending_seconds / substep).floor().max(0.0) as u32).min(remaining)
+            } else {
+                remaining
+            };
+            if count == 0 {
+                self.slice = Some((current, done));
+                break;
             }
-            self.pending_seconds -= step;
-            self.simulated_seconds += step;
+            match &mut self.solver {
+                Solver::Dense(simulation) => simulation.encode_substeps(encoder, count),
+                Solver::Sparse(sparse) => sparse.simulation.encode_substeps(encoder, count),
+            }
+            self.pending_seconds -= substep * f64::from(count);
+            self.simulated_seconds += substep * f64::from(count);
+            if count < remaining {
+                self.slice = Some((current, done + count));
+                break;
+            }
+            match &mut self.solver {
+                Solver::Dense(simulation) => simulation.encode_frame_end(encoder),
+                Solver::Sparse(sparse) => sparse.simulation.encode_frame_end(encoder),
+            }
             steps += 1;
             moved = true;
         }
@@ -1478,6 +1560,7 @@ impl LiveRiver {
         if self.body_groups.is_none() {
             if let (Some(water), Some(textures), Some(blocks)) = (water, material.textures(), self.blocks.as_ref()) {
                 let (pair, _) = foam.foam_pair();
+                if self.eye_state.is_none() { self.eye_state = Some(water.eye_state(device)); }
                 self.body_groups = Some([0, 1].map(|i| {
                     water.body_group(
                         device,
@@ -1494,6 +1577,11 @@ impl LiveRiver {
         }
         if diag > 0 { self.debug.record(steps, dropped, start.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0)); }
         Ok(())
+    }
+
+    /// The stepping controls at the current r_riverSimRate.
+    fn solver_controls(&self) -> Controls {
+        Controls { substeps: sim_rate_substeps(self.controls.substeps), ..self.controls }
     }
 
     /// Once-per-second progress counters without GPU readback or synchronization.
@@ -1520,7 +1608,7 @@ impl LiveRiver {
             if let Some(far) = &self.far { let st = far.stats; eprintln!("[RIVER DBG WATERMESH] patch={} enabled={} leaves={} nodes={} depth={} instances={} per_density={:?} rebuilds={}", index, crate::river_far::enabled(), st.leaves, st.nodes, st.tree_depth, st.instances, far.draws.iter().map(|d| d.1).collect::<Vec<_>>(), st.rebuilds); }
             eprintln!("[RIVER DBG BODIES] patch={} deformation={} actors={} used={} first={:?} first_cell={:?} lattice={}x{} source_level_cm={:.0} dx_cm={:.1}", index, self.body_source.0, self.body_source.1, self.body_debug.0, self.body_debug.1, self.body_debug.1.map(|b| [(b.centre[0] / sparse.dx_cm).floor() as i32, (b.centre[1] / sparse.dx_cm).floor() as i32]), dims[0], dims[1], level_cm, sparse.dx_cm);
         }
-        if mode >= 2 { eprintln!("[RIVER DBG PERF] patch={} CPU_encode={:.3}ms/s {:.4}ms/render-frame last_solver_steps={} grid={}x{} estimated_solver_kernel_dispatches={}", index, self.debug.cpu_encode_ms / interval, self.debug.cpu_encode_ms / self.debug.frames.max(1) as f64, self.debug.last_steps, self.grid.dimensions[0], self.grid.dimensions[1], self.debug.steps * (4 + u64::from(self.controls.substeps) * 6)); }
+        if mode >= 2 { eprintln!("[RIVER DBG PERF] patch={} CPU_encode={:.3}ms/s {:.4}ms/render-frame last_solver_steps={} grid={}x{} estimated_solver_kernel_dispatches={}", index, self.debug.cpu_encode_ms / interval, self.debug.cpu_encode_ms / self.debug.frames.max(1) as f64, self.debug.last_steps, self.grid.dimensions[0], self.grid.dimensions[1], self.debug.steps * (4 + u64::from(self.solver_controls().substeps) * 6)); }
         self.debug.reset_interval(now);
     }
 
@@ -1541,9 +1629,19 @@ impl LiveRiver {
     }
 
     /// The window grid's live block list and indirect draw (river_blocks).
+    /// r_riverBlockFrustum: this frame's view wedge for the window blocks.
+    /// After `update_view` (the window origin) and `RiverSurface::prepare`
+    /// (the view); `encode_frame` compacts against it.
+    pub fn update_block_frustum(&mut self, queue: &wgpu::Queue, water: &crate::river_surface::RiverSurface) {
+        let Some(blocks) = self.blocks.as_mut() else { return };
+        blocks.set_frustum(queue, water.block_frustum(self.origin_cm, self.mesh.geometry.size(), self.mesh.geometry.cells()));
+    }
+
     pub fn block_cull(&self) -> Option<&crate::river_blocks::Cull> {
         self.blocks.as_ref()
     }
+
+    pub(super) fn eye_state(&self) -> Option<&crate::river_surface::EyeState> { self.eye_state.as_ref() }
 
     /// The water body's group for the current FoamRT, once the fields exist.
     pub fn body_group(&self) -> Option<&wgpu::BindGroup> {

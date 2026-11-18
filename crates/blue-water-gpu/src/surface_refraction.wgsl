@@ -82,3 +82,54 @@ fn jka_refracted_scene(origin:vec3<f32>,incident:vec3<f32>,normal:vec3<f32>,eta:
     }
     return vec4<f32>(0.0,0.0,0.0,-1.0);
 }
+
+// r_underwaterReflections (surface.shadows.y, unused upstream): seen from
+// below, the surface mirrors the submerged scene: totally past Snell's window,
+// by the water-to-air Fresnel inside it. Traced in the same opaque scene copy
+// as the transmission; rgb the mirrored scene, a its weight (Fresnel times hit
+// confidence; 0 when off or missed, keeping upstream's mirrored water light).
+// `up` is the surface normal toward the air; the camera is below it.
+fn jka_underwater_reflection(origin:vec3<f32>,view:vec3<f32>,up:vec3<f32>)->vec4<f32> {
+    if surface.shadows.y < 0.5 {return vec4<f32>(0.0);}
+    let facing=clamp(abs(dot(view,up)),0.00002,1.0);
+    var fresnel=0.02+0.98*pow(1.0-facing,5.0);
+    if 1.333*1.333*(1.0-facing*facing)>1.0 {fresnel=1.0;}
+    let direction=reflect(-view,up);
+    // Only rays back down into the water reach the submerged scene.
+    if direction.y>-1e-3 || -(camera.view*vec4<f32>(curved(origin),1.0)).z>=camera.far*0.999 {return vec4<f32>(0.0);}
+    let limit=min(camera.far,100.0);
+    var previous=0.02;
+    for(var i=1u;i<=24u;i+=1u) {
+        let fraction=f32(i)/24.0;
+        let along=max(fraction*fraction*limit,0.03);
+        let point=origin+direction*along;
+        let projected=jka_refraction_uv(point);
+        if projected.z<=0.0 || projected.z>=camera.far || any(projected.xy<vec2<f32>(0.002)) || any(projected.xy>vec2<f32>(0.998)) {break;}
+        let depth=jka_refraction_depth(projected.xy);
+        let scene=camera.near*camera.far/(depth*(camera.far-camera.near)+camera.near);
+        let ray=-(camera.view*vec4<f32>(curved(point),1.0)).z;
+        if depth>0.0 && ray>=scene {
+            var low=previous;var high=along;
+            for(var step=0u;step<5u;step+=1u) {
+                let middle=(low+high)*0.5;
+                let probe=origin+direction*middle;
+                let screen=jka_refraction_uv(probe);
+                let d=jka_refraction_depth(screen.xy);
+                let receiver=camera.near*camera.far/(d*(camera.far-camera.near)+camera.near);
+                let probe_depth=-(camera.view*vec4<f32>(curved(probe),1.0)).z;
+                if d>0.0 && probe_depth>=receiver {high=middle;} else {low=middle;}
+            }
+            let screen=jka_refraction_uv(origin+direction*high);
+            let d=jka_refraction_depth(screen.xy);
+            let receiver=camera.near*camera.far/(d*(camera.far-camera.near)+camera.near);
+            let actual=-(camera.view*vec4<f32>(curved(origin+direction*high),1.0)).z;
+            // Reject foreground silhouettes and rays that jump across a depth discontinuity.
+            if abs(actual-receiver)>max(0.15,receiver*0.005) {return vec4<f32>(0.0);}
+            let edge=min(min(screen.x,screen.y),min(1.0-screen.x,1.0-screen.y));
+            let confidence=smoothstep(0.02,0.08,edge);
+            return vec4<f32>(textureSampleLevel(scene_color,wake_sampler,screen.xy,0.0).rgb,fresnel*confidence);
+        }
+        previous=along;
+    }
+    return vec4<f32>(0.0);
+}

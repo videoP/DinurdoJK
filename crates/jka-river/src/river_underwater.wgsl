@@ -41,6 +41,21 @@ fn river_eye_water_at(eye: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(top, bed, select(0.0, 1.0, eye.z < top), 0.0);
 }
 
+// A single invocation per live body. The renderer clears the shared draw
+// record before dispatching all bodies; any wet camera enables the copy.
+@group(0) @binding(1) var<storage, read_write> river_submerged_args: array<atomic<u32>, 4>;
+@group(0) @binding(2) var<storage, read_write> river_eye_result: vec4<f32>;
+@group(6) @binding(5) var<uniform> river_eye_cached: vec4<f32>;
+@compute @workgroup_size(1)
+fn classify_river_eye() {
+    let result = river_eye_water_at(river_view.eye.xyz);
+    river_eye_result = result;
+    if result.z > 0.5 {
+        atomicStore(&river_submerged_args[0], 3u);
+        atomicStore(&river_submerged_args[1], 1u);
+    }
+}
+
 fn river_hybrid_underside(input: RiverOut, graph_normal: vec3<f32>, foam: RiverFoam) -> vec4<f32> {
     let n = -graph_normal;
     let v = normalize(river_view.eye.xyz - input.world);
@@ -59,7 +74,11 @@ fn river_hybrid_underside(input: RiverOut, graph_normal: vec3<f32>, foam: RiverF
     // Reflection points into the water. Screen tracing uses the pre-river scene;
     // misses see the underwater body color rather than an air-side sky capture.
     let roughness = mix(river_slw_parameters().shading.z, river_foam_settings().shading.y, saturate(foam.opacity));
-    let reflected = river_ssr(input.world, reflect(-v, n), dot(input.world - river_view.eye.xyz, river_view.forward.xyz), roughness, input.clip.xy);
+    // r_underwaterReflections (material_lod.w): 0 skips the trace entirely.
+    var reflected = vec4<f32>(0.0);
+    if river_view.material_lod.w > 0.5 {
+        reflected = river_ssr(input.world, reflect(-v, n), dot(input.world - river_view.eye.xyz, river_view.forward.xyz), roughness, input.clip.xy);
+    }
     let environment = reflected.rgb + authored.underwater.rgb * (1.0 - reflected.a);
     let foam_amount = saturate(foam.opacity);
     let color = mix(transmission, environment, fresnel);
@@ -94,7 +113,8 @@ struct RiverSubmergedOut {
     var out: RiverSubmergedOut;
     let xy = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
     out.clip = vec4<f32>(xy * 2.0 - 1.0, 0.0, 1.0);
-    out.eye_water = river_eye_water_at(river_view.eye.xyz);
+    out.eye_water = river_eye_cached;
+    if out.eye_water.z < 0.5 { out.clip = vec4<f32>(2.0, 2.0, 0.0, 1.0); }
     return out;
 }
 

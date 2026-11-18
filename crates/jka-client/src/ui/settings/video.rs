@@ -76,6 +76,8 @@ pub struct VideoSettings {
     /// Continuous projectile FX sampling rate. `0` preserves legacy JKA's
     /// render-frame-driven behavior; non-zero values are fixed Hz.
     pub fx_fps: u32,
+    /// 0 both games, 1 JKA only, 2 JK2 only.
+    pub fx_fps_game: u32,
     /// `cg_fxFPSScope`: 0 continuous EFX only, 1 also stock frame-driven FX.
     pub fx_fps_scope: u32,
     /// `fx_physics`: 0 off, 2 authored expensivePhysics (default), 3 force all.
@@ -835,6 +837,7 @@ impl Default for VideoSettings {
             face_plane_cull: false,
             fps_cap: 0,
             fx_fps: crate::fx::FX_FPS_DEFAULT,
+            fx_fps_game: crate::fx::FX_FPS_GAME_BOTH,
             fx_fps_scope: crate::fx::FX_FPS_SCOPE_DEFAULT,
             fx_physics: crate::fx::FX_PHYSICS_DEFAULT,
             fx_lod: crate::fx::FX_LOD_DEFAULT,

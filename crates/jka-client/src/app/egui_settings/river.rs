@@ -25,6 +25,12 @@ impl App {
         color_row(ui, "Underwater color", "Fog tint below the solved water surface (sRGB).", theme::Reset::None, &mut s.underwater_color, &mut changed);
         ocean_slider_d(ui, "Underwater visibility", "Distance in map units at which blue transmission falls to five percent. Red and green fade sooner, as in Hybrid ocean.", &mut s.underwater_visibility, d.underwater_visibility, 1.0..=65536.0, &mut changed);
         ocean_slider_d(ui, "Underwater darkening depth", "Downwelling-light depth distance in map units; larger values darken more slowly.", &mut s.underwater_darkening, d.underwater_darkening, 1.0..=65536.0, &mut changed);
+        {
+            let mut mirror = crate::ocean::underwater_reflections();
+            if ui.checkbox(&mut mirror, "Underwater reflections").on_hover_text("Seen from below, the surface mirrors the submerged scene (screen traced) where it reflects: fully outside Snell's window. Off shows the water's own color there and skips the trace. Shared with the Hybrid/Blue Water ocean; all rivers, live, this session. Console: r_underwaterReflections.").changed() {
+                let _ = self.set_console_cvar("r_underwaterReflections", if mirror { "1" } else { "0" });
+            }
+        }
         theme::section(
             ui,
             "WATER MATERIAL",
@@ -192,6 +198,20 @@ impl App {
             1.0..=50000.0,
             &mut changed,
         );
+        theme::section(ui, "SOLVER PACING", "How the river solver's GPU work is scheduled, for all rivers, live, this session. Console: r_riverSolverSpread, r_riverSimRate.");
+        {
+            let mut spread = crate::river_runtime::solver_spread();
+            if ui.checkbox(&mut spread, "Spread solver over frames").on_hover_text("On: each 1/60 s solver frame's substeps run as their time comes due, so the solver costs about the same every rendered frame. Off: whole solver frames at once, a GPU spike every 1/60 s (the original). Same simulation either way.").changed() {
+                let _ = self.set_console_cvar("r_riverSolverSpread", if spread { "1" } else { "0" });
+            }
+            let mut rate = i32::from(crate::river_runtime::sim_rate());
+            let substeps = crate::river_runtime::sim_rate_substeps(10);
+            if ui.add(egui::Slider::new(&mut rate, i32::from(crate::river_runtime::SIM_RATE_MIN)..=60).step_by(6.0).suffix(" Hz").text(format!("Simulation rate ({substeps} substeps)")))
+                .on_hover_text("Hydraulic update rate. 60 Hz is native: 10 substeps per 1/60 s solver frame. Lower rates run fewer, longer substeps (30 Hz = 5, half the solver cost); the surface still updates 60 times a second and sources, drains and the inlet are unchanged. The flow changes slightly.")
+                .changed() {
+                let _ = self.set_console_cvar("r_riverSimRate", &rate.to_string());
+            }
+        }
         theme::section(ui, "POUROVERS (A/B)", "Drawn water surface over ledges and drops, for all rivers, live. The simulation is unchanged. Console: r_riverSmoothing, r_riverSmoothingCutoff, r_riverBedClamp.");
         theme::row(ui, "Surface smoothing", "Unreal's render-height smoothing. Unreal default ramps the surface across drops, so it can dip under a ledge. Edge-preserving ignores neighbours beyond the height cutoff and keeps drops sharp. None and Blur are for comparison.", theme::Reset::None, |ui| {
             let current = crate::river_runtime::smoothing_method();

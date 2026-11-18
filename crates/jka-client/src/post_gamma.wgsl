@@ -1,6 +1,6 @@
 struct GammaSettings {
     values: vec4<f32>, // gamma, LUT strength, vignette, manual exposure EV
-    flags: vec4<f32>, // x: HDR, y: LUT headroom, z: output overbright, w: JK2MV color space
+    flags: vec4<f32>, // x: HDR scene, y: LUT headroom, z: output overbright, w: JK2 SDR LUT mode
 };
 
 @group(0) @binding(0) var scene_texture: texture_2d<f32>;
@@ -72,7 +72,7 @@ fn apply_color_lut(color: vec3<f32>) -> vec3<f32> {
     let scale = select(1.0, max(1.0, max(color.r, max(color.g, color.b))), settings.flags.y > 0.5);
     let input = clamp(color / scale, vec3<f32>(0.0), vec3<f32>(1.0));
     var coord_input = input;
-    if (settings.flags.w > 1.5 && settings.flags.x < 0.5) {
+    if (settings.flags.w > 1.5) {
         coord_input = sqrt(input);
     }
     let coord = (coord_input * (COLOR_LUT_SIZE - 1.0) + vec3<f32>(0.5)) / COLOR_LUT_SIZE;
@@ -91,8 +91,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     var corrected = color * exp2(settings.values.w);
     // JK2MV applies gamma/overbright in encoded display space. Reproduce that
     // via a precomputed transfer lookup rather than six full-screen pow calls.
-    // The JKA and HDR paths keep their current linear-space presentation.
-    let jk2_sdr = settings.flags.w > 0.5 && settings.flags.x < 0.5;
+    // The CPU selects the transfer by output policy, not scene precision.
+    // JKA and native HDR keep their existing linear-space presentation.
+    let jk2_sdr = settings.flags.w > 0.5;
     if (!(jk2_sdr && settings.flags.w > 1.5)) {
         // If the grading cube contains JK2's transfer, skip this entirely.
         if (jk2_sdr && (abs(gamma - 1.0) > 0.001 || settings.flags.z > 0.5)) {
@@ -107,7 +108,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         corrected *= 1.0 - edge * 0.28;
     }
     // The JK2 SDR branch already applied the output shift before sRGB decode.
-    // Keep OpenJK's existing linear output gain for JKA and modern HDR paths.
+    // Keep OpenJK's existing linear output gain for JKA and native HDR.
     if (settings.flags.z > 0.5 && !jk2_sdr) {
         corrected *= 2.0;
     }

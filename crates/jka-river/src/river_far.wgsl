@@ -178,6 +178,12 @@ fn river_far_pixel(world: vec3<f32>, pixel_depth: f32, foam: RiverFoam) -> River
 }
 
 @fragment fn fs_far(input: RiverFarOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    return river_far_shade(input, front, false);
+}
+@fragment fn fs_far_fused(input: RiverFarOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    return river_far_shade(input, front, true);
+}
+fn river_far_shade(input: RiverFarOut, front: bool, fused: bool) -> vec4<f32> {
     let eye = river_view.eye.xyz;
     let pixel_depth = dot(input.world - eye, river_view.forward.xyz);
     let slope = max(abs(dpdxFine(pixel_depth)), abs(dpdyFine(pixel_depth)));
@@ -186,7 +192,12 @@ fn river_far_pixel(world: vec3<f32>, pixel_depth: f32, foam: RiverFoam) -> River
     if !pixel.outside_window || pixel.material_mask < 0.3333 || input.eye_under > 0.5 {
         discard;
     }
-    return river_base_pass(input.clip, input.world, front, pixel.graph_normal, foam, pixel_depth, slope, input.ambient, input.directed);
+    let base = river_base_pass(input.clip, input.world, front, pixel.graph_normal, foam, pixel_depth, slope, input.ambient, input.directed);
+    if fused {
+        let reflection = river_composite_pass(input.clip, input.world, front, pixel.graph_normal, foam, pixel_depth, slope);
+        return vec4<f32>(base.rgb + reflection.rgb, base.a);
+    }
+    return base;
 }
 
 // r_showtris river bit: the water mesh tiles, coloured by LOD level (as
@@ -221,5 +232,7 @@ fn river_far_lod_colour(input: RiverFarOut) -> vec4<f32> {
     if !pixel.outside_window || pixel.material_mask < 0.3333 || input.eye_under > 0.5 {
         discard;
     }
-    return river_composite_pass(input.clip, input.world, front, pixel.graph_normal, foam, pixel_depth, slope);
+    let reflection = river_composite_pass(input.clip, input.world, front, pixel.graph_normal, foam, pixel_depth, slope);
+    if reflection.a == 0.0 { discard; }
+    return reflection;
 }

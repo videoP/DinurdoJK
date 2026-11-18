@@ -315,7 +315,7 @@ fn river_window_vertex(position: vec3<f32>, uv: vec2<f32>) -> RiverOut {
     out.clip = camera.view_proj * vec4<f32>(map.x, map.z, -map.y, 1.0);
     out.uv = uv;
     out.world = world;
-    out.eye_water = river_eye_water_at(river_view.eye.xyz);
+    out.eye_water = river_eye_cached;
     return out;
 }
 
@@ -340,6 +340,12 @@ fn river_to_view(v: vec3<f32>) -> vec3<f32> {
 }
 
 @fragment fn fs(input: RiverOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    return river_window_shade(input, front, false);
+}
+@fragment fn fs_fused(input: RiverOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+    return river_window_shade(input, front, true);
+}
+fn river_window_shade(input: RiverOut, front: bool, fused: bool) -> vec4<f32> {
     let eye = river_view.eye.xyz;
     let pixel_depth = dot(input.world - eye, river_view.forward.xyz); // GetPixelDepth
     // The bilateral slope tolerance (ddx_fine/ddy_fine), taken before the clip.
@@ -381,7 +387,12 @@ fn river_to_view(v: vec3<f32>) -> vec3<f32> {
         ambient = textureSampleLevel(ambient_texture, ambient_sampler, input.uv, 0.0);
         directed = textureSampleLevel(directed_texture, ambient_sampler, input.uv, 0.0);
     }
-    return river_base_pass(input.clip, input.world, front, graph_normal, foam, pixel_depth, slope, ambient, directed);
+    let base = river_base_pass(input.clip, input.world, front, graph_normal, foam, pixel_depth, slope, ambient, directed);
+    if fused {
+        let reflection = river_composite_pass(input.clip, input.world, front, graph_normal, foam, pixel_depth, slope);
+        return vec4<f32>(base.rgb + reflection.rgb, base.a);
+    }
+    return base;
 }
 
 // The Single Layer Water base pass after the material graph, shared by the

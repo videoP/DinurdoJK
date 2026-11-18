@@ -1478,6 +1478,7 @@ pub struct WeaponFx {
     /// frame. Non-zero values sample them at a fixed rate independent of FPS.
     continuous_fx_fps: u32,
     fx_fps_scope: u32,
+    jk2_assets: bool,
     /// Mirrors the worker's `fx_physics` mode (worker starts at the default).
     fx_physics: u32,
     gpu_staging: bool,
@@ -1575,6 +1576,7 @@ impl WeaponFx {
             eprintln!("FX VEHICLE DEFINITIONS UNAVAILABLE: {error}");
             VehicleDefinitions::default()
         });
+        let jk2_assets = assets.jk2_version().is_some();
         let (worker_tx, rx) = mpsc::channel();
         let worker = thread::Builder::new().name("jka-fx".to_owned()).spawn(move || fx_worker_loop(rx, assets)).expect("failed to start JKA FX worker");
         Self {
@@ -1612,6 +1614,7 @@ impl WeaponFx {
             force_fx_cadence: HashMap::new(),
             continuous_fx_fps: crate::fx::FX_FPS_DEFAULT,
             fx_fps_scope: crate::fx::FX_FPS_SCOPE_DEFAULT,
+            jk2_assets,
             fx_physics: crate::fx::FX_PHYSICS_DEFAULT,
             gpu_staging: false,
             gpu_owned: std::collections::HashSet::new(),
@@ -1822,6 +1825,14 @@ impl WeaponFx {
         if self.fx_lod.0 != crate::fx::FX_LOD_OFF {
             let _ = self.worker_tx.send(FxWorkerCommand::SetLodView { origin, px_per_unit });
         }
+    }
+
+    /// Resolve the archived preference against this session's asset game,
+    /// not the global game selector (demo and speculative sessions may differ).
+    pub fn set_fx_fps_settings(&mut self, fps: u32, scope: u32, game: u32) {
+        let enabled = crate::fx::fx_fps_game_enabled(game, self.jk2_assets);
+        self.set_continuous_fx_fps(if enabled { fps } else { crate::fx::FX_FPS_LEGACY_JKA });
+        self.set_fx_fps_scope(scope);
     }
 
     pub fn set_continuous_fx_fps(&mut self, value: u32) {

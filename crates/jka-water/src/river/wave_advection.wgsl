@@ -42,15 +42,28 @@ fn river_wave_plan(velocity:vec2<f32>,normal:vec3<f32>,time:f32,s:RiverAdvection
 fn river_wave_uv(p:RiverWavePlan,position:vec2<f32>,scale:f32,bracket:u32,phase:u32)->vec2<f32> {
     return ((position-p.velocities[bracket]*p.times[phase])+p.offsets[phase])*scale;
 }
+fn river_wave_sample_bracket(tex:texture_2d<f32>,tex_sampler:sampler,p:RiverWavePlan,position:vec2<f32>,scale:f32,mips:vec3<f32>,i:u32)->vec4<f32> {
+    let a=textureSampleLevel(tex,tex_sampler,river_wave_uv(p,position,scale,i,0u),mips.x);
+    let b=textureSampleLevel(tex,tex_sampler,river_wave_uv(p,position,scale,i,1u),mips.y);
+    let c=textureSampleLevel(tex,tex_sampler,river_wave_uv(p,position,scale,i,2u),mips.z);
+    return a*p.weights.x+b*p.weights.y+c*p.weights.z;
+}
 fn river_wave_sample(tex:texture_2d<f32>,tex_sampler:sampler,p:RiverWavePlan,position:vec2<f32>,scale:f32,mips:vec3<f32>)->vec4<f32> {
-    var values:array<vec4<f32>,4>;
-    for (var i=0u;i<4u;i++) {
-        let a=textureSampleLevel(tex,tex_sampler,river_wave_uv(p,position,scale,i,0u),mips.x);
-        let b=textureSampleLevel(tex,tex_sampler,river_wave_uv(p,position,scale,i,1u),mips.y);
-        let c=textureSampleLevel(tex,tex_sampler,river_wave_uv(p,position,scale,i,2u),mips.z);
-        values[i]=a*p.weights.x+b*p.weights.y+c*p.weights.z;
+    // At zero speed the native bracket plan has magnitude_blend == 0 and
+    // identical lower-speed vectors. All four brackets mathematically reduce
+    // to the first three pulse samples. Do not approximate slow nonzero flow.
+    let a=river_wave_sample_bracket(tex,tex_sampler,p,position,scale,mips,0u);
+    if p.magnitude_blend == 0.0 {
+        if p.angle_blend == 0.0 || all(p.velocities[0] == p.velocities[2]) { return a; }
+        let c=river_wave_sample_bracket(tex,tex_sampler,p,position,scale,mips,2u);
+        return mix(a,c,p.angle_blend);
     }
-    return mix(mix(values[0],values[1],p.magnitude_blend),mix(values[2],values[3],p.magnitude_blend),p.angle_blend);
+    let b=river_wave_sample_bracket(tex,tex_sampler,p,position,scale,mips,1u);
+    let low=mix(a,b,p.magnitude_blend);
+    if p.angle_blend == 0.0 { return low; }
+    let c=river_wave_sample_bracket(tex,tex_sampler,p,position,scale,mips,2u);
+    let d=river_wave_sample_bracket(tex,tex_sampler,p,position,scale,mips,3u);
+    return mix(low,mix(c,d,p.magnitude_blend),p.angle_blend);
 }
 fn river_wave_vertex(tex:texture_2d<f32>,tex_sampler:sampler,position:vec2<f32>,velocity:vec2<f32>,normal:vec3<f32>,time:f32,s:RiverAdvection)->vec4<f32> {
     let p=river_wave_plan(velocity,normal,time,s);

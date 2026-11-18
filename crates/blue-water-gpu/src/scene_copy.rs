@@ -157,7 +157,7 @@ impl SceneCopy {
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
     ) {
-        self.capture_impl(device, encoder, color, depth, false);
+        self.capture_impl(device, encoder, color, depth, false, None);
     }
 
     /// Resolve reversed depth without reading or writing scene color. The color
@@ -170,7 +170,20 @@ impl SceneCopy {
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
     ) {
-        self.capture_impl(device, encoder, color, depth, true);
+        self.capture_impl(device, encoder, color, depth, true, None);
+    }
+
+    /// GPU-authored DrawIndirect arguments: zero vertices when no copy is
+    /// needed. Load the previous capture so a skipped draw has no effect.
+    pub fn capture_indirect(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        color: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        args: &wgpu::Buffer,
+    ) {
+        self.capture_impl(device, encoder, color, depth, false, Some(args));
     }
 
     fn capture_impl(
@@ -180,6 +193,7 @@ impl SceneCopy {
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         depth_only: bool,
+        indirect: Option<&wgpu::Buffer>,
     ) {
         let input = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Blue Water scene copy input"),
@@ -209,7 +223,7 @@ impl SceneCopy {
             depth_slice: None,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                load: if indirect.is_some() { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::BLACK) },
                 store: wgpu::StoreOp::Store,
             },
         })];
@@ -219,7 +233,7 @@ impl SceneCopy {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &self.depth,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(0.0),
+                    load: if indirect.is_some() { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(0.0) },
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -232,7 +246,11 @@ impl SceneCopy {
             &self.pipeline
         });
         pass.set_bind_group(0, &input, &[]);
-        pass.draw(0..3, 0..1);
+        if let Some(args) = indirect {
+            pass.draw_indirect(args, 0);
+        } else {
+            pass.draw(0..3, 0..1);
+        }
     }
 }
 

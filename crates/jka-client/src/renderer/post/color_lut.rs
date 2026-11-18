@@ -121,8 +121,7 @@ impl Renderer {
     /// so they cannot be baked into a static 3D LUT without changing behavior.
     /// Otherwise JK2 SDR grading can use a single 3D lookup.
     pub(in crate::renderer) fn should_fuse_jk2_output_lut(&self) -> bool {
-        self.jk2_legacy_color
-            && !self.hdr_enabled
+        self.jk2_sdr_color()
             && self.color_lut_effective_strength > 0.001
             && self.chromatic_aberration_strength <= 0.001
             && (self.weather.rain.fast_post || !self.weather.rain.enabled

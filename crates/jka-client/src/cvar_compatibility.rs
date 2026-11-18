@@ -128,6 +128,7 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", swim_turn_bank: 1.0", "")
         .replace(", move_lean: 0.75", "")
         .replace(", jk2_lean_fix: false", "")
+        .replace(", fx_fps_game: 0", "")
         .replace(", underwater: 2", "")
         .replace(", footstep_trace: false", "")
         .replace(", chat_translate: Settings { mode: Off, target: \"\", display: Translated, provider: MyMemory, libre_url: \"\", team: false, demos: false, codepage: Auto, max_chars: 300 }", "")
@@ -230,6 +231,7 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta cg_fovViewmodelAdjust ")
                     && !line.starts_with("seta cg_gunAlpha ")
                     && !line.starts_with("seta cg_jk2LeanFix ")
+                    && !line.starts_with("seta cg_fxFPSGame ")
                     && !line.starts_with("seta cg_chatTranslate")
             })
             .map(|line| format!("{line}\n"))
@@ -823,4 +825,21 @@ fn bake_threads_cvar_loads_and_archives() {
     ).unwrap();
     assert!(fs::read_to_string(&path).unwrap().contains("seta r_bakeThreads \"12\""));
     assert_eq!(config::load_video_settings(&path).bake_threads, 12);
+}
+
+#[test]
+fn fx_fps_game_loads_and_archives_without_changing_rate() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("fx.cfg");
+    assert_eq!(crate::ui::VideoSettings::default().fx_fps_game, crate::fx::FX_FPS_GAME_BOTH);
+    for game in 0..=2 {
+        fs::write(&path, format!("seta cg_fxFPSGame \"{game}\"\nseta cg_fxFPS \"137\"\n")).unwrap();
+        let video = config::load_video_settings(&path);
+        assert_eq!(video.fx_fps_game, game);
+        assert_eq!(video.fx_fps, 137);
+        config::save_video_settings(&path, video, &crate::keybinds::Bindings::default(),
+            &config::ClientPresentationSettings::default(), &config::AudioSettings::default()).unwrap();
+        assert_eq!(config::load_video_settings(&path).fx_fps_game, game);
+        assert_eq!(config::load_video_settings(&path).fx_fps, 137);
+    }
 }

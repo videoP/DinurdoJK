@@ -1713,8 +1713,9 @@ impl App {
             // so OpenJK-style saber marks could never connect oldPos -> newPos.
             // build_game_session/map-load paths already install the current world.
             playback.weapon_fx.set_saber_trail(self.saber_trail);
-            playback.weapon_fx.set_continuous_fx_fps(self.video.fx_fps);
-            playback.weapon_fx.set_fx_fps_scope(self.video.fx_fps_scope);
+            playback.weapon_fx.set_fx_fps_settings(
+                self.video.fx_fps, self.video.fx_fps_scope, self.video.fx_fps_game,
+            );
             playback.weapon_fx.set_fx_physics(self.video.fx_physics);
             playback.weapon_fx.set_mark_count(self.video.mark_count as usize);
             playback.weapon_fx.set_fx_lod(

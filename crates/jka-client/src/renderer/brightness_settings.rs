@@ -67,6 +67,20 @@ fn upload_jk2_gamma_lut(queue: &wgpu::Queue, texture: &wgpu::Texture, gamma: f32
 }
 
 impl Renderer {
+    /// Math-only HDR changes scene precision, not JK2's SDR color transfer.
+    /// Only native HDR presentation uses the existing linear HDR policy.
+    pub(in crate::renderer) fn jk2_sdr_color(&self) -> bool {
+        self.jk2_legacy_color && self.hdr_output.is_none()
+    }
+
+    /// Shared by compact and full/temporal post (0 = linear, 1 = legacy
+    /// transfer LUT, 2 = legacy transfer fused into the grading cube).
+    pub(in crate::renderer) fn jk2_output_lut_mode(&self) -> f32 {
+        if !self.jk2_sdr_color() { 0.0 }
+        else if self.jk2_gamma_baked { 2.0 }
+        else { 1.0 }
+    }
+
     pub(super) fn output_gamma(&self) -> f32 {
         if self.gamma_method.is_hardware()
             || self.baked_brightness.overrides_output()
@@ -184,7 +198,7 @@ impl Renderer {
             }
         }
         let wants_fused = self.should_fuse_jk2_output_lut();
-        // Also rebuild on mode/HDR transitions: the same grading settings
+        // Also rebuild on color-policy transitions: the same grading settings
         // require a different texture when JK2's output transfer is fused.
         if ((wants_fused && output_changed)
             || wants_fused != self.jk2_gamma_baked
@@ -203,7 +217,7 @@ impl Renderer {
                     if self.vignette_enabled { 1.0 } else { 0.0 },
                     self.color_grade.exposure_ev,
                 ],
-                flags: [if self.hdr_enabled { 1.0 } else { 0.0 }, if self.hdr_output.is_some() { 1.0 } else { 0.0 }, f32::from(self.overbright_bits), if self.jk2_gamma_baked { 2.0 } else { f32::from(u8::from(self.jk2_legacy_color)) }],
+                flags: [if self.hdr_enabled { 1.0 } else { 0.0 }, if self.hdr_output.is_some() { 1.0 } else { 0.0 }, f32::from(self.overbright_bits), self.jk2_output_lut_mode()],
             }),
         );
         self.rebuild_frame_plan();

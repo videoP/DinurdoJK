@@ -417,7 +417,7 @@ mod tests {
         wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(), wgpu::naga::valid::Capabilities::all())
             .validate(&module)
             .unwrap_or_else(|e| panic!("river surface shader validates: {e:?}"));
-        for entry in ["vs", "vs_block", "fs", "fs_composite", "fs_river_wire", "fs_river_wire_masked", "vs_far", "fs_far", "fs_composite_far", "fs_far_wire", "fs_far_wire_full"] {
+        for entry in ["vs", "vs_block", "fs", "fs_composite", "fs_river_wire", "fs_river_wire_masked", "vs_far", "fs_far", "fs_fused", "fs_far_fused", "fs_composite_far", "fs_far_wire", "fs_far_wire_full"] {
             assert!(module.entry_points.iter().any(|e| e.name == entry), "missing entry point {entry}");
         }
     }

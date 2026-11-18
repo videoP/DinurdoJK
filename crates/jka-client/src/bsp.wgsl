@@ -165,7 +165,7 @@ struct OceanRenderSettings {
     appearance_a: vec4<f32>, // detail mode, foam gates, foam gain, promoted seam flatten (0/1)
     appearance_b: vec4<f32>, // body color mode, foam brightness, sun gain, foam debug
     appearance_c: vec4<f32>, // x visual fixes; y dynamic LOD ready; z mesh spacing; w analytic far radius
-    hybrid_eye: vec4<f32>, // x Godot-mesh lift near the camera (metres); y active
+    hybrid_eye: vec4<f32>, // x Godot-mesh lift near the camera (metres); y active; z r_underwaterReflections
     // Submerged Hybrid: Blue Water's own clipmap through `vs_ocean_native`.
     // Its upstream `Surface` prefix: per level xy snapped centre (m), z cell (m), w 1 / cell.
     native_frames: array<vec4<f32>, 10>,
@@ -3561,6 +3561,58 @@ fn ocean_windrow_lod(index: u32, live_offset: u32, middle: f32, far: f32) -> f32
     return mix(ocean_windrow[live_offset+index],ocean_windrow_medium[index],middle);
 }
 
+// r_underwaterReflections (ocean.hybrid_eye.z): seen from below, the surface
+// mirrors the submerged scene (total internal reflection outside Snell's
+// window). Traced through the ocean optics capture (colour + linear depth,
+// 1e6 sentinel for no receiver) that the transmission already reads. `n`
+// faces the camera below; rgb the mirrored scene, a its hit confidence.
+fn ocean_underwater_mirror(world: vec3<f32>, n: vec3<f32>, view_dir: vec3<f32>) -> vec4<f32> {
+    if (ocean.hybrid_eye.z < 0.5) { return vec4<f32>(0.0); }
+    let direction = reflect(-view_dir, n);
+    // Only rays back down into the water reach the submerged scene.
+    if (direction.y > -1e-3) { return vec4<f32>(0.0); }
+    let eye = camera.camera_pos_time.xyz;
+    let forward = camera.camera_forward.xyz;
+    let dims = vec2<f32>(textureDimensions(ocean_scene));
+    let units = max(ocean.ocean_info.z, 1.0);
+    let limit = 100.0 * units;
+    var previous = 0.5;
+    for (var i = 1u; i <= 24u; i += 1u) {
+        let fraction = f32(i) / 24.0;
+        let along = max(fraction * fraction * limit, 1.0);
+        let point = world + direction * along;
+        let clip = camera.view_proj * vec4<f32>(point, 1.0);
+        if (clip.w <= 1e-4) { break; }
+        let uv = vec2<f32>(clip.x / clip.w * 0.5 + 0.5, 0.5 - clip.y / clip.w * 0.5);
+        if (any(uv < vec2<f32>(0.002)) || any(uv > vec2<f32>(0.998))) { break; }
+        let scene = textureLoad(ocean_scene_depth, vec2<i32>(uv * dims), 0).r;
+        if (scene < 999999.0 && dot(point - eye, forward) >= scene) {
+            var low = previous;
+            var high = along;
+            for (var s = 0u; s < 5u; s += 1u) {
+                let middle = (low + high) * 0.5;
+                let probe = world + direction * middle;
+                let c = camera.view_proj * vec4<f32>(probe, 1.0);
+                let u = vec2<f32>(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5);
+                let d = textureLoad(ocean_scene_depth, vec2<i32>(clamp(u, vec2<f32>(0.0), vec2<f32>(0.999)) * dims), 0).r;
+                if (d < 999999.0 && dot(probe - eye, forward) >= d) { high = middle; } else { low = middle; }
+            }
+            let hit = world + direction * high;
+            let c = camera.view_proj * vec4<f32>(hit, 1.0);
+            let hit_uv = clamp(vec2<f32>(c.x / c.w * 0.5 + 0.5, 0.5 - c.y / c.w * 0.5), vec2<f32>(0.0), vec2<f32>(0.999));
+            let receiver = textureLoad(ocean_scene_depth, vec2<i32>(hit_uv * dims), 0).r;
+            // Reject foreground silhouettes and rays that jump across a depth discontinuity.
+            if (receiver >= 999999.0 || abs(dot(hit - eye, forward) - receiver) > max(0.15 * units, receiver * 0.005)) {
+                return vec4<f32>(0.0);
+            }
+            let edge = min(min(hit_uv.x, hit_uv.y), min(1.0 - hit_uv.x, 1.0 - hit_uv.y));
+            return vec4<f32>(textureSampleLevel(ocean_scene, ocean_scene_sampler, hit_uv, 0.0).rgb, smoothstep(0.02, 0.08, edge));
+        }
+        previous = along;
+    }
+    return vec4<f32>(0.0);
+}
+
 fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     let units_per_meter = max(ocean.ocean_info.z, 0.001);
     let world_m = input.ocean_uv_m;
@@ -3785,6 +3837,13 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
     }
     let albedo = mix(body_color, foam_color, foam_factor);
     let environment = ocean_environment(input, n, view_dir, ibl_roughness);
+    // Below: where the trace hits, the mirrored submerged scene replaces the
+    // sky/planar/probe environment (r_underwaterReflections).
+    var below_environment = environment;
+    if (below) {
+        let mirror = ocean_underwater_mirror(input.world_position, n, view_dir);
+        below_environment = mix(environment, mirror.rgb, mirror.a);
+    }
     let indirect = ocean_indirect_lighting(input, n, albedo);
     let local_lights = ocean_dynamic_lighting(input, n, view_dir, albedo, roughness);
 
@@ -3862,7 +3921,7 @@ fn ocean_surface_sample(input: VertexOut, below: bool) -> vec4<f32> {
             below_body = ocean_authored_blend(vec4<f32>(stage.rgb*t,stage.a),vec4<f32>(transmission,1.0),factors);
         }
         color = below_body * (1.0-fresnel) * (1.0-foam_factor)
-            + (surface_light * foam_factor + (specular + environment * fresnel) * glossy) * t
+            + (surface_light * foam_factor + (specular + below_environment * fresnel) * glossy) * t
             + ambient * (1.0-t) * (fresnel + (1.0-fresnel)*foam_factor);
     }
     return vec4<f32>(color, 1.0);

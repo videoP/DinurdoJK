@@ -717,6 +717,10 @@ pub struct SparseSimulation {
     current: usize,
     history_needs_snapshot: bool,
     started: bool,
+    /// MatchSpline is an identity copy the derived layouts skip; fixed at
+    /// a solver frame's begin so a frame split across render frames keeps
+    /// one ping-pong parity sequence.
+    frame_identity_match: bool,
     parameters: Parameters,
     /// Substeps per solver frame at spawn (riverdump's CPU replay).
     substeps: u32,
@@ -1032,6 +1036,7 @@ impl SparseSimulation {
             inlet_active: false,
             current: 0,
             history_needs_snapshot: false,
+            frame_identity_match: false,
             started: false,
             parameters: p,
             substeps: spawn.substeps,
@@ -1578,7 +1583,19 @@ impl SparseSimulation {
 
     /// encode_reference_frame over the pool: stages 6/7 once, 8..12 per
     /// substep, 13/14 once; the CFS inlet runs in place after stage 6.
+    /// One whole native solver frame: begin, every substep, end.
     pub fn encode_reference_frame(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, frame: Frame) -> Result<(), &'static str> {
+        self.encode_frame_begin(device, encoder, frame)?;
+        self.encode_substeps(encoder, frame.substeps());
+        self.encode_frame_end(encoder);
+        Ok(())
+    }
+
+    /// A solver frame's once-per-frame head: controls upload, colliders, the
+    /// tile schedule, sources/inlet and DistributeOverlap. Then
+    /// `encode_substeps` (any split over render frames, in order) and
+    /// `encode_frame_end`: the same kernel sequence as one whole frame.
+    pub fn encode_frame_begin(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, frame: Frame) -> Result<(), &'static str> {
         if frame.parameters().dx != self.parameters.dx {
             return Err("river frame cell size differs from the sparse lattice");
         }
@@ -1606,7 +1623,7 @@ impl SparseSimulation {
         // MatchSpline writes its input unchanged while spline matching is off.
         // The derived layouts leave that copy out (the ping-pong parity just
         // follows the dispatches); native storage keeps the reference pass.
-        let identity_match = !self.storage.stores_history() && self.boundary_template.flags[1] == 0;
+        self.frame_identity_match = !self.storage.stores_history() && self.boundary_template.flags[1] == 0;
         let mut kernels = vec![Kernel::SourceAndSink];
         if self.inlet_active {
             // The CFS inlet (copies and its own passes) runs after stage 6.
@@ -1615,11 +1632,26 @@ impl SparseSimulation {
             kernels.clear();
         }
         kernels.push(Kernel::DistributeOverlap);
-        for _ in 0..frame.substeps() {
+        self.encode_kernels(encoder, &kernels);
+        Ok(())
+    }
+
+    /// `count` hydraulic substeps of the frame begun last.
+    pub fn encode_substeps(&mut self, encoder: &mut wgpu::CommandEncoder, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let identity_match = self.frame_identity_match;
+        let mut kernels = Vec::with_capacity(count as usize * 6);
+        for _ in 0..count {
             kernels.extend(Kernel::ALL[2..8].iter().filter(|&&k| !(identity_match && k == Kernel::MatchSpline)));
         }
-        kernels.extend([Kernel::PrepareSurface, Kernel::ComputeNormalsAndReset]);
         self.encode_kernels(encoder, &kernels);
+    }
+
+    /// The frame's tail: render surface and normals/reset, frame bookkeeping.
+    pub fn encode_frame_end(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.encode_kernels(encoder, &[Kernel::PrepareSurface, Kernel::ComputeNormalsAndReset]);
         if self.storage.stores_history() {
             self.history_needs_snapshot = true;
         } else if !self.started {
@@ -1629,7 +1661,6 @@ impl SparseSimulation {
         }
         self.started = true;
         self.solver_frames += 1;
-        Ok(())
     }
 
     /// Per-slot occupancy of the current state into the async readback ring.

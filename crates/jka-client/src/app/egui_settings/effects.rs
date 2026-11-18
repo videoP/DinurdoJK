@@ -5,13 +5,26 @@ use crate::app::egui_settings::{
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_effects(&mut self, ui: &mut egui::Ui) {
+        if let Some(game) = segmented_row(
+            ui, "FX FPS game",
+            "Apply the fixed FX cadence to JKA, JK2 or both. The excluded game uses the existing legacy per-frame FX path without changing your saved rate or scope.",
+            theme::Reset::Video(ui::VIDEO_ROW_FX_FPS_GAME), self.video.fx_fps_game,
+            &[(crate::fx::FX_FPS_GAME_JKA, "JKA only"), (crate::fx::FX_FPS_GAME_JK2, "JK2 only"), (crate::fx::FX_FPS_GAME_BOTH, "Both")],
+        ) {
+            let _ = self.set_console_cvar("cg_fxFPSGame", &game.to_string());
+        }
+        // Keep both saved values visible but inactive in an excluded game.
+        let fixed_fx_available = crate::fx::fx_fps_game_enabled(
+            self.video.fx_fps_game, self.fs_roots.active_jk2.is_some(),
+        );
+        ui.add_enabled_ui(fixed_fx_available, |ui| {
         theme::row(
             ui,
             "FX FPS",
             "Fixed FX worker update rate and projectile/trail emission sampling. Worker snapshots \
              are prepared asynchronously while the renderer reuses the last completed FX \
              visuals; authored EFX lifetimes and counts are preserved. Drag to the far-right \
-             Legacy JKA endpoint for synchronous per-frame updates (cg_fxFPS 0).",
+             Legacy endpoint for synchronous per-frame updates (cg_fxFPS 0).",
             theme::Reset::Video(ui::VIDEO_ROW_FX_FPS),
             |ui| {
                 const LEGACY_SLIDER_VALUE: f32 = crate::fx::FX_FPS_MAX as f32 + 1.0;
@@ -21,7 +34,7 @@ impl App {
                     self.video.fx_fps.clamp(crate::fx::FX_FPS_MIN, crate::fx::FX_FPS_MAX) as f32
                 };
                 let readout = if self.video.fx_fps == crate::fx::FX_FPS_LEGACY_JKA {
-                    "Legacy JKA".to_owned()
+                    "Legacy (per-frame)".to_owned()
                 } else {
                     format!("{} Hz", self.video.fx_fps)
                 };
@@ -56,6 +69,8 @@ impl App {
         ) {
             let _ = self.set_console_cvar("cg_fxFPSScope", &scope.to_string());
         }
+
+        });
 
         ui.add_enabled_ui(self.video.ghoul2_skinning == Ghoul2SkinningMode::Gpu, |ui| {
         if let Some(value) = segmented_row(

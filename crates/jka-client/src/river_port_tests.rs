@@ -1386,7 +1386,7 @@ fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
     }
     std::eprintln!("live river water body foam detail: {}", water.has_foam_detail());
     let format = wgpu::TextureFormat::Rgba32Float;
-    water.ensure_pipeline(device, &camera_layout, &shadow_layout, format, 1, wgpu::TextureFormat::Depth32Float, wgpu::CompareFunction::GreaterEqual);
+    water.ensure_pipeline(device, &camera_layout, &shadow_layout, format, 1, wgpu::TextureFormat::Depth32Float, wgpu::CompareFunction::GreaterEqual, false);
     // One submission per rendered frame, as the renderer does: each solver
     // frame owns a small control upload until the queue retires it.
     for frame in 0..240 {
@@ -1501,6 +1501,7 @@ fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
             }),
             ..Default::default()
         });
+        water.classify_eyes(&mut encoder, std::slice::from_ref(&river));
         water.capture(device, &mut encoder, &color_view, &depth_view);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

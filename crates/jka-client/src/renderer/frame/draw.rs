@@ -138,7 +138,7 @@ impl Renderer {
     /// scales rgbGen wave by identityLight. Bit 19: JK2 encoded color
     /// (rgbGen wave glow multiplies the encoded texel).
     pub(in crate::renderer) fn overbright_sky_flag(&self) -> u32 {
-        let jk2_encoded = self.jk2_legacy_color && !self.hdr_enabled;
+        let jk2_encoded = self.jk2_sdr_color();
         let overbright = if self.overbright_bits == 0 { 0 }
             else if jk2_encoded { 1 << 17 }
             else { 1 << 18 };
@@ -7030,6 +7030,7 @@ impl Renderer {
                 // Encoder endpoints: the river breaks the world pass anyway.
                 self.gpu_profiler.write_encoder_timestamp(&mut encoder, GpuPass::RiverDraw, false);
                 let copyable = plan.use_post || self.msaa_samples > 1;
+                water.classify_eyes(&mut encoder, &self.live_rivers);
                 if copyable {
                     water.capture(&self.device, &mut encoder, color_view, &self.targets.depth_view);
                 }

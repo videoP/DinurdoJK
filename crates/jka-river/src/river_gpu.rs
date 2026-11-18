@@ -863,6 +863,21 @@ impl Simulation {
         encoder: &mut wgpu::CommandEncoder,
         frame: Frame,
     ) -> Result<(), &'static str> {
+        self.encode_frame_begin(device, encoder, frame)?;
+        self.encode_substeps(encoder, frame.substeps());
+        self.encode_frame_end(encoder);
+        Ok(())
+    }
+
+    /// A solver frame's head (controls, sources, discharge, DistributeOverlap);
+    /// then `encode_substeps` in any split and `encode_frame_end`, the same
+    /// kernel sequence as `encode_reference_frame`.
+    pub fn encode_frame_begin(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: Frame,
+    ) -> Result<(), &'static str> {
         if frame.parameters().dx != self.parameters.dx {
             return Err("river frame cell size differs from the captured simulation grid");
         }
@@ -885,14 +900,22 @@ impl Simulation {
             self.current=1-self.current;
         }
         self.encode_kernel(encoder, Kernel::DistributeOverlap);
-        for _ in 0..frame.substeps() {
+        Ok(())
+    }
+
+    /// `count` hydraulic substeps of the frame begun last.
+    pub fn encode_substeps(&mut self, encoder: &mut wgpu::CommandEncoder, count: u32) {
+        for _ in 0..count {
             for kernel in &Kernel::ALL[2..8] {
                 self.encode_kernel(encoder, *kernel);
             }
         }
+    }
+
+    /// The frame's tail: render surface and normals/reset.
+    pub fn encode_frame_end(&mut self, encoder: &mut wgpu::CommandEncoder) {
         self.encode_kernel(encoder, Kernel::PrepareSurface);
         self.encode_kernel(encoder, Kernel::ComputeNormalsAndReset);
-        Ok(())
     }
 
     /// Optional host volume forcing, separate from every native reference stage.

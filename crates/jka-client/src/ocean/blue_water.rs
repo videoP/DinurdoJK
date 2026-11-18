@@ -37,6 +37,24 @@ fn convert(@builtin(global_invocation_id) id: vec3<u32>) {
 }
 "#;
 
+// r_oceanUpdateSpread (live): 1 spreads each throttled Blue Water FFT update
+// (r_oceanUpdates > 0) over the rendered frames of its period, as the original
+// ocean path already does with its FFT phases; 0 encodes it whole on its tick.
+static UPDATE_SPREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+pub fn update_spread() -> bool { UPDATE_SPREAD.load(std::sync::atomic::Ordering::Relaxed) }
+pub fn set_update_spread(enabled: bool) { UPDATE_SPREAD.store(enabled, std::sync::atomic::Ordering::Relaxed); }
+
+/// A Blue Water field update in flight (r_oceanUpdateSpread).
+#[derive(Clone, Copy)]
+struct FieldJob {
+    /// Render time the job began; its slices follow `ocean_phases_due`.
+    start: f64,
+    /// Wave time the field is computed for: when it is expected to publish.
+    time: f64,
+    /// Transform passes encoded so far.
+    done: usize,
+}
+
 pub struct BlueWaterOcean {
     pub field: blue_water_gpu::WaveField,
     pub surface_waves: blue_water_gpu::surface_waves::SurfaceWaves,
@@ -58,6 +76,7 @@ pub struct BlueWaterOcean {
     time: f64,
     next_update: f64,
     last_step: f64,
+    job: Option<FieldJob>,
     pub updated_this_frame: bool,
     pub adapter_enabled: bool,
 }
@@ -223,6 +242,7 @@ impl BlueWaterOcean {
             last_step: 0.0,
             updated_this_frame: false,
             adapter_enabled: true,
+            job: None,
         }
     }
 
@@ -240,6 +260,7 @@ impl BlueWaterOcean {
         self.time = time as f64;
         self.next_update = self.time;
         self.last_step = self.time;
+        self.job = None;
     }
 
     pub fn encode(
@@ -274,6 +295,24 @@ impl BlueWaterOcean {
         } else {
             0.0
         };
+        // An update in flight: the passes now due, then publish with its last.
+        if let Some(mut job) = self.job.take() {
+            let total = self.field.transform_pass_count();
+            // The finish (resolve, mips, crest limits) is the final phase.
+            let phases = total + 1;
+            let due = super::ocean_phases_due((self.time - job.start) as f32, 0.0, period as f32, phases);
+            let transforms = due.min(total);
+            if transforms > job.done {
+                self.field.encode_transform_passes(encoder, job.done..transforms);
+                job.done = transforms;
+            }
+            if due < phases {
+                self.job = Some(job);
+                return;
+            }
+            self.field.finish_update(encoder);
+            self.publish(queue, encoder, job.time, swell);
+        }
         if period > 0.0 && self.time < self.next_update {
             return;
         }
@@ -284,26 +323,40 @@ impl BlueWaterOcean {
         } else {
             self.time
         };
-        let step_dt = (self.time - self.last_step).max(0.0);
-        self.last_step = self.time;
+        let spread = period > 0.0 && update_spread();
+        // A spread update publishes most of a period later: compute the field
+        // for that time, so the shown waves (and BG_SailingSea physics, which
+        // reads the same clock) are no staler than a whole update on its tick.
+        let phases = self.field.transform_pass_count() + 1;
+        let time = if spread { self.time + period * (phases - 1) as f64 / phases as f64 } else { self.time };
+        let step_dt = (time - self.last_step).max(0.0);
+        self.last_step = time;
         let params = waves.parameters();
-        if self
-            .field
-            .update(queue, encoder, params, false, self.time, step_dt, 1.0, 1.0)
-        {
-            self.updated_this_frame = true;
-            self.surface_waves.write(queue, &self.field, self.time, 1.0, 1.0);
-            for waves in self.shore_waves.iter().flatten() {waves.write_with_swell(queue,&self.field,self.time,1.0,1.0,swell);}
-            if !self.adapter_enabled { return; }
-            let n = self.field.resolution();
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Blue Water JKA surface conversion"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.groups[self.field.current_index()], &[]);
-            pass.dispatch_workgroups(n.div_ceil(8), n.div_ceil(8), 3);
+        if spread {
+            if self.field.begin_update(queue, encoder, params, false, time, step_dt, 1.0, 1.0) {
+                // The first phase now; the rest as the period elapses.
+                self.field.encode_transform_passes(encoder, 0..1);
+                self.job = Some(FieldJob { start: self.time, time, done: 1 });
+            }
+        } else if self.field.update(queue, encoder, params, false, time, step_dt, 1.0, 1.0) {
+            self.publish(queue, encoder, time, swell);
         }
+    }
+
+    /// A finished field update: CPU wave copies and the JKA surface textures.
+    fn publish(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, time: f64, swell: [[f32; 4]; 2]) {
+        self.updated_this_frame = true;
+        self.surface_waves.write(queue, &self.field, time, 1.0, 1.0);
+        for waves in self.shore_waves.iter().flatten() {waves.write_with_swell(queue,&self.field,time,1.0,1.0,swell);}
+        if !self.adapter_enabled { return; }
+        let n = self.field.resolution();
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Blue Water JKA surface conversion"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.groups[self.field.current_index()], &[]);
+        pass.dispatch_workgroups(n.div_ceil(8), n.div_ceil(8), 3);
     }
 }
 
@@ -329,7 +382,8 @@ mod tests {
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let mut ocean = BlueWaterOcean::new(&device);
             let mut encoder = device.create_command_encoder(&Default::default());
-            ocean.encode(&queue, &mut encoder, 1.0 / 48.0, 48.0, super::super::BlueWaterWaves::default(),[[0.0;4],[0.0,0.0,1.0,0.0]], 0, [0, 0], [1.0, 1.0]);
+            // 0 Hz: one whole update (a throttled one may spread over frames).
+            ocean.encode(&queue, &mut encoder, 1.0 / 48.0, 0.0, super::super::BlueWaterWaves::default(),[[0.0;4],[0.0,0.0,1.0,0.0]], 0, [0, 0], [1.0, 1.0]);
             let n = ocean.field.resolution();
             let read = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Blue Water adapter readback"),

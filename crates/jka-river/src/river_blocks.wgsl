@@ -40,6 +40,21 @@ struct Wake {
     rects: array<vec4<i32>, 16>,
 }
 @group(0) @binding(8) var<uniform> wake: Wake;
+struct ViewWedge { planes: array<vec4<f32>, 2>, }
+@group(0) @binding(9) var<uniform> view_wedge: ViewWedge;
+
+// Planes bound a visible XY wedge; a zero plane accepts every block.
+// This filters only render instances, never the shared wet/foam flags.
+fn visible_block(i: u32) -> bool {
+    let lo = vec2<f32>(vec2<u32>(i % settings.blocks.x, i / settings.blocks.x) * 16u);
+    let hi = min(lo + vec2<f32>(16.0), vec2<f32>(settings.cells));
+    for (var j = 0u; j < 2u; j++) {
+        let p = view_wedge.planes[j];
+        let support = select(lo, hi, p.xy >= vec2<f32>(0.0));
+        if dot(p.xy, support) + p.z < 0.0 { return false; }
+    }
+    return true;
+}
 
 const BLOCK: i32 = 16;
 const SPAN: i32 = 18; // BLOCK plus the one-cell border each side
@@ -85,7 +100,7 @@ fn compact(@builtin(local_invocation_index) lane: u32) {
     for (var chunk = 0u; chunk < chunks; chunk++) {
         let i = chunk * 256u + lane;
         var flag = 0u;
-        if i < count { flag = flags[i]; }
+        if i < count && visible_block(i) { flag = flags[i]; }
         scan[lane] = flag;
         workgroupBarrier();
         for (var offset = 1u; offset < 256u; offset <<= 1u) {
@@ -271,7 +286,7 @@ fn compact_adaptive(@builtin(local_invocation_index) lane: u32) {
         for (var chunk = 0u; chunk < chunks; chunk++) {
             let i = chunk * 256u + lane;
             var flag = 0u;
-            if i < count && flags[i] != 0u && template_of[i] == t { flag = 1u; }
+            if i < count && flags[i] != 0u && template_of[i] == t && visible_block(i) { flag = 1u; }
             scan[lane] = flag;
             workgroupBarrier();
             for (var offset = 1u; offset < 256u; offset <<= 1u) {

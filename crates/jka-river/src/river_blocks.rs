@@ -39,7 +39,11 @@ const SHADER: &str = include_str!("river_blocks.wgsl");
 // r_riverBlockCull (session A/B): 0 lists every block (the full grid).
 static CULL: AtomicBool = AtomicBool::new(true);
 // r_riverAdaptiveMesh (session A/B): rendering only, no solver change.
-static ADAPTIVE: AtomicBool = AtomicBool::new(false);
+static ADAPTIVE: AtomicBool = AtomicBool::new(true);
+// Conservative XY-only view wedge: no water height assumptions.
+static FRUSTUM: AtomicBool = AtomicBool::new(false);
+pub fn frustum_enabled() -> bool { FRUSTUM.load(Ordering::Relaxed) }
+pub fn set_frustum_enabled(enabled: bool) { FRUSTUM.store(enabled, Ordering::Relaxed); }
 // r_riverMeshTurbulence: B's sensitivity (f32 bits; higher = more detail).
 static SENSITIVITY: AtomicU32 = AtomicU32::new(0x3F80_0000); // 1.0
 // r_riverWire: 0 the drawn water only, 1 the full window grid and water-mesh
@@ -71,6 +75,49 @@ pub fn wire_mode() -> u8 {
 }
 pub fn set_wire_mode(mode: u8) {
     WIRE.store(mode.min(1), Ordering::Relaxed);
+}
+
+/// Conservative horizontal projection of the view frustum. A ray through
+/// any visible point is a positive linear combination of the four corner
+/// directions, so if all four are in the same horizontal half-plane their
+/// min/max slopes bound every visible XY point, independent of water Z.
+/// WPO moves only Z; no guessed wave-height or source-level bound is needed.
+pub fn view_wedge(view: &crate::river_surface::ViewUniform, origin: [f64; 3], size: [f32; 2], cells: [u32; 2]) -> [[f32; 4]; 2] {
+    let disabled = [[0.0; 4]; 2];
+    let f = glam::Vec2::new(view.forward[0], view.forward[1]).normalize_or_zero();
+    if f.length_squared() < 0.5 || cells.contains(&0) { return disabled; }
+    let side = glam::Vec2::new(-f.y, f.x);
+    let right = glam::Vec2::new(view.right[0], view.right[1]);
+    let up = glam::Vec2::new(view.up[0], view.up[1]);
+    let forward = glam::Vec2::new(view.forward[0], view.forward[1]);
+    let sx = view.distortion[0];
+    let sy = sx * view.distortion[1];
+    if !(sx > 0.0 && sy > 0.0) { return disabled; }
+    let mut lo = f32::INFINITY;
+    let mut hi = f32::NEG_INFINITY;
+    for x in [-1.0, 1.0] {
+        for y in [-1.0, 1.0] {
+            let ray = forward + right * (x / sx) + up * (y / sy);
+            let along = ray.dot(f);
+            if along <= 1e-3 || !along.is_finite() { return disabled; }
+            let slope = ray.dot(side) / along;
+            if !slope.is_finite() { return disabled; }
+            lo = lo.min(slope);
+            hi = hi.max(slope);
+        }
+    }
+    let base = glam::Vec2::new(origin[0] as f32, origin[1] as f32) - glam::Vec2::from_array(size) * 0.5;
+    let eye = glam::Vec2::new(view.eye[0], view.eye[1]);
+    let cell = glam::Vec2::new(size[0] / cells[0] as f32, size[1] / cells[1] as f32);
+    let plane = |normal: glam::Vec2| {
+        let n = normal.normalize_or_zero();
+        // Keep a two-cell guard + floating-point margin. These planes only
+        // reject obviously off-screen blocks, including near map extremes.
+        let margin = 2.0 * cell.abs().max_element() + 0.001 * (base.abs().max_element() + eye.abs().max_element());
+        [n.x * cell.x, n.y * cell.y, n.dot(base - eye) + margin, 0.0]
+    };
+    let planes = [plane(side - f * lo), plane(f * hi - side)];
+    if planes.iter().flatten().all(|v| v.is_finite()) { planes } else { disabled }
 }
 
 /// The B compute entry points, compiled on first use only.
@@ -129,6 +176,7 @@ impl Pipelines {
                 storage(7),
                 // B: block rectangles around the solver's wake bodies.
                 uniform(8),
+                uniform(9), // conservative view wedge, compact only
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -272,6 +320,11 @@ pub struct Cull {
     wake_rects: Vec<[i32; 4]>,
     /// `wake_rects` changed since the last list.
     wake_changed: bool,
+    /// r_riverBlockFrustum: the conservative view wedge (river_blocks.wgsl
+    /// binding 9), last written planes, and whether `compact` must rerun.
+    view_buffer: wgpu::Buffer,
+    listed_view: [[f32; 4]; 2],
+    view_changed: bool,
 }
 
 /// Cells around a wake body that keep the tile resolution while it is there
@@ -305,6 +358,7 @@ impl Cull {
         let template = buffer("river window block templates", count * 4, wgpu::BufferUsages::STORAGE);
         let score = buffer("river window block scores", count * 4, wgpu::BufferUsages::STORAGE);
         let wake = buffer("river window block wake", WAKE_BYTES, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
+        let view_buffer = buffer("river window view wedge", 32, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let tuning = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("river window block tuning"),
             contents: bytemuck::cast_slice(&tuning_words(cell_cm, sensitivity())),
@@ -336,9 +390,10 @@ impl Cull {
                 wgpu::BindGroupEntry { binding: 6, resource: template.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 7, resource: score.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 8, resource: wake.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 9, resource: view_buffer.as_entire_binding() },
             ],
         });
-        Ok(Self { group, flags, blocks, args, tuning, blocks_xy, cell_cm, listed: None, wake, wake_rects: Vec::new(), wake_changed: false })
+        Ok(Self { group, flags, blocks, args, tuning, blocks_xy, cell_cm, listed: None, wake, wake_rects: Vec::new(), wake_changed: false, view_buffer, listed_view: [[0.0; 4]; 2], view_changed: false })
     }
 
     pub fn flags(&self) -> &wgpu::Buffer {
@@ -377,14 +432,27 @@ impl Cull {
         self.wake_changed = true;
     }
 
+    /// The wetness flags remain independent of view (foam consumes them).
+    /// Called once per frame before `encode`; uploads only when the wedge
+    /// changes, through the queue (no per-frame staging buffer).
+    pub fn set_frustum(&mut self, queue: &wgpu::Queue, planes: [[f32; 4]; 2]) {
+        let view = if enabled() && frustum_enabled() { planes } else { [[0.0; 4]; 2] };
+        if view != self.listed_view {
+            queue.write_buffer(&self.view_buffer, 0, bytemuck::cast_slice(&view));
+            self.listed_view = view;
+            self.view_changed = true;
+        }
+    }
+
     pub fn encode(&mut self, pipelines: &Pipelines, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, surface_changed: bool) {
         let (cull, adaptive) = (enabled(), adaptive());
         let sensitivity = if adaptive { sensitivity() } else { 0.0 };
         let mode = (cull, adaptive, sensitivity.to_bits());
         let wake_changed = std::mem::take(&mut self.wake_changed) && adaptive;
-        if !surface_changed && !wake_changed && self.listed == Some(mode) {
-            return;
-        }
+        let classify = surface_changed || wake_changed || self.listed != Some(mode);
+        // A new wedge needs only the compaction over the existing flags.
+        let view_changed = std::mem::take(&mut self.view_changed);
+        if !classify && !view_changed { return; }
         // Slider changes only: upload the new tuning ahead of the classifier.
         if adaptive && self.listed.is_none_or(|(_, _, bits)| bits != mode.2) {
             let words = tuning_words(self.cell_cm, sensitivity);
@@ -403,16 +471,20 @@ impl Cull {
         pass.set_bind_group(0, &self.group, &[]);
         if adaptive {
             let b = pipelines.adaptive(device);
-            pass.set_pipeline(if cull { &b.mark } else { &b.mark_all });
-            pass.dispatch_workgroups(self.blocks_xy[0], self.blocks_xy[1], 1);
+            if classify {
+                pass.set_pipeline(if cull { &b.mark } else { &b.mark_all });
+                pass.dispatch_workgroups(self.blocks_xy[0], self.blocks_xy[1], 1);
+            }
             pass.set_pipeline(&b.compact);
         } else {
-            if cull {
-                pass.set_pipeline(&pipelines.mark);
-                pass.dispatch_workgroups(self.blocks_xy[0], self.blocks_xy[1], 1);
-            } else {
-                pass.set_pipeline(&pipelines.mark_all);
-                pass.dispatch_workgroups((self.blocks_xy[0] * self.blocks_xy[1]).div_ceil(64), 1, 1);
+            if classify {
+                if cull {
+                    pass.set_pipeline(&pipelines.mark);
+                    pass.dispatch_workgroups(self.blocks_xy[0], self.blocks_xy[1], 1);
+                } else {
+                    pass.set_pipeline(&pipelines.mark_all);
+                    pass.dispatch_workgroups((self.blocks_xy[0] * self.blocks_xy[1]).div_ceil(64), 1, 1);
+                }
             }
             pass.set_pipeline(&pipelines.compact);
         }
@@ -425,6 +497,21 @@ mod tests {
     use super::*;
     use jka_water::river::grid_mesh::GridMesh;
     use std::collections::HashSet;
+
+    #[test]
+    fn view_wedge_selects_forward_and_keeps_vertical_views() {
+        let mut view = crate::river_surface::ViewUniform::default();
+        view.forward = [1.0, 0.0, 0.0, 0.0];
+        view.right = [0.0, 1.0, 0.0, 0.0];
+        view.up = [0.0, 0.0, 1.0, 0.0];
+        view.distortion = [1.0, 1.0, 0.0, 0.0];
+        let planes = view_wedge(&view, [0.0; 3], [1024.0; 2], [64; 2]);
+        let inside = |x: f32, y: f32| planes.iter().all(|p| p[0]*x+p[1]*y+p[2] >= 0.0);
+        assert!(inside(60.0, 32.0));
+        assert!(!inside(0.0, 32.0));
+        view.forward = [0.0, 0.0, -1.0, 0.0];
+        assert_eq!(view_wedge(&view, [0.0; 3], [1024.0; 2], [64; 2]), [[0.0; 4]; 2]);
+    }
 
     #[test]
     fn block_cull_shader_validates() {

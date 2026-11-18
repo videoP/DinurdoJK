@@ -86,6 +86,7 @@ pub(super) fn check(
             samples,
             wgpu::TextureFormat::Depth32Float,
             wgpu::CompareFunction::GreaterEqual,
+            false,
         );
         for (position, pitch, wet) in [
             ([0.0, 0.0, 160.0], 0.0, false),  // above the surface
@@ -171,6 +172,7 @@ pub(super) fn check(
                     ..Default::default()
                 });
             }
+            water.classify_eyes(&mut encoder, std::slice::from_ref(river));
             water.capture(device, &mut encoder, &color_view, &depth_view);
             // Dry cases isolate the medium: it must leave every pixel intact.
             if wet {

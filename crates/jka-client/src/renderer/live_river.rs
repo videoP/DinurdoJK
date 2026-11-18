@@ -479,6 +479,7 @@ impl super::Renderer {
             self.msaa_samples,
             super::depth_format(),
             super::camera_depth_compare(),
+            self.live_rivers.len() == 1 && crate::river_runtime::fused_material(),
         );
         let size = [
             self.targets._scene_texture.width(),
@@ -502,6 +503,9 @@ impl super::Renderer {
             // Render-only material LOD. Shared by the base, composite, and far draws.
             view.material_lod[0] = f32::from(crate::river_runtime::material_lod());
             view.material_lod[1] = crate::river_runtime::material_lod_cutoff();
+            view.material_lod[2] = if crate::river_runtime::adaptive_ssr() { 1.0 } else { 0.0 };
+            // r_underwaterReflections, shared with the ocean.
+            view.material_lod[3] = if crate::ocean::underwater_reflections() { 1.0 } else { 0.0 };
             let water = self.river_surface.as_mut().expect("checked above");
             water.prepare(&self.device, &self.queue, size, self.msaa_samples, &view);
         }
@@ -524,6 +528,11 @@ impl super::Renderer {
                     |point| grid.and_then(|grid| grid.sample_classic_entity_light(point)),
                     map_toward_sun,
                 );
+            }
+            if let Some(water) = self.river_surface.as_ref() {
+                for river in &mut self.live_rivers {
+                    river.update_block_frustum(&self.queue, water);
+                }
             }
         }
         // Player wake: the Water menu's "Player water deformation" toggle and

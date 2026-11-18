@@ -1146,6 +1146,7 @@ pub const VIDEO_ROW_RENDERER_VERBOSE: usize = 82;
 pub const VIDEO_ROW_PICMIP: usize = 83;
 
 pub const VIDEO_ROW_FX_FPS_SCOPE: usize = 84;
+pub const VIDEO_ROW_FX_FPS_GAME: usize = 122;
 
 pub const VIDEO_ROW_DOF_AUTOFOCUS: usize = 85;
 

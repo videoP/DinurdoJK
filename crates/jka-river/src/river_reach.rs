@@ -21,6 +21,11 @@
 //!    height for stage 6: an actor above it is passed under; one resting on
 //!    it (a footing, a crate, a deck end on its abutment) stays solid.
 //!
+//! 5. Overhangs past the cap. A discharge flood rises above the source
+//!    level, and unreached columns keep every actor solid, which dammed the
+//!    flood at bridges. `open_overhangs` opens the gap under an actor
+//!    wherever a level floor connects it to open air or a reached floor.
+//!
 //! The source level bounds reach only; it never clips geometry, so a bridge
 //! below the source but above the local river is passed under however far
 //! downstream it is. Stacked waterways (two reachable floors in one column)
@@ -29,7 +34,7 @@
 
 use crate::river_capture::wall_slab;
 use jka_assets::bsp::river::{CaptureBrush, CaptureGeometry, MeshFace};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 static MODE: AtomicU8 = AtomicU8::new(1);
@@ -136,6 +141,7 @@ enum Shape {
     Wall { quad: [[f32; 3]; 4], bottom: f32 },
 }
 
+#[derive(Clone, Copy)]
 struct Item {
     lo: [f32; 2],
     hi: [f32; 2],
@@ -505,6 +511,8 @@ pub struct Stats {
     /// Columns with two or more reachable floors (stacked; lowest kept).
     pub stacked: usize,
     pub actor_items: usize,
+    /// Unreached cells opened under an actor (`open_overhangs`).
+    pub opened: usize,
     pub landscape_triangles: usize,
     pub actor_triangles: usize,
     pub millis: f64,
@@ -631,7 +639,8 @@ pub fn classify(geometry: &CaptureGeometry, region: Region, seed: [f32; 3], leve
     // of a stacked wall absent, the wall ended at the lower brush's top and
     // the water poured over it out of the map. As actors, stage 6 still
     // passes water under roofs/decks over reached floors, while a brush
-    // resting on solid (capture clearance) or over unreached columns blocks.
+    // resting on solid (capture clearance) or over unreached columns blocks,
+    // unless `open_overhangs` finds a level floor under it.
     // Skybox shells (any sky face) stay absent: as actors their ceiling would
     // make every unreached open-sky column a solid tower and fill the void.
     let sky_shell = |item: &Item| match item.shape {
@@ -642,14 +651,30 @@ pub fn classify(geometry: &CaptureGeometry, region: Region, seed: [f32; 3], leve
         _ => false,
     };
     let high = items(geometry, region, f32::INFINITY);
-    let entries = context
-        .items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| item.zmin <= cap || !sky_shell(item))
-        .map(|(i, item)| (item, above[i] || item.zmin > cap))
-        .chain(high.iter().filter(|item| item.zmin > cap + PASSAGE && !sky_shell(item)).map(|item| (item, true)));
-    for (item, actor) in entries {
+    // `context.items` is the subsequence of `high` with zmin <= cap + PASSAGE
+    // (items() keeps one order for every cutoff).
+    let mut above_high = vec![false; high.len()];
+    {
+        let mut i = 0;
+        for (j, item) in high.iter().enumerate() {
+            if item.zmin <= cap + PASSAGE {
+                above_high[j] = above[i];
+                i += 1;
+            }
+        }
+        debug_assert_eq!(i, context.items.len());
+    }
+    // Stage 6's scene: every item except skybox shells above the cap.
+    let present: Vec<usize> = (0..high.len()).filter(|&j| high[j].zmin <= cap || !sky_shell(&high[j])).collect();
+    let full = {
+        let items: Vec<Item> = present.iter().map(|&j| high[j]).collect();
+        let index = Index::new(&items, region)?;
+        Context { geometry, items, index, region }
+    };
+    let actor_of = |k: usize| above_high[present[k]] || full.items[k].zmin > cap;
+    let landscape_floor = open_overhangs(&full, &actor_of, &mut references, climb, &mut stats);
+    for (k, item) in full.items.iter().enumerate() {
+        let actor = above_high[present[k]] || (item.zmin > cap && !landscape_floor[k]);
         stats.actor_items += usize::from(actor);
         match item.shape {
             Shape::Brush(b) => {
@@ -686,6 +711,164 @@ pub fn classify(geometry: &CaptureGeometry, region: Region, seed: [f32; 3], leve
     stats.actor_triangles = actors.len();
     stats.millis = started.elapsed().as_secs_f64() * 1000.0;
     Ok(Classified { landscape, actors, references, stats })
+}
+
+/// Reach covers floors up to the source level + LEVEL_MARGIN, but a discharge
+/// flood rises past it. Unreached columns get NO_REFERENCE_CM, so every actor
+/// there is solid, and a bridge over a bed above the cap dammed the flood.
+/// This opens the gap under an actor wherever a level floor (a continuous
+/// floor within `climb`, as in `step`; no drops, no ponding) connects it to
+/// open air or to a reached floor. The opened floor becomes that cell's
+/// reference, and the items forming it stay Landscape (the returned flags,
+/// per `full` item) so stage 6 sees one bed under the actors. A hollow under
+/// terrain is not level with the ground outside, so it stays shut, as do
+/// stacked walls (no gap). Tunnels behave as in reached columns: the lowest
+/// connected floor wins. Work is bounded by the footprints of actors with a
+/// floored gap directly beneath them; open terrain is never visited.
+fn open_overhangs(
+    full: &Context<'_>,
+    actor: &dyn Fn(usize) -> bool,
+    references: &mut References,
+    climb: f32,
+    stats: &mut Stats,
+) -> Vec<bool> {
+    let region = full.region;
+    let geometry = full.geometry;
+    let mut landscape_floor = vec![false; full.items.len()];
+    let mut columns = Columns::new(region);
+    let mut scratch = Vec::new();
+    // The item's underside at a cell centre (meshes: plane extrapolation).
+    let underside = |item: &Item, c: [u32; 2]| -> Option<f32> {
+        let q = region.centre(c);
+        match item.shape {
+            Shape::Mesh { plane, .. } => Some(plane[0] * q[0] + plane[1] * q[1] + plane[2]),
+            _ => sample(item, geometry, q).map(|(lo, _)| lo),
+        }
+    };
+
+    // 1. Actors with a floored gap directly beneath them at a sample point.
+    let mut candidates = Vec::new();
+    for (k, item) in full.items.iter().enumerate() {
+        if !actor(k) {
+            continue;
+        }
+        let points: Vec<[f32; 2]> = match item.shape {
+            Shape::Brush(b) => {
+                let footprint = &geometry.brushes[b as usize].footprint;
+                if footprint.is_empty() {
+                    continue;
+                }
+                let n = footprint.len() as f32;
+                let c = [0, 1].map(|a| footprint.iter().map(|v| v[a]).sum::<f32>() / n);
+                std::iter::once(c).chain(footprint.iter().map(|v| [0.5 * (v[0] + c[0]), 0.5 * (v[1] + c[1])])).collect()
+            }
+            Shape::Mesh { mesh, .. } => {
+                let t = geometry.meshes[mesh as usize].triangle;
+                vec![[0, 1].map(|a| t.iter().map(|v| v[a]).sum::<f32>() / 3.0)]
+            }
+            Shape::Wall { .. } => continue,
+        };
+        let floored = points.iter().any(|&p| {
+            let Some(c) = region.cell_of(p) else { return false };
+            let Some(lo) = underside(item, c) else { return false };
+            let id = columns.column(c, full, &mut scratch);
+            columns.gaps_of(id).iter().filter(|g| g.ceil <= lo + 0.01).last().is_some_and(|g| g.floor.is_finite())
+        });
+        if floored {
+            candidates.push(k);
+        }
+    }
+
+    // 2. Their cells without a reference (unreached and undilated).
+    let mut cells: HashMap<[u32; 2], Option<u32>> = HashMap::new();
+    for &k in &candidates {
+        let item = &full.items[k];
+        let Some((first, last)) = region.cell_range(item.lo, item.hi) else { continue };
+        for y in first[1]..=last[1] {
+            for x in first[0]..=last[0] {
+                let c = [x, y];
+                if underside(item, c).is_some() && references.get(c.map(i64::from)).is_none() {
+                    cells.entry(c).or_insert(None);
+                }
+            }
+        }
+    }
+    if cells.is_empty() {
+        return landscape_floor;
+    }
+
+    // 3. Level-floor flood, seeded from open air or referenced neighbours.
+    let level = |a: Gap, b: &[Gap]| -> Option<usize> {
+        let mut best: Option<(usize, f32)> = None;
+        for (k, g) in b.iter().enumerate() {
+            let rise = (g.floor - a.floor).abs();
+            if g.floor.is_finite()
+                && g.ceil.is_finite()
+                && rise <= climb
+                && a.ceil.min(g.ceil) - a.floor.max(g.floor) >= CLEARANCE
+                && best.is_none_or(|(_, r)| rise < r)
+            {
+                best = Some((k, rise));
+            }
+        }
+        best.map(|(k, _)| k)
+    };
+    let mut keys: Vec<[u32; 2]> = cells.keys().copied().collect();
+    keys.sort_unstable();
+    let mut queue = VecDeque::new();
+    for &c in &keys {
+        for n in region.neighbours(c) {
+            if cells.contains_key(&n) {
+                continue;
+            }
+            let id = columns.column(n, full, &mut scratch);
+            let gaps = columns.gaps_of(id);
+            let source = match references.get(n.map(i64::from)) {
+                Some(r) if r == f32::NEG_INFINITY => None,
+                Some(r) => gaps.iter().find(|g| g.floor <= r && r < g.ceil).copied(),
+                // Open air: the column's top floor, under nothing.
+                None => gaps.last().filter(|g| g.floor.is_finite() && g.ceil == f32::INFINITY).copied(),
+            };
+            let Some(a) = source else { continue };
+            let id = columns.column(c, full, &mut scratch);
+            let (start, _) = columns.spans[id as usize];
+            if let Some(k) = level(a, columns.gaps_of(id)) {
+                cells.insert(c, Some(start + k as u32));
+                queue.push_back(c);
+                break;
+            }
+        }
+    }
+    while let Some(c) = queue.pop_front() {
+        let Some(Some(g)) = cells.get(&c).copied() else { continue };
+        let a = columns.gaps[g as usize];
+        for n in region.neighbours(c) {
+            if !matches!(cells.get(&n), Some(None)) {
+                continue;
+            }
+            let id = columns.column(n, full, &mut scratch);
+            let (start, _) = columns.spans[id as usize];
+            if let Some(k) = level(a, columns.gaps_of(id)) {
+                cells.insert(n, Some(start + k as u32));
+                queue.push_back(n);
+            }
+        }
+    }
+
+    // 4. Opened floors: the reference, and their floor items stay Landscape.
+    for (&c, &open) in &cells {
+        let Some(g) = open else { continue };
+        let floor = columns.gaps[g as usize].floor;
+        references.set(c, floor + REFERENCE_LIFT);
+        stats.opened += 1;
+        full.collect(c, &mut scratch);
+        for &(_, hi, i) in &scratch {
+            if hi <= floor + ABOVE {
+                landscape_floor[i as usize] = true;
+            }
+        }
+    }
+    landscape_floor
 }
 
 /// Which items start above the lowest reached floor of a column they cross,
