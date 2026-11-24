@@ -86,6 +86,12 @@ pub struct SurfaceDeformationStamp {
     pub travel: f32,
     /// Horizontal speed at the contact, in JKA world units / second.
     pub speed: f32,
+    /// Actual render-space player velocity at the traced contact.
+    pub velocity: [f32; 3],
+    pub previous_velocity: [f32; 3],
+    /// Previous traced point for a continuous movement source; discrete foot
+    /// plants deliberately do not draw a segment between separate steps.
+    pub previous_position: [f32; 3],
 }
 
 pub struct LocalFootContactShim {
@@ -94,6 +100,8 @@ pub struct LocalFootContactShim {
     next_foot: FootSide,
     pending: Vec<SurfaceDeformationStamp>,
     was_grounded: bool,
+    previous_velocity: [f32; 3],
+    previous_walk: Option<[f32; 3]>,
 }
 
 impl LocalFootContactShim {
@@ -108,6 +116,8 @@ impl LocalFootContactShim {
             next_foot: FootSide::Left,
             pending: Vec::new(),
             was_grounded: false,
+            previous_velocity: [0.0; 3],
+            previous_walk: None,
         }
     }
 
@@ -117,6 +127,8 @@ impl LocalFootContactShim {
         self.next_foot = FootSide::Left;
         self.pending.clear();
         self.was_grounded = false;
+        self.previous_velocity = [0.0; 3];
+        self.previous_walk = None;
     }
 
     pub fn observe_pmove<W: TraceWorld>(&mut self, view: PlayerView, world: &mut W) {
@@ -128,32 +140,41 @@ impl LocalFootContactShim {
         let dy = view.origin[1] - self.last_origin[1];
         let horizontal_delta = (dx * dx + dy * dy).sqrt();
         self.last_origin = view.origin;
-
+        let velocity = render_position(view.velocity);
+        let previous_velocity = std::mem::replace(&mut self.previous_velocity, velocity);
         if !view.grounded() {
             self.was_grounded = false;
             self.distance_since_step = 0.0;
+            self.previous_walk = None;
             return;
         }
         if !self.was_grounded {
             self.was_grounded = true;
             self.distance_since_step = 0.0;
+            self.previous_walk = None;
             return;
         }
         if !horizontal_delta.is_finite() || horizontal_delta > TELEPORT_DISTANCE {
             self.distance_since_step = 0.0;
+            self.previous_walk = None;
             return;
         }
 
         let horizontal_speed =
             (view.velocity[0] * view.velocity[0] + view.velocity[1] * view.velocity[1]).sqrt();
         if horizontal_speed < MIN_MOVING_SPEED || horizontal_delta <= 0.001 {
+            self.previous_walk = None;
             return;
         }
 
         // Snowflow _walk(): shallow distance-scaled continuous scuff. This is
         // intentionally separate from touchdown prints so boots remain legible.
-        if let Some(stamp) = trace_walk(view, world, horizontal_delta, horizontal_speed) {
+        if let Some(mut stamp) = trace_walk(view, world, horizontal_delta, horizontal_speed) {
+            stamp.previous_velocity = previous_velocity;
+            stamp.previous_position = self.previous_walk.replace(stamp.position).unwrap_or(stamp.position);
             self.pending.push(stamp);
+        } else {
+            self.previous_walk = None;
         }
 
         self.distance_since_step += horizontal_delta;
@@ -161,7 +182,8 @@ impl LocalFootContactShim {
             self.distance_since_step -= STRIDE_DISTANCE;
             let foot = self.next_foot;
             self.next_foot = self.next_foot.opposite();
-            if let Some(stamp) = trace_foot(view, world, foot, horizontal_speed) {
+            if let Some(mut stamp) = trace_foot(view, world, foot, horizontal_speed) {
+                stamp.previous_velocity = previous_velocity;
                 self.pending.push(stamp);
             }
         }
@@ -227,6 +249,9 @@ fn trace_foot<W: TraceWorld>(
         kind: SurfaceDeformationKind::Foot,
         travel: 0.0,
         speed,
+        velocity: render_position(view.velocity),
+        previous_velocity: [0.0; 3],
+        previous_position: position,
     })
 }
 
@@ -246,6 +271,9 @@ fn trace_walk<W: TraceWorld>(
         kind: SurfaceDeformationKind::Walk,
         travel,
         speed,
+        velocity: render_position(view.velocity),
+        previous_velocity: [0.0; 3],
+        previous_position: position,
     })
 }
 
@@ -414,6 +442,47 @@ pub struct SurfaceDeformationGpu {
     focus: Vec2,
     relax_owed: f32,
     last_update: Instant,
+    ninja: Option<Box<NinjaSnowGpu>>,
+    ninja_attempted: Option<jka_ninja::SnowProfile>,
+    // Renderer-only JKA-local rim presentation. Independent of the Snowflow
+    // deformation field and of the private Ninja solver's persistent buffers.
+    ninja_berm_stamps: Vec<SurfaceDeformationStamp>,
+    ninja_berm_version: u64,
+}
+
+struct NinjaSnowGpu {
+    profile: jka_ninja::SnowProfile,
+    field: jka_ninja::SnowField,
+    tiles: [wgpu::TextureView; 3],
+    contacts: Vec<jka_ninja::SnowContact>,
+    origin: Vec2,
+    valid: bool,
+    failed: bool,
+    last_game_ms: Option<i32>,
+}
+
+impl NinjaSnowGpu {
+    fn new(
+        device: &wgpu::Device,
+        profile: jka_ninja::SnowProfile,
+        images: [wgpu::TextureView; 6],
+    ) -> Result<Self, String> {
+        let [tile1, tile2, roughness, amplitude, foam, velocity] = images;
+        Ok(Self {
+            profile,
+            field: jka_ninja::SnowField::new(device, profile, [&roughness, &amplitude, &foam, &velocity])?,
+            tiles: [tile1, tile2, roughness],
+            contacts: Vec::with_capacity(jka_ninja::SNOW_MAX_CONTACTS),
+            origin: Vec2::ZERO,
+            valid: false,
+            failed: false,
+            last_game_ms: None,
+        })
+    }
+
+    fn extent(&self) -> f32 {
+        self.profile.extent_metres() * UNITS_PER_METRE
+    }
 }
 
 fn create_fields(device: &wgpu::Device, resolution: u32) -> ([wgpu::Texture; 2], [wgpu::TextureView; 2]) {
@@ -528,6 +597,8 @@ impl SurfaceDeformationGpu {
             sim_params_buffer, sim_layout, sim_bind_groups, sim_pipeline, pending_brushes: Vec::with_capacity(SNOWFLOW_MAX_BRUSHES),
             active_field: 0, field_valid: false, center: Vec2::ZERO, prev_center: Vec2::splat(1.0e6),
             focus: Vec2::ZERO, relax_owed: 0.0, last_update: Instant::now(),
+            ninja: None, ninja_attempted: None,
+            ninja_berm_stamps: Vec::new(), ninja_berm_version: 0,
         }
     }
 
@@ -552,8 +623,37 @@ impl SurfaceDeformationGpu {
     }
 
     pub fn set_mode(&mut self, queue: &wgpu::Queue, mode: FootprintMode) {
+        if mode != self.mode {
+            self.ninja_berm_stamps.clear();
+            self.ninja_berm_version = self.ninja_berm_version.wrapping_add(1);
+        }
         self.mode = mode;
         self.upload_world_uniform(queue);
+    }
+
+    pub fn set_ninja_enabled(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        profile: Option<jka_ninja::SnowProfile>,
+        load_images: impl FnOnce(jka_ninja::SnowProfile) -> Result<[wgpu::TextureView; 6], String>,
+    ) -> bool {
+        if self.ninja_attempted == profile {
+            return false;
+        }
+        self.ninja_attempted = profile;
+        let had_ninja = self.ninja.take().is_some();
+        if let Some(profile) = profile {
+            match load_images(profile).and_then(|images| NinjaSnowGpu::new(device, profile, images)) {
+                Ok(ninja) => self.ninja = Some(Box::new(ninja)),
+                Err(error) => eprintln!("[NINJA SNOW] {error}"),
+            }
+        }
+        let changed = had_ninja || self.ninja.is_some();
+        if changed {
+            self.upload_world_uniform(queue);
+        }
+        changed
     }
 
     pub fn set_legacy_mark_info(&mut self, queue: &wgpu::Queue, mask: u32, blends: [u8; 2]) {
@@ -563,12 +663,29 @@ impl SurfaceDeformationGpu {
     }
 
     pub fn buffer(&self) -> &wgpu::Buffer { &self.buffer }
-    pub fn field_views(&self) -> [&wgpu::TextureView; 2] { [&self.field_views[0], &self.field_views[1]] }
+    pub fn field_views(&self) -> [&wgpu::TextureView; 2] {
+        if let Some(ninja) = &self.ninja {
+            return [ninja.field.view(), &ninja.tiles[0]];
+        }
+        [&self.field_views[0], &self.field_views[1]]
+    }
+    pub fn mark_views<'a>(&'a self, marks: [&'a wgpu::TextureView; 2]) -> [&'a wgpu::TextureView; 2] {
+        self.ninja.as_ref().map_or(marks, |ninja| [&ninja.tiles[1], &ninja.tiles[2]])
+    }
     pub fn field_sampler(&self) -> &wgpu::Sampler { &self.field_sampler }
-    pub fn field_center(&self) -> Vec2 { self.center }
+    pub fn ninja_berm_stamps(&self) -> &[SurfaceDeformationStamp] { &self.ninja_berm_stamps }
+    pub fn ninja_berm_stamp_version(&self) -> u64 { self.ninja_berm_version }
+    pub fn field_center(&self) -> Vec2 {
+        if self.mode.ninja_profile().is_some() { self.focus } else { self.center }
+    }
+    pub fn shell_enabled(&self) -> bool {
+        self.mode == FootprintMode::ThreeD || self.ninja.as_ref().is_some_and(|ninja| ninja.profile == jka_ninja::SnowProfile::Minimal && ninja.valid)
+    }
 
     pub fn clear(&mut self, queue: &wgpu::Queue) {
         self.legacy_stamps.clear();
+        self.ninja_berm_stamps.clear();
+        self.ninja_berm_version = self.ninja_berm_version.wrapping_add(1);
         self.pending_brushes.clear();
         self.active_field = 0;
         self.field_valid = false;
@@ -577,12 +694,52 @@ impl SurfaceDeformationGpu {
         self.focus = Vec2::ZERO;
         self.relax_owed = 0.0;
         self.last_update = Instant::now();
+        self.ninja = None;
+        self.ninja_attempted = None;
         self.upload_world_uniform(queue);
     }
 
     pub fn push(&mut self, queue: &wgpu::Queue, stamp: SurfaceDeformationStamp) {
+        // World-to-Ninja convention shared with ninja_snow_surface.wgsl.
+        let ue_cm = |v: [f32; 3]| [v[0] * 2.54, -v[2] * 2.54, v[1] * 2.54];
         if stamp.material as u32 != MATERIAL_SNOW { return; }
         self.focus = Vec2::new(stamp.position[0], stamp.position[2]);
+        if self.mode.ninja_profile().is_some() {
+            if self.mode.ninja_profile() == Some(jka_ninja::SnowProfile::Composite)
+                && stamp.kind == SurfaceDeformationKind::Foot
+                && stamp.position.iter().all(|x| x.is_finite())
+            {
+                if self.ninja_berm_stamps.len() >= 48 { self.ninja_berm_stamps.remove(0); }
+                self.ninja_berm_stamps.push(stamp);
+                self.ninja_berm_version = self.ninja_berm_version.wrapping_add(1);
+            }
+            if let Some(ninja) = &mut self.ninja {
+                if !ninja.failed && self.focus.is_finite() {
+                    if ninja.profile == jka_ninja::SnowProfile::Minimal {
+                        if stamp.kind != SurfaceDeformationKind::Foot { return; }
+                        let reanchor = (!ninja.valid && ninja.contacts.is_empty())
+                            || (self.focus - ninja.origin).abs().max_element() > ninja.extent() * 0.25;
+                        if reanchor {
+                            ninja.origin = self.focus;
+                            ninja.contacts.clear();
+                            ninja.valid = false;
+                        }
+                    }
+                    // World-space queue: moving a simulation window must not
+                    // invalidate pending points. Walk is the continuous traced
+                    // body path; Foot is a separate discrete plant, not a decal.
+                    if ninja.contacts.len() < jka_ninja::SNOW_MAX_CONTACTS {
+                        ninja.contacts.push(jka_ninja::SnowContact {
+                            position_cm: ue_cm(stamp.position),
+                            previous_cm: ue_cm(stamp.previous_position),
+                            velocity_cm_s: ue_cm(stamp.velocity),
+                            previous_velocity_cm_s: ue_cm(stamp.previous_velocity),
+                        });
+                    }
+                }
+            }
+            return;
+        }
         // 2D mode's prints are projected decals from the footstep system
         // (`WeaponFx::footstep`); the shader stamp only accompanies the 3D dent.
         if stamp.kind == SurfaceDeformationKind::Foot && self.mode == FootprintMode::ThreeD {
@@ -605,7 +762,52 @@ impl SurfaceDeformationGpu {
     /// Advances Snowflow's persistent field only when it can change: new brush
     /// input, a texel-snapped window move, or a banked 0.4 s relaxation step.
     /// This preserves Snowflow's math while avoiding a 2048² pass at 2000 render FPS.
-    pub fn prepare_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    pub fn prepare_frame(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, game_ms: Option<i32>, player_position: Option<glam::Vec3>, camera_position: glam::Vec3) {
+        if self.mode.ninja_profile().is_some() {
+            let Some(ninja) = &mut self.ninja else { return; };
+            if ninja.failed { return; }
+            let delta = game_ms.zip(ninja.last_game_ms)
+                .map_or(0.0, |(now, previous)| f64::from(now.saturating_sub(previous).max(0)) * 0.001);
+            let rewind = game_ms.zip(ninja.last_game_ms).is_some_and(|(now, previous)| now < previous);
+            ninja.last_game_ms = game_ms;
+            if rewind {
+                ninja.contacts.clear();
+                ninja.valid = false;
+                self.upload_world_uniform(queue);
+                return;
+            }
+            let composite = ninja.profile == jka_ninja::SnowProfile::Composite;
+            if !composite && ninja.contacts.is_empty() { return; }
+            let next_origin = if composite {
+                let follow = player_position.unwrap_or(camera_position);
+                let target = Vec2::new(follow.x, follow.z);
+                if !target.is_finite() { return; }
+                // One painter cell = two fluid cells in the captured profile.
+                // The source supports quantized offsets; use a shared cell
+                // quantum so both grids preserve overlapping texel centres.
+                let quantum = ninja.extent() / 1024.0;
+                (target / quantum).round() * quantum
+            } else { ninja.origin };
+            let reset = !ninja.valid || (next_origin - ninja.origin).abs().max_element() >= ninja.extent();
+            let origin_cm = |p: Vec2| [p.x * 2.54, -p.y * 2.54];
+            let time = game_ms.unwrap_or_default() as f32 * 0.001;
+            match ninja.field.step(device, queue, &ninja.contacts, origin_cm(next_origin), origin_cm(ninja.origin), time, delta, reset) {
+                Ok(true) => {
+                    ninja.contacts.clear();
+                    ninja.origin = next_origin;
+                    ninja.valid = true;
+                }
+                Ok(false) => return,
+                Err(error) => {
+                    eprintln!("[NINJA SNOW] {error}");
+                    ninja.contacts.clear();
+                    ninja.failed = true;
+                    ninja.valid = false;
+                }
+            }
+            self.upload_world_uniform(queue);
+            return;
+        }
         let now = Instant::now();
         self.relax_owed += now.duration_since(self.last_update).as_secs_f32().min(0.25);
         self.last_update = now;
@@ -677,7 +879,7 @@ impl SurfaceDeformationGpu {
         let mut stamps = [LegacyGpuStamp::zeroed(); MAX_VISUAL_STAMPS];
         stamps[..self.legacy_stamps.len()].copy_from_slice(&self.legacy_stamps);
         let legacy_bounds = self.legacy_bounds();
-        let uniform = SurfaceDeformationUniform {
+        let mut uniform = SurfaceDeformationUniform {
             header: [self.legacy_stamps.len() as u32, self.mode.shader_value(), self.legacy_mark_mask, self.legacy_mark_blends],
             snowflow_header: [self.active_field as u32, u32::from(self.field_valid), 0, 0],
             snowflow_params: [self.center.x, self.center.y, SNOWFLOW_FIELD_SIZE, SNOWFLOW_FIELD_SIZE / SNOWFLOW_FIELD_RES as f32],
@@ -685,6 +887,18 @@ impl SurfaceDeformationGpu {
             legacy_bounds,
             stamps,
         };
+        if self.mode.ninja_profile().is_some() {
+            uniform.header[0] = 0;
+            uniform.snowflow_header[1] = 0;
+            if let Some(ninja) = &self.ninja {
+                uniform.snowflow_header[1] = u32::from(ninja.valid);
+                // Header.z is Ninja asset availability, separate from an
+                // exported field. No Snowflow deformation state is consumed.
+                uniform.snowflow_header[2] = u32::from(!ninja.failed && ninja.profile == jka_ninja::SnowProfile::Composite);
+                uniform.snowflow_params = [ninja.origin.x, ninja.origin.y, ninja.extent(), 0.0];
+                uniform.legacy_bounds = [self.focus.x, self.focus.y, 0.0, 0.0];
+            }
+        }
         queue.write_buffer(&self.buffer, 0, bytemuck::bytes_of(&uniform));
     }
 }

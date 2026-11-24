@@ -96,6 +96,23 @@ fn source_and_sink(@builtin(global_invocation_id) id: vec3<u32>) {
     if !invocation_active(id, at) { return; }
     var water = read_water(at);
     let geo = read_geometry(at);
+    if (boundary.flags.z & 2u) != 0u {
+        // Promoted river only: finite, one-directional exchanges at reconstructed
+        // terminal cells; interior flow remains the native conservative solver.
+        let info = water_info_at(index(at));
+        if geo.y >= 1.0 - 1e-5 {
+            water = vec4<f32>(geo.x, 0.0, 0.0, 0.0);
+        } else if info.z != 0.0 {
+            let depth = max(water.y, 0.0);
+            let target_depth = clamp(info.x - geo.x, 0.0, params.limits.z);
+            let limit = abs(info.z) * boundary.times.x;
+            let delta = select(-min(max(depth - target_depth, 0.0), limit), min(max(target_depth - depth, 0.0), limit), info.z > 0.0);
+            water.y = max(depth + delta, 0.0);
+            water.x = geo.x + water.y;
+        }
+        write_water(at, water);
+        return;
+    }
     let position = boundary.origin.xyz + vec3<f32>((vec2<f32>(at) + 0.5) * params.stepping.x, 0.0);
     for (var sink = 0u; sink < 2u; sink++) {
         for (var i = 0u; i < boundary.flags.x; i++) {
@@ -173,6 +190,10 @@ fn extrapolate_velocity(@builtin(global_invocation_id) id: vec3<u32>) {
     let at = invocation_cell(id);
     if !invocation_active(id, at) { return; }
     var w = read_water(at);
+    if (boundary.flags.z & 2u) != 0u && read_geometry(at).y >= 1.0 - 1e-5 {
+        write_water(at, w);
+        return;
+    }
     if (w.y < 1e-5 && (params.dimensions.w & 1u) != 0u) || read_geometry(at).y > 1.0 - 1e-5 {
         var distance = 65500.0;
         let radius = i32(params.dimensions.z);
@@ -226,6 +247,10 @@ fn extrapolate_height(@builtin(global_invocation_id) id: vec3<u32>) {
     if !invocation_active(id, at) { return; }
     var w = read_water(at);
     let geo = read_geometry(at);
+    if (boundary.flags.z & 2u) != 0u && geo.y >= 1.0 - 1e-5 {
+        write_water(at, vec4<f32>(geo.x, 0.0, 0.0, 0.0));
+        return;
+    }
     if geo.y > 1.0 - 1e-5 {
         var distance = 65500.0;
         let radius = i32(params.dimensions.z);
@@ -301,6 +326,10 @@ fn update_depth(@builtin(global_invocation_id) id: vec3<u32>) {
     if !invocation_active(id, at) { return; }
     let input = read_water(at);
     let geo = read_geometry(at);
+    if (boundary.flags.z & 2u) != 0u && geo.y >= 1.0 - 1e-5 {
+        write_water(at, vec4<f32>(geo.x, 0.0, 0.0, 0.0));
+        return;
+    }
     let d = input.y;
     let left = read_water(at + vec2<i32>(-1, 0)).y;
     let right = read_water(at + vec2<i32>(1, 0)).y;
@@ -335,7 +364,8 @@ fn update_depth(@builtin(global_invocation_id) id: vec3<u32>) {
     wet += f32(select(0i, 1i, down > 1e-8));
     wet += f32(select(0i, 1i, up > 1e-8));
     // Preserve the source expression; all-dry behavior needs backend validation.
-    let average = (left + right + down + up) / wet;
+    let divisor = select(wet, max(wet, 1.0), (boundary.flags.z & 2u) != 0u);
+    let average = (left + right + down + up) / divisor;
     let adjustment = max(0.0, average - params.limits.w * params.stepping.x
         / (params.stepping.z * params.stepping.y));
     il -= adjustment;
@@ -413,7 +443,7 @@ fn prepare_surface(@builtin(global_invocation_id) id: vec3<u32>) {
     else if extrap { height = input.x; }
     if weight_depth > 1e-8 { depth /= weight_depth; }
     else if extrap { depth = input.y; }
-    if is_border { depth = 0.0; }
+    if is_border || ((boundary.flags.z & 2u) != 0u && read_geometry(at).y >= 1.0 - 1e-5) { depth = 0.0; }
     // Bed clamp (extension, off = native): smoothing may not sink a wet cell's
     // surface below the bed it covers.
     if presentation.extension.x > 0.5 && !extrap {

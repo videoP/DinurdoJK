@@ -129,6 +129,10 @@ const PHYS_JIGGLE_STOMACH_DAMPING: u8 = 60;
 const PHYS_HAIR: u8 = 61;
 const PHYS_RAGDOLL_JOINT_MODEL: u8 = 62;
 const PHYS_BREAKABLES: u8 = 63;
+const PHYS_CLOTH_STIFFNESS: u8 = 64;
+const PHYS_CLOTH_DAMPING: u8 = 65;
+const PHYS_CLOTH_STIFFENING: u8 = 66;
+const PHYS_CLOTH_GPU: u8 = 67;
 
 const OCEAN_MAP_SIZE: u8 = 0;
 const OCEAN_MESH_QUALITY: u8 = 1;
@@ -321,6 +325,31 @@ fn color_row(
             12.5,
             theme::TEXT_FAINT(),
         );
+    });
+}
+
+/// River color rows use the same double-clickable label as slider rows,
+/// without changing the behavior of color editors elsewhere in settings.
+fn color_row_default(
+    ui: &mut egui::Ui,
+    label: &str,
+    tip: &str,
+    values: &mut [f32; 3],
+    default: [f32; 3],
+    changed: &mut bool,
+) {
+    theme::row(ui, label, &format!("{tip} Double-click the label to restore its default."), theme::Reset::None, |ui| {
+        if theme::row_label_double_clicked(ui) && *values != default {
+            *values = default;
+            *changed = true;
+        }
+        let mut rgb = *values;
+        if ui.color_edit_button_rgb(&mut rgb).changed() {
+            *values = rgb;
+            *changed = true;
+        }
+        ui.add_space(10.0);
+        theme::glow_label(ui, &format!("{:.2}  {:.2}  {:.2}", values[0], values[1], values[2]), 12.5, theme::TEXT_FAINT());
     });
 }
 

@@ -7,10 +7,12 @@ use crate::app::egui_settings::{
 
 impl App {
     pub(in crate::app::egui_settings) fn egui_surface(&mut self, ui: &mut egui::Ui) {
-        const FOOTPRINTS: [(FootprintMode, &str); 3] = [
+        const FOOTPRINTS: [(FootprintMode, &str); 5] = [
             (FootprintMode::Off, "Off"),
             (FootprintMode::TwoD, "2D stamp"),
             (FootprintMode::ThreeD, "3D + 2D stamp"),
+            (FootprintMode::Ninja, "Ninja"),
+            (FootprintMode::NinjaComposite, "Ninja composite"),
         ];
         if let Some(target) = quality_table_row(
             ui,
@@ -66,65 +68,10 @@ impl App {
     }
 
     pub(in crate::app::egui_settings) fn egui_water(&mut self, ui: &mut egui::Ui) {
-        // This is a global player-wake selection, not an ocean backend option.
-        // Keep it visible for stock JKA water, all promoted water renderers,
-        // and Lakes / ponds (which has its own early return below).
-        theme::section(ui, "PLAYER WATER WAKE", "Independent of the water renderer. Console: cg_waterwake.");
-        theme::row(ui, "Water wake",
-            "Off disables player wakes; Regular uses the original JKA wake on unpromoted water; Enhanced adds the animated JKA wake and enables supported promoted-water player interaction (where configured). This does not change ship wakes or ambient wave foam.",
-            theme::Reset::None, |ui| {
-                for (mode, label) in [(0u8, "Off"), (1, "Regular"), (2, "Enhanced")] {
-                    if theme::chip(ui, label, self.video.water_wake == mode).clicked()
-                        && self.video.water_wake != mode
-                    {
-                        let _ = self.set_console_cvar("cg_waterwake", &mode.to_string());
-                    }
-                    ui.add_space(3.0);
-                }
-            });
-
-        let mut interaction = self.video.ocean_settings.interaction;
-        let mut strength = self.video.ocean_settings.interaction_strength;
-        let mut splash_mode = self.video.ocean_settings.interaction_splash_mode;
-        let toggled = ui.checkbox(&mut interaction, "Player water deformation").on_hover_text(
-            "Global player displacement for Godot, Blue Water, Hybrid, Gerstner and supported lake surfaces. Requires Enhanced wake.").changed();
-        let adjusted = ui.horizontal(|ui| {
-            ui.label("Deformation strength (all water renderers)");
-            ui.add(egui::DragValue::new(&mut strength).speed(0.5).range(0.0..=f32::MAX)).changed()
-        }).inner;
-        let mut splash_changed = false;
-        ui.horizontal(|ui| {
-            ui.label("Interaction FX A/B");
-            egui::ComboBox::from_id_salt("ocean_interaction_splash_mode")
-                .selected_text(match splash_mode {
-                    0 => "Off",
-                    1 => "A: Entry droplets",
-                    2 => "B: Wake spray",
-                    3 => "A + B",
-                    4 => "Entry jets",
-                    _ => "All FX",
-                })
-                .show_ui(ui, |ui| {
-                    splash_changed |= ui.selectable_value(&mut splash_mode, 0, "Off").changed();
-                    splash_changed |= ui.selectable_value(&mut splash_mode, 1, "A: Entry droplets").changed();
-                    splash_changed |= ui.selectable_value(&mut splash_mode, 2, "B: Wake spray").changed();
-                    splash_changed |= ui.selectable_value(&mut splash_mode, 3, "A + B").changed();
-                    splash_changed |= ui.selectable_value(&mut splash_mode, 4, "Entry jets").changed();
-                    splash_changed |= ui.selectable_value(&mut splash_mode, 5, "All FX").changed();
-                });
-        }).response.on_hover_text(
-            "Compare entry droplets with spray emitted along the moving wake. Count and size follow speed and deformation strength; Entry jets and All FX add upward jets.");
-        if toggled || adjusted || splash_changed {
-            self.video.ocean_settings.interaction = interaction;
-            self.video.ocean_settings.interaction_strength = strength;
-            self.video.ocean_settings.interaction_splash_mode = splash_mode;
-            self.commit_ocean_settings();
-        }
-
         let current = self.ocean_type();
         theme::section(ui, "WATER PROMOTION", "Choose how map water is promoted. Off keeps stock JKA water.");
-        theme::row(ui, "Water renderer", "Lakes / ponds uses subtle noise relief, wind ripples and editable water colors, without ocean FFT or an infinite horizon. Gerstner is Hybrid with godot-water-shader's waves, colour and persistent foam, lit by Blue Water. Switch live to compare. Sky and clouds are independent.", theme::Reset::None, |ui| {
-            for (mode, label) in [(0, "Off / JKA"), (1, "Godot"), (2, "Blue Water"), (3, "Hybrid"), (5, "Gerstner"), (4, "Lakes / ponds")] {
+        theme::row(ui, "Water renderer", "Lakes / ponds uses Half-Life 2 (Source) water over subtle noise relief, without ocean FFT or an infinite horizon. Switch live to compare. Sky and clouds are independent.", theme::Reset::None, |ui| {
+            for (mode, label) in [(0, "Off / JKA"), (1, "Godot"), (2, "Blue Water"), (3, "Hybrid"), (4, "Lakes / ponds")] {
                 if theme::chip(ui, label, mode == current).clicked() && mode != current {
                     self.set_ocean_type(mode);
                 }

@@ -91,7 +91,7 @@ pub fn wave_heuristic(variation: f32, deformation: Option<f32>) -> WaveHeuristic
     }
 }
 
-fn base_uv_scroll_velocity(mods: &[TcMod]) -> Option<[f32; 2]> {
+pub(crate) fn base_uv_scroll_velocity(mods: &[TcMod]) -> Option<[f32; 2]> {
     // final_uv = linear * base_uv + velocity * time + constant
     let mut linear = [[1.0f32, 0.0], [0.0, 1.0]];
     let mut velocity = [0.0f32; 2];

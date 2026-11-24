@@ -91,6 +91,11 @@ pub const LOD_SCALE_DEFAULT: f32 = 5.0;
 pub const LOD_SCALE_MIN: f32 = 0.1;
 pub const LOD_SCALE_MAX: f32 = 100.0;
 
+/// `r_fxSmokeDurationScale`: density persistence of promoted EFX smoke.
+pub const SMOKE_DURATION_SCALE_DEFAULT: f32 = 1.0;
+pub const SMOKE_DURATION_SCALE_MIN: f32 = 0.25;
+pub const SMOKE_DURATION_SCALE_MAX: f32 = 8.0;
+
 pub fn lod_label(mode: u32) -> &'static str {
     match mode {
         FX_LOD_OFF => "OFF (STOCK)",
@@ -150,6 +155,7 @@ pub mod draw;
 pub mod gpu_sparks;
 pub mod gp2;
 pub mod light_promotion;
+pub(crate) mod fire_geometry;
 pub mod diagnostics;
 pub mod system;
 pub mod template;

@@ -27,13 +27,14 @@ struct RiverBody {
 struct RiverView {
     eye: vec4<f32>,             // xyz eye, w projection far plane (map units)
     forward: vec4<f32>,         // view forward, w projection near plane (map units)
-    right: vec4<f32>,           // screen right
-    up: vec4<f32>,              // screen up
+    right: vec4<f32>,           // xyz screen right, w Fluid Ninja material time
+    up: vec4<f32>,              // screen up; Ninja underwater resources in w
     distortion: vec4<f32>,      // SingleLayerWater.DistortionParams
     sun_direction: vec4<f32>,   // DirectionalLightDirection (toward the light)
     sun_illuminance: vec4<f32>, // rgb DirectionalLightColor * pi; w 1 = Blue Water ambient
-    time: vec4<f32>,            // material Time, foam detail present, Engine.DeltaTime, bed clamp (not Unreal)
+    time: vec4<f32>,            // material Time, unused, Engine.DeltaTime, bed clamp (not Unreal)
     material_lod: vec4<f32>,    // x: render-only per-fragment A/B (0 native, 1 waves, 2 waves+foam); y: mip cutoff
+    ninja_debug: vec4<u32>,     // x: r_riverNinjaMaterialDebug
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -46,6 +47,29 @@ struct RiverView {
 @group(1) @binding(6) var ambient_sampler: sampler;
 @group(1) @binding(7) var foam_rt: texture_2d<f32>;
 @group(1) @binding(8) var foam_rt_sampler: sampler;
+// Fluid Ninja presentation (always on when built in). The material WGSL comes from
+// jka_ninja::river_material_wgsl() (private implementation or inert stub).
+// While off: inert 1x1 views and body.origin.w == 0, so nothing is sampled.
+@group(1) @binding(16) var ninja_vd: texture_2d<f32>;
+@group(1) @binding(17) var ninja_pd: texture_2d<f32>;
+@group(1) @binding(18) var ninja_distance: texture_2d<f32>;
+@group(1) @binding(19) var ninja_flow_map: texture_2d<f32>;
+@group(1) @binding(20) var ninja_roughness_map: texture_2d<f32>;
+@group(1) @binding(21) var ninja_clamp: sampler;
+@group(1) @binding(22) var ninja_wrap: sampler;
+@group(1) @binding(23) var ninja_caustics: texture_3d<f32>;
+struct RiverNinjaSurface { enabled: f32, normal: vec3<f32>, base_color: vec3<f32>, roughness: f32, opacity: f32, specular: f32, refraction_ior: f32 }
+// Set by the camera-window fragments before the shared base/composite passes;
+// zero (inactive) everywhere else, e.g. the far water-mesh tiles.
+var<private> river_ninja: RiverNinjaSurface;
+// FNL graph normal is tangent space on the water mesh: reorient it onto the
+// river's own surface normal (x along world +X, as the simulation UVs are).
+fn river_ninja_world_normal(base: vec3<f32>, t: vec3<f32>) -> vec3<f32> {
+    let n = normalize(base);
+    let tangent = normalize(vec3<f32>(1.0, 0.0, 0.0) - n * n.x);
+    let bitangent = cross(n, tangent);
+    return normalize((t.x * tangent + t.y * bitangent) * authored.ninja_albedo.w + t.z * n);
+}
 @group(2) @binding(0) var shadow_texture: texture_depth_2d_array;
 @group(2) @binding(1) var shadow_sampler: sampler_comparison;
 @group(2) @binding(2) var<uniform> shadow_settings: ShadowSettings;
@@ -58,15 +82,38 @@ struct RiverView {
 @group(3) @binding(5) var gf_sampler: sampler;
 @group(3) @binding(6) var ocean_detail: texture_2d<f32>;
 @group(3) @binding(7) var ocean_sampler: sampler;
-@group(3) @binding(8) var foam_detail: texture_2d<f32>;
-@group(3) @binding(9) var foam_detail_sampler: sampler;
 @group(4) @binding(0) var env_map: texture_2d<f32>;
 @group(4) @binding(1) var env_sampler: sampler;
 @group(4) @binding(2) var<uniform> env: SkyEnvironment;
 
-struct RiverAuthored {water:RiverSlwParameters,foam:RiverFoamSettings,detail:vec4<f32>,underwater:vec4<f32>,underwater_depth:vec4<f32>}
+struct RiverAuthored {
+    water: RiverSlwParameters,
+    foam: RiverFoamSettings,
+    detail: vec4<f32>,
+    underwater: vec4<f32>,
+    underwater_depth: vec4<f32>,
+    ninja_optics: vec4<f32>, // distance density, distortion, brightness, caustics gain
+    ninja_distance_color: vec4<f32>,
+    ninja_caustics_color: vec4<f32>,
+    ninja_scattering: vec4<f32>, // scattering RGB scale, phase delta
+    ninja_absorption: vec4<f32>, // absorption RGB scale
+    ninja_albedo: vec4<f32>, // surface RGB scale, normal strength
+    ninja_foam_color: vec4<f32>, // foam RGB scale, gain
+    ninja_water_highlights: vec4<f32>, // roughness deltas and specular scales, face-on then grazing
+    ninja_foam_highlights: vec4<f32>, // roughness delta, specular scale, opacity
+}
 @group(1) @binding(9) var<uniform> authored: RiverAuthored;
 @group(3) @binding(11) var reflection_hzb: texture_2d<f32>;
+
+fn river_ninja_attributes(n_dot_v: f32, fresnel_exponent: f32) -> RiverFoamAttributes {
+    let fresnel = river_slw_fresnel(n_dot_v, fresnel_exponent);
+    let water = authored.ninja_water_highlights;
+    let foam = authored.ninja_foam_highlights;
+    let coverage = saturate(river_ninja.opacity * authored.ninja_foam_color.w * foam.z);
+    let roughness = saturate(river_ninja.roughness + mix(water.x, water.y, fresnel) + foam.x * coverage);
+    let specular = saturate(river_ninja.specular * mix(water.z, water.w, fresnel) * mix(1.0, foam.y, coverage));
+    return RiverFoamAttributes(river_ninja.base_color, roughness, specular, coverage);
+}
 
 const RIVER_CM_PER_UNIT: f32 = 2.5;
 
@@ -356,20 +403,29 @@ fn river_window_shade(input: RiverOut, front: bool, fused: bool) -> vec4<f32> {
     let fluid = river_live_field(sim_grid, input.uv);
     let masks = river_surface_masks(fluid.y, 1.0, input.uv, vec2<f32>(textureDimensions(sim_grid, 0)), 1.0, pixel_depth, 3.0e38);
 
-    // Primary foam and the detail-normal graph, both before the clip: their
-    // advected samples take fragment derivatives. Without the foam detail
-    // resource foam is absent (not substituted): zero total and opacity.
+    // The detail-normal graph, before the clip: its advected samples take
+    // fragment derivatives. Foam is Fluid Ninja's (river_ninja below); the
+    // native foam presentation is gone, so primary foam is zero here.
     let world_xy = input.world.xy;
     let time = river_view.time.x;
-    var foam = RiverFoam(vec3<f32>(0.0, 0.0, 1.0), 0.0, 0.0, 0.0, 0.0, vec3<f32>(0.0));
-    if river_view.time.y > 0.5 {
-        foam = river_live_grid_foam_lod(sim_grid, normals_rt, normal_sampler, foam_rt, foam_rt_sampler, foam_detail, foam_detail_sampler,
-            input.uv, world_xy, time, river_foam_advection(), river_foam_settings(), river_view.material_lod.xy);
-    }
+    let ninja_on = body.origin.w > 0.5;
+    let foam = RiverFoam(vec3<f32>(0.0, 0.0, 1.0), 0.0, 0.0, 0.0, 0.0, vec3<f32>(0.0));
     // FoamOpacity 1 (live instance); the normal gate takes the simulation mask.
-    let graph_normal = river_live_grid_normal_lod(sim_grid, normals_rt, normal_sampler, ocean_detail, ocean_sampler, input.uv, world_xy, time,
+    var graph_normal = river_live_grid_normal_lod(sim_grid, normals_rt, normal_sampler, ocean_detail, ocean_sampler, input.uv, world_xy, time,
         river_motion(river_view.time.z), river_wpo_advection(), river_detail_advection(), river_wave_height(),
         foam.normal, foam.total, river_foam_settings().shading.x, masks.simulation_mask, river_view.material_lod.xy);
+    river_ninja = RiverNinjaSurface(0.0, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0), 0.0, 0.0, 0.0, 1.0);
+    var ninja_color_scale = vec3<f32>(0.0);
+    if ninja_on {
+        river_ninja = ninja_river_shade(input.uv, input.world, eye, pixel_depth, river_view.right.w, select(-1.0, 1.0, front));
+        graph_normal = river_ninja_world_normal(graph_normal, river_ninja.normal);
+        if body.origin.w > 1.5 && masks.material_mask >= 0.3333 && input.eye_water.z <= 0.5 {
+            // SceneDepthWithoutWater at this pixel, before the SLW refraction lookup.
+            let scene_z = textureLoad(scene_depth, vec2<i32>(input.clip.xy), 0);
+            ninja_color_scale = ninja_river_color_scale(input.uv, input.world, eye, body.grid.xy,
+                pixel_depth, river_scene_depth(scene_z), river_view.right.w);
+        }
+    }
     if masks.material_mask < 0.3333 {
         discard;
     }
@@ -379,6 +435,10 @@ fn river_window_shade(input: RiverOut, front: bool, fused: bool) -> vec4<f32> {
     if input.eye_water.z > 0.5 {
         return river_hybrid_underside(input, graph_normal, foam);
     }
+    if ninja_on && river_view.ninja_debug.x == 5u {
+        let wetmap = textureSampleLevel(ninja_vd, ninja_clamp, input.uv, 0.0).a;
+        return vec4<f32>(vec3<f32>(wetmap), 1.0);
+    }
 
     // The classic indirect field of the window (unused under Blue Water).
     var ambient = vec4<f32>(0.0);
@@ -387,7 +447,7 @@ fn river_window_shade(input: RiverOut, front: bool, fused: bool) -> vec4<f32> {
         ambient = textureSampleLevel(ambient_texture, ambient_sampler, input.uv, 0.0);
         directed = textureSampleLevel(directed_texture, ambient_sampler, input.uv, 0.0);
     }
-    let base = river_base_pass(input.clip, input.world, front, graph_normal, foam, pixel_depth, slope, ambient, directed);
+    let base = river_base_pass(input.clip, input.world, front, graph_normal, foam, pixel_depth, slope, ambient, directed, ninja_color_scale);
     if fused {
         let reflection = river_composite_pass(input.clip, input.world, front, graph_normal, foam, pixel_depth, slope);
         return vec4<f32>(base.rgb + reflection.rgb, base.a);
@@ -399,7 +459,7 @@ fn river_window_shade(input: RiverOut, front: bool, fused: bool) -> vec4<f32> {
 // camera window (fs) and the water-mesh quadtree tiles (fs_far). `ambient`
 // and `directed` are the classic indirect field at this pixel.
 fn river_base_pass(clip: vec4<f32>, world: vec3<f32>, front: bool, graph_normal: vec3<f32>, foam: RiverFoam,
-                   pixel_depth: f32, slope: f32, ambient: vec4<f32>, directed: vec4<f32>) -> vec4<f32> {
+                   pixel_depth: f32, slope: f32, ambient: vec4<f32>, directed: vec4<f32>, ninja_color_scale: vec3<f32>) -> vec4<f32> {
     let eye = river_view.eye.xyz;
     // Two-sided: WorldNormal flips on the back face.
     let two_sided_sign = select(-1.0, 1.0, front);
@@ -409,11 +469,22 @@ fn river_base_pass(clip: vec4<f32>, world: vec3<f32>, front: bool, graph_normal:
     let p = river_slw_parameters();
     let surface = river_slw_surface(p, n_dot_v, two_sided_sign, pixel_depth);
     // WaterAttributes, Water_Underside, then MF_ShallowWaterRiver's foam lerps.
-    let attributes = river_foam_attributes(
+    var attributes = river_foam_attributes(
         RiverFoamAttributes(surface.base_color, surface.roughness, surface.specular, surface.opacity), foam, river_foam_settings());
-    // The foam scattering only enters through WaterInfo velocity, which is
-    // zero for spline-less (simulation-first) rivers.
-    let coefficients = river_slw_coefficients(p, foam.scattering, vec2<f32>(0.0), two_sided_sign);
+    var coefficients: RiverSlwCoefficients;
+    if river_ninja.enabled > 0.5 {
+        // FNL MakeMaterialAttributes BaseColor/Roughness/Specular/Opacity into
+        // the same Single Layer Water lighting (no native foam lerp on top).
+        attributes = river_ninja_attributes(n_dot_v, p.fresnel.x);
+        coefficients = ninja_river_volume_coefficients(ninja_color_scale);
+        coefficients.scattering *= authored.ninja_scattering.xyz;
+        coefficients.absorption *= authored.ninja_absorption.xyz;
+        coefficients.phase_g = clamp(coefficients.phase_g + authored.ninja_scattering.w, -0.99, 0.99);
+    } else {
+        // The native foam scattering enters through WaterInfo velocity,
+        // which is zero for these simulation-first rivers.
+        coefficients = river_slw_coefficients(p, foam.scattering, vec2<f32>(0.0), two_sided_sign);
+    }
 
     let roughness = attributes.roughness;
     let specular = attributes.specular;
@@ -448,8 +519,17 @@ fn river_base_pass(clip: vec4<f32>, world: vec3<f32>, front: bool, graph_normal:
     let viewport_uv = clamp(clip.xy / size, uv_min, uv_max);
     let ior = river_slw_ior(specular);
     let pixel = river_gather_behind(viewport_uv, size, pixel_depth, slope);
-    let distortion = river_slw_uv_distortion(normalize(river_to_view(n)), river_to_view(vec3<f32>(0.0, 0.0, 1.0)),
-        surface.refraction, vec2<f32>(1.0), river_view.distortion, pixel.scene_depth, pixel_depth);
+    let view_normal = normalize(river_to_view(n));
+    var distortion: vec2<f32>;
+    if river_ninja.enabled > 0.5 {
+        if river_view.ninja_debug.x != 3u {
+            distortion = river_slw_ior_uv_distortion(view_normal, river_ninja.refraction_ior,
+                river_view.distortion, pixel.scene_depth, pixel_depth);
+        }
+    } else {
+        distortion = river_slw_uv_distortion(view_normal, river_to_view(vec3<f32>(0.0, 0.0, 1.0)),
+            surface.refraction, vec2<f32>(1.0), river_view.distortion, pixel.scene_depth, pixel_depth);
+    }
     let distorted_uv = clamp(viewport_uv + distortion, uv_min, uv_max);
     let distorted = river_gather_behind(distorted_uv, size, pixel_depth, slope);
     var behind_depth = distorted.scene_depth;
@@ -469,5 +549,8 @@ fn river_base_pass(clip: vec4<f32>, world: vec3<f32>, front: bool, graph_normal:
     let volume = river_slw_volume(coefficients, pixel_depth, behind_depth, behind_luminance, 1.0, world.z, behind_z,
         v, n, ior, l, sun, indirect * RIVER_PI, env_brdf, shadow, vec3<f32>(1.0), water_visibility);
     color += volume.luminance;
+    if river_ninja.enabled > 0.5 && river_view.ninja_debug.x == 4u {
+        color -= volume.in_scattering;
+    }
     return vec4<f32>(color, 1.0);
 }

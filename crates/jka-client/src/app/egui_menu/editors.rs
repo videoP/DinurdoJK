@@ -17,8 +17,10 @@ fn snap_gameplay_hud_position(
         rect, neighbors.iter().filter(|(other, _)| *other != id).map(|(_, rect)| *rect),
         grid, 12.0, 32.0,
     );
-    layout.offset[0] += position[0] - rect.x;
-    layout.offset[1] += position[1] - rect.y;
+    let delta = ui::hud_pixel_delta_to_offset(
+        [position[0] - rect.x, position[1] - rect.y], w, h);
+    layout.offset[0] += delta[0];
+    layout.offset[1] += delta[1];
     (layout, matched)
 }
 
@@ -84,9 +86,8 @@ impl App {
             self.hud_edit_chat_resize_corner = None;
         }
 
-        // The grid is visual only. Layout values remain framebuffer-pixel offsets
-        // from their anchors and are snapped in that same unit, so the renderer
-        // never needs to parse cvar text or know that edit mode exists.
+        // The editor's grid and pointer input are in physical pixels; only
+        // HUD layout offsets are stored in fixed 1280x720 reference units.
         if self.hud_layout.snap_to_grid {
             let spacing_px = self.hud_layout.grid_size.clamp(1.0, 64.0);
             let spacing = to_points(spacing_px);
@@ -398,7 +399,9 @@ impl App {
                         // Chat is bottom-left anchored. Left/top handles change the
                         // offset necessary to keep the opposite edge fixed; right/
                         // bottom handles naturally leave the corresponding origin.
-                        let next_offset = [left - base.x, bottom - (base.y + base.height)];
+                        let next_offset = ui::hud_pixel_delta_to_offset(
+                            [left - base.x, bottom - (base.y + base.height)],
+                            size.width, size.height);
                         let target = self.hud_layout.element_mut(HudElementId::Chat);
                         if target.extent != next_extent || target.offset != next_offset {
                             target.extent = next_extent;
@@ -435,7 +438,8 @@ impl App {
                     .total_drag_delta()
                     .unwrap_or(egui::Vec2::ZERO)
                     * pixels_per_point;
-                self.hud_edit_drag_delta = [delta.x, delta.y];
+                self.hud_edit_drag_delta = ui::hud_pixel_delta_to_offset(
+                    [delta.x, delta.y], size.width, size.height);
                 let mut offset = [
                     origin[0] + self.hud_edit_drag_delta[0],
                     origin[1] + self.hud_edit_drag_delta[1],
@@ -545,6 +549,7 @@ impl App {
                 delta[1] += step;
             }
             if delta != [0.0, 0.0] {
+                let delta = ui::hud_pixel_delta_to_offset(delta, size.width, size.height);
                 let target = self.hud_layout.element_mut(selected);
                 target.offset[0] += delta[0];
                 target.offset[1] += delta[1];
@@ -739,8 +744,10 @@ impl App {
                 correction[1] -= chat.y + chat.height - size.height as f32;
             }
             if correction != [0.0, 0.0] {
-                self.hud_layout.chat.offset[0] += correction[0];
-                self.hud_layout.chat.offset[1] += correction[1];
+                let delta = ui::hud_pixel_delta_to_offset(
+                    correction, size.width, size.height);
+                self.hud_layout.chat.offset[0] += delta[0];
+                self.hud_layout.chat.offset[1] += delta[1];
                 layout_changed = true;
             }
         }

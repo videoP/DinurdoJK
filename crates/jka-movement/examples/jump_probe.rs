@@ -31,18 +31,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut summary = BufWriter::new(fs::File::create(out.join("summary.csv"))?);
     writeln!(
         summary,
-        "backend,race,level,rate,peak,apex,assignments,contacts"
+        "server_mod,race,level,rate,peak,apex,assignments,contacts"
     )?;
-    for backend in [0, 1] {
+    for server_mod in [0, 1] {
         for race in [0, 1] {
-            if backend == 0 && race == 1 {
+            if server_mod == 0 && race == 1 {
                 continue;
             }
             for level in [1, 2, 3] {
                 for rate in [30, 60, 125, 250, 333] {
                     let settings = PredictSettings {
-                        backend,
-                        server_mod: backend,
+                        server_mod,
                         ..Default::default()
                     };
                     let mut p =
@@ -76,7 +75,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         net.fields[7] = (-speed).to_bits(); // velocity[1], protocol-26 wire order
                         p.set_network(&net)?;
                     }
-                    let stem = format!("b{backend}-r{race}-l{level}-hz{rate}");
+                    let stem = format!("b{server_mod}-r{race}-l{level}-hz{rate}");
                     let mut trace =
                         BufWriter::new(fs::File::create(out.join(format!("{stem}.csv")))?);
                     writeln!(trace,"stage,time,msec,ground,walking,ground_plane,flags,entity,bump,x,y,z,inx,iny,inz,outx,outy,outz,nx,ny,nz,jump_start,fraction,overbounce")?;
@@ -125,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     writeln!(
                         summary,
-                        "{backend},{race},{level},{rate},{peak},{apex},{assignments},{contacts}"
+                        "{server_mod},{race},{level},{rate},{peak},{apex},{assignments},{contacts}"
                     )?;
                     println!("{stem}: peak={peak:.3} apex={apex:.3} assignments={assignments} contacts={contacts}");
                 }

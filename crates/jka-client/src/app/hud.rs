@@ -7,23 +7,6 @@ use crate::app::{
 };
 
 impl App {
-    /// Snap only untouched/default HUD elements when opening the editor. This
-    /// changes layout coordinates, not the underlying JKA stock draw routines.
-    pub(in crate::app) fn align_hud_defaults_for_editor(&mut self) {
-        let Some(window) = self.window.as_ref() else { return; };
-        let size = window.inner_size();
-        let mut context = ui::HudRectContext::new(
-            self.movement_keys_hud, &self.video, &self.perf, self.threads.len(),
-            &self.japro_cg, self.strafe_helper, self.video.draw_timer,
-            [self.draw_score_x, self.draw_score_y], self.draw_scores,
-        );
-        context.jk2_mode = self.fs_roots.active_jk2.is_some() || self.live_input.is_jk2();
-        if self.hud_layout.align_default_elements_to_grid(&context, size.width, size.height) {
-            self.mark_config_dirty();
-            self.publish_ui();
-        }
-    }
-
     /// Editor handles follow configuration, including transient components
     /// whose live data may currently be empty (for example jump measurements).
     pub(in crate::app) fn hud_edit_element_enabled(&self, id: ui::HudElementId) -> bool {
@@ -272,6 +255,7 @@ impl App {
             console_help_hover: self.console_help_hover && self.overlay == OverlayMode::Console,
             chat_mode: self.chat_mode,
             chat_input: self.chat_input.clone(),
+            chat_cursor: self.chat_cursor,
             chat_input_selected: self.chat_input_selected,
             chat_emoji_atlas: None, // Installed by the renderer, never by app snapshots.
             chat_emoji_picker_available: self.chat_emoji_picker.can_show(self.chat_settings.emojis),
@@ -2230,6 +2214,7 @@ pub(in crate::app) fn generic_timer_bar(
         texture: None,
         blend: FxBlend::Alpha,
         rgb_vertex: true,
+        rgb_identity_light: false,
         alpha_vertex: true,
         rgb_const: [1.0; 3],
         alpha_const: 1.0,

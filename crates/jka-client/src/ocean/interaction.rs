@@ -35,6 +35,37 @@ pub struct ActorSample {
     pub velocity: Option<[f32; 3]>,
 }
 
+impl ActorSample {
+    /// Same presentation sample as the hydraulic wake; preserve identity,
+    /// timestamp, and missing velocity instead of reconstructing a brush here.
+    pub(crate) fn ninja_sample(&self) -> jka_river::river_ninja::ActorSample {
+        use jka_render_core::coordinates::jka_position;
+        let (mins_map, maxs_map, _) = self.jka_hull();
+        jka_river::river_ninja::ActorSample {
+            id: self.id, kind: jka_river::river_ninja::ActorKind::Player,
+            continuity: self.continuity, time_ms: self.time_ms,
+            origin_map: jka_position(self.origin), mins_map, maxs_map,
+            velocity_map_s: self.velocity.map(jka_position),
+            river_bones: None,
+        }
+    }
+
+    /// The JKA player hull around this actor (bg_public.h: mins -15,-15,-24;
+    /// maxs 15,15,40, or 16 crouched) in JKA map units, with its JKA-space
+    /// velocity. Shared by every system that treats players as boxes.
+    pub fn jka_hull(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
+        use jka_render_core::coordinates::jka_position;
+        let origin = jka_position(self.origin);
+        // CROUCH_VIEWHEIGHT is 12, DEFAULT_VIEWHEIGHT 36 (remote records use 26).
+        let top = if self.head_height < 20.0 { 16.0 } else { 40.0 };
+        (
+            [origin[0] - 15.0, origin[1] - 15.0, origin[2] - 24.0],
+            [origin[0] + 15.0, origin[1] + 15.0, origin[2] + top],
+            self.velocity.map_or([0.0; 3], jka_position),
+        )
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod, Zeroable)]
 struct Domain {

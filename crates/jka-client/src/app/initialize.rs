@@ -71,6 +71,7 @@ impl App {
         crate::logging::set_developer_level(video.developer_level);
         crate::logging::set_renderer_verbose_level(video.renderer_verbose);
         let audio = config::load_audio_settings(&config_path);
+        crate::ninja_blood::set_enabled(audio.game.blood != 0);
         let mut presentation =
             config::load_client_presentation_settings(&config_path);
         ui::movement_components::normalize(&mut presentation.strafe_helper.flags,
@@ -743,6 +744,7 @@ impl App {
             console_search_index: None,
             chat_mode: ChatMode::Global,
             chat_input: String::new(),
+            chat_cursor: 0,
             chat_input_selected: false,
             chat_emoji_picker: Default::default(),
             chat_player_completion: None,
@@ -808,6 +810,7 @@ impl App {
             hdr_modes_known: false,
             applied_resolution: video.resolution,
             applied_resolution_desktop: video.resolution_desktop,
+            applied_resolution_mode: video.resolution_mode,
             desktop_resolution: None,
             applied_grass: video.grass,
             applied_ocean: video.ocean,
@@ -846,6 +849,7 @@ impl App {
                 grass: video.grass,
                 voxel_probe_gi: video.voxel_probe_gi,
                 ocean: video.ocean,
+                river_promotion: 0,
                 client_physics: video.client_physics,
                 gen_normal_maps: video.gen_normal_maps,
                 float_lightmap: video.float_lightmap && (video.hdr || video.hdr_output != 0),
@@ -859,6 +863,7 @@ impl App {
                 glass_promotion: crate::materials::glass_promotion_enabled(),
                 allow_asset_overrides: video.allow_asset_overrides,
                 steam_audio: audio.steam_audio,
+                echo_acoustics: audio.echofield,
                 menu_look: false,
                 menu_props: false,
             },
@@ -868,6 +873,7 @@ impl App {
                 crate::fx::light_promotion::FxLightPromotionCatalog::default(),
             ),
             shader_remaps: scene::ShaderRemapState::default(),
+            shader_promotion: Default::default(),
             shader_remap_upload: false,
             shader_remap_dirty: false,
             shader_remap_ui: ShaderRemapUi::default(),

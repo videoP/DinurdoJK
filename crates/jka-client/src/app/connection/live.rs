@@ -400,7 +400,8 @@ impl App {
                 .and_then(|s| s.current_snapshot.as_ref())
             {
                 let ps = ps.player_state.clone();
-                self.live_input.sync_selection(&ps);
+                let japro = self.active_server_mod() == crate::net::mod_support::ServerMod::Japro;
+                self.live_input.sync_selection(&ps, japro);
             }
             if let Some(frame) = self.jk2_selection_frame() {
                 self.live_input.sync_jk2(&frame);
@@ -1193,6 +1194,7 @@ impl App {
                 self.video.fx_count_scale,
                 self.video.fx_lod_scale,
             );
+            session.weapon_fx.set_fx_smoke_duration_scale(self.video.fx_smoke_duration_scale);
             session.promote_fx_lights = self.video.promote_fx_lights;
             session.apply_client_options(
                 self.screen_shake,

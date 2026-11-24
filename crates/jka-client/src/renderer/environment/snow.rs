@@ -1,8 +1,8 @@
 //! Environment snow.
 use crate::renderer::{
     aabb_intersects_clip_frustum, hidden_bsp_model_surface, mpsc, Arc, BTreeMap, DrawBatch, DrawClass, Duration, GpuVertex,
-    HashMap, HashSet, Instant, Mat4, Mutex, PipelineKey, Vec2, Vec3, WorldGpu,
-    WorldPipelineBinding, MATERIAL_SNOW,
+    HashMap, HashSet, Instant, Mat4, Mutex, Vec2, Vec3, WorldGpu,
+    WorldPipelineBinding, WorldPipelineVariant, MATERIAL_SNOW,
     SNOW_SHELL_CHUNK_SIZE, SNOW_SHELL_DRAW_RADIUS, SNOW_SHELL_TESSELLATION,
 };
 use wgpu::util::DeviceExt;
@@ -13,6 +13,17 @@ pub(in crate::renderer) struct SnowShellDraw {
     pub(in crate::renderer) vertices: std::ops::Range<u32>,
     pub(in crate::renderer) bounds_min: [f32; 3],
     pub(in crate::renderer) bounds_max: [f32; 3],
+}
+
+impl SnowShellDraw {
+    pub(in crate::renderer) fn clip_bounds(&self, ninja: bool) -> ([f32; 3], [f32; 3]) {
+        if ninja {
+            // Composite WPO can move vertices up to 80 cm, including sideways on slopes.
+            let padding = 32.0;
+            return (self.bounds_min.map(|v| v - padding), self.bounds_max.map(|v| v + padding));
+        }
+        (self.bounds_min, self.bounds_max)
+    }
 }
 
 /// One up-facing snow triangle as authored, before tessellation.
@@ -528,9 +539,10 @@ pub(in crate::renderer) fn snow_shell_draw_near_center(draw: &SnowShellDraw, cen
 pub(in crate::renderer) fn draw_snow_shell<'a>(
     pass: &mut wgpu::RenderPass<'a>,
     world: &'a WorldGpu,
-    pipelines: &'a BTreeMap<PipelineKey, wgpu::RenderPipeline>,
+    pipelines: &'a WorldPipelineVariant,
     view_proj: Mat4,
     deform_center: Vec2,
+    ninja: bool,
     draw_bsp_model_surfaces: bool,
     current_pipeline: &mut Option<WorldPipelineBinding>,
 ) {
@@ -550,8 +562,9 @@ pub(in crate::renderer) fn draw_snow_shell<'a>(
         }
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
         for draw in &chunk.draws {
+            let (bounds_min, bounds_max) = draw.clip_bounds(ninja);
             if !snow_shell_draw_near_center(draw, deform_center)
-                || !aabb_intersects_clip_frustum(draw.bounds_min, draw.bounds_max, view_proj)
+                || !aabb_intersects_clip_frustum(bounds_min, bounds_max, view_proj)
             {
                 continue;
             }
@@ -561,10 +574,11 @@ pub(in crate::renderer) fn draw_snow_shell<'a>(
             if hidden_bsp_model_surface(draw_bsp_model_surfaces, batch, &world.material_debug) {
                 continue;
             }
-            // Snow shells always use the general program.
-            if *current_pipeline != Some((batch.source.pipeline, None)) {
-                pass.set_pipeline(&pipelines[&batch.source.pipeline]);
-                *current_pipeline = Some((batch.source.pipeline, None));
+            // Specialized variants can omit the general PSO for this stage.
+            let (binding, pipeline) = pipelines.base_pipeline(batch);
+            if *current_pipeline != Some(binding) {
+                pass.set_pipeline(pipeline);
+                *current_pipeline = Some(binding);
             }
             pass.set_bind_group(1, &batch.bind_group, &[]);
             pass.draw(draw.vertices.clone(), 1..2);

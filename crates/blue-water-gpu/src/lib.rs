@@ -33,10 +33,14 @@ pub mod shore;
 #[path = "../../../vendor/blue-water-sea-and-sky/ocean/src/hull_sea.rs"]
 pub mod hull_sea;
 pub mod lakes;
-pub mod godot_water;
 use blue_water_core::{sea_state, spectrum, whitecaps, CascadeInfo, QualityTier, WaveParameters};
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
+
+/// Common crest arithmetic for the native and JKA adapter paths.
+pub const CREST_MATH_WGSL: &str = include_str!("crest_math.wgsl");
+/// Same binding and arithmetic used by native geometry and the eye probe.
+pub const CREST_CONTROL_WGSL: &str = concat!(include_str!("crest_math.wgsl"), "\n", include_str!("crest_control.wgsl"));
 
 const FFT: &str = include_str!("../../../vendor/blue-water-sea-and-sky/ocean/shaders/fft.wgsl");
 const RESOLVE: &str =
@@ -63,6 +67,9 @@ struct FieldParams {
     time: [f32; 4],
     wind: [f32; 4],
     cascades: [CascadeParams; 3],
+    /// xyz: 1 when cascade 0/1/2 carries visible waves (`cascade_visible`); fft.wgsl skips an inactive
+    /// cascade and resolve.wgsl writes zeros for it.
+    active: [f32; 4],
 }
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -100,6 +107,10 @@ pub struct WaveField {
     current: usize,
     last_phase: f32,
     spectrum_fresh: bool,
+    /// Cascades whose waves are visible (`cascade_visible`), from the last spectrum build.
+    visible: [bool; 3],
+    /// The active mask of the update begun last (`FieldParams::active`).
+    active: [f32; 4],
     crest_limits: crest_limits::CrestLimits,
     /// `r_oceanLongWaves`: the first cascade rebuilt from this many waves
     /// (`sparse_long_waves`); 0 keeps upstream's spectrum.
@@ -153,7 +164,31 @@ fn apply_authored_lattice(wave: &mut spectrum::WaveSpectrum, lattice: &[LatticeW
 }
 
 /// `build_spectrum`'s per-cascade statistics from its stored amplitudes.
+/// A cascade whose waves can be seen: significant height (4 sigma) of at least 1 cm or RMS slope of at
+/// least .003 (a sub-millimetre normal shift). Below both its FFT, resolve and foam are skipped and the
+/// field holds zeros for it; e.g. a 1 m sea leaves the 1 km swell cascade inactive.
+pub fn cascade_visible(cascade: &spectrum::CascadeSpectrum) -> bool {
+    const MIN_SIGNIFICANT_HEIGHT_M: f64 = 0.01;
+    const MIN_RMS_SLOPE: f64 = 0.003;
+    let (variance, slope_variance, _) = cascade_stats(cascade);
+    4.0 * variance.max(0.0).sqrt() >= MIN_SIGNIFICANT_HEIGHT_M
+        || slope_variance.max(0.0).sqrt() >= MIN_RMS_SLOPE
+}
+
+/// Cascades the current spectrum keeps active (`cascade_visible`), for diagnostics.
+impl WaveField {
+    pub fn active_cascades(&self) -> [bool; 3] { self.visible }
+}
+
 fn recompute_cascade_stats(cascade: &mut spectrum::CascadeSpectrum) {
+    let (variance, slope_variance, reach) = cascade_stats(cascade);
+    cascade.variance = variance;
+    cascade.slope_variance = slope_variance;
+    cascade.slope_length = if slope_variance > 0.0 { 2.0 * reach / slope_variance } else { 0.0 };
+}
+
+/// (height variance, slope variance, slope-weighted |k| sum) of a cascade's drawn texels.
+fn cascade_stats(cascade: &spectrum::CascadeSpectrum) -> (f64, f64, f64) {
     let n = cascade.resolution as usize;
     let signed = |i: usize| if i < n / 2 { i as i64 } else { i as i64 - n as i64 };
     let dk = 2.0 * std::f64::consts::PI / cascade.size;
@@ -169,9 +204,7 @@ fn recompute_cascade_stats(cascade: &mut spectrum::CascadeSpectrum) {
         slope_variance += energy * k2;
         reach += energy * k2.sqrt();
     }
-    cascade.variance = variance;
-    cascade.slope_variance = slope_variance;
-    cascade.slope_length = if slope_variance > 0.0 { 2.0 * reach / slope_variance } else { 0.0 };
+    (variance, slope_variance, reach)
 }
 
 /// The field's height and horizontal-displacement bounds from every cascade.
@@ -629,6 +662,8 @@ impl WaveField {
             current: 0,
             last_phase: -1.0,
             spectrum_fresh: false,
+            visible: [true; 3],
+            active: [1.0; 4],
         }
     }
 
@@ -747,6 +782,13 @@ impl WaveField {
         }
         if (self.small_gain - 1.0).abs() > 1e-6 {
             scale_cascade(&mut wave, 2, self.small_gain, self.sea.choppiness);
+        }
+        let before = self.visible;
+        for (c, cascade) in wave.cascades.iter().enumerate().take(3) {
+            self.visible[c] = cascade_visible(cascade);
+        }
+        if before != self.visible {
+            eprintln!("[BLUE WATER] FFT cascades active (1 km / 181 m / 31 m tiles): {:?}", self.visible);
         }
         self.surface_stats = surface_waves::SpectrumStats::from_spectrum(&wave);
         self.surface_stats.set_shore_tables(&wave, self.sea.wind_speed);
@@ -893,6 +935,12 @@ impl WaveField {
                 d: lines,
             };
         }
+        // Wind streaks (cascade 1) need the cascade even when its waves are tiny.
+        field.active = std::array::from_fn(|c| {
+            let streaks = c < 3 && field.cascades[c].c[3] > 0.0;
+            f32::from(u8::from(c < self.count as usize && (self.visible.get(c).copied().unwrap_or(true) || streaks)))
+        });
+        self.active = field.active;
         queue.write_buffer(&self.field_params, 0, bytemuck::bytes_of(&field));
         true
     }
@@ -900,7 +948,8 @@ impl WaveField {
     /// Transform passes `range` of the update begun last, in order.
     pub fn encode_transform_passes(&self, encoder: &mut wgpu::CommandEncoder, range: std::ops::Range<usize>) {
         let range = range.start.min(self.passes.len())..range.end.min(self.passes.len());
-        if range.is_empty() {
+        // Every cascade flat (height 0): resolve alone writes the zeros.
+        if range.is_empty() || self.active[..self.count as usize].iter().all(|a| *a < 0.5) {
             return;
         }
         let n = self.n;

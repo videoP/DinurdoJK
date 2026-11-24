@@ -1892,7 +1892,7 @@ impl App {
     }
 
     /// Gate the existing promoted-water player interactions without erasing
-    /// the user's Godot/cheapwater preferences. Regular uses the JKA shader on
+    /// the user's Godot/lake preferences. Regular uses the JKA shader on
     /// unpromoted water; only Enhanced enables promoted mesh interactions.
     /// RenderCommand carries canonical
     /// (unresolved) settings: Renderer::set_ocean_settings resolves exactly once.
@@ -1900,14 +1900,14 @@ impl App {
     pub(in crate::app) fn effective_ocean_settings(&self) -> crate::ocean::OceanSettings {
         let mut settings = self.video.ocean_settings;
         settings.interaction &= self.video.water_wake == 2;
-        // A single strength setting drives all supported backends. Cheapwater
+        // A single strength setting drives all supported backends. Lake wakes
         // has a [0,10] gain range; keep its legacy stored preference intact.
         settings.lake.wake_strength = if settings.interaction {
             settings.interaction_strength.clamp(0.0, 10.0)
         } else { 0.0 };
         // A map (jaPRO) ocean drives the shared Blue Water/Hybrid simulation:
         // those backends have one FFT for every pool, so the map's waves are
-        // the shared waves. Gerstner (type 5) keeps its own upstream sea.
+        // the shared waves.
         if let (Some(ocean), Some(sea)) = (self.authored_oceans.first(), self.hybrid_sailing_sea()) {
             ocean.apply_to_hybrid(&sea, &mut settings);
         }
@@ -1917,10 +1917,9 @@ impl App {
     /// The map ocean's sea (`BG_SailingSea`, the waves physics floats in) when
     /// it drives the shared Blue Water/Hybrid simulation: those backends have
     /// one FFT for every pool, so the map's waves are the shared waves.
-    /// Gerstner (type 5) keeps its own upstream sea.
     pub(in crate::app) fn hybrid_sailing_sea(&self) -> Option<jka_movement::SailingSea> {
         let settings = &self.video.ocean_settings;
-        if !matches!(settings.backend, 1 | 2) || settings.gerstner_water {
+        if !matches!(settings.backend, 1 | 2) {
             return None;
         }
         jka_movement::sailing_sea(self.authored_oceans.first()?.index)
@@ -1939,23 +1938,20 @@ impl App {
 
     /// Single ocean selector. No promotion uses the existing resource-off path,
     /// so stock BSP/JKA water returns rather than an invisible promoted mesh.
-    /// `r_oceanType`: 0 off, backend + 1, or 5 for Hybrid with the Gerstner surface.
+    /// `r_oceanType`: 0 off, else backend + 1.
     pub(in crate::app) fn ocean_type(&self) -> u8 {
-        if !self.video.ocean { 0 }
-        else if self.video.ocean_settings.gerstner_active() { 5 }
-        else { self.video.ocean_settings.backend + 1 }
+        if !self.video.ocean { 0 } else { self.video.ocean_settings.backend + 1 }
     }
 
     pub(in crate::app) fn set_ocean_type(&mut self, ocean_type: u8) {
-        let ocean_type = ocean_type.min(5);
+        let ocean_type = ocean_type.min(4);
         let enabled = ocean_type != 0;
-        let backend = if ocean_type == 5 { 2 } else { ocean_type.saturating_sub(1) };
         if enabled {
-            self.video.ocean_settings.backend = backend;
-            self.video.ocean_settings.gerstner_water = ocean_type == 5;
+            self.video.ocean_settings.backend = ocean_type - 1;
         }
         self.video.ocean = enabled;
         if let Some(session) = self.game_session.as_mut() {
+            session.ocean_ninja_enabled = jka_ninja::INCLUDED && self.video.ocean && self.video.ocean_settings.ninja_wake_requested();
             session.ocean_interaction_enabled = enabled
                 && self.video.ocean_settings.interaction && self.video.water_wake == 2;
         }
@@ -1984,7 +1980,8 @@ impl App {
 
     pub(in crate::app) fn commit_ocean_settings(&mut self) {
         if let Some(session) = self.game_session.as_mut() {
-            session.lake_wakes_enabled = self.video.water_wake == 2 && self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.interaction && self.video.ocean_settings.interaction_strength > 0.0;
+            session.lake_wakes_enabled = self.video.water_wake == 2 && self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.interaction && self.video.ocean_settings.interaction_strength > 0.0;
+            session.ocean_ninja_enabled = jka_ninja::INCLUDED && self.video.ocean && self.video.ocean_settings.ninja_wake_requested();
             session.ocean_interaction_enabled = self.video.ocean
                 && self.video.ocean_settings.interaction && self.video.water_wake == 2;
         }
@@ -2355,7 +2352,8 @@ impl App {
             ui::ENV_ROW_OCEAN => {
                 self.video.ocean = !self.video.ocean;
                 if let Some(session) = self.game_session.as_mut() {
-                    session.lake_wakes_enabled = self.video.water_wake == 2 && self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.interaction && self.video.ocean_settings.interaction_strength > 0.0;
+                    session.lake_wakes_enabled = self.video.water_wake == 2 && self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.interaction && self.video.ocean_settings.interaction_strength > 0.0;
+                    session.ocean_ninja_enabled = jka_ninja::INCLUDED && self.video.ocean && self.video.ocean_settings.ninja_wake_requested();
                     session.ocean_interaction_enabled = self.video.ocean
                 && self.video.ocean_settings.interaction && self.video.water_wake == 2;
                 }

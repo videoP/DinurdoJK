@@ -100,8 +100,7 @@ impl Renderer {
             &self.device,&self.surface_layout,&self.fast_surface_layout,&self.white,&self.missing,
             &self.flat_normal,&self.repeat_sampler,&self.clamp_sampler,&self.pbr_repeat_sampler,
             &self.pbr_clamp_sampler,&self.lightmap_sampler,&self.sky_sampler,&self.detail_texture,
-            self.detail_texture_auto,&self.detail_auto_textures,self.surface_deformation.buffer(),
-            self.surface_deformation.field_views(),self.surface_deformation.field_sampler(),world);
+            self.detail_texture_auto,&self.detail_auto_textures,&self.surface_deformation,world);
     }
 
     pub(in crate::renderer) fn restore_static_ao_lightmaps(&mut self) {

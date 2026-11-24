@@ -1977,6 +1977,36 @@ mod cloud_composite_order_tests {
     }
 
     #[test]
+    fn painted_sky_uses_opaque_world_depth() {
+        use jka_assets::{bsp::SURF_SKY, pk3::AssetSearchPath, shader};
+
+        let shaders = shader::parse(
+            "test {\nsurfaceparm sky\n{\nmap $whiteimage\nrgbGen identityLighting\n}\n}",
+        )
+        .unwrap();
+        let definition = &shaders["test"];
+        assert!(definition.sky);
+        let root = std::env::temp_dir().join("jka-painted-sky-test");
+        let mut assets = AssetSearchPath::open(&root).unwrap();
+        let material = materials::describe(
+            "test", SURF_SKY, Some(definition), None, &mut assets,
+            &mut materials::Textures::new(), false, false,
+        );
+        let mut batches = Vec::new();
+        append_material_batches(
+            &mut batches, &material, 0, None, false, 0..3, None,
+            &[], [0; 4], [0.0; 4], false,
+        );
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.pipeline.class, DrawClass::Opaque);
+        assert_eq!(batch.pipeline.cull, CullMode::Back);
+        assert!(batch.pipeline.depth_write);
+        assert!(matches!(batch.tc_gen, TcGen::Base));
+        assert_eq!(batch.rgb_gen, RgbGen::IdentityLighting);
+    }
+
+    #[test]
     fn depthfunc_disable_is_not_an_opaque_depth_seed() {
         let mut stage = base_stage();
         stage.depth_test_disabled = true;

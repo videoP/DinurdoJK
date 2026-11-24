@@ -74,7 +74,7 @@ fn safe_opaque_stage(batches: &[WorldBatch], indices: &[usize], position: usize)
     let batch = &batches[indices[position]];
     let material = &batch.source;
     let pipeline = material.pipeline;
-    if batch.is_inline_entity || batch.ocean_replaced || batch.ocean_clipmap.is_some()
+    if batch.is_inline_entity || batch.ocean_owners != 0 || batch.ocean_clipmap.is_some()
         || material.late_sorted_material || material.water || material.planar_reflection
         || material.planar_environment_candidate || material.authored_ocean.is_some()
         || material.opaque_composite_before_clouds

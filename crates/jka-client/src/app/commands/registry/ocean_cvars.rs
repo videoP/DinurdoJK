@@ -19,29 +19,24 @@ video_scalar_cvars! { SCALAR_DEFINITIONS, commit_ocean_settings;
         range: "0|1", description: "Use each promoted JKA water shader's source hue, alpha-blend clarity, authored deformation, roughness and tcMod scroll heading in Lake mode. 0 restores the global Lake material.",
         kind: CvarType::Bool, field: ocean_settings.lake.source_hints, archive: 27377
     }
-    APP_R_LAKEWINDSPEED {
-        name: "r_lakeWindSpeed", default: "0",
-        range: "0..40", description: "Lake ripple wind speed in metres per second; independent of ocean spectrum.",
-        kind: CvarType::Float { min: 0.0, max: 40.0 }, field: ocean_settings.lake.wind_speed, archive: 27340
-    }
     APP_R_LAKEDIRECTION {
         name: "r_lakeDirection", default: "52",
-        range: "-180..180", description: "Lake ripple direction in degrees from +X toward world +Z.",
+        range: "-180..180", description: "Lake surface relief drift direction in degrees from +X toward world +Z.",
         kind: CvarType::Float { min: -180.0, max: 180.0 }, field: ocean_settings.lake.direction, archive: 27341
     }
     APP_R_LAKETRANSPARENCY {
         name: "r_lakeTransparency", default: "0.5",
-        range: "0.1..10", description: "Lake optical clarity multiplier; higher values reveal more of the bed.",
+        range: "0.1..10", description: "Lake underwater visibility (Godot fog and Fluid Ninja submerged views); higher is clearer.",
         kind: CvarType::Float { min: 0.1, max: 10.0 }, field: ocean_settings.lake.transparency, archive: 27342
     }
     APP_R_LAKEREFLECTIONS {
         name: "r_lakeReflections", default: "0.525",
-        range: "0..1", description: "Lake world/sky reflection and sun glitter strength; 0 removes reflections.",
+        range: "0..1", description: "Lake world reflections (SSR/planar); 0 leaves only the sky reflection.",
         kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.lake.reflections, archive: 27363
     }
     APP_R_LAKEAMPLITUDE {
         name: "r_lakeAmplitude", default: "6.65",
-        range: "0..12", description: "Lake geometric amplitude in inches above/below the map plane; 0 is flat.",
+        range: "0..12", description: "Lake geometric amplitude in inches above/below the map plane; 0 is flat and draws one quad per pool instead of the relief clipmap.",
         kind: CvarType::Float { min: 0.0, max: 12.0 }, field: ocean_settings.lake.amplitude, archive: 27360
     }
     APP_R_LAKESPEED {
@@ -49,35 +44,30 @@ video_scalar_cvars! { SCALAR_DEFINITIONS, commit_ocean_settings;
         range: "0..3", description: "Lake deformation animation speed; 0 freezes it, 1 is normal.",
         kind: CvarType::Float { min: 0.0, max: 3.0 }, field: ocean_settings.lake.speed, archive: 27364
     }
-    APP_R_LAKETRANSMISSION {
-        name: "r_lakeTransmission", default: "1",
-        range: "0..1.0", description: "Cheapwater transmission: 0 preserves opaque shading, 1 reveals the bed with depth absorption.",
-        kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.lake.cheap_transmission, archive: 27369
-    }
     APP_R_LAKEREFRACTION {
         name: "r_lakeRefraction", default: "0.026",
-        range: "0..0.05", description: "Cheapwater screen-space refraction strength; reuses its moving normal layers. Zero disables distortion.",
+        range: "0..0.05", description: "Lake distortion: scales the HL2 material's $refractamount/$reflectamount; the default 0.026 is exactly HL2. Zero disables distortion.",
         kind: CvarType::Float { min: 0.0, max: 0.05 }, field: ocean_settings.lake.cheap_refraction, archive: 27370
-    }
-    APP_R_LAKEDEPTHCOLOR {
-        name: "r_lakeDepthColor", default: "0.52",
-        range: "0.0..1.0", description: "Cheapwater shallow/deep color blend. Zero preserves the base material.",
-        kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.lake.depth_color_strength, archive: 27371
-    }
-    APP_R_LAKECOLORDEPTH {
-        name: "r_lakeColorDepth", default: "52",
-        range: "0.1..100.0", description: "Vertical bed depth in metres at which Cheapwater reaches its deep color.",
-        kind: CvarType::Float { min: 0.1, max: 100.0 }, field: ocean_settings.lake.color_depth, archive: 27372
     }
     APP_R_LAKEOPAQUEDEPTH {
         name: "r_lakeOpaqueDepth", default: "8",
-        range: "0.25..100 feet", description: "Cheapwater vertical bed depth in feet where nonlinear transparency reaches zero. 3-inch water remains almost fully clear at the default 8 feet.",
+        range: "0.25..100 feet", description: "Lake fog distance in feet (Source $fogend), shared above and below the surface; also the depth below which submerged geometry is culled from above.",
         kind: CvarType::Float { min: 0.25, max: 100.0 }, field: ocean_settings.lake.opaque_depth, archive: 27375
     }
-    APP_R_LAKESHADER {
-        name: "r_lakeShader", default: "1",
-        range: "0|1", description: "Lake material A/B: 0 original optical water, 1 Cheapwater material with neutral water reflections. Geometry and reflection selection are shared.",
-        kind: CvarType::Int { min: 0, max: 1 }, field: ocean_settings.lake.shader, archive: 27367
+    APP_R_LAKESOURCESTYLE {
+        name: "r_lakeSourceStyle", default: "0",
+        range: "0|1", description: "Lake water material: 0 HL2 canal water (animated normal, 128-unit tiles), 1 HL2 open coast water (static normal, three scrolling layers, 768-unit tiles).",
+        kind: CvarType::Int { min: 0, max: 1 }, field: ocean_settings.lake.source_style, archive: 27395
+    }
+    APP_R_LAKESOURCECUBEMAPFADE {
+        name: "r_lakeSourceCubemapFade", default: "50",
+        range: "0..500 m", description: "Lake water: distance where reflections start fading to the sky cubemap (HL2 cheap water), fully cubemap at 1.5x. 0 keeps real reflections at every distance.",
+        kind: CvarType::Float { min: 0.0, max: 500.0 }, field: ocean_settings.lake.source_cubemap_fade, archive: 27396
+    }
+    APP_R_LAKEUNDERWATERMODE {
+        name: "r_lakeUnderwaterMode", default: "4",
+        range: "4|5|6", description: "Lakes submerged view: 4 Godot submerged fog (shared with Hybrid), 5 Fluid Ninja (the river's underwater post material: distortion, distance tint, meniscus, caustics), 6 Source (HL2 underwater view). Costs only while the camera is underwater.",
+        kind: CvarType::Int { min: 4, max: 6 }, field: ocean_settings.lake.underwater_mode, archive: 27394
     }
     APP_R_LAKEREFLECTIONMODE {
         name: "r_lakeReflectionMode", default: "2",
@@ -131,8 +121,8 @@ video_scalar_cvars! { SCALAR_DEFINITIONS, commit_ocean_settings;
     }
     APP_R_HYBRIDBREAKER {
         name: "r_hybridBreaker", default: "0",
-        range: "0..2", description: "Hybrid crest A/B: 0 original; 1 conservative horizontal compression limit; 2 bounded crest folds, signed normals and spilling foam. Preserves vertical wave height. Applies live.",
-        kind: CvarType::Int { min: 0, max: 2 }, field: ocean_settings.hybrid_breaker, archive: 25221
+        range: "0..3", description: "Hybrid crest A/B: 0 original; 1 conservative horizontal compression limit; 2 bounded crest folds (legacy spilling); 3 conservative spill, no intentional overhang budget, foam driven by pre-limit compression. Preserves vertical wave height. Applies live.",
+        kind: CvarType::Int { min: 0, max: 3 }, field: ocean_settings.hybrid_breaker, archive: 25221
     }
     APP_R_BLUEWATERMESHLEVELS {
         name: "r_blueWaterMeshLevels", default: "6",
@@ -166,13 +156,188 @@ video_scalar_cvars! { SCALAR_DEFINITIONS, commit_ocean_settings;
     }
     APP_R_HYBRIDUNDERWATERMODE {
         name: "r_hybridUnderwaterMode", default: "4",
-        range: "0..4", description: "Hybrid only: 4 Godot surface+optics when submerged, 0/1/3 native, 2 composite off.",
-        kind: CvarType::Int { min: 0, max: 4 }, field: ocean_settings.hybrid_underwater_mode, archive: 25204
+        range: "0..5", description: "Hybrid only: 4 Godot surface+optics when submerged, 0/1/3 native, 2 composite off, 5 Fluid Ninja (the river's underwater post material; r_hybridMaterial 4 turns 4 into 5).",
+        kind: CvarType::Int { min: 0, max: 5 }, field: ocean_settings.hybrid_underwater_mode, archive: 25204
     }
     APP_R_HYBRIDMATERIAL {
         name: "r_hybridMaterial", default: "1",
-        range: "0..3", description: "Hybrid ocean quality: 0 original Bluewater material; 1 compact full-resolution GGX/foam (default, honors r_hybridSSR); 2 compact with SSR disabled; 3 experimental adaptive compact: restores resolved near ripples, skips unresolvable FFT cascade reads and draws inexpensive stable world-space sun glints. Material 3 honors r_hybridSSR. All fast modes shade at native pixel resolution, independent of r_oceanPixelDetail; native FFT geometry, sky admission, and underwater behavior are preserved.",
-        kind: CvarType::Int { min: 0, max: 3 }, field: ocean_settings.hybrid_material, archive: 25206
+        range: "0..4", description: "Hybrid ocean quality: 0 original Bluewater material; 1 compact full-resolution GGX/foam (default, honors r_hybridSSR); 2 compact with SSR disabled; 3 experimental adaptive compact: restores resolved near ripples, skips unresolvable FFT cascade reads and draws inexpensive stable world-space sun glints. Material 3 honors r_hybridSSR. 4 private Fluid Ninja (r_ninjaOceanPreset) + bounded FFT; FFT wave height 0 runs the Ninja surface alone. 4 requires the Ninja preset's authored textures. All fast modes shade at native pixel resolution, independent of r_oceanPixelDetail; native FFT geometry, sky admission, and underwater behavior are preserved.",
+        kind: CvarType::Int { min: 0, max: 4 }, field: ocean_settings.hybrid_material, archive: 25206
+    }
+    APP_R_NINJAOCEANPRESET {
+        name: "r_ninjaOceanPreset", default: "1",
+        range: "0|1", description: "Private Fluid Ninja preset used by r_hybridMaterial 4: 0 Ocean2 (Water_Sparse_Sea_Ship, fixed open-water field); 1 Coast (Water_Dense_Sea 100 m: BSP bed capture, shore wave forcing and the Coast material). Coast needs its local textures (t_foam2c_normal_soft, t_sandheight1b, t_windnoise).",
+        kind: CvarType::Int { min: 0, max: 1 }, field: ocean_settings.ninja_preset, archive: 25234
+    }
+    APP_R_NINJACOASTDEBUG {
+        name: "r_ninjaCoastDebug", default: "0",
+        range: "0..11", description: "Fluid Ninja Coast debug view: 0 off; unlit 1 density (red) and wet map (green); 2 velocity; 3 pressure (red) and divergence (green +, blue -); 4 landscape gradient (red/green) and peaks (blue); 5 bed height (blue below, green above the plane, magenta unknown); lit components 6 SLW volume only (scattering + transmitted scene); 7 opaque surface layer only (BaseColor x Opacity lit, plus emissive); 8 water path (red = view path through water / 20 m, green = refraction depth valid, blue = Opacity x 4); whitewater sprites opaque: 9 particle colour / 300, 10 light term / 4, 11 emissive before fog.",
+        kind: CvarType::Int { min: 0, max: 11 }, field: ocean_settings.ninja_coast_debug, archive: 25235
+    }
+    APP_R_NINJACOASTWHITEWATER {
+        name: "r_ninjaCoastWhitewater", default: "0.3",
+        range: "0..1", description: "Fluid Ninja Coast whitewater particle amount: scale on the reference spawn rate (300000/s); 0 disables the particles, 1 = UE's rate.",
+        kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.ninja_coast_whitewater, archive: 25237
+    }
+    APP_R_NINJACOASTWHITEWATEROPACITY {
+        name: "r_ninjaCoastWhitewaterOpacity", default: "0.2",
+        range: "0..1", description: "Fluid Ninja Coast whitewater sprite opacity: host scale on each sprite's displayed alpha (1 = the measured UE HDR calibration, 0 invisible). Independent of r_ninjaCoastWhitewater, which sets how many spawn.",
+        kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.ninja_coast_whitewater_opacity, archive: 25238
+    }
+    APP_R_NINJACOASTWAVEGAIN {
+        name: "r_ninjaCoastWaveGain", default: "1",
+        range: "0..4", description: "Fluid Ninja Coast wave push toward the shore: multiplier on the automatic gain, which scales UE's landscape-slope gain (10) by the reference seabed slope / this window's slope so steep BSP seabeds do not flood the beach. 1 = auto, 0 = no waves.",
+        kind: CvarType::Float { min: 0.0, max: 4.0 }, field: ocean_settings.ninja_coast_wave_gain, archive: 25239
+    }
+    APP_R_NINJACOASTTILEMAP {
+        name: "r_ninjaCoastTileMap", default: "1",
+        range: "0|1", description: "Fluid Ninja Coast passive tile map: the long dark density streaks, their foam boost and their mesh distortion. 0 removes it (and its texture reads); the fluid sim, flow map and tile normals stay.",
+        kind: CvarType::Bool, field: ocean_settings.ninja_coast_tile_map, archive: 37136
+    }
+    APP_R_NINJACOASTTILENORMALS {
+        name: "r_ninjaCoastTileNormals", default: "1",
+        range: "0|1", description: "Fluid Ninja Coast tile height normals: the fine honeycomb ripple pattern. 0 removes them (and their texture reads); FFT waves, flow-map normals and the sim remain.",
+        kind: CvarType::Bool, field: ocean_settings.ninja_coast_tile_normals, archive: 37137
+    }
+    APP_R_NINJACOASTWAKEFOAM {
+        name: "r_ninjaCoastWakeFoam", default: "1",
+        range: "0|1", description: "Fluid Ninja Coast wake foam: 1 uses the Fluid Ninja Lake material's velocity-to-foam weights (SimVelocity x1.4 ^2.4, FlowVelocity x100 ^1.4, ColorVelocity .04 ^2), so moving water such as a player's wake leaves foam trails; also brightens fast shore swash. 0 = the Coastline material (weak wake foam).",
+        kind: CvarType::Bool, field: ocean_settings.ninja_coast_wake_foam, archive: 37153
+    }
+    APP_R_LAKENINJAWAKE {
+        name: "r_lakeNinjaWake", default: "1",
+        range: "0|1", description: "Lakes / ponds (Source water): Fluid Ninja wake. A 50 m window of the Fluid Ninja Lake simulation follows the camera over the lake and players moving through the water push it; the lake draws its ripples and the Lake material's foam trails. Needs Fluid Ninja in the build and Water wake (cg_waterwake) not Off. 0 frees it.",
+        kind: CvarType::Bool, field: ocean_settings.lake_ninja_wake, archive: 37154
+    }
+    APP_R_LAKECAUSTICS {
+        name: "r_lakeCaustics", default: "1",
+        range: "0|1", description: "Lakes / ponds (Source water): Fluid Ninja caustics. The Fluid Ninja ocean's animated caustics (its caustics volume, Coast material values) on the lakebed seen through the water, before the depth fade; within 30-50 m of the camera. Inside the Fluid Ninja wake window its flow distorts and brightens them. Needs Fluid Ninja in the build.",
+        kind: CvarType::Bool, field: ocean_settings.lake.caustics, archive: 37155
+    }
+    APP_R_LAKEUNDERWATERCAUSTICS {
+        name: "r_lakeUnderwaterCaustics", default: "1",
+        range: "0|1", description: "Lakes / ponds with Source underwater effects (r_lakeUnderwaterMode 6): the Fluid Ninja caustics (as r_lakeCaustics) on everything below the surface while you are underwater, before the Source water fog dims them. Needs Fluid Ninja in the build.",
+        kind: CvarType::Bool, field: ocean_settings.lake.underwater_caustics, archive: 37156
+    }
+    APP_R_NINJACOASTSIMDISTANCE {
+        name: "r_ninjaCoastSimDistance", default: "0",
+        range: "0..10000", description: "Fluid Ninja Coast: hold the fluid solver and whitewater simulation while the eye is more than this many metres (3D) from the nearest water in the 100 m sim window (0 = always simulate). Past 45 m the sim no longer shades any visible water; only the frozen swash height inside the window remains. 55 is a safe value.",
+        kind: CvarType::Float { min: 0.0, max: 10000.0 }, field: ocean_settings.ninja_coast_sim_distance, archive: 37138
+    }
+    APP_R_NINJACOASTFARMESHLEVELS {
+        name: "r_ninjaCoastFarMeshLevels", default: "2",
+        range: "0..3", description: "Fluid Ninja Coast mesh when the eye is more than 55 m from all water in the sim window: drop this many of the finest clipmap levels (each removes one ring, about 25k triangles). The fine Coast mesh only resolves the sim's swash near you; FFT waves keep the coarser levels. 0 = always the full mesh.",
+        kind: CvarType::Int { min: 0, max: 3 }, field: ocean_settings.ninja_coast_far_mesh_levels, archive: 37139
+    }
+    APP_R_NINJACOASTSHOREDEPTH {
+        name: "r_ninjaCoastShoreDepth", default: "8",
+        range: "0..1000", description: "Fluid Ninja Coast: the fluid sim's surface detail (its small ripples, foam, swash height and wet sand), the whitewater particles and the passive tile map (r_ninjaCoastTileMap) only over seabed shallower than this many metres; open sea (deeper or no seabed) gets none. Past the 100 m sim window the depth comes from the Blue Water coast (r_blueWaterCoast). 0 = everywhere (the original).",
+        kind: CvarType::Float { min: 0.0, max: 1000.0 }, field: ocean_settings.ninja_coast_shore_depth, archive: 37140
+    }
+    APP_R_NINJACOASTOPENFOAM {
+        name: "r_ninjaCoastOpenFoam", default: "4",
+        range: "0..10", description: "Fluid Ninja Coast open-sea foam strength: over open sea (outside r_ninjaCoastShoreDepth) the Coast foam (its flow-map and roughness lace) shows on the FFT wave crests (from the mean level, full at 30% of the significant height), riding with the waves, at every distance, up to 80% opaque; bright foam only, no dark bands. 4 matches the tile map's foam density; 0 = off. Needs FFT waves (r_blueWaterHeight > 0). Near shore the tile map (r_ninjaCoastTileMap) draws as authored.",
+        kind: CvarType::Float { min: 0.0, max: 10.0 }, field: ocean_settings.ninja_coast_open_foam, archive: 37141
+    }
+    APP_R_NINJACOASTFOLLOWSWELL {
+        name: "r_ninjaCoastFollowSwell", default: "1",
+        range: "0|1", description: "Fluid Ninja Coast sim waves follow the Blue Water wave sliders: shores facing the swell direction get the full wave drive (lee shores a quarter), the drive speed scales with the square root of the peak wavelength and its strength with the wave height (relative to the default sea). Near shore the waves still run up the beach, as real swell does. 0 = the authored Fluid Ninja drive.",
+        kind: CvarType::Bool, field: ocean_settings.ninja_coast_follow_swell, archive: 37142
+    }
+    APP_R_NINJACOASTFARLOD {
+        name: "r_ninjaCoastFarLod", default: "0",
+        range: "0..10000", description: "Fluid Ninja Coast far-water LOD A/B (lossy): eye distance in metres where the far material starts; it fully replaces the authored material at 1.5x. 0 = authored everywhere. r_ninjaCoastFarDetail picks the far material.",
+        kind: CvarType::Float { min: 0.0, max: 10000.0 }, field: ocean_settings.ninja_coast_far_lod, archive: 37128
+    }
+    APP_R_NINJACOASTFARDETAIL {
+        name: "r_ninjaCoastFarDetail", default: "1",
+        range: "0..2", description: "Fluid Ninja Coast far material (r_ninjaCoastFarLod > 0): 0 flat (FFT slope, fixed roughness, no tile foam); 1 tile density/foam without tile normals or flow map; 2 tile density and tile normals without the flow map.",
+        kind: CvarType::Int { min: 0, max: 2 }, field: ocean_settings.ninja_coast_far_detail, archive: 37129
+    }
+    APP_R_NINJACOASTSSRDISTANCE {
+        name: "r_ninjaCoastSSRDistance", default: "0",
+        range: "0..100000", description: "Fluid Ninja Coast SSR range A/B (lossy): eye distance in metres past which screen-space reflections are skipped (fading over the last quarter) and the sky reflection remains. 0 = unlimited.",
+        kind: CvarType::Float { min: 0.0, max: 100000.0 }, field: ocean_settings.ninja_coast_ssr_distance, archive: 37130
+    }
+    APP_R_NINJACOASTFFTDISTANCE {
+        name: "r_ninjaCoastFftDistance", default: "0",
+        range: "0..100000", description: "Fluid Ninja Coast FFT detail range A/B (lossy): eye distance in metres past which the full FFT wave slope hands over (over the last quarter) to r_ninjaCoastFftLite. 0 = unlimited.",
+        kind: CvarType::Float { min: 0.0, max: 100000.0 }, field: ocean_settings.ninja_coast_fft_distance, archive: 37132
+    }
+    APP_R_NINJACOASTFFTLITE {
+        name: "r_ninjaCoastFftLite", default: "2",
+        range: "0..4", description: "Fluid Ninja Coast FFT slope past r_ninjaCoastFftDistance (lossy): 0 tile ripples only; 1 anisotropic filtering capped at 4:1; 2 4:1 and no strain reads; 3 2:1 and no strain reads; 4 tile ripples and slope-variance roughness.",
+        kind: CvarType::Int { min: 0, max: 4 }, field: ocean_settings.ninja_coast_fft_lite, archive: 37133
+    }
+    APP_R_NINJACOASTDEEPWATER {
+        name: "r_ninjaCoastDeepWater", default: "1",
+        range: "0|1", description: "Fluid Ninja Coast deep-water pass: 1 = water past the shore band (seabed deeper than 1.5x r_ninjaCoastShoreDepth, or open sea) is drawn by a separate pipeline with the compact Optimized Blue Water material (FFT normals, wave-variance roughness, persistent whitecap foam); the Coast material shades the shore band and blends over it. 0 = Coast everywhere. Applies live.",
+        kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.ninja_coast_deep_water, archive: 37134
+    }
+    APP_R_NINJACOASTWAVECLIPMAP {
+        name: "r_ninjaCoastWaveClipmap", default: "0",
+        range: "0|1", description: "Experimental live A/B for the Coast deep-water pass. 1 samples baked FFT slope, roughness and crest coverage from a camera-centred clipmap. 0 samples the FFT cascades directly.",
+        kind: CvarType::Bool, field: ocean_settings.ninja_coast_wave_clipmap, archive: 37143
+    }
+    APP_R_NINJACOASTSHORECLIPMAP {
+        name: "r_ninjaCoastShoreClipmap", default: "0",
+        range: "0|1", description: "Extend r_ninjaCoastWaveClipmap to the Coast shore band's FFT normals. Applies live when the wave clipmap and deep-water split are enabled.",
+        kind: CvarType::Bool, field: ocean_settings.ninja_coast_shore_clipmap, archive: 37150
+    }
+    APP_R_NINJACOASTDEEPFOAM {
+        name: "r_ninjaCoastDeepFoam", default: "1",
+        range: "0..2", description: "Persistent foam gain for the split Coast deep-water pass. 1 keeps the current foam, 0 removes it. Applies live.",
+        kind: CvarType::Float { min: 0.0, max: 2.0 }, field: ocean_settings.ninja_coast_deep_foam, archive: 37144
+    }
+    APP_R_NINJACOASTADAPTIVE {
+        name: "r_ninjaCoastAdaptive", default: "0",
+        range: "0|1", description: "Experimental live 2x2 shading for the Coast deep-water pass. Protects visible detail, occlusion, foam and reflections. Uses direct shading or the requested wave clipmap near active shore water or when too little of the screen qualifies for 2x2 shading.",
+        kind: CvarType::Bool, field: ocean_settings.ninja_coast_adaptive, archive: 37145
+    }
+    APP_R_NINJACOASTSHOREBLEND {
+        name: "r_ninjaCoastShoreBlend", default: "1.5",
+        range: "1.01..2", description: "End of the Coast material and solver blend band, as a multiple of r_ninjaCoastShoreDepth. Applies live.",
+        kind: CvarType::Float { min: 1.01, max: 2.0 }, field: ocean_settings.ninja_coast_shore_blend, archive: 37146
+    }
+    APP_R_NINJACOASTFFTDETAIL {
+        name: "r_ninjaCoastFftDetail", default: "1",
+        range: "0..1", description: "Coast FFT shading detail. Lower values fade the smallest wave bands first. Wave height, mesh displacement and simulation rate stay the same. Applies live.",
+        kind: CvarType::Float { min: 0.0, max: 1.0 }, field: ocean_settings.ninja_coast_fft_detail, archive: 37147
+    }
+    APP_R_NINJACOASTSIMQUALITY {
+        name: "r_ninjaCoastSimQuality", default: "3",
+        range: "0..3", description: "Fluid Ninja Coast fluid sim resolution over its 100 m window. 3 = 2048 solver with a 2048 velocity/density output (the original port); 2 = 2048 solver with the UE water actor's 512 output (UE parity, cheaper surface reads); 1 = 1024 solver (about a quarter of the sim cost); 0 = 512 solver. Below 2048 the solver keeps the reference's world-space step, so waves and swirls keep their size and speed and only fine detail coarsens. A change restarts the Coast sim.",
+        kind: CvarType::Int { min: 0, max: 3 }, field: ocean_settings.ninja_coast_sim_quality, archive: 37152
+    }
+    APP_R_NINJACOASTFOAMLACE {
+        name: "r_ninjaCoastFoamLace", default: "0",
+        range: "0|1", description: "Deep-water foam texture A/B. 1 uses the Coast flow texture's foam lace with the persistent Blue Water foam. Applies live.",
+        kind: CvarType::Bool, field: ocean_settings.ninja_coast_foam_lace, archive: 37148
+    }
+    APP_R_NINJACOASTDEEPRED {
+        name: "r_ninjaCoastDeepRed", default: "0",
+        range: "0..0.2", description: "Red in-scatter added to the deep-water body as a fraction of its green or blue in-scatter. Applies live.",
+        kind: CvarType::Float { min: 0.0, max: 0.2 }, field: ocean_settings.ninja_coast_deep_red, archive: 37149
+    }
+    APP_R_NINJACOASTFFTLATE {
+        name: "r_ninjaCoastFftLate", default: "0",
+        range: "0|1", description: "Live split Coast shore-pass A/B. 1 evaluates its FFT normal after the material, 0 evaluates it before the material. Bench with the shore clipmap off.",
+        kind: CvarType::Bool, field: ocean_settings.ninja_coast_fft_late, archive: 37151
+    }
+    APP_R_NINJACOASTCOSTPROBE2 {
+        name: "r_ninjaCoastCostProbe2", default: "0",
+        range: "0..524287", description: "Fluid Ninja Coast per-operation ablation (diagnostic, wrong image): FFT slope 1 isotropic reads, 2 no strain reads, 4 one scatter copy, 8/16/32 skip cascade 0/1/2, 64 no ripple read, 128 no gust noise, 256 no shore lookup; 512 no scene colour reads, 1024 no cloud shadow, 2048 no sun shadow map, 4096 no sky irradiance, 8192 no sky radiance, 16384 no BRDF LUT, 32768 no sky admission, 65536 no fog; material 131072 no tile density reads, 262144 no roughness map read.",
+        kind: CvarType::Int { min: 0, max: 524287 }, field: ocean_settings.ninja_coast_cost_probe2, archive: 37135
+    }
+    APP_R_NINJACOASTCOSTPROBE {
+        name: "r_ninjaCoastCostProbe", default: "0",
+        range: "0..65535", description: "Fluid Ninja Coast cost bisection (diagnostic, wrong image): bits remove 1 SSR, 2 whole material (flat), 4 FFT slope, 8 scene depth/colour reads, 16 sun/cloud shadow, 32 sky lighting lookups, 64 SLW volume, 128 flow map (its mean), 256 tile normals; 512 uses the full vendor wave_surface instead of the Coast slope-only copy (same image); 1024 lite FFT slope everywhere (r_ninjaCoastFftLite, 1 if 0); 2048 no FFT vertex displacement (flat mesh); 4096 Coast fragment returns black at once; deep-water split: 8192 skip deep gates, 16384 flat deep shading, 32768 omit the Coast shore draw.",
+        kind: CvarType::Int { min: 0, max: 65535 }, field: ocean_settings.ninja_coast_cost_probe, archive: 37131
+    }
+    APP_R_NINJACOASTDUMP {
+        name: "r_ninjaCoastDump", default: "0",
+        range: "0..1000000", description: "Fluid Ninja Coast readback: changing this to a new nonzero value writes RT_VelocityDensity, RT_PressureDivergence, RT_Painter, the field capture and the bed as raw RGBA f32 (UE capture layout) plus stats.json to DinurdoJK/debug/ninja_coast. The value at startup never dumps.",
+        kind: CvarType::Int { min: 0, max: 1000000 }, field: ocean_settings.ninja_coast_dump, archive: 25236
     }
     APP_R_HYBRIDSSR {
         name: "r_hybridSSR", default: "0",
@@ -196,8 +361,8 @@ video_scalar_cvars! { SCALAR_DEFINITIONS, commit_ocean_settings;
     }
     APP_R_BLUEWATERUNDERWATERMODE {
         name: "r_blueWaterUnderwaterMode", default: "0",
-        range: "0..4", description: "Native: 0 full, 1 no motes, 2 no composite, 3 submerged-only. Legacy 4 now belongs to r_hybridUnderwaterMode.",
-        kind: CvarType::Int { min: 0, max: 4 }, field: ocean_settings.blue_water_underwater_mode, archive: 25197
+        range: "0..5", description: "Native: 0 full, 1 no motes, 2 no composite, 3 submerged-only, 5 Fluid Ninja (the river's underwater post material). Legacy 4 now belongs to r_hybridUnderwaterMode.",
+        kind: CvarType::Int { min: 0, max: 5 }, field: ocean_settings.blue_water_underwater_mode, archive: 25197
     }
     APP_R_BLUEWATERPREPAREGODOTMESH {
         name: "r_blueWaterPrepareGodotMesh", default: "0",
@@ -218,21 +383,6 @@ video_scalar_cvars! { SCALAR_DEFINITIONS, commit_ocean_settings;
         name: "r_blueWaterRefractionMode", default: "2",
         range: "0..2", description: "A/B: 0 off; 1 inexpensive Godot-style screen offset; 2 physical scene ray trace.",
         kind: CvarType::Int { min: 0, max: 2 }, field: ocean_settings.blue_water_refraction_mode, archive: 25199
-    }
-    APP_R_GERSTNERWAVESCALE {
-        name: "r_gerstnerWaveScale", default: "1",
-        range: "0.1..20", description: "Gerstner ocean (r_oceanType 5): godot-water-shader's sea this many times larger. Lengths scale by it and time by its square root, so a larger sea keeps the same shape and slows as real swell does. 1 is the original (0.4 m, 6 m waves). Applies live.",
-        kind: CvarType::Float { min: 0.1, max: 20.0 }, field: ocean_settings.gerstner_wave_scale, archive: 25231
-    }
-    APP_R_GERSTNERFOAM {
-        name: "r_gerstnerFoam", default: "7",
-        range: "0..7", description: "Gerstner ocean (r_oceanType 5) foam bits: 1 near persistent cascade (15 m), 2 far persistent cascade (30 m), 4 distant compression foam past them (per pixel, no persistence). 3 is the original; 7 all. Distances scale with r_gerstnerWaveScale. Applies live.",
-        kind: CvarType::Int { min: 0, max: 7 }, field: ocean_settings.gerstner_foam, archive: 25232
-    }
-    APP_R_GERSTNERFOAMRATE {
-        name: "r_gerstnerFoamRate", default: "60",
-        range: "0..60", description: "Gerstner ocean (r_oceanType 5): persistent foam simulation steps per second for each cascade, staggered so the near and far cascades rarely step in the same frame. 0 steps every rendered frame (the original). Applies live.",
-        kind: CvarType::Float { min: 0.0, max: 60.0 }, field: ocean_settings.gerstner_foam_rate, archive: 25233
     }
     APP_R_OCEANSCREENLODPIXELS {
         name: "r_oceanScreenLodPixels", default: "0",
@@ -327,25 +477,8 @@ app_cvars! {
             }
         }]
     }
-    APP_R_LAKESHALLOWCOLOR {
-        runtime: CvarDef::new("r_lakeShallowColor", "0 0.043898553 0.025940072", "r g b (0..1)", "Cheapwater shallow color for depth coloring.",
-            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| { let c=app.video.ocean_settings.lake.shallow_color; CvarValue::String(format!("{} {} {}",c[0],c[1],c[2])) },
-            |app,value| App::cvar_set_lake_shallow_color(app, APP_R_LAKESHALLOWCOLOR.entry.name, &value.to_string()))
-            .with_text_setter(App::cvar_set_lake_shallow_color, None),
-        config: CvarBinding {
-            load_video: Some(|settings,_name,value,_context| { if let Some(c)=parse_vec3(value) { if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.lake.shallow_color=c.map(|v| v.clamp(0.0,1.0)); } } }),
-            archive: Some((27373, |state| { let c=state.video.ocean_settings.lake.shallow_color; format!("{} {} {}",c[0],c[1],c[2]) })),
-            ..CvarBinding::NONE
-        }, implementations: [impl App {
-            fn cvar_set_lake_shallow_color(&mut self,name:&str,value:&str)->Result<(),String> {
-                self.video.ocean_settings.lake.shallow_color=Self::parse_cvar_floats(name,value)?.map(|v| v.clamp(0.0,1.0));
-                self.commit_ocean_settings();Ok(())
-            }
-        }]
-    }
     APP_R_LAKEDEEPCOLOR {
-        runtime: CvarDef::new("r_lakeDeepColor", "0 0.08160421 0.061574105", "r g b (0..1)", "Cheapwater deep color for depth coloring.",
+        runtime: CvarDef::new("r_lakeDeepColor", "0 0.08160421 0.061574105", "r g b (0..1)", "Lake water color (Source $fogcolor): what deep water fades to from above and the underwater fog in every lake underwater mode.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| { let c=app.video.ocean_settings.lake.deep_color; CvarValue::String(format!("{} {} {}",c[0],c[1],c[2])) },
             |app,value| App::cvar_set_lake_deep_color(app, APP_R_LAKEDEEPCOLOR.entry.name, &value.to_string()))
@@ -404,31 +537,6 @@ app_cvars! {
             fn cvar_set_lake_tint(&mut self, name: &str, value: &str) -> Result<(), String> {
                 self.video.ocean_settings.lake.tint_color = Self::parse_cvar_floats(name, value)?.map(|v| v.clamp(0.0, 1.0));
                 self.commit_ocean_settings(); Ok(())
-            }
-        }]
-    }
-    APP_R_LAKEFOGCOLOR {
-        runtime: CvarDef::new("r_lakeFogColor", "0 0.00003021201 0.01662098", "r g b (0..1)",
-            "Lake underwater fog color, independent of the surface color.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| { let c = app.video.ocean_settings.lake.fog_color;
-                CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
-            |app, value| App::cvar_set_lake_fog_color(app, APP_R_LAKEFOGCOLOR.entry.name, &value.to_string()))
-            .with_text_setter(App::cvar_set_lake_fog_color, None),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Some(c) = parse_vec3(value) {
-                    if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.lake.fog_color = c.map(|v| v.clamp(0.0, 1.0)); }
-                }
-            }),
-            archive: Some((27362, |state| { let c = state.video.ocean_settings.lake.fog_color;
-                format!("{} {} {}", c[0], c[1], c[2]) })),
-            ..CvarBinding::NONE
-        },
-        implementations: [impl App {
-            fn cvar_set_lake_fog_color(&mut self, name: &str, value: &str) -> Result<(), String> {
-                self.video.ocean_settings.lake.fog_color = Self::parse_cvar_floats(name, value)?.map(|v| v.clamp(0.0, 1.0));
-                self.commit_ocean_settings();
-                Ok(())
             }
         }]
     }
@@ -517,34 +625,9 @@ app_cvars! {
             }
         }]
     }
-    APP_R_HYBRIDFOGCOLOR {
-        runtime: CvarDef::new("r_hybridFogColor", "", "r g b (0..1)",
-            "Hybrid-only fog color shared by Godot submerged optics and native scattering.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| { let c = app.video.ocean_settings.hybrid_fog_color;
-                CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
-            |app, value| App::cvar_set_hybrid_fog_color(app, APP_R_HYBRIDFOGCOLOR.entry.name, &value.to_string()))
-            .with_text_setter(App::cvar_set_hybrid_fog_color, None),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Some(c) = parse_vec3(value) {
-                    if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.hybrid_fog_color = c.map(|v| v.clamp(0.0, 1.0)); }
-                }
-            }),
-            archive: Some((25211, |state| { let c = state.video.ocean_settings.hybrid_fog_color;
-                format!("{} {} {}", c[0], c[1], c[2]) })),
-            ..CvarBinding::NONE
-        },
-        implementations: [impl App {
-            fn cvar_set_hybrid_fog_color(&mut self, name: &str, value: &str) -> Result<(), String> {
-                self.video.ocean_settings.hybrid_fog_color = Self::parse_cvar_floats(name, value)?.map(|v| v.clamp(0.0, 1.0));
-                self.commit_ocean_settings();
-                Ok(())
-            }
-        }]
-    }
     APP_R_HYBRIDWATERCOLOR {
         runtime: CvarDef::new("r_hybridWaterColor", "", "r g b (0..1)",
-            "Hybrid-only water body color; native Blue Water is unaffected.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            "Hybrid / Fluid Ninja water color: the surface body tint and the underwater fog (Godot submerged optics and Blue Water scattering). Native Blue Water is unaffected.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| { let c = app.video.ocean_settings.hybrid_water_color;
                 CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
             |app, value| App::cvar_set_hybrid_water_color(app, APP_R_HYBRIDWATERCOLOR.entry.name, &value.to_string()))
@@ -868,7 +951,7 @@ app_cvars! {
 
     APP_CG_WATERWAKE {
         runtime: CvarDef::new("cg_waterwake", "1", "0|1|2",
-            "Global player water wake: 0 off; 1 regular JKA shader on unpromoted water; 2 enhanced JKA wake plus configured Godot and Cheapwater player interaction. Independent of r_oceanType.",
+            "Global player water wake (Effects > Water wake): 0 off everywhere, including the Fluid Ninja river/ocean wake; 1 regular JKA shader on unpromoted water plus the shared Fluid Ninja river/ocean wake; 2 enhanced JKA wake plus configured Godot and lake player interaction. Independent of r_oceanType.",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.water_wake.to_string()),
             |app, value| App::cvar_set_water_wake(app, APP_CG_WATERWAKE.entry.name, &value.to_string()))
@@ -891,7 +974,7 @@ app_cvars! {
                 if let Some(session) = self.game_session.as_mut() {
                     session.water_wake_mode = mode;
                 }
-                // Keep saved Godot/Cheapwater preferences untouched. Only the
+                // Keep saved Godot/lake preferences untouched. Only the
                 // renderer-facing copies are gated by the global wake mode.
                 self.commit_ocean_settings();
                 Ok(())
@@ -899,9 +982,9 @@ app_cvars! {
         }]
     }
     APP_R_OCEANTYPE {
-        runtime: CvarDef::new("r_oceanType", "4", "0..5",
-            "Water promotion: 0 stock JKA, 1 Godot ocean, 2 native Blue Water ocean, 3 Hybrid ocean, 4 Blue Water lakes/ponds (subtle relief, no FFT), 5 Gerstner ocean (Hybrid with godot-water-shader's waves, colour and foam, lit by Blue Water).",
-            CvarType::Int { min: 0, max: 5 }, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_oceanType", "4", "0..4",
+            "Water promotion: 0 stock JKA, 1 Godot ocean, 2 native Blue Water ocean, 3 Hybrid ocean, 4 Blue Water lakes/ponds (Source water, no FFT).",
+            CvarType::Int { min: 0, max: 4 }, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::Int(i32::from(app.ocean_type())),
             |app, value| {
                 let CvarValue::Int(value) = value else { unreachable!() };
@@ -911,76 +994,22 @@ app_cvars! {
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
                 if let Ok(v) = value.parse::<u8>() {
-                    if v <= 5 {
+                    if v <= 4 {
                         settings.ocean = v != 0;
                         if v != 0 {
-                            // 5 is Hybrid (backend 2) with the Gerstner surface.
-                            settings.ocean_settings.backend = if v == 5 { 2 } else { v - 1 };
-                            settings.ocean_settings.gerstner_water = v == 5;
+                            settings.ocean_settings.backend = v - 1;
                         }
                     }
                 }
             }),
             archive: Some((25225, |state| if !state.video.ocean {
                 "0".to_owned()
-            } else if state.video.ocean_settings.gerstner_active() {
-                "5".to_owned()
             } else {
                 (state.video.ocean_settings.backend + 1).to_string()
             })),
             ..CvarBinding::NONE
         },
         implementations: []
-    }
-    APP_R_GERSTNERWATERCOLOR {
-        runtime: CvarDef::new("r_gerstnerWaterColor", "0 0.21568628 0.25490198", "r g b (0..1)",
-            "Gerstner ocean (r_oceanType 5) water color, sRGB (the original's 0, 55, 65). Crests blend toward r_gerstnerCrestColor.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| { let c = app.video.ocean_settings.gerstner_water_color;
-                CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
-            |app, value| App::cvar_set_gerstner_water_color(app, APP_R_GERSTNERWATERCOLOR.entry.name, &value.to_string()))
-            .with_text_setter(App::cvar_set_gerstner_water_color, None),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Some(c) = parse_vec3(value) {
-                    if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.gerstner_water_color = c.map(|v| v.clamp(0.0, 1.0)); }
-                }
-            }),
-            archive: Some((25234, |state| { let c = state.video.ocean_settings.gerstner_water_color;
-                format!("{} {} {}", c[0], c[1], c[2]) })),
-            ..CvarBinding::NONE
-        },
-        implementations: [impl App {
-            fn cvar_set_gerstner_water_color(&mut self, name: &str, value: &str) -> Result<(), String> {
-                self.video.ocean_settings.gerstner_water_color = Self::parse_cvar_floats(name, value)?.map(|v| v.clamp(0.0, 1.0));
-                self.commit_ocean_settings();
-                Ok(())
-            }
-        }]
-    }
-    APP_R_GERSTNERCRESTCOLOR {
-        runtime: CvarDef::new("r_gerstnerCrestColor", "0 0.3133 0.1517", "r g b (0..1)",
-            "Gerstner ocean (r_oceanType 5) crest color, sRGB: wave tops blend from r_gerstnerWaterColor toward it (the original's green).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
-            |app: &App| { let c = app.video.ocean_settings.gerstner_crest_color;
-                CvarValue::String(format!("{} {} {}", c[0], c[1], c[2])) },
-            |app, value| App::cvar_set_gerstner_crest_color(app, APP_R_GERSTNERCRESTCOLOR.entry.name, &value.to_string()))
-            .with_text_setter(App::cvar_set_gerstner_crest_color, None),
-        config: CvarBinding {
-            load_video: Some(|settings, _name, value, _context| {
-                if let Some(c) = parse_vec3(value) {
-                    if c.iter().all(|v| v.is_finite()) { settings.ocean_settings.gerstner_crest_color = c.map(|v| v.clamp(0.0, 1.0)); }
-                }
-            }),
-            archive: Some((25235, |state| { let c = state.video.ocean_settings.gerstner_crest_color;
-                format!("{} {} {}", c[0], c[1], c[2]) })),
-            ..CvarBinding::NONE
-        },
-        implementations: [impl App {
-            fn cvar_set_gerstner_crest_color(&mut self, name: &str, value: &str) -> Result<(), String> {
-                self.video.ocean_settings.gerstner_crest_color = Self::parse_cvar_floats(name, value)?.map(|v| v.clamp(0.0, 1.0));
-                self.commit_ocean_settings();
-                Ok(())
-            }
-        }]
     }
     APP_R_OCEANSURFACEPIXELS {
         runtime: CvarDef::new("r_oceanSurfacePixels", "1", "0|1",
@@ -1092,7 +1121,7 @@ app_cvars! {
     }
     APP_R_OCEANPIXELDEBUG {
         runtime: CvarDef::new("r_oceanPixelDebug", "0", "0|1",
-            "Native Blue Water diagnostic, not archived: with r_oceanPixelDetail 5, tint the 2x2 blocks that get full shading by why (yellow water edge, blue depth step, red luminance).",
+            "Adaptive ocean shading diagnostic. Native mode 5 colors full-rate tiles by reason. Coast colors full-rate pixels pink and reconstructed pixels green. Applies live for the session.",
             CvarType::Bool, CvarFlags::NONE, LatchScope::None,
             |app: &App| CvarValue::Bool(app.video.ocean_settings.pixel_detail_debug),
             |app, value| {
@@ -1507,9 +1536,10 @@ app_cvars! {
                     {
                         self.video.ocean = Self::parse_cvar_bool(name, value)?;
                         if let Some(session) = self.game_session.as_mut() {
+                            session.ocean_ninja_enabled = jka_ninja::INCLUDED && self.video.ocean && self.video.ocean_settings.ninja_wake_requested();
                             session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction && self.video.water_wake == 2;
                             session.lake_wakes_enabled = self.video.water_wake == 2 && self.video.ocean
-                                && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1
+                                && self.video.ocean_settings.backend == 3
                                 && self.video.ocean_settings.interaction && self.video.ocean_settings.interaction_strength > 0.0;
                         }
                         // OFF releases the FFT resources immediately, and ON can be

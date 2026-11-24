@@ -14,6 +14,7 @@ pub(in crate::app) struct AppliedVideoMode {
     pub(in crate::app) hdr_output: u32,
     pub(in crate::app) resolution: [u32; 2],
     pub(in crate::app) resolution_desktop: bool,
+    pub(in crate::app) resolution_mode: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,8 +181,9 @@ impl App {
 
     pub(in crate::app) fn set_desktop_resolution(&mut self) {
         let resolution = self.selected_desktop_resolution();
-        if self.video.resolution_desktop && self.video.resolution == resolution { return; }
+        if self.video.resolution_mode == -2 && self.video.resolution == resolution { return; }
         self.video.resolution_desktop = true;
+        self.video.resolution_mode = -2;
         self.video.resolution = resolution;
         self.desktop_resolution = Some(resolution);
         self.mark_config_dirty();
@@ -193,13 +195,30 @@ impl App {
     }
 
     pub(in crate::app) fn set_custom_resolution(&mut self, resolution: [u32; 2]) {
-        if !self.video.resolution_desktop && self.video.resolution == resolution { return; }
+        if self.video.resolution_mode == -1 && self.video.resolution == resolution { return; }
         self.video.resolution_desktop = false;
+        self.video.resolution_mode = -1;
         self.video.resolution = resolution;
         self.mark_config_dirty();
         self.console_status = format!(
             "RESOLUTION: {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
             resolution[0], resolution[1]
+        );
+        self.publish_ui();
+    }
+
+    /// Select one of OpenJK's stable numeric r_mode presets; do not infer a
+    /// mode from dimensions, since -1 is valid even at a preset resolution.
+    pub(in crate::app) fn set_preset_resolution(&mut self, index: usize) {
+        let Some(&resolution) = crate::ui::OPENJK_R_MODES.get(index) else { return; };
+        if self.video.resolution_mode == index as i32 && self.video.resolution == resolution { return; }
+        self.video.resolution_mode = index as i32;
+        self.video.resolution_desktop = false;
+        self.video.resolution = resolution;
+        self.mark_config_dirty();
+        self.console_status = format!(
+            "R_MODE {}: {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
+            index, resolution[0], resolution[1]
         );
         self.publish_ui();
     }
@@ -330,6 +349,7 @@ impl App {
         self.video.hdr_output = self.applied_hdr_output;
         self.video.resolution = self.applied_resolution;
         self.video.resolution_desktop = self.applied_resolution_desktop;
+        self.video.resolution_mode = self.applied_resolution_mode;
 
         if target == FullscreenMode::Exclusive
             && self.applied_renderer_backend != RendererBackend::Dx12
@@ -569,6 +589,7 @@ impl App {
             hdr_output: self.applied_hdr_output,
             resolution: self.applied_resolution,
             resolution_desktop: self.applied_resolution_desktop,
+            resolution_mode: self.applied_resolution_mode,
         }
     }
 
@@ -727,6 +748,7 @@ impl App {
             // resources needed to draw them.
             || crate::app::cvar_registry().requires_restart(self)
             || self.map_prepare_restart_required()
+            || self.video.resolution_mode != self.applied_resolution_mode
             || !self.latched_console_cvars.is_empty()
     }
 
@@ -780,6 +802,7 @@ impl App {
         }
         if self.video.resolution != self.applied_resolution
             || self.video.resolution_desktop != self.applied_resolution_desktop
+            || self.video.resolution_mode != self.applied_resolution_mode
         {
             let label = |desktop: bool, resolution: [u32; 2]| {
                 if desktop { format!("Desktop ({} x {})", resolution[0], resolution[1]) }
@@ -935,7 +958,7 @@ impl App {
                             target.fullscreen.label()
                         ),
                     ),
-                    "r_customwidth" | "r_customheight" => add(
+                    "r_mode" | "r_customwidth" | "r_customheight" => add(
                         "resolution",
                         "Resolution",
                         format!(
@@ -1068,6 +1091,7 @@ impl App {
         self.video.hdr_output = previous.hdr_output;
         self.video.resolution = previous.resolution;
         self.video.resolution_desktop = previous.resolution_desktop;
+        self.video.resolution_mode = previous.resolution_mode;
         self.normalize_video_selection();
         self.console_status = format!("VIDEO SETTINGS {reason}; REVERTING...");
         self.push_console_line(format!("^3{}", self.console_status));
@@ -1110,6 +1134,7 @@ impl App {
         self.applied_fullscreen = mode;
         self.applied_resolution = self.video.resolution;
         self.applied_resolution_desktop = self.video.resolution_desktop;
+        self.applied_resolution_mode = self.video.resolution_mode;
         Ok(())
     }
 
@@ -1139,6 +1164,11 @@ impl App {
         let framebuffer_restart = self.framebuffer_format_restart_pending();
         self.apply_latched_console_cvars(ApplyLatchedScope::VidRestart);
         self.refresh_desktop_resolution();
+        // Switching between a custom size and an indexed mode with the same
+        // dimensions changes only cvar identity; no swapchain work is needed.
+        if !self.display_restart_required() {
+            self.applied_resolution_mode = self.video.resolution_mode;
+        }
         Some(if framebuffer_restart {
             ApplyVideoPath::RestartRenderer
         } else if !self.display_restart_required() {
@@ -1262,6 +1292,8 @@ impl App {
                     self.applied_resolution = actual;
                     self.video.resolution_desktop = false;
                     self.applied_resolution_desktop = false;
+                    self.video.resolution_mode = -1;
+                    self.applied_resolution_mode = -1;
                     self.mark_config_dirty();
                 }
             }
@@ -1337,6 +1369,7 @@ impl App {
         self.video.hdr_output = target.hdr_output;
         self.video.resolution = target.resolution;
         self.video.resolution_desktop = target.resolution_desktop;
+        self.video.resolution_mode = target.resolution_mode;
     }
 
     pub(in crate::app) fn restart_display_apply_failed(
@@ -1536,6 +1569,7 @@ impl App {
         self.applied_fullscreen = target.fullscreen;
         self.applied_resolution = target.resolution;
         self.applied_resolution_desktop = target.resolution_desktop;
+        self.applied_resolution_mode = target.resolution_mode;
         self.window_hidden_for_restart = true;
         self.window = Some(Arc::clone(&window));
         self.reset_egui_for_window(&window);
@@ -1773,6 +1807,7 @@ impl App {
             hdr_output: self.video.hdr_output,
             resolution: self.video.resolution,
             resolution_desktop: self.video.resolution_desktop,
+            resolution_mode: self.video.resolution_mode,
         };
 
         // Preserve the current window placement before leaving windowed mode,
@@ -1917,6 +1952,7 @@ impl App {
         self.applied_fullscreen = target.fullscreen;
         self.applied_resolution = target.resolution;
         self.applied_resolution_desktop = target.resolution_desktop;
+        self.applied_resolution_mode = target.resolution_mode;
         rverbose!(
             1,
             "[VID_RESTART] display mode unchanged; skipped Win32 mode transition"

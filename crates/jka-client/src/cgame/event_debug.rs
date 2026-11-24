@@ -153,6 +153,16 @@ pub fn verbose_lines(event: &PresentationEvent, game: &ClientGameState) -> Vec<S
     )];
 
     let name = event_name(event.event);
+    // The flagged MISSILE_HIT / MISSILE_MISS path uses trickedentindex to
+    // request a Ghoul2 mark in TaystJK's CG_EntityEvent.
+    if matches!(name, "EV_GHOUL2_MARK" | "EV_MISSILE_HIT" | "EV_MISSILE_MISS") {
+        lines.push(format!(
+            "^5  GHOUL2 MARK^7 requested={} trickedentindex={} target={} trace={}",
+            name == "EV_GHOUL2_MARK" || field("trickedentindex") != 0,
+            field("trickedentindex"), field("otherEntityNum"),
+            event.parm != 0,
+        ));
+    }
     if matches!(name, "EV_GENERAL_SOUND" | "EV_GLOBAL_SOUND" | "EV_ENTITY_SOUND" | "EV_STARTLOOPINGSOUND" | "EV_GRENADE_BOUNCE" | "EV_MISSILE_STICK") {
         if let Some(qpath) = game.sound_qpath(event.parm) {
             lines.push(format!("^5  RESOURCE^7 sound[{}]={}", event.parm, qpath));

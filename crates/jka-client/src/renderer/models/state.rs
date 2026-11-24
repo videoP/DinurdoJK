@@ -489,6 +489,7 @@ impl DynamicModelRenderer {
             fx_sprite_instance_buffer,
             fx_sprite_instance_capacity,
             fx_sprite_draws: Vec::new(),
+            fx_water_split: std::cell::Cell::new(super::types::FxWaterSplit::Off),
             fx_rope_present: false,
             lightning_gpu: None,
             lightning_gpu_attempted: false,
@@ -508,6 +509,7 @@ impl DynamicModelRenderer {
             skin_bind_group,
             glass_bind_group: None,
             skin_draws: Vec::new(),
+            skin_gore_gpu: None,
             skin_instance_entities: Vec::new(),
             object_motion: false,
             motion: Default::default(),
@@ -553,6 +555,7 @@ impl DynamicModelRenderer {
             scratch_group_sort: Vec::new(),
             scratch_group_order: Vec::new(),
             rt_skinning: None,
+            cloth_gpu: Default::default(),
             rt_prepared: false,
             frame_texture_keys: HashMap::new(),
         }
@@ -593,6 +596,8 @@ impl DynamicModelRenderer {
     pub(in crate::renderer) fn record_cpu_geometry(&mut self,
         source: crate::renderer::ModelGeometrySource, vertices: usize, indices: usize) {
         if self.capture_prepare {
+            use crate::renderer::ModelGeometrySource;
+            let source = if source == ModelGeometrySource::TranslatedFx { ModelGeometrySource::Fx } else { source };
             let count = &mut self.perf_prepare.cpu_sources[source as usize];
             count.surfaces += 1;
             count.vertices += vertices as u64;
@@ -803,19 +808,27 @@ impl DynamicModelRenderer {
         self.companion_excluded_entity = entity;
     }
 
+    /// `storage`: GPU cloth writes its surfaces into this buffer from compute.
+    /// The usage is only added once that path is in use, and then kept.
     pub(in crate::renderer) fn ensure_vertex_capacity(
         &mut self,
         device: &wgpu::Device,
         required: u64,
+        storage: bool,
     ) {
-        if required <= self.vertex_capacity {
+        let has_storage = self.vertex_buffer.usage().contains(wgpu::BufferUsages::STORAGE);
+        if required <= self.vertex_capacity && (has_storage || !storage) {
             return;
         }
-        self.vertex_capacity = required.next_power_of_two().max(4096);
+        self.vertex_capacity = required.next_power_of_two().max(4096).max(self.vertex_capacity);
+        let mut usage = wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST;
+        if storage || has_storage {
+            usage |= wgpu::BufferUsages::STORAGE;
+        }
         self.vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("JKA dynamic model vertex buffer"),
             size: self.vertex_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage,
             mapped_at_creation: false,
         });
     }

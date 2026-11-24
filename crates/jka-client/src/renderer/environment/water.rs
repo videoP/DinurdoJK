@@ -282,6 +282,18 @@ impl Renderer {
         apply(&mut world.auto4_batches);
     }
 
+    fn source_water_normal_view(&mut self) -> Option<wgpu::TextureView> {
+        if self.source_water_normal.is_none() {
+            self.source_water_normal = Some(load_source_water_normal(
+                &self.device,
+                &self.queue,
+                &self.base,
+                self.detail_texture_game.as_deref(),
+            ));
+        }
+        self.source_water_normal.clone().flatten()
+    }
+
     pub(in crate::renderer) fn set_ocean_settings(
         &mut self,
         settings: crate::ocean::OceanSettings,
@@ -321,6 +333,15 @@ impl Renderer {
             } else if let Some(ocean) = &mut self.ocean {
                 ocean.set_settings(&self.queue, self.ocean_settings);
             }
+            // Decoded only once lakes are selected; startup never reads it.
+            let source_normal = if settings.backend == 3 {
+                self.source_water_normal_view()
+            } else {
+                self.source_water_normal.clone().flatten()
+            };
+            if let Some(ocean) = &mut self.ocean {
+                ocean.set_source_water_normal(source_normal);
+            }
         }
         let descriptors = self.authored_ocean_definitions.clone();
         self.set_authored_oceans(descriptors);
@@ -346,7 +367,7 @@ impl Renderer {
         descriptors: Vec<crate::ocean::authoring::AuthoredOcean>,
     ) {
         self.authored_ocean_definitions = descriptors.clone();
-        // Native backends (Blue Water, Hybrid, Gerstner) draw water only through
+        // Native backends (Blue Water, Hybrid) draw water only through
         // the shared ocean's promoted pools, and an authored instance would claim
         // a pool it never draws. The app folds the map's values into the shared
         // settings instead (`effective_ocean_settings`).
@@ -620,4 +641,81 @@ impl OceanVisibility {
         self.slots[current].pending = Some(receiver);
         self.encoded = false;
     }
+}
+
+/// HL2 water normals for Source lake water, as one array: the canal
+/// `dev/water_normal` frames (29 at 30 fps), then `water_coast01_normal` as
+/// the last layer. Either missing: the other stands in for it. Both missing:
+/// Source water keeps the `textures/japro/water_normal` fallback normal map.
+fn load_source_water_normal(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    base: &std::path::Path,
+    game: Option<&std::path::Path>,
+) -> Option<wgpu::TextureView> {
+    const CANAL: &str = "materials/dev/water_normal.vtf";
+    const COAST: &str = "materials/nature/water_coast01_normal.vtf";
+    let mut assets = match crate::renderer::AssetSearchPath::open_game(base, game) {
+        Ok(assets) => assets,
+        Err(error) => {
+            eprintln!("Source water normal: asset search: {error}");
+            return None;
+        }
+    };
+    let mut load = |path: &str| -> Option<Vec<crate::materials::TextureData>> {
+        let asset = match assets.read(path, 32 * 1024 * 1024) {
+            Ok(Some(asset)) => asset,
+            Ok(None) => {
+                eprintln!("Source water normal: {path} not found");
+                return None;
+            }
+            Err(error) => {
+                eprintln!("Source water normal {path}: {error}");
+                return None;
+            }
+        };
+        crate::cgame::player_presenter::source_vtf::decode_linear_vtf_frames(path, &asset.bytes)
+            .map_err(|error| eprintln!("Source water normal: {error}"))
+            .ok()
+            .filter(|frames| !frames.is_empty())
+    };
+    let canal = load(CANAL);
+    let coast = load(COAST);
+    let (canal, coast) = match (canal, coast) {
+        (Some(canal), Some(mut coast)) => {
+            let shape = |t: &crate::materials::TextureData| (t.width, t.height, t.mip_level_count);
+            if shape(&coast[0]) == shape(&canal[0]) {
+                (canal, coast.swap_remove(0))
+            } else {
+                eprintln!("Source water normal: {COAST} size differs from {CANAL}; using the canal normal for open water");
+                let first = canal[0].clone();
+                (canal, first)
+            }
+        }
+        (Some(canal), None) => {
+            let first = canal[0].clone();
+            (canal, first)
+        }
+        (None, Some(mut coast)) => {
+            let first = coast.swap_remove(0);
+            (vec![first.clone()], first)
+        }
+        (None, None) => {
+            eprintln!("Source water normal: using the textures/japro/water_normal fallback");
+            return None;
+        }
+    };
+    let layers: Vec<&[u8]> = canal
+        .iter()
+        .chain(std::iter::once(&coast))
+        .map(|frame| frame.rgba.as_slice())
+        .collect();
+    Some(blue_water_gpu::lakes::LakePipeline::normal_array(
+        device,
+        queue,
+        &layers,
+        coast.width,
+        coast.height,
+        coast.mip_level_count,
+    ))
 }

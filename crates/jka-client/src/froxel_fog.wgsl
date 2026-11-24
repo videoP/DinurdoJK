@@ -190,6 +190,11 @@ fn local_shadow_visibility(light: PointLight, world: vec3<f32>) -> f32 {
 
 fn local_light_attenuation(light: PointLight, distance_to_light: f32) -> f32 {
     let radius = max(light.position_radius.w, 1.0);
+    if (light.shadow.y < 0.0) {
+        // UE DynamicLightingCommon.ush, RadialAttenuation.
+        let ratio = distance_to_light / radius;
+        return pow(max(1.0 - ratio * ratio, 0.0), -light.shadow.y);
+    }
     let edge = max(1.0 - distance_to_light / radius, 0.0);
     if (light.shadow.y > 1.5) {
         let safe_distance = max(distance_to_light, 16.0);
@@ -527,6 +532,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let authored_depth = max(settings.fog_params.w, 0.0);
     let camera_forward = world_ray(vec2<f32>(0.5, 0.5));
     let ray_forward_scale = max(dot(ray, camera_forward), 0.0);
+    // NINJA_FOG_RAY
 
     var transmittance = 1.0;
     var scattering = vec3<f32>(0.0);
@@ -584,7 +590,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             max(snow_optical_depth_limit - snow_optical_depth, 0.0)
         );
         snow_optical_depth += snow_extinction;
-        let extinction = fog_extinction + rain_extinction + snow_extinction;
+        // NINJA_FOG_SEGMENT
+        // NINJA_SNOW_DUST_SEGMENT
+        let extinction = fog_extinction + rain_extinction + snow_extinction /* NINJA_FOG_EXTINCTION */ /* NINJA_SNOW_DUST_EXTINCTION */;
         let step_transmittance = exp(-extinction);
 
         var direct_visibility = 1.0;
@@ -610,6 +618,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 + local_fog.rgb
                 + rain_color * rain_extinction
                 + snow_color * snow_extinction
+                // NINJA_FOG_COLOR
+                // NINJA_SNOW_DUST_COLOR
             ) / extinction;
         }
         // Manual volumetric fog keeps the stylized low ambient term. Authored
@@ -621,7 +631,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let sun_scatter = medium_color * sun_color * phase * direct_visibility * (0.42 * sun_intensity);
         let local_scatter = local_light_scattering(gid, world, midpoint_depth, ray, medium_color, g);
         let source = ambient_scatter + sun_scatter + local_scatter;
-        let integrated_step = source * (1.0 - step_transmittance);
+        let integrated_step = source * (1.0 - step_transmittance) /* NINJA_FOG_EMISSION */ /* NINJA_SNOW_DUST_EMISSION */;
         scattering += transmittance * integrated_step;
         transmittance *= step_transmittance;
 

@@ -73,5 +73,5 @@ fn vs_main(input: VertexInput) -> @builtin(position) vec4<f32> {
         -turn.x * bent_vertex.x + turn.y * bent_vertex.z,
     );
     let world_position = root_world + vertex_m_turned / WORLD_SCALE;
-    return shadow.view_proj * vec4<f32>(world_position, 1.0);
+    return shadow.view_proj * vec4<f32>(world_position /* BLADE_MATERIAL_OFFSET */, 1.0);
 }

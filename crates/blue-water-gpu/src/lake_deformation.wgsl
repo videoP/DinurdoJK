@@ -1,4 +1,4 @@
-// Static smooth simplex noise from the Gerstner material's noise baker. RGB holds
+// Static smooth simplex noise (ocean/lake_noise.rs, baked once). RGB holds
 // height and its world-space derivatives: one filtered lookup, no wave simulation.
 @group(1) @binding(10) var jka_lake_noise: texture_2d<f32>;
 @group(1) @binding(11) var jka_lake_repeat: sampler;
@@ -113,11 +113,12 @@ fn jka_lake_ssr(world: vec3<f32>, normal: vec3<f32>, fallback: vec3<f32>) -> vec
     return fallback;
 }
 
-fn jka_lake_project(world: vec3<f32>, horizon: f32) -> vec4<f32> {
+fn jka_lake_project(world: vec3<f32>) -> vec4<f32> {
     var clip = camera.view_projection * vec4<f32>(world, 1.0);
-    // Continue over sky beyond the finite scene's far clip. Nearby geometry
-    // retains its ordinary depth and still occludes the extension.
-    if (horizon > 0.5 || lake.offset.w > 0.5) && clip.w > 0.0 {
+    // Continue over sky beyond the finite scene's far clip (offset.w: this pool
+    // has the horizon strip). Nearby geometry retains its ordinary depth and
+    // still occludes the extension.
+    if lake.offset.w > 0.5 && clip.w > 0.0 {
         clip.z = max(clip.z, clip.w * 0.000001);
     }
     return clip;
@@ -128,6 +129,7 @@ fn jka_lake_world(input: VertexIn) -> vec3<f32> {
     if lake.deformation.y < 0.5 { return input.position; }
     let level = u32(input.lake.z);
     let frame = lake.frames[level];
+    // Horizon strip and the zero-amplitude quad: flat, about the level's frame.
     if input.lake.w > 0.5 {
         return vec3<f32>(frame.x + input.position.x, 0.0, frame.y + input.position.z);
     }

@@ -134,7 +134,11 @@ impl PlayerPresenter {
         self.force_refractions.clear();
         self.speed_trail_history.clear();
         self.gore.clear();
+        self.skin_gore.clear();
         self.pending_gore.clear();
+        self.skin_gore_pains.clear();
+        self.saber_gore_hits.clear();
+        self.saber_gore_blades.clear();
         self.last_gpu.clear();
         self.studio_bones.clear();
         self.studio_saber_tips.clear();
@@ -295,7 +299,7 @@ impl PlayerPresenter {
             anim_events,
             footstep_stages: FootstepStages::from_level(footsteps::FOOTSTEPS_MARKS),
             footstep_trace: false,
-            footstep_solids: Vec::new(),
+            presentation_solids: Vec::new(),
             footsteps: Vec::new(),
             jk2_footsteps: Vec::new(),
             jk2_footstep_diag: Default::default(),
@@ -308,6 +312,8 @@ impl PlayerPresenter {
             studio_bone_masks:HashMap::new(),studio_bones:HashMap::new(),
             studio_saber_clients:Vec::new(),studio_saber_tips:HashMap::new(),studio_fpls:false,
             viewer_anim_debug: None,
+            river_ninja_bones: None,
+            ninja_fire_pose: None,
             viewer_dueling: false,
             viewer_force_see: false,
             cloak_states: HashMap::new(),
@@ -344,8 +350,13 @@ impl PlayerPresenter {
             disintegration_start: HashMap::new(),
             disintegration_smoke_last: HashMap::new(),
             gore_limit: 0,
+            skin_gore_enabled: false,
+            skin_gore: Default::default(),
             gore: Vec::new(),
             pending_gore: Vec::new(),
+            skin_gore_pains: Vec::new(),
+            saber_gore_hits: HashMap::new(),
+            saber_gore_blades: Vec::new(),
             gore_next_id: 1,
             last_gpu: HashMap::new(),
             vehicle_snaps: HashMap::new(),
@@ -361,6 +372,8 @@ impl PlayerPresenter {
             cloth: super::AsyncClothSystem::default(),
             cloth_weather_wind: None,
             cloth_body_templates: HashMap::new(),
+            cloth_remeshes: HashMap::new(),
+            cloth_gpu_garments: HashMap::new(),
             ragdolls: RagdollWorld::new(),
             force_grip_targets: HashMap::new(),
             force_gripped_entities: HashSet::new(),
@@ -552,7 +565,7 @@ impl PlayerPresenter {
     pub fn set_footstep_trace(&mut self, enabled: bool) {
         self.footstep_trace = enabled;
         if !enabled {
-            self.footstep_solids.clear();
+            self.presentation_solids.clear();
         }
     }
 

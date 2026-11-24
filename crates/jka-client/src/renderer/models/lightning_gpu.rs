@@ -75,6 +75,7 @@ fn projected_light(
         kind: crate::fx::system::FxLightKind::AuthoredEffect,
         position: position.to_array(), color, radius,
         source_radius: 0.0, intensity,
+        radial_exponent: None,
         spot: Some(crate::fx::system::FxSpotLight {
             direction: direction.to_array(),
             inner_cone_cos: inner_degrees.to_radians().cos(),
@@ -89,6 +90,7 @@ fn plasma_light(position: Vec3, radius:f32, intensity:f32) -> TransientLight {
         kind: crate::fx::system::FxLightKind::AuthoredEffect,
         position: position.to_array(), color:[0.16,0.42,1.0], radius,
         source_radius: 0.0, intensity,
+        radial_exponent: None,
         spot: None, segment: None, blade_segments: None,
     }
 }
@@ -343,6 +345,7 @@ impl LightningGpu {
                 position: (hit-incoming*1.5).to_array(),
                 color: [0.17,0.45,1.0], radius: 110.0,
                 source_radius: 0.0, intensity: 1.75*flicker,
+                radial_exponent: None,
                 spot: None, segment: None, blade_segments: None,
             });
         }

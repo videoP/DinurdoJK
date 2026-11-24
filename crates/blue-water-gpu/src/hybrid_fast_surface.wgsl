@@ -7,11 +7,10 @@ struct JkaFastWave {
     foam: f32,
     variance: f32,
     jacobian: f32,
+    raw_jacobian: f32,
 }
 
-fn jka_fast_wave(xz: vec2<f32>, calm: f32) -> JkaFastWave {
-    let dx = dpdx(xz);
-    let dy = dpdy(xz);
+fn jka_fast_wave_grad(xz: vec2<f32>, calm: f32, dx: vec2<f32>, dy: vec2<f32>, fft_detail: f32) -> JkaFastWave {
     let footprint = max(min(length(dx), length(dy)), max(length(dx), length(dy)) / ANISOTROPY);
     let coast = shore_at(xz);
 #ifdef JKA_ADAPTIVE_HYBRID
@@ -33,7 +32,15 @@ fn jka_fast_wave(xz: vec2<f32>, calm: f32) -> JkaFastWave {
     var variance = waves.tail.x;
     for (var i = 0; i < CASCADES; i++) {
         let level = log2(max(footprint * waves.texels[i], 1e-6));
-        let detail = 1.0 - smoothstep(waves.info.x - 1.0, waves.info.x, level);
+        let detail = (1.0 - smoothstep(waves.info.x - 1.0, waves.info.x, level))
+            * clamp(fft_detail * f32(CASCADES) - f32(i), 0.0, 1.0);
+#ifdef JKA_NINJA_OPEN_SEA
+        if detail <= 0.0 {
+            let kept = coast.scales[i];
+            variance += waves.slopes[i] * kept * kept;
+            continue;
+        }
+#endif
 #ifdef JKA_ADAPTIVE_HYBRID
         if detail <= 0.0 {
             // Same variance as the fully filtered branch below, without the
@@ -99,13 +106,16 @@ fn jka_fast_wave(xz: vec2<f32>, calm: f32) -> JkaFastWave {
     variance = max(variance, 0.0001);
 #endif
     slope = slope * jka_hybrid.motion_mix.z + jka_hybrid_slope(xz);
-    strain = (strain * jka_hybrid.motion_mix.z + jka_hybrid_strain(xz)) * jka_hybrid_crest_scale();
+    let raw_strain = strain * jka_hybrid.motion_mix.z + jka_hybrid_strain(xz);
+    strain = raw_strain * jka_hybrid_crest_scale();
+    var raw_jacobian = 1.0;
+    if jka_hybrid.breaker.x > 2.5 { raw_jacobian = jka_crest_jacobian(raw_strain); }
     let xx = 1.0 + strain.x;
     let zz = 1.0 + strain.y;
     let determinant = xx * zz - strain.z * strain.z;
     let normal = normalize(vec3<f32>(-(zz * slope.x - strain.z * slope.y),
         determinant, -(xx * slope.y - strain.z * slope.x)) + vec3<f32>(0.0, 1e-6, 0.0));
-    return JkaFastWave(normal, foam / clamp(determinant, FOAM_JACOBIAN_MIN, FOAM_JACOBIAN_MAX), variance, determinant);
+    return JkaFastWave(normal, foam / clamp(determinant, FOAM_JACOBIAN_MIN, FOAM_JACOBIAN_MAX), variance, determinant, raw_jacobian);
 }
 
 #ifdef JKA_ADAPTIVE_HYBRID
@@ -189,7 +199,16 @@ fn fragment(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0
     let xz = input.grid;
     let footprint = max(length(dpdx(xz)), length(dpdy(xz)));
     let wake = wake_surface(xz, input.world, footprint);
-    let sample = jka_fast_wave(xz, wake.slick);
+#ifdef JKA_NINJA_WAVE_CLIPMAP
+    let sample = ninja_cached_wave(xz, wake.slick, dpdx(xz), dpdy(xz), ninja_host.detail.y);
+#else
+#ifdef JKA_NINJA_OPEN_SEA
+    let wave_detail = ninja_host.detail.y;
+#else
+    let wave_detail = 1.0;
+#endif
+    let sample = jka_fast_wave_grad(xz, wake.slick, dpdx(xz), dpdy(xz), wave_detail);
+#endif
     let to_camera = camera.position.xyz - input.world;
     let distance = max(length(to_camera), 1e-5);
     let view = to_camera / distance;
@@ -216,6 +235,9 @@ fn fragment(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0
         normalize(vec3<f32>(direction.x, max(direction.y, 0.0), direction.z)), alpha)
         * (jka_admission * jka_hybrid.breaker.w);
     var reflected = sky;
+#ifdef JKA_NINJA_REDUCED
+    var highlight_hit = false;
+#endif
 #ifdef JKA_FAST_SSR
     let to_view = camera.view;
     let traced = screen_space_reflection(scene_color, wake_sampler, scene_depth,
@@ -224,8 +246,15 @@ fn fragment(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0
         surface.reflections.y, REFLECTION_STEPS,
         (to_view * vec4<f32>(up, 0.0)).xyz, alpha, TRACE_BELOW);
     reflected = mix(sky, traced.color, traced.confidence);
+#ifdef JKA_NINJA_REDUCED
+    highlight_hit = traced.confidence > 0.05;
 #endif
+#endif
+#ifdef JKA_NINJA_REDUCED
+    let pixel = ninja_coarse_scene_pixel(input.clip.xy);
+#else
     let pixel = vec2<i32>(input.clip.xy);
+#endif
     let depth = textureLoad(scene_depth, pixel, 0);
     let scene_view_z = -camera.near * camera.far / (depth * (camera.far - camera.near) + camera.near);
     let ray_view_z = (camera.view * vec4<f32>(-view, 0.0)).z;
@@ -235,19 +264,47 @@ fn fragment(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0
     let absorption = optics.absorption;
     let backscatter = optics.backscatter;
     let attenuation = select(absorption, water_beam(optics) - backscatter, surface.water.absorption.w > 0.5);
-    let deep = upwelling(subsurface_reflectance(absorption, backscatter), sun_direction, sun_radiance, daylight, lit)
+    var deep = upwelling(subsurface_reflectance(absorption, backscatter), sun_direction, sun_radiance, daylight, lit)
         * (surface.transmission.rgb / JKA_FAST_TRANSMISSION);
+#ifdef JKA_NINJA_OPEN_SEA
+    deep.r += max(deep.g, deep.b) * ninja_host.detail.w;
+#endif
     let bent = jka_refracted_scene(input.world, -view, up, 1.0 / 1.333, column * 2.0, true);
     let transmitted = select(textureLoad(scene_color, pixel, 0).rgb, bent.rgb, bent.a >= 0.0);
     let through = select(column, bent.a, bent.a >= 0.0);
     let body = water_body(transmitted, deep, column_transmittance(attenuation, backscatter, through, view));
     let water = mix(body, reflected, reflectance);
-    let patterns = jka_fast_patterns(xz, surface.foam.x * 2.0 + 1.0, sun_direction);
+    let stretch = surface.foam.x * 2.0 + 1.0;
+    var patterns = jka_fast_patterns(xz, stretch, sun_direction);
+#ifdef JKA_NINJA_OPEN_SEA
+    if ninja_host.detail.z > 0.5 {
+        let heading = vec2<f32>(cos(waves.sea.z), sin(waves.sea.z));
+        let uv = vec2<f32>(dot(xz, heading) / stretch, dot(xz, vec2<f32>(-heading.y, heading.x))) / 40.0;
+        let density = textureSample(ninja_flow, ninja_repeat, uv).b;
+        // Coast uses this channel as a dark multiplicative density mask.
+        // Remap its linear-light 50th, 75th and 90th percentiles to the
+        // distribution expected by the persistent-foam coverage threshold.
+        let lace = 0.50 * smoothstep(0.0, 0.006, density)
+            + 0.25 * smoothstep(0.006, 0.030, density)
+            + 0.15 * smoothstep(0.030, 0.065, density)
+            + 0.10 * smoothstep(0.065, 0.42, density);
+        patterns.pattern.r = lace;
+        patterns.streaks = lace;
+    }
+#endif
     let pattern = patterns.pattern;
     let blur = patterns.blur;
     let foam_light = foam_radiance(daylight / 3.14159265359, sun_radiance, up, sun_direction, lit);
-    let cover = max(sample.foam * surface.crest_foam.a, wake.foam);
-    let crest_foam = foam_share(cover, pattern.r, blur, 0.08);
+    var crest_cover = sample.foam;
+    if jka_hybrid.breaker.x > 2.5 {
+        crest_cover = max(crest_cover, jka_crest_spilling_cue(sample.raw_jacobian, input.world.y, waves.sea.x));
+    }
+    let cover = max(crest_cover * surface.crest_foam.a, wake.foam);
+    var crest_foam = foam_share(cover, pattern.r, blur, 0.08);
+    let breakers = surf_at(input.world.xz, footprint, footprint).x;
+    if breakers > 0.0 {
+        crest_foam = max(crest_foam, foam_share(breakers, pattern.r, blur, SURF_EDGE) * surface.crest_foam.a);
+    }
     let shore_foam = foam_share(pow(1.0 - smoothstep(0.0, SHORE_DEPTH, column), 2.0) * SHORE_COVER,
         pattern.r, blur, SHORE_EDGE) * surface.shoreline_foam.a;
     let windrow = windrow_opacity(surface.foam.y, patterns.lines, max(surface.foam.z, 0.001),
@@ -294,5 +351,11 @@ fn fragment(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0
             color += (window_scene.rgb - sky_reflection(window_ray, 0.0)) * WINDOW_GAIN * (1.0 - water_fresnel(max(dot(window_ray, -up), 0.0)));
         }
     }
+#ifdef JKA_NINJA_REDUCED
+    let glint = dot(sun, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let salient = highlight_hit || bent.a >= 0.0 || max(foam, windrows) > 0.12 || glint > 0.035;
+    return vec4<f32>(color, select(1.0, 2.0, salient));
+#else
     return vec4<f32>(color, 1.0);
+#endif
 }

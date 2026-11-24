@@ -12,7 +12,14 @@ pub(crate) fn shader() -> &'static str {
 /// World shader composition also includes the existing snow/footprint module.
 /// Models consume shader() directly without binding any world-only resources.
 pub(crate) fn surface_shader() -> String {
-    format!("{}\n{}", shader(), include_str!("surface_deformation.wgsl"))
+    let deformation = include_str!("surface_deformation.wgsl");
+    if let Some(snow) = jka_ninja::snow_material_wgsl(jka_ninja::SnowProfile::Minimal) {
+        let deformation = deformation
+            .replace("fn ninja_snow_vertex_offset(", "fn ninja_snow_vertex_offset_stub(")
+            .replace("fn ninja_snow_material(", "fn ninja_snow_material_stub(");
+        return format!("{}\n{}\n{}\n{}\n{}", shader(), deformation, snow.humpy1, snow.composite, include_str!("ninja_snow_surface.wgsl"));
+    }
+    format!("{}\n{deformation}", shader())
 }
 
 /// All scene cameras share the existing grass wind texture. Vertex-stage

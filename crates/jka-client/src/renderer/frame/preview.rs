@@ -179,6 +179,7 @@ impl Renderer {
             &self.queue,
             dynamic_models,
             None,
+            None,
             false,
             false,
             false,
@@ -226,6 +227,7 @@ impl Renderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("JKA asset viewer encoder"),
             });
+        self.dynamic_model_renderer.cloth_gpu.encode(&mut encoder);
         let scene_view = if needs_blit {
             self.targets.world_color_view.as_ref().unwrap_or(&self.targets.scene_view)
         } else { &frame_view };

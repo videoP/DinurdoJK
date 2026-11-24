@@ -136,7 +136,7 @@ impl AudioProbe {
                 depth_stencil_attachment: None, ..Default::default()
             });
             pass.set_pipeline(&self.pipeline);
-            for river in rivers {
+            for river in rivers.iter().filter(|r| r.audio_enabled()) {
                 let Some(body) = river.body_group() else { continue; };
                 pass.set_bind_group(0, camera, &[]);
                 pass.set_bind_group(1, body, &[]);
@@ -177,7 +177,7 @@ impl AudioProbe {
         let water = if result.is_ok() {
             let view = self.staging.slice(..).get_mapped_range();
             let contact = view.ok().map(|v| river_runtime::RiverAudioContact {
-                eye: v[0] > 127, foot: v[1] > 127,
+                eye: v[0] > 127, foot: v[1] > 127, camera: v[2] > 127,
             });
             self.staging.unmap();
             contact

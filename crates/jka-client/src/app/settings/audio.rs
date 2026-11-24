@@ -3,6 +3,13 @@ use crate::{app::{App, FootprintMode}, runtime::UserEvent, scene};
 use std::{sync::Arc, thread, time::Instant};
 
 impl App {
+    pub(in crate::app) fn apply_echofield_settings(&mut self) {
+        if let Some(sound) = self.game_session.as_mut().and_then(|session| session.sound_presenter.as_mut()) {
+            sound.set_echofield_settings(self.audio.echofield_settings);
+        }
+        self.mark_config_dirty();
+        self.publish_ui();
+    }
     pub(in crate::app) fn update_variometer(&mut self) {
         use crate::audio::variometer::MotionSample;
         use crate::app::{playerstate_vec3, OverlayMode, SessionPhase};
@@ -72,11 +79,12 @@ impl App {
         let footprints = self.video.footprints;
         if let Some(playback) = &mut self.game_session {
             playback.weapon_fx.set_footprint_mode(footprints);
-            playback.weapon_fx.set_gib_level(options.blood);
+            playback.weapon_fx.set_blood_mode(options.blood);
             playback.weapon_fx.set_score_plums(options.score_plums);
             playback
                 .player_presenter
                 .set_gore_limit(usize::from(options.g2_marks));
+            playback.player_presenter.set_skin_gore_enabled(options.blood != 0);
             playback
                 .player_presenter
                 .set_footstep_level(options.footsteps, footprints != FootprintMode::Off);

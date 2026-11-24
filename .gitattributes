@@ -1,4 +1,3 @@
-# Preserve upstream bytes so the OpenJK source-hash manifest works on Windows.
-crates/jka-movement/vendor/openjk/** -text
+# Preserve upstream bytes so the vendored-source hash manifests work on Windows.
 crates/jka-movement/vendor/japro/** -text
 crates/jka-movement/vendor/mvsdk/** -text

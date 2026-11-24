@@ -868,6 +868,29 @@ fn open_overhangs(
             }
         }
     }
+    // An item that is a floor here but starts above a reached or opened floor
+    // elsewhere (an arch whose top carries a covered walkway) stays an Actor:
+    // as Landscape its top would become the bed there and dam the water that
+    // passes under it. References now hold every reached, dilated and opened
+    // floor (+ REFERENCE_LIFT; -inf a reached void).
+    for k in 0..landscape_floor.len() {
+        if !landscape_floor[k] {
+            continue;
+        }
+        let item = &full.items[k];
+        let Some((first, last)) = region.cell_range(item.lo, item.hi) else { continue };
+        'cells: for y in first[1]..=last[1] {
+            for x in first[0]..=last[0] {
+                let c = [x, y];
+                let Some(reference) = references.get(c.map(i64::from)) else { continue };
+                let Some((lo, _)) = sample(item, geometry, region.centre(c)) else { continue };
+                if lo > reference - REFERENCE_LIFT + ABOVE {
+                    landscape_floor[k] = false;
+                    break 'cells;
+                }
+            }
+        }
+    }
     landscape_floor
 }
 

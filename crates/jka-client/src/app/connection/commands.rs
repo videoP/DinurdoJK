@@ -355,11 +355,26 @@ impl App {
                         },
                         GameCommand::ForceNext | GameCommand::ForcePrev => {
                             let forward = matches!(action, GameCommand::ForceNext);
-                            // TaystJK: force cycling becomes inventory cycling
-                            // while USE is held or there are no usable powers.
+                            let japro = self.active_server_mod() == crate::net::mod_support::ServerMod::Japro;
+                            // EternalJK CG_Next/PrevForcePower_f: race shortcut
+                            // precedes the spectator and inventory branches.
+                            if crate::net::LiveInput::japro_race_force_teleport(&ps, japro) {
+                                self.live_input.inventory_select = 5; // HI_BINOCULARS: +useforce zoom
+                                self.forward_command_to_server(if forward { "amTeleMark" } else { "amTele" });
+                                return true;
+                            }
+                            // CG_Next/PrevForcePower_f: never select while
+                            // spectating or following another player.
+                            if ps.field_i32("pm_type").unwrap_or(0) == 4
+                                || ps.field_i32("pm_flags").unwrap_or(0) & 4096 != 0
+                            {
+                                return true;
+                            }
+                            // EternalJK: +use or no usable powers selects a
+                            // holdable instead, without changing key bindings.
                             if self.live_buttons.contains("+use")
                                 || self.live_buttons.contains("+button5")
-                                || !crate::net::LiveInput::has_selectable_force(&ps)
+                                || crate::net::LiveInput::no_useable_force(&ps, japro)
                             {
                                 self.live_input.cycle_inventory(&ps, forward);
                                 self.show_inventory_selection(&ps);

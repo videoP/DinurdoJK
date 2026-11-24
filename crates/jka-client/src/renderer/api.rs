@@ -74,6 +74,8 @@ pub enum DynamicModelAlphaMode {
     BlendUnlitDepthWrite,
     /// Alpha-tested material plus OpenJK RF_FORCE_ENT_ALPHA semantics.
     MaskBlend,
+    /// Authored GE128 coverage with source-alpha blending in stage order.
+    StageMaskBlend,
     /// Unlit GL_ONE GL_ONE additive stage. Alpha does not scale source RGB.
     AdditiveOne,
     /// Unlit GL_SRC_ALPHA GL_ONE additive presentation primitive.
@@ -98,7 +100,7 @@ pub enum DynamicModelAlphaMode {
 }
 
 impl DynamicModelAlphaMode {
-    pub(in crate::renderer) const COUNT: usize = 16;
+    pub(in crate::renderer) const COUNT: usize = 17;
 
     /// Dense index for per-alpha-mode pipeline tables and draw bitmasks.
     pub(crate) const fn index(self) -> usize {
@@ -119,11 +121,12 @@ impl DynamicModelAlphaMode {
             Self::Glass => 13,
             Self::SightShellNoDepth => 14,
             Self::Screen => 15,
+            Self::StageMaskBlend => 16,
         }
     }
 }
 
-pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; 16] = [
+pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode; DynamicModelAlphaMode::COUNT] = [
     DynamicModelAlphaMode::Opaque,
     DynamicModelAlphaMode::Mask,
     DynamicModelAlphaMode::BlendDepthWrite,
@@ -139,6 +142,7 @@ pub(in crate::renderer) const DYNAMIC_MODEL_ALPHA_ORDER: [DynamicModelAlphaMode;
     DynamicModelAlphaMode::BlendUnlit,
     DynamicModelAlphaMode::AdditiveOne,
     DynamicModelAlphaMode::Additive,
+    DynamicModelAlphaMode::StageMaskBlend,
     DynamicModelAlphaMode::SightShellNoDepth,
 ];
 
@@ -160,7 +164,7 @@ pub(in crate::renderer) fn dynamic_model_writes_depth(alpha_mode: DynamicModelAl
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, PartialEq, Pod, Zeroable)]
 pub struct DynamicModelVertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
@@ -285,8 +289,18 @@ pub struct SourceMaterialParams {
     pub half_lambert: bool,
 }
 
+/// SkinGore UV damage map, kept per (entity, GLM mesh). The renderer
+/// updates its dedicated 64x64 GPU mask in place on revision changes.
+#[derive(Clone, Debug)]
+pub struct Ghoul2SkinGore {
+    pub key: Arc<str>,
+    pub pixels: Arc<Vec<u8>>,
+    pub revision: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Ghoul2GpuSkinning {
+    pub skin_gore: Option<Ghoul2SkinGore>,
     /// Also used by rigid MD3 instances routed through the GPU model path.
     pub foliage_wind: bool,
     /// Stable geometry cache key, e.g. `models/players/kyle/model.glm#lod0#surface3`.
@@ -327,6 +341,118 @@ pub struct Ghoul2GpuSkinning {
     /// Source 1 bump/phong material, if this surface came from a VMT. `None` for
     /// every JKA surface, and the renderer keys its pipeline choice off that.
     pub source_material: Option<SourceMaterialParams>,
+}
+
+/// Parameters of the GPU cloth solver (port of gpu-cloth-sim's
+/// `GPUClothSolver` exports), derived from the shared r_cloth* settings.
+/// Units are the reference's: metres, seconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClothGpuTuning {
+    pub hz: u32,
+    /// Fixed ticks allowed per rendered frame before excess time is dropped.
+    pub max_ticks: u32,
+    pub solver_iterations: u32,
+    pub substeps: u32,
+    /// Fraction of a distance error corrected per iteration (reference `stiffness`).
+    pub stiffness: f32,
+    /// Exponential velocity damping rate, 1/s (r_clothDamping); the solver
+    /// converts it to the reference's per-substep multiplier.
+    pub damping: f32,
+    pub max_speed: f32,
+    /// r_clothAnimationInfluence: free fabric follows its sewn attachments at
+    /// 0 and the full skeletal animation at 1.
+    pub animation_influence: f32,
+    pub gravity_strength: f32,
+    pub inertia_scale: [f32; 3],
+    pub wind_turbulence: f32,
+    pub wind_frequency: f32,
+}
+
+/// Static, per-garment GPU cloth topology. Built once by cgame from the
+/// stitched garment (welds, attachments) and shared by every player wearing
+/// that model/LOD.
+pub struct ClothGpuGarment {
+    /// Unique identity; GPU buffers are cached by this key.
+    pub key: Arc<str>,
+    /// Every render vertex of every garment surface, surface after surface.
+    pub render_vertices: Vec<Ghoul2GpuVertex>,
+    /// Per garment surface: (first render vertex, render vertex count).
+    pub surface_ranges: Vec<(u32, u32)>,
+    /// Flat render vertex -> particle; `u32::MAX` = not simulated (skinned).
+    pub render_to_particle: Vec<u32>,
+    /// Welded render copies per particle (CSR): offsets has particles + 1 entries.
+    pub member_offsets: Vec<u32>,
+    pub member_list: Vec<u32>,
+    /// gpu-cloth-sim cloth weight: 0 = skeleton-driven, 1 = fully simulated.
+    /// Also the attachment freedom of the animated target.
+    pub cloth_weights: Vec<f32>,
+    /// Bind-pose particle positions in metres.
+    pub bind_particles: Vec<[f32; 3]>,
+    /// Attachment particles whose skin transforms drive free fabric.
+    pub driver_particles: Vec<u32>,
+    /// Per particle: up to three (driver, weight) attachments.
+    pub attachment_drivers: Vec<Vec<(u32, f32)>>,
+    /// Reference max_travel_distance (metres): the garment's runaway reach.
+    pub max_travel: f32,
+    /// Distance constraints (a, b, rest metres) in graph-colour order.
+    pub constraints: Vec<(u32, u32, f32)>,
+    /// (offset, count) of each colour group inside `constraints`.
+    pub constraint_groups: Vec<(u32, u32)>,
+    /// Particle triangles (GLM winding) for the face-normal pass.
+    pub triangles: Vec<[u32; 3]>,
+    /// Particle -> triangles adjacency (CSR, counts + offsets + list).
+    pub vert_tri_counts: Vec<u32>,
+    pub vert_tri_offsets: Vec<u32>,
+    pub vert_tri_list: Vec<u32>,
+}
+
+impl ClothGpuGarment {
+    pub fn particle_count(&self) -> usize {
+        self.cloth_weights.len()
+    }
+}
+
+/// gpu-cloth-sim collider in model-local metres: 4 vec4 per collider, the
+/// layout `GPUClothCollider.pack_collider_data` writes.
+pub type ClothGpuCollider = [[f32; 4]; 4];
+
+/// One player's garment inputs for this frame.
+pub struct ClothGpuFrame {
+    pub entity_num: u16,
+    pub garment: Arc<ClothGpuGarment>,
+    /// Same final pose matrices GPU skinning uses (skeleton bone indexed).
+    pub bones: Arc<Vec<Ghoul2GpuBone>>,
+    pub colliders: Vec<ClothGpuCollider>,
+    pub axis: [[f32; 3]; 3],
+    pub origin: [f32; 3],
+    /// Presentation clock (ms); drives the fixed-rate accumulator and gusts.
+    pub time_ms: i32,
+    /// Wind (metres/s^2 style vector of the reference `wind` export), JKA world axes.
+    pub wind: [f32; 3],
+    pub tuning: ClothGpuTuning,
+}
+
+/// One render surface of a GPU-simulated garment. Its vertices are written
+/// by the cloth compute pass straight into the dynamic model vertex buffer.
+#[derive(Clone)]
+pub struct ClothGpuSurface {
+    pub frame: Arc<ClothGpuFrame>,
+    /// Index into `garment.surface_ranges`.
+    pub surface: u32,
+    pub color: [f32; 4],
+    pub uv_xform: [f32; 4],
+    pub uv_cross: [f32; 4],
+    pub specular: Option<([f32; 3], [f32; 3])>,
+}
+
+impl ClothGpuSurface {
+    pub fn vertex_count(&self) -> usize {
+        self.frame
+            .garment
+            .surface_ranges
+            .get(self.surface as usize)
+            .map_or(0, |range| range.1 as usize)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -453,6 +579,7 @@ pub struct FxGpuSprites {
 #[derive(Clone)]
 pub struct FxGpuResidentSprites {
     pub frame: Arc<FxGpuResidentFrame>,
+    /// Low 30 bits: resident slot; high bits: per-stage identityLight scale.
     pub slots: Arc<Vec<u32>>,
 }
 
@@ -469,7 +596,7 @@ pub struct FxGpuResidentFrame {
     pub ready_modes: Arc<std::sync::atomic::AtomicU16>,
 }
 
-/// Presentation provenance. This is diagnostic metadata, not material state.
+/// Presentation provenance and the coordinate space of CPU geometry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ModelGeometrySource {
@@ -478,6 +605,8 @@ pub enum ModelGeometrySource {
     Fx,
     BlobShadow,
     Other,
+    /// Baked FX vertices use render axes relative to `lighting_origin`.
+    TranslatedFx,
 }
 
 #[derive(Clone)]
@@ -515,6 +644,9 @@ pub struct DynamicModelSurface {
     /// Instanced RT_SPRITE path used by r_fxGeometry gpu. Non-sprite EFX and
     /// the CPU reference modes leave this unset.
     pub fx_gpu_sprites: Option<FxGpuSprites>,
+    /// GPU cloth (r_clothSolver 1): `vertices` stays empty; the cloth compute
+    /// pass fills this surface's range of the dynamic vertex buffer.
+    pub cloth_gpu: Option<ClothGpuSurface>,
     /// Exact JKA shader-stage `glow` marker. Synthetic/modern FX leave this false.
     pub authored_glow: bool,
     pub texture: Option<Arc<TextureData>>,
@@ -522,9 +654,19 @@ pub struct DynamicModelSurface {
 }
 
 impl DynamicModelSurface {
+    pub(in crate::renderer) fn vertex_translation(&self) -> Option<glam::Vec3> {
+        if self.geometry_source == ModelGeometrySource::TranslatedFx {
+            return self.lighting_origin.map(|origin| glam::Vec3::from_array(crate::scene::render_position(origin)));
+        }
+        None
+    }
+
     pub fn vertex_count(&self) -> usize {
         if let Some(sprites) = self.fx_gpu_sprites.as_ref() {
             return sprites.instances.len().saturating_mul(4);
+        }
+        if let Some(cloth) = self.cloth_gpu.as_ref() {
+            return cloth.vertex_count();
         }
         self.ghoul2_gpu
             .as_ref()
@@ -712,6 +854,8 @@ pub struct TransientLight {
     /// This does not change raster attenuation/range.
     pub source_radius: f32,
     pub intensity: f32,
+    /// Optional exponent for (1 - distance? / radius?) ^ exponent.
+    pub radial_exponent: Option<f32>,
     /// Local projected-light cone. Direction is in renderer space.
     pub spot: Option<crate::fx::system::FxSpotLight>,
     pub segment: Option<[[f32; 3]; 2]>,
@@ -737,6 +881,7 @@ impl TransientLight {
             // RE_AddLightToScene; the renderer's point-light intensity
             // scale of 1.0 is the matching neutral source strength.
             intensity: 1.0,
+            radial_exponent: None,
             spot: light.spot.map(|spot| crate::fx::system::FxSpotLight {
                 direction: scene::render_position(spot.direction),
                 ..spot
@@ -808,6 +953,7 @@ pub struct RenderSnapshot {
     pub frontend_scene: Option<FrontendSceneToken>,
     /// Presented JKA serverTime, absent outside a live/demo game session.
     pub weather_server_time_ms: Option<i32>,
+    pub river_wake_debug_subject: Option<jka_river::river_ninja::WakeDebugSubject>,
     pub studio_lens: Option<StudioLens>,
     pub studio_environment: Option<StudioSceneLighting>,
     /// Independent Studio scenes. Never references the gameplay session/world.
@@ -824,6 +970,7 @@ pub struct RenderSnapshot {
     pub dynamic_crosshair_world: Option<[f32; 3]>,
     pub player_position: Option<Vec3>,
     pub ocean_actors: Arc<Vec<crate::ocean::interaction::ActorSample>>,
+    pub ninja_entities: Option<Arc<Vec<jka_river::river_ninja::ActorSample>>>,
     /// Current server snapshot portal-area mask. Set bits are areas closed off
     /// by areaportals/doors. `None` for solo/offline scenes with no snapshot.
     pub area_mask: Option<[u8; 32]>,
@@ -864,6 +1011,9 @@ pub struct RenderSnapshot {
     /// Active `EV_SCREENSHAKE`/`CGCam_Shake`; the render thread rolls a fresh
     /// offset each frame so it composes with the late-latched view.
     pub camera_shake: Option<crate::camera::CameraShake>,
+    pub(crate) ninja_blood: Option<crate::ninja_blood::BloodScene>,
+    pub(crate) ninja_fire: Option<crate::ninja_fire_debug::FireScene>,
+    pub(crate) ninja_fog: Option<crate::ninja_fog_debug::Placement>,
 }
 
 #[derive(Clone)]
@@ -883,6 +1033,7 @@ pub struct StudioSourceFrame {
     pub screen_fx: Arc<Vec<crate::fx::draw::ScreenFxDraw>>,
     pub cloud_foreground: Arc<Vec<CloudForegroundBlade>>,
     pub ocean_actors: Arc<Vec<crate::ocean::interaction::ActorSample>>,
+    pub ninja_entities: Option<Arc<Vec<jka_river::river_ninja::ActorSample>>>,
     /// Source-owned native HUD; rendered into source color before transitions.
     pub hud: Option<Arc<crate::ui::UiSnapshot>>,
 }
@@ -1289,6 +1440,7 @@ pub enum RenderCommand {
     SetPostEffects(PostEffects),
     SetFootprintMode(FootprintMode),
     SetGrassEnabled(bool),
+    SetGrassStyle(bool),
     SetGrassPrecompute(bool),
     SetGrassMidLod(bool),
     SetGrassFrontToBack(bool),

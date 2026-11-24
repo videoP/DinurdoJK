@@ -4,7 +4,7 @@ use crate::app::egui_settings::{
     OCEAN_FOAM_COLOR, OCEAN_MAP_SIZE, OCEAN_MESH_QUALITY, OCEAN_NORMAL_STRENGTH, OCEAN_ROUGHNESS,
     OCEAN_SEA_SPRAY, OCEAN_UPDATES, OCEAN_WATER_COLOR, OCEAN_WIND_FOAM, PHYS_CCD,
     PHYS_CLIENT_ENABLED, PHYS_CLOTH, PHYS_CLOTH_AIR, PHYS_CLOTH_ANIMATION,
-    PHYS_CLOTH_BODY_COLLISION, PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_BREAKABLES, PHYS_DEBRIS,
+    PHYS_CLOTH_BODY_COLLISION, PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_DAMPING, PHYS_CLOTH_GPU, PHYS_CLOTH_STIFFENING, PHYS_CLOTH_STIFFNESS, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_BREAKABLES, PHYS_DEBRIS,
     PHYS_DEBRIS_LIFETIME, PHYS_DEBRIS_MAX, PHYS_DEBUG_DRAW, PHYS_DISMEMBERMENT,
     PHYS_DISMEMBER_LIFETIME, PHYS_DISMEMBER_MAX, PHYS_EXPLOSION_IMPULSES, PHYS_FORCE_IMPULSES,
     PHYS_HAIR, PHYS_JIGGLE, PHYS_JIGGLE_BREAST, PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z,
@@ -703,6 +703,10 @@ impl App {
                 self.video.cloth_animation_influence = defaults.cloth_animation_influence
             }
             PHYS_CLOTH_CLEARANCE => self.video.cloth_body_clearance = defaults.cloth_body_clearance,
+            PHYS_CLOTH_STIFFNESS => self.video.cloth_stiffness = defaults.cloth_stiffness,
+            PHYS_CLOTH_DAMPING => self.video.cloth_damping = defaults.cloth_damping,
+            PHYS_CLOTH_STIFFENING => self.video.cloth_stiffening = defaults.cloth_stiffening,
+            PHYS_CLOTH_GPU => self.video.cloth_solver = defaults.cloth_solver,
             PHYS_PROPS => self.video.physics_props = defaults.physics_props,
             PHYS_PROP_MAX => self.video.physics_prop_max = defaults.physics_prop_max,
             PHYS_DEBRIS => self.video.physics_debris = defaults.physics_debris,

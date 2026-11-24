@@ -247,8 +247,11 @@ pub(in crate::renderer) struct WorldBatch {
     /// Which promoted surface `ocean_clipmap` belongs to. Every face merged into
     /// one surface shares that clipmap, so a pass draws it once, not per face.
     pub(in crate::renderer) ocean_clipmap_id: u8,
-    /// An uploaded ocean replaces this stage, including its sibling passes.
-    pub(in crate::renderer) ocean_replaced: bool,
+    /// Pools eligible to replace this authored stage, including siblings and overlays.
+    pub(in crate::renderer) ocean_owners: u8,
+    /// Cold exact draw ownership; active only with a ready native river body.
+    pub(in crate::renderer) river_owner: Option<u64>,
+    pub(in crate::renderer) river_replaced: bool,
     pub(in crate::renderer) bind_group: wgpu::BindGroup,
     /// Fixed at upload from the material uniform (r_fragmentShaderMode 1).
     pub(in crate::renderer) fragment_key: MaterialFragmentKey,
@@ -443,6 +446,7 @@ pub(in crate::renderer) struct VoxelProbeGiGpu {
 pub(in crate::renderer) struct GpuReflectionProbe {
     pub(in crate::renderer) _texture: wgpu::Texture,
     pub(in crate::renderer) view: wgpu::TextureView,
+    pub(in crate::renderer) position: [f32; 3],
     pub(in crate::renderer) capture_position: Option<[f32; 3]>,
 }
 

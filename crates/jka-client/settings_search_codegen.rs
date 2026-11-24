@@ -74,7 +74,7 @@ fn subsection_for(path: &str, source: &str, pos: usize) -> &'static str {
         else if pos < source.find("\"SPECTATING & DEMOS\"").unwrap() { "Some(SetupSection::GameGameplay)" }
         else { "Some(SetupSection::GamePresentation)" }
     } else if path.ends_with("egui_menu/audio.rs") {
-        if pos < source.find("\"MAP ACOUSTICS · EAL / OPENAL SOFT\"").unwrap() { "Some(SetupSection::AudioGeneral)" }
+        if pos < source.find("if section == Some(SetupSection::AudioPositional)").unwrap() { "Some(SetupSection::AudioGeneral)" }
         else { "Some(SetupSection::AudioPositional)" }
     } else if path.ends_with("egui_settings/interface.rs") {
         let helpers = source.find("fn egui_killfeed_settings(").unwrap();

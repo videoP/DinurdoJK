@@ -37,8 +37,17 @@ pub(in crate::ui) fn draw_chat_marks(out: &mut Vec<UiVertex>, flags: u8, x: f32,
 }
 
 pub(in crate::ui) fn wrap_fixed_chat_text(value: &str, max_columns: usize) -> String {
-    let max_columns = max_columns.max(1);
-    let mut out = String::with_capacity(value.len() + value.len() / max_columns.max(8));
+    wrap_chat_text_with_caret(value, 0, max_columns.max(1) as f32, |_, columns| columns as f32).0
+}
+
+fn wrap_chat_text_with_caret(
+    value: &str,
+    caret: usize,
+    max_width: f32,
+    measure: impl Fn(&str, usize) -> f32,
+) -> (String, usize) {
+    let mut out = String::with_capacity(value.len() + value.len() / 32);
+    let mut wrapped_caret = caret;
     let mut line_start = 0usize;
     let mut line_columns = 0usize;
     let mut last_space_out = None::<usize>;
@@ -56,18 +65,42 @@ pub(in crate::ui) fn wrap_fixed_chat_text(value: &str, max_columns: usize) -> St
         if ch == ' ' { last_space_out = Some(out.len()); }
         out.push(ch);
         line_columns += 1;
-        if line_columns >= max_columns {
+        let width = measure(&out[line_start..], line_columns);
+        if width >= max_width {
             if let Some(space) = last_space_out.filter(|space| *space >= line_start) {
                 out.replace_range(space..=space, "\n");
                 line_start = space + 1;
                 line_columns = visible_jka_chars(&out[line_start..]);
             } else {
-                out.push('\n'); line_start = out.len(); line_columns = 0;
+                // Keep the overflowing glyph on the next line when possible.
+                let trailing_bytes = if width > max_width && line_columns > 1 {
+                    ch.len_utf8()
+                } else {
+                    0
+                };
+                if index + ch.len_utf8() - trailing_bytes <= caret {
+                    wrapped_caret += 1;
+                }
+                let split = out.len() - trailing_bytes;
+                out.insert(split, '\n');
+                line_start = split + 1;
+                line_columns = usize::from(trailing_bytes > 0);
             }
             last_space_out = None;
         }
     }
-    out
+    (out, wrapped_caret)
+}
+
+/// The editor can step through a color code, which has zero display width.
+pub(super) fn chat_display_cursor(input: &str, cursor: usize) -> usize {
+    if cursor >= input.len() || !input.is_char_boundary(cursor) {
+        return input.len();
+    }
+    input[..cursor].char_indices().find_map(|(index, _)| {
+        let (length, _) = color_escape(input.as_bytes(), index, 1.0)?;
+        (index + length > cursor).then_some(index)
+    }).unwrap_or(cursor)
 }
 
 pub(in crate::ui) fn clamp_wrapped_chat_lines(value: &str, max_lines: usize) -> String {
@@ -343,14 +376,27 @@ pub(in crate::ui) fn build_chat_input(
         ChatMode::Team => "TEAM:",
         ChatMode::Direct(_) => "TELL:",
     };
-    let field = format!("{prompt} {}_", ui.chat_input);
+    let field = format!("{prompt} {}", ui.chat_input);
+    let caret = prompt.len() + 1 + chat_display_cursor(&ui.chat_input, ui.chat_cursor);
     let selected_font = (ui.chat_settings.font() != super::ChatFont::Classic)
         .then(|| super::text::UiText::chat(ui, small_font, w, h).without_chat_emojis());
-    let wrapped = if let Some(txt) = &selected_font {
-        super::chat_dock::wrap(txt, &field, big_char, text_width - padding_x * 2.0).join("\n")
+    let (wrapped, wrapped_caret) = if let Some(txt) = &selected_font {
+        wrap_chat_text_with_caret(
+            &field,
+            caret,
+            (text_width - padding_x * 2.0).max(big_char),
+            |line, _| txt.width(line, big_char),
+        )
     } else {
-        wrap_fixed_chat_text(&field, max_columns)
+        wrap_chat_text_with_caret(&field, caret, max_columns as f32, |_, columns| columns as f32)
     };
+    let prefix = &wrapped[..wrapped_caret];
+    let caret_line = prefix.bytes().filter(|&ch| ch == b'\n').count();
+    let line_prefix = prefix.rsplit('\n').next().unwrap_or_default();
+    let caret_width = selected_font.as_ref().map_or_else(
+        || visible_jka_chars(line_prefix) as f32 * big_char,
+        |txt| txt.width(line_prefix, big_char),
+    );
     let line_count = wrapped.bytes().filter(|&byte| byte == b'\n').count() + 1;
     let height = padding_y * 2.0 + big_char * line_count as f32 + underline;
     let x = margin;
@@ -370,10 +416,8 @@ pub(in crate::ui) fn build_chat_input(
         h,
     );
     if ui.chat_input_selected && !ui.chat_input.is_empty() {
-        // Selection belongs to the message, not the SAY/TEAM/TELL prompt or
-        // trailing cursor marker. Both classic and proportional chat use this.
-        for (index, line) in wrapped.split('\n').enumerate() {
-            let text = line.strip_suffix('_').unwrap_or(line);
+        // Select the message after the SAY/TEAM/TELL prompt.
+        for (index, text) in wrapped.split('\n').enumerate() {
             let prefix_chars = if index == 0 { prompt.chars().count() + 1 } else { 0 };
             let byte = text.char_indices().nth(prefix_chars)
                 .map_or(text.len(), |(at, _)| at);
@@ -382,8 +426,8 @@ pub(in crate::ui) fn build_chat_input(
             let (offset, selection_width) = if let Some(txt) = &selected_font {
                 (txt.width(&text[..byte], big_char), txt.width(selected, big_char))
             } else {
-                (text[..byte].chars().count() as f32 * big_char,
-                 selected.chars().count() as f32 * big_char)
+                (visible_jka_chars(&text[..byte]) as f32 * big_char,
+                 visible_jka_chars(selected) as f32 * big_char)
             };
             rect(out, x + padding_x + offset, y + padding_y + index as f32 * big_char,
                 selection_width, big_char, [0.18, 0.42, 0.65, 0.80], w, h);
@@ -391,25 +435,30 @@ pub(in crate::ui) fn build_chat_input(
     }
     if let Some(txt) = selected_font {
         let mut baseline = y + padding_y + (big_char + txt.cap(big_char)) * 0.5;
+        let mut color = CHAT_WHITE;
         for line in wrapped.split('\n') {
-            txt.draw(out, line, x + padding_x, baseline, big_char, CHAT_WHITE);
+            txt.draw(out, line, x + padding_x, baseline, big_char, color);
+            color = super::text::colour_after(line, color, CHAT_WHITE[3]);
             baseline += big_char;
         }
-        return;
+    } else {
+        fixed_charset_text(
+            out,
+            &wrapped,
+            x + padding_x,
+            y + padding_y,
+            big_char,
+            big_char,
+            big_char,
+            CHAT_WHITE,
+            true,
+            w,
+            h,
+        );
     }
-    fixed_charset_text(
-        out,
-        &wrapped,
-        x + padding_x,
-        y + padding_y,
-        big_char,
-        big_char,
-        big_char,
-        CHAT_WHITE,
-        true,
-        w,
-        h,
-    );
+    let caret_x = x + padding_x + caret_width;
+    let caret_y = y + padding_y + caret_line as f32 * big_char;
+    rect(out, caret_x, caret_y, underline, big_char, CHAT_WHITE, w, h);
 }
 
 /// `gfx/hud/keys/*` images `DF_DrawMovementKeys` draws, in atlas order (see

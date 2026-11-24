@@ -13,7 +13,12 @@ use std::sync::{
 };
 
 const QUEUE_CAPACITY: usize = 32;
-const MAX_RESULT_AGE_MS: i32 = 100;
+/// A late solver result is still far better than snapping back to the
+/// authored (unsimulated) garment for a frame: that alternation showed both
+/// shapes at once under temporal AA. Only a long stall drops the result.
+const MAX_RESULT_AGE_MS: i32 = 750;
+/// Report a solve slower than this many fixed ticks (developer 1).
+const SLOW_SOLVE_TICKS: f32 = 1.5;
 
 struct Request {
     epoch: u64,
@@ -33,7 +38,13 @@ struct ResultFrame {
     entity: u16,
     model: String,
     lod: usize,
+    /// Request (presentation) time; used for staleness.
     time_ms: i32,
+    /// Time the solver state actually represents: the request time minus the
+    /// fixed-tick remainder not yet integrated. Interpolating by request time
+    /// stalls and jumps whenever a request lands between ticks (frame rate and
+    /// solver rate beating against each other).
+    sim_time_ms: f64,
     // Store *secondary displacement* rather than the stale animation pose.
     // These displacements are applied to the CURRENT Ghoul2 vertex positions.
     offsets: HashMap<usize, Vec<[f32; 3]>>,
@@ -43,12 +54,23 @@ struct ResultFrame {
 struct FramePair {
     previous: Option<ResultFrame>,
     latest: ResultFrame,
+    /// Smoothed delay between a state's simulated time and its arrival here.
+    /// Rendering that far behind (plus one result interval) keeps the
+    /// interpolation moving continuously instead of holding at the newest
+    /// result until the next arrives.
+    lag_ms: f64,
 }
+
+/// Weight of each new arrival in the smoothed render delay.
+const LAG_SMOOTHING: f64 = 0.1;
 
 pub(crate) struct AsyncClothSystem {
     tx: Option<SyncSender<Request>>,
     rx: Option<Receiver<ResultFrame>>,
     config: ClothConfig,
+    /// r_clothSolver 1: the renderer's gpu-cloth-sim port replaces this
+    /// worker for GPU-skinned players.
+    gpu_solver: bool,
     wind: [f32; 3],
     epoch: u64,
     generation: Arc<AtomicU64>,
@@ -64,6 +86,7 @@ impl Default for AsyncClothSystem {
             tx: None,
             rx: None,
             config: ClothConfig::default(),
+            gpu_solver: false,
             wind: [0.0; 3],
             epoch: 0,
             generation: Arc::new(AtomicU64::new(0)),
@@ -98,6 +121,7 @@ impl AsyncClothSystem {
     ) {
         let mut solver = ClothSystem::default();
         let mut epoch: Option<u64> = None;
+        let mut last_slow_report: Option<std::time::Instant> = None;
         while let Ok(job) = requests.recv() {
             // A reset can have work queued; reject older generations.
             if job.epoch != generation.load(Ordering::Acquire) {
@@ -110,6 +134,7 @@ impl AsyncClothSystem {
             solver.set_config(job.config);
             solver.set_wind_velocity(job.wind);
             solver.begin_frame(job.time_ms);
+            let started = std::time::Instant::now();
             let output = solver.simulate_garment(
                 job.entity,
                 &job.model,
@@ -119,6 +144,21 @@ impl AsyncClothSystem {
                 job.motion,
                 job.time_ms,
             );
+            let solve_ms = started.elapsed().as_secs_f32() * 1000.0;
+            let tick_ms = 1000.0 / job.config.hz.max(1) as f32;
+            if solve_ms > tick_ms * SLOW_SOLVE_TICKS
+                && last_slow_report.is_none_or(|last| last.elapsed().as_secs_f32() >= 1.0)
+            {
+                last_slow_report = Some(std::time::Instant::now());
+                devprintln!(
+                    1,
+                    "CLOTH: worker behind: {} solve took {:.1} ms (tick {:.1} ms, stiffness {:.1})",
+                    job.model,
+                    solve_ms,
+                    tick_ms,
+                    job.config.stiffness,
+                );
+            }
             let mut offsets = HashMap::new();
             let mut topology = None;
             if let Ok(output) = output {
@@ -143,6 +183,7 @@ impl AsyncClothSystem {
             if job.epoch != generation.load(Ordering::Acquire) {
                 continue;
             }
+            let pending_ms = solver.pending_seconds(job.entity).unwrap_or(0.0) as f64 * 1000.0;
             if results
                 .send(ResultFrame {
                     epoch: job.epoch,
@@ -150,6 +191,7 @@ impl AsyncClothSystem {
                     model: job.model,
                     lod: job.lod,
                     time_ms: job.time_ms,
+                    sim_time_ms: job.time_ms as f64 - pending_ms,
                     offsets,
                     topology,
                 })
@@ -178,6 +220,10 @@ impl AsyncClothSystem {
             || self.config.animation_influence != config.animation_influence
             || self.config.body_clearance != config.body_clearance
             || self.config.body_collision != config.body_collision
+            || self.config.stiffness != config.stiffness
+            || self.config.damping != config.damping
+            || self.config.stiffening != config.stiffening
+            || self.config.hz != config.hz
         {
             self.invalidate();
         }
@@ -186,6 +232,21 @@ impl AsyncClothSystem {
 
     pub(crate) fn set_wind_velocity(&mut self, velocity: [f32; 3]) {
         self.wind = velocity;
+    }
+
+    pub(crate) fn set_gpu_solver(&mut self, enabled: bool) {
+        self.gpu_solver = enabled;
+    }
+
+    /// GPU solver tuning (from the shared cloth settings) while cloth is on
+    /// and r_clothSolver selects it.
+    pub(crate) fn gpu_tuning(&self) -> Option<crate::renderer::ClothGpuTuning> {
+        (self.gpu_solver && self.config.enabled)
+            .then(|| super::cloth_gpu::tuning(&self.config))
+    }
+
+    pub(crate) fn config(&self) -> ClothConfig {
+        self.config
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -197,12 +258,12 @@ impl AsyncClothSystem {
             self.invalidate();
         }
         self.last_time = Some(now_ms);
-        self.poll();
+        self.poll(now_ms);
         self.frames
             .retain(|_, pair| now_ms.saturating_sub(pair.latest.time_ms) <= MAX_RESULT_AGE_MS);
     }
 
-    fn poll(&mut self) {
+    fn poll(&mut self, now_ms: i32) {
         let Some(rx) = &self.rx else {
             return;
         };
@@ -213,20 +274,32 @@ impl AsyncClothSystem {
                         continue;
                     }
                     self.pending.remove(&frame.entity);
-                    let existing = self.frames.remove(&frame.entity);
-                    let previous = existing.and_then(|pair| {
-                        (pair.latest.model == frame.model
-                            && pair.latest.lod == frame.lod
-                            && pair.latest.time_ms < frame.time_ms)
-                            .then_some(pair.latest)
-                    });
-                    self.frames.insert(
-                        frame.entity,
-                        FramePair {
-                            previous,
+                    let lag = (now_ms as f64 - frame.sim_time_ms).max(0.0);
+                    let entity = frame.entity;
+                    let pair = match self.frames.remove(&entity) {
+                        Some(mut pair)
+                            if pair.latest.model == frame.model && pair.latest.lod == frame.lod =>
+                        {
+                            if frame.sim_time_ms <= pair.latest.sim_time_ms + 0.01 {
+                                // No new fixed tick was integrated: same state.
+                                // Keep the interpolation pair; only refresh age.
+                                pair.latest.time_ms = pair.latest.time_ms.max(frame.time_ms);
+                                self.frames.insert(entity, pair);
+                                continue;
+                            }
+                            FramePair {
+                                lag_ms: pair.lag_ms + (lag - pair.lag_ms) * LAG_SMOOTHING,
+                                previous: Some(pair.latest),
+                                latest: frame,
+                            }
+                        }
+                        _ => FramePair {
+                            previous: None,
                             latest: frame,
+                            lag_ms: lag,
                         },
-                    );
+                    };
+                    self.frames.insert(entity, pair);
                 }
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
@@ -247,8 +320,12 @@ impl AsyncClothSystem {
         if !self.enabled() || surfaces.is_empty() {
             return Ok(HashMap::new());
         }
-        self.poll();
-        let outputs = self.latest_outputs(entity, model, lod, &surfaces, now_ms);
+        self.poll(now_ms);
+        let body = self
+            .config
+            .body_collision
+            .then_some((capsules.as_slice(), self.config.body_clearance));
+        let outputs = self.latest_outputs_with_body(entity, model, lod, &surfaces, now_ms, body);
         // Dispatch only at the requested fixed rate. Avoid a large allocation
         // or a channel send at the thousands-of-FPS display cadence.
         let interval_ms = (1000 / self.config.hz.max(1)) as i32;
@@ -285,6 +362,7 @@ impl AsyncClothSystem {
         Ok(outputs)
     }
 
+    #[cfg(test)]
     fn latest_outputs(
         &self,
         entity: u16,
@@ -292,6 +370,20 @@ impl AsyncClothSystem {
         lod: usize,
         surfaces: &[ClothSurfaceFrame],
         now_ms: i32,
+    ) -> HashMap<usize, ClothOutput> {
+        self.latest_outputs_with_body(entity, model, lod, surfaces, now_ms, None)
+    }
+
+    /// `body` re-projects the interpolated garment out of the CURRENT body
+    /// pose; solver output is at least one tick old.
+    fn latest_outputs_with_body(
+        &self,
+        entity: u16,
+        model: &str,
+        lod: usize,
+        surfaces: &[ClothSurfaceFrame],
+        now_ms: i32,
+        body: Option<(&[ClothCapsule], f32)>,
     ) -> HashMap<usize, ClothOutput> {
         let Some(pair) = self.frames.get(&entity) else {
             return HashMap::new();
@@ -311,17 +403,19 @@ impl AsyncClothSystem {
         let previous = pair.previous.as_ref().filter(|p| {
             p.model == model
                 && p.lod == lod
-                && p.time_ms < latest.time_ms
+                && p.sim_time_ms < latest.sim_time_ms
                 && p.topology
                     .as_ref()
                     .is_some_and(|prior| Arc::ptr_eq(prior, topology))
         });
-        // Render a tick behind and interpolate secondary displacement, not
-        // old absolute vertex positions. Never extrapolate solver output.
+        // Interpolate secondary displacement (not old absolute positions) in
+        // simulated time, one result interval behind the observed arrival
+        // delay: alpha is 0 when a result arrives and reaches 1 about when
+        // the next one is due. Never extrapolate solver output.
         let alpha = previous.map_or(1.0, |p| {
-            let step_ms = (latest.time_ms - p.time_ms).max(1);
-            let target = now_ms - (1000 / self.config.hz.max(1)) as i32;
-            ((target - p.time_ms) as f32 / step_ms as f32).clamp(0.0, 1.0)
+            let step_ms = (latest.sim_time_ms - p.sim_time_ms).max(0.001);
+            let display = now_ms as f64 - pair.lag_ms - step_ms;
+            ((display - p.sim_time_ms) / step_ms).clamp(0.0, 1.0) as f32
         });
         let mut interpolated = HashMap::new();
         for surface in surfaces {
@@ -349,7 +443,7 @@ impl AsyncClothSystem {
                 .collect();
             interpolated.insert(surface.surface_index, offsets);
         }
-        topology.reconstruct(surfaces, &interpolated)
+        topology.reconstruct_with_body(surfaces, &interpolated, body)
     }
 }
 
@@ -406,6 +500,7 @@ mod tests {
             model: "jedi".into(),
             lod: 0,
             time_ms: 0,
+            sim_time_ms: 0.0,
             offsets: surfaces
                 .iter()
                 .map(|s| {
@@ -441,6 +536,7 @@ mod tests {
             model: "jedi".into(),
             lod: 0,
             time_ms,
+            sim_time_ms: f64::from(time_ms),
             offsets: HashMap::from([(7, vec![[offset, 0.0, 0.0]; 3])]),
             topology: topology.clone(),
         };
@@ -449,6 +545,7 @@ mod tests {
             FramePair {
                 previous: Some(frame(0, 1.0)),
                 latest: frame(16, 3.0),
+                lag_ms: 0.0,
             },
         );
         // At 16ms, target is 0ms (one tick latency): use the older offset.
@@ -491,6 +588,7 @@ mod tests {
         let previous = solved_frame(&surfaces);
         let latest = ResultFrame {
             time_ms: 16,
+            sim_time_ms: 16.0,
             topology: previous.topology.clone(),
             offsets: previous
                 .offsets
@@ -508,6 +606,7 @@ mod tests {
             FramePair {
                 previous: Some(previous),
                 latest,
+                lag_ms: 0.0,
             },
         );
         surfaces[1].posed_positions[2][1] += 2.0;
@@ -549,6 +648,7 @@ mod tests {
             FramePair {
                 previous: None,
                 latest: frame,
+                lag_ms: 0.0,
             },
         );
         surfaces[0].posed_positions = vec![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];

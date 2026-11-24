@@ -53,8 +53,14 @@ impl Renderer {
             self.ssao_history_valid = false;
             self.ssr_history_valid = false;
             self.studio_revision = sample.revision;
+            self.river_ninja_history = None;
         }
         self.scene_time = Some(sample.time);
+        if jka_river::river_ninja::actor_capture_requested() || self.ocean_settings.ninja_wake_requested() {
+            self.river_ninja_entities = sample.ninja_entities.clone();
+        } else {
+            self.river_ninja_entities = None;
+        }
         self.update_inline_models(Some(sample.inline_models.as_slice()));
         self.set_screen_fx(&sample.screen_fx);
         self.set_cloud_foreground(&sample.cloud_foreground);
@@ -126,12 +132,6 @@ impl Renderer {
         if hud.movement_keys.mode != 0 && !self.ui_keys_loaded {
             self.load_ui_key_atlas_now();
         }
-        let mut scaled_hud;
-        let hud=if hud.studio_hud_virtual_layout {
-            scaled_hud=hud.clone();
-            scaled_hud.hud_layout=hud.hud_layout.studio_for_frame(w,h);
-            &scaled_hud
-        }else{hud};
         // Studio standings use a separate sans-serif atlas; gameplay keeps its
         // OCR HUD font. Both batches still land in preview and exported frames.
         let wanted_font=hud.studio_race.as_ref().map(|race|race.font.as_str());

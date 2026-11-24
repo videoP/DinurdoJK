@@ -2,6 +2,21 @@
 use crate::app::{App, Arc, EntityPresenter, GameSession, LocalServer, Path, PlayerPresenter, Instant};
 
 impl App {
+    fn cached_echo_geometry(
+        &self,
+        name: &str,
+        sound: &crate::cgame::sound_presenter::SoundPresenter,
+    ) -> Option<jka_audio::EchoGeometryInput> {
+        let cache = self.prepared_map_cache.as_ref()?;
+        let (token, variant) = cache.map.shader_vfs.as_ref()?;
+        if Self::normalized_bsp_name(&cache.label) != Self::normalized_bsp_name(name)
+            || !sound.matches_echo_vfs(token, *variant, cache.prepare_options.allow_asset_overrides)
+        {
+            return None;
+        }
+        cache.map.echo_geometry.clone()
+    }
+
     pub(in crate::app) fn build_cgame_cpu_assets(
         base: &Path,
         game: Option<&Path>,
@@ -127,7 +142,8 @@ impl App {
         &self, session: &mut GameSession, game: Option<&Path>, inherit_map: bool,
     ) {
         session.water_wake_mode = self.video.water_wake;
-        session.lake_wakes_enabled = self.video.water_wake == 2 && self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.lake.shader == 1 && self.video.ocean_settings.interaction && self.video.ocean_settings.interaction_strength > 0.0;
+        session.ocean_ninja_enabled = jka_ninja::INCLUDED && self.video.ocean && self.video.ocean_settings.ninja_wake_requested();
+        session.lake_wakes_enabled = self.video.water_wake == 2 && self.video.ocean && self.video.ocean_settings.backend == 3 && self.video.ocean_settings.interaction && self.video.ocean_settings.interaction_strength > 0.0;
         session.ocean_interaction_enabled = self.video.ocean && self.video.ocean_settings.interaction && self.video.water_wake == 2;
         session.set_fx_light_promotion_catalog(Arc::clone(&self.fx_light_promotion_catalog));
         session
@@ -152,7 +168,7 @@ impl App {
         session.entity_presenter.set_static_md3_bvh(self.video.static_md3_bvh);
         session.entity_presenter.set_static_md3_pvs_fallback(self.video.static_md3_pvs_fallback);
         session.entity_presenter.set_occlusion_stats(self.video.occlusion_stats);
-        session.weapon_fx.set_runner_culling(self.video.fx_occlusion == 1);
+        session.weapon_fx.set_runner_culling(self.video.fx_occlusion == 1 || crate::ninja_fire_debug::promotion_enabled());
         if inherit_map { session
             .player_presenter
             .set_collision_world(self.map_collision.clone()); }
@@ -181,6 +197,7 @@ impl App {
             self.video.fx_count_scale,
             self.video.fx_lod_scale,
         );
+        session.weapon_fx.set_fx_smoke_duration_scale(self.video.fx_smoke_duration_scale);
         session.promote_fx_lights = self.video.promote_fx_lights;
         session.apply_client_options(
             self.screen_shake,
@@ -189,6 +206,9 @@ impl App {
             self.japro_cg,
             self.network.plugin_disable,
         );
+        if let Err(error) = session.weapon_fx.reload_blood_assets(&self.base, game) {
+            log::warn!("[BLOOD] {error}");
+        }
         session
             .client_game
             .set_predicted_event_correction(self.network.correct_predicted_events);
@@ -202,7 +222,8 @@ impl App {
                 );
                 sound.set_steam_audio_hrtf_interpolation(self.audio.steam_audio_hrtf_interpolation);
                 sound.set_eal_hrtf_enabled(self.audio.eal_hrtf);
-                sound.set_eal_enabled(self.audio.eal_enabled);
+                sound.set_echofield_settings(self.audio.echofield_settings);
+                sound.set_eal_enabled(self.audio.echofield);
                 sound.set_eal_debug_mode(self.audio.eal_debug_mode);
                 let (effects, voice, separation) = self.effective_audio_mix();
                 sound.set_mix(effects, voice, separation);
@@ -210,12 +231,16 @@ impl App {
                 sound.set_music_volume(self.effective_music_volume());
                 sound.set_emote_music_volume(self.effective_emote_music_volume());
                 sound.set_underwater_mode(self.audio.underwater);
+                sound.set_river_volume(self.audio.river_volume);
                 sound.set_underwater_oceans(&self.authored_oceans);
                 if inherit_map { sound.set_steam_audio_map(
                     self.steam_audio_acoustic_mesh.clone(),
                     self.steam_audio_bake.clone(),
                 ); }
-                if let Some(map_name) = session.map_name.as_deref() { sound.set_eal_map(map_name); }
+                if let Some(map_name) = session.map_name.as_deref() {
+                    let geometry = self.cached_echo_geometry(map_name, &sound);
+                    sound.set_prepared_eal_map(map_name, geometry);
+                }
                 session.sound_presenter = Some(sound);
             }
             Err(error) => eprintln!("AUDIO ASSET PATH UNAVAILABLE: {error}"),
@@ -266,7 +291,8 @@ impl App {
         // name is available. Initialize authored acoustics now, rather than
         // leaving a local game with an empty EAL state until the next map load.
         if let Some(sound) = session.sound_presenter.as_mut() {
-            sound.set_eal_map(server.map_name());
+            let geometry = self.cached_echo_geometry(server.map_name(), sound);
+            sound.set_prepared_eal_map(server.map_name(), geometry);
         }
         session
             .client_game
@@ -347,7 +373,8 @@ impl App {
                 );
                 sound.set_steam_audio_hrtf_interpolation(self.audio.steam_audio_hrtf_interpolation);
                 sound.set_eal_hrtf_enabled(self.audio.eal_hrtf);
-                sound.set_eal_enabled(self.audio.eal_enabled);
+                sound.set_echofield_settings(self.audio.echofield_settings);
+                sound.set_eal_enabled(self.audio.echofield);
                 sound.set_eal_debug_mode(self.audio.eal_debug_mode);
                 let (effects, voice, separation) = self.effective_audio_mix();
                 sound.set_mix(effects, voice, separation);
@@ -355,12 +382,16 @@ impl App {
                 sound.set_music_volume(self.effective_music_volume());
                 sound.set_emote_music_volume(self.effective_emote_music_volume());
                 sound.set_underwater_mode(self.audio.underwater);
+                sound.set_river_volume(self.audio.river_volume);
                 sound.set_underwater_oceans(&self.authored_oceans);
                 sound.set_steam_audio_map(
                     self.steam_audio_acoustic_mesh.clone(),
                     self.steam_audio_bake.clone(),
                 );
-                if let Some(map_name) = session.map_name.as_deref() { sound.set_eal_map(map_name); }
+                if let Some(map_name) = session.map_name.as_deref() {
+                    let geometry = self.cached_echo_geometry(map_name, &sound);
+                    sound.set_prepared_eal_map(map_name, geometry);
+                }
                 session.sound_presenter = Some(sound);
             }
             Err(error) => eprintln!("AUDIO ASSET PATH UNAVAILABLE: {error}"),

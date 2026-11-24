@@ -77,7 +77,7 @@ fn non_finite_snapshot_movement_fails_before_any_collision_callback() {
         fn point_contents(&mut self, _: [f32; 3], _: i32) -> i32 { panic!("invalid state reached contents") }
     }
     let movement = animations();
-    for backend in [0, 1] {
+    for server_mod in [0, 1] {
         for field in ["origin[0]", "velocity[2]", "viewangles[1]"] {
             let mut p = player(80.0);
             let mut state = p.network();
@@ -85,17 +85,17 @@ fn non_finite_snapshot_movement_fails_before_any_collision_callback() {
             schema.fields.clone_from(&state.fields);
             assert!(schema.set_field_bits(field, f32::NAN.to_bits()));
             state.fields.clone_from(&schema.fields);
-            p.configure(&PredictSettings { backend, ..Default::default() }).unwrap();
+            p.configure(&PredictSettings { server_mod, ..Default::default() }).unwrap();
             p.set_network(&state).unwrap();
             let error = movement.predict(&mut p, UserCmd { server_time: 8, ..Default::default() },
-                &PredictSettings { backend, ..Default::default() }, &mut NoCollision).unwrap_err();
+                &PredictSettings { server_mod, ..Default::default() }, &mut NoCollision).unwrap_err();
             assert!(error.contains("Non-finite movement state"), "{error}");
             // A subsequent authoritative correction can recover the same player.
             assert!(schema.set_field_bits(field, 0.0f32.to_bits()));
             state.fields.clone_from(&schema.fields);
             p.set_network(&state).unwrap();
             movement.predict(&mut p, UserCmd { server_time: 8, ..Default::default() },
-                &PredictSettings { backend, ..Default::default() }, &mut Map::floor().world()).unwrap();
+                &PredictSettings { server_mod, ..Default::default() }, &mut Map::floor().world()).unwrap();
         }
     }
 }

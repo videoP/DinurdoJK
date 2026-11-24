@@ -563,6 +563,11 @@ fn local_light_attenuation(light: PointLight, distance_to_light: f32) -> f32 {
     // Runtime/FX lights keep the engine's existing smooth finite-radius response.
     // Source-map q3map lights use q3map_light_scalar() instead.
     let radius = max(light.position_radius.w, 1.0);
+    if (light.shadow.y < 0.0) {
+        // UE DynamicLightingCommon.ush, RadialAttenuation.
+        let ratio = distance_to_light / radius;
+        return pow(max(1.0 - ratio * ratio, 0.0), -light.shadow.y);
+    }
     let edge = max(1.0 - distance_to_light / radius, 0.0);
     return edge * edge;
 }
@@ -596,6 +601,9 @@ fn q3map_fast_contribution_visible(light_scalar: f32) -> bool {
 }
 
 fn local_light_surface_scale(light: PointLight) -> f32 {
+    if (light.shadow.y < 0.0) {
+        return 0.318309886; // Unreal's Diffuse_Lambert, 1 / PI.
+    }
     if (ENABLE_MAP_LIGHT_SIMULATION && light.shadow.y > 0.5) {
         return 1.0;
     }
@@ -625,6 +633,11 @@ fn transient_vertex_dlight(world_position: vec3<f32>, world_normal: vec3<f32>) -
         if (ndotl <= 0.0) { continue; }
         let emission_visibility = emitter_visibility(light, light_direction);
         if (emission_visibility <= 0.0) { continue; }
+        if (light.shadow.y < 0.0) {
+            result += light.color_intensity.rgb * light.color_intensity.a
+                * local_light_attenuation(light, distance_to_light) * ndotl * local_light_surface_scale(light);
+            continue;
+        }
         let falloff = max(1.0 - distance_to_light / radius, 0.0);
         result += light.color_intensity.rgb * light.color_intensity.a
             * (falloff * falloff) * ndotl * emission_visibility * 2.20;
@@ -1539,6 +1552,15 @@ fn legacy_dynamic_light(input: VertexOut) -> LegacyDynamicLighting {
         let radius = max(light.position_radius.w, 1.0);
         let radius_sq = radius * radius;
         let delta = light.position_radius.xyz - input.world_position;
+        if (light.shadow.y < 0.0) {
+            let distance = length(delta);
+            if (distance > 1.0e-5) {
+                let ndotl = max(dot(normalize(input.world_normal), delta / distance), 0.0);
+                result.diffuse_factor += light.color_intensity.rgb * light.color_intensity.a
+                    * local_light_attenuation(light, distance) * ndotl * local_light_surface_scale(light);
+            }
+            continue;
+        }
         let plane_distance = dot(plane_normal, delta);
         if (plane_distance <= 0.0 || plane_distance >= radius) { continue; }
 
@@ -1648,6 +1670,15 @@ fn openjk_projected_dlight_contribution(input: VertexOut) -> vec3<f32> {
         let radius = max(light.position_radius.w, 1.0);
         let radius_sq = radius * radius;
         let to_light = light.position_radius.xyz - input.world_position;
+        if (light.shadow.y < 0.0) {
+            let distance = length(to_light);
+            if (distance > 1.0e-5) {
+                let ndotl = max(dot(normalize(input.world_normal), to_light / distance), 0.0);
+                contribution += diffuse * light.color_intensity.rgb * light.color_intensity.a
+                    * local_light_attenuation(light, distance) * ndotl * local_light_surface_scale(light);
+            }
+            continue;
+        }
         let plane_distance = dot(plane_normal, to_light);
         // OpenJK rejects backfaces and triangles whose plane is outside radius.
         if (plane_distance <= 0.0 || plane_distance >= radius) {
@@ -1917,7 +1948,8 @@ fn pbr_surface_for_path(
     shared_frame: mat3x3<f32>,
     shared_surface: PbrSurface,
 ) -> PbrSurface {
-    if (PBR_SHARED_MATERIAL_EVAL) {
+    if (PBR_SHARED_MATERIAL_EVAL ||
+        (ENABLE_SURFACE_DEFORMATION && ninja_snow_receiver_active(input.shell_kind, material_flags_w(), material_tc_gen(), material_flags()))) {
         return shared_surface;
     }
     return evaluate_pbr_surface(input, albedo, uv, weather, shared_frame);
@@ -2384,16 +2416,15 @@ fn legacy_separate_fog(world_position: vec3<f32>) -> vec4<f32> {
     if (!map_has_authored_fog && !has_override) {
         return vec4<f32>(0.0);
     }
-    // Legacy 1 global opaque/depth-writing geometry is fogged later in
-    // display-space to match OpenJK's old gamma/LDR framebuffer blend. Local
-    // fog and transparent-only global geometry still use this pass. Legacy 2
-    // routes every authored fogged BSP surface through this geometry pass so
-    // all materials share the same EXP2 equation and ordering.
-    let legacy1_geometry = drawfog_mode < 1.5
-        && (surface_fog.flags.x < 0.5 || surface_fog.flags.w < 0.5);
+    // Global fog on opaque/depth-writing geometry is applied by the fullscreen
+    // legacy global fog pass in both modes. Local fog and transparent-only
+    // global geometry still use this pass.
+    let geometry = surface_fog.flags.x < 0.5 || surface_fog.flags.w < 0.5;
+    let legacy1_geometry = drawfog_mode < 1.5 && geometry;
     let legacy2_geometry = drawfog_mode >= 1.5
         && map_has_authored_fog
-        && has_map_fog;
+        && has_map_fog
+        && geometry;
     let separate_pass = legacy1_geometry || legacy2_geometry;
     if (!separate_pass) {
         return vec4<f32>(0.0);
@@ -2807,7 +2838,8 @@ fn light_bsp_surface(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f
     return remaining + lighting_settings.runtime_sun_radiance.rgb * facing * visibility;
 }
 
-fn shade_surface(input: VertexOut) -> vec4<f32> {
+fn shade_surface(vertex: VertexOut) -> vec4<f32> {
+    var input = vertex;
     if (ENABLE_PLANAR_REFLECTIONS && dot(camera.clip_plane.xyz, camera.clip_plane.xyz) > 0.5
         && dot(camera.clip_plane.xyz, input.world_position) + camera.clip_plane.w < 0.0) {
         discard;
@@ -2816,6 +2848,13 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     let classic_fullbright = (classic_flags & CLASSIC_FULLBRIGHT) != 0u;
     let classic_vertex_light = (classic_flags & CLASSIC_VERTEX_LIGHT) != 0u;
     let classic_lightmap_only = (classic_flags & CLASSIC_LIGHTMAP_ONLY) != 0u;
+    let ninja_snow = ENABLE_SURFACE_DEFORMATION && !classic_lightmap_only &&
+        ninja_snow_receiver_active(input.shell_kind, material_flags_w(), material_tc_gen(), material_flags());
+    var snow = NinjaSnowShading(vec3<f32>(1.0), input.world_normal, 1.0);
+    if (ninja_snow) {
+        snow = ninja_snow_material(input.world_position, input.world_normal, camera.camera_pos_time.xyz, camera.camera_forward.xyz);
+        input.world_normal = snow.normal;
+    }
     let explicit_lightmap_stage = (material_flags() & MATERIAL_FLAG_EXPLICIT_LIGHTMAP) != 0u;
     let has_lightmap = (material_flags() & MATERIAL_FLAG_HAS_LIGHTMAP) != 0u;
     let opaque_stage = (material_flags() & MATERIAL_FLAG_OPAQUE_STAGE) != 0u;
@@ -2891,7 +2930,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         return vec4<f32>(selection_color, 1.0);
     }
 
-    let has_pbr_brdf_map = (material_flags() & (MATERIAL_FLAG_NORMAL_MAP | MATERIAL_FLAG_ROUGHNESS_MAP | MATERIAL_FLAG_METALLIC_MAP | MATERIAL_FLAG_SPECULAR_MAP)) != 0u;
+    let has_pbr_brdf_map = ninja_snow || (material_flags() & (MATERIAL_FLAG_NORMAL_MAP | MATERIAL_FLAG_ROUGHNESS_MAP | MATERIAL_FLAG_METALLIC_MAP | MATERIAL_FLAG_SPECULAR_MAP)) != 0u;
     let static_pbr_path = ENABLE_DELUXE
         && has_pbr_brdf_map
         && classic_flags == 0u
@@ -3061,6 +3100,7 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
         }
     }
     var base = source_sample * stage_color;
+    if (ninja_snow) { base = ninja_snow_apply_albedo(base, snow); }
     // An authored masked base with BSP vertex alpha 127/255 and GE128 cannot
     // seed depth. For the narrowly identified multi-stage depth-equal case,
     // test the source texture's alpha while retaining the vertex alpha for
@@ -3100,7 +3140,8 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     }
     // Vertex RGB is baked illumination, not the metal's base reflectance.
     // Rend2 lightall samples diffuse/F0 before multiplying by vertex lighting.
-    let albedo = select(base.rgb, source_sample.rgb * material.color.rgb, vertex_baked_pbr);
+    let raw_albedo = select(source_sample.rgb, source_sample.rgb * snow.color_scale, ninja_snow && ninja_snow_composite_mode());
+    let albedo = select(base.rgb, raw_albedo * material.color.rgb, vertex_baked_pbr);
     let source_map_unbaked_receiver = ENABLE_SOURCE_MAP_WORLD
         && (material_flags() & MATERIAL_FLAG_DYNAMIC_RECEIVER) != 0u
         && input.lightmap_uv.x < 0.0
@@ -3120,6 +3161,11 @@ fn shade_surface(input: VertexOut) -> vec4<f32> {
     }
     if (PBR_SHARED_MATERIAL_EVAL && needs_pbr_surface) {
         shared_pbr = evaluate_pbr_surface(input, albedo, surface_uv, weather, shared_frame);
+    }
+    if (ninja_snow && ENABLE_PBR) {
+        shared_pbr.n = snow.normal;
+        shared_pbr.specular_n = weather_reflection_normal(snow.normal, weather);
+        shared_pbr.roughness = weather_wet_roughness(snow.roughness, weather);
     }
 
     // Only the synthesized implicit material uses a single-pass

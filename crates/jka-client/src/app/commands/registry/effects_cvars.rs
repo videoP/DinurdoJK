@@ -470,6 +470,31 @@ app_cvars! {
         ]
     }
 
+    APP_R_FXSMOKEDURATIONSCALE {
+        runtime: CvarDef::new("r_fxSmokeDurationScale", "1", "0.25..8", "Scales how long promoted EFX smoke lingers. 1 uses the Ninja smoke preset's density decay.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(app.video.fx_smoke_duration_scale.to_string()), |app, value| App::cvar_set_r_fxsmokedurationscale(app, APP_R_FXSMOKEDURATIONSCALE.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_fxsmokedurationscale, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Ok(scale) = value.trim().parse::<f32>() {
+                    if scale.is_finite() { settings.fx_smoke_duration_scale = scale.clamp(crate::fx::SMOKE_DURATION_SCALE_MIN, crate::fx::SMOKE_DURATION_SCALE_MAX); }
+                }
+            }),
+            archive: Some((175, |state| state.video.fx_smoke_duration_scale.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_r_fxsmokedurationscale(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                let scale = value.trim().parse::<f32>().map_err(|_| "r_fxSmokeDurationScale expects 0.25..8".to_owned())?;
+                if !scale.is_finite() { return Err("r_fxSmokeDurationScale expects a finite number".to_owned()); }
+                self.video.fx_smoke_duration_scale = scale.clamp(crate::fx::SMOKE_DURATION_SCALE_MIN, crate::fx::SMOKE_DURATION_SCALE_MAX);
+                self.apply_fx_smoke_duration_scale();
+                self.mark_config_dirty();
+                self.publish_ui();
+                self.console_status = format!("EFX SMOKE DURATION: {:.2}x", self.video.fx_smoke_duration_scale);
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_FXPARTICLESIMULATION {
         runtime: CvarDef::new("r_fxParticleSimulation", "", "0..1", "Opt-in GPU-resident motion for compatible noncolliding EFX sprite primitives. Requires r_fxGeometry gpu. Other primitives retain CPU fallback; experimental until FX visual parity and frame-time A/B testing.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_r_fxparticlesimulation(app)), |app, value| App::cvar_set_r_fxparticlesimulation(app, APP_R_FXPARTICLESIMULATION.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_fxparticlesimulation, None),
         config: CvarBinding {
@@ -535,7 +560,7 @@ app_cvars! {
                 }
                 self.video.fx_occlusion = mode;
                 if let Some(session) = self.game_session.as_mut() {
-                    session.weapon_fx.set_runner_culling(mode == 1);
+                    session.weapon_fx.set_runner_culling(mode == 1 || crate::ninja_fire_debug::promotion_enabled());
                 }
                 self.publish_ui();
                 self.console_status = format!("FX CPU OCCLUSION A/B: {}", if mode == 0 {"ORIGINAL"} else {"MAP RUNNERS (rear-plane only)"});

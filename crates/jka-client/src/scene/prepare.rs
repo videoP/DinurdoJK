@@ -218,7 +218,7 @@ pub(in crate::scene) fn prepare_internal(
     let seed_collision = seed
         .filter(|_| !options.visual_only)
         .and_then(|seed| seed.collision.clone());
-    let seed_acoustic = seed.and_then(|seed| seed.steam_audio_acoustic_mesh.clone());
+    let seed_acoustic = seed.and_then(|seed| seed.steam_audio_acoustic_mesh.clone().or_else(|| match &seed.echo_geometry { Some(jka_audio::EchoGeometryInput::Prepared(_,mesh))=>Some(Arc::clone(mesh)),_=>None }));
     if seed_collision.is_some() {
         note_reused_stage(jobs, &mut reused, "collision", Task::MapCollision);
     }
@@ -281,7 +281,7 @@ pub(in crate::scene) fn prepare_internal(
         let (parsed, parse_ms) = parse.join()?;
         load_timings.bsp_parse_ms = parse_ms;
         let (bsp, mesh) = parsed?;
-        if options.steam_audio {
+        if options.steam_audio || options.echo_acoustics {
             if let Some(hit) = seed_acoustic.clone() {
                 note_reused_stage(Some(jobs), &mut reused, "acoustic mesh", Task::MapAcoustics);
                 steam_audio_sync = Some((Ok(hit), 0.0));
@@ -327,7 +327,7 @@ pub(in crate::scene) fn prepare_internal(
             load_timings.collision_ms = stage.elapsed().as_secs_f64() * 1000.0;
         }
 
-        if options.steam_audio {
+        if options.steam_audio || options.echo_acoustics {
             if let Some(hit) = seed_acoustic.clone() {
                 note_reused_stage(jobs, &mut reused, "acoustic mesh", Task::MapAcoustics);
                 steam_audio_sync = Some((Ok(hit), 0.0));
@@ -378,6 +378,16 @@ pub(in crate::scene) fn prepare_internal(
     let mut phase_clock = prepare_started;
     phase_lap(&mut load_timings, 0, &mut phase_clock);
     let (inline_mesh, inline_batch_models) = inline_visual;
+    let mut river_plans = Vec::new();
+    if options.river_promotion != 0 && !options.visual_only && !options.menu_look {
+        match super::river_promotion::detect(&bsp, &mesh, &inline_mesh, &inline_batch_models, &library) {
+            Ok(bodies) => {
+                super::river_promotion::report(&bsp, &bodies);
+                river_plans = super::river_promotion::plan::build(&bsp, &bodies);
+            },
+            Err(error) => eprintln!("[RIVER PROMOTION] skipped: {error}"),
+        }
+    }
 
     // Which shaders (and so which textures) the map uses needs only the meshes and
     // the shader library. Queue texture reads and decodes on the workers right now
@@ -1987,6 +1997,13 @@ pub(in crate::scene) fn prepare_internal(
         None => None,
     };
 
+    let echo_geometry = if options.echo_acoustics {
+        steam_audio_acoustic_mesh.as_ref().and_then(|mesh| match bsp.acoustic_collision() {
+            Ok(collision) => Some(jka_audio::EchoGeometryInput::Prepared(Arc::new(collision),Arc::clone(mesh))),
+            Err(error) => {warnings.push(format!("EchoField collision unavailable: {error}")); None}
+        })
+    } else {None};
+    let steam_audio_acoustic_mesh = if options.steam_audio {steam_audio_acoustic_mesh} else {None};
     let mut steam_audio_bake = None;
     let mut steam_audio_bake_request = None;
     if let (Some(acoustic_mesh), Some(cache)) = (&steam_audio_acoustic_mesh, steam_audio_bake_cache)
@@ -2178,6 +2195,11 @@ pub(in crate::scene) fn prepare_internal(
         println!("{name}: {relocated} of {inferred} flare shadow lamp(s) were inside solid brushes and moved to open space");
     }
 
+    if options.river_promotion == 3 {
+        super::river_promotion::ownership::admit(
+            &mut river_plans, &batches, &pvs_batches, &legacy_dlight_triangle_surfaces,
+        );
+    }
     let coastal_bathymetry = if options.ocean {
         crate::ocean::bathymetry::start(Arc::clone(&bsp), &vertices, &batches, &pvs_batches,
             map_hash, root, game)
@@ -2185,6 +2207,8 @@ pub(in crate::scene) fn prepare_internal(
 
     let baked_sun_encoding = crate::scene::source::baked_sun_encoding(&bsp, &used_shader_names, &library);
     Ok(PreparedMap {
+        river_plans: Arc::new(river_plans),
+        river_promotion_mode: options.river_promotion,
         patch_draws,
         inline_patch_draws,
         coastal_bathymetry,
@@ -2241,6 +2265,7 @@ pub(in crate::scene) fn prepare_internal(
         deluxemaps: Arc::new(deluxemaps),
         static_bsp_ao_cache,
         steam_audio_acoustic_mesh,
+        echo_geometry,
         steam_audio_bake,
         steam_audio_bake_request,
         visibility,

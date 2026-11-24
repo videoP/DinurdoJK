@@ -260,8 +260,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     return vec4(color.rgb,select(color.a,1.0,CAPTURE_OPAQUE_ALPHA));
 }
 
-@fragment
-fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
+fn masked_color(input: VertexOut, authored_stage: bool) -> vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
     if (is_disintegration(input.color.a)) {
         if (tex.a < 0.5) { discard; }
@@ -271,7 +270,8 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
         return disintegration_body_color(lit, input.color.a,
             input.world_position, input.predator_local);
     }
-    if tex.a < 0.5 {
+    let coverage = select(tex.a, tex.a * input.color.a, authored_stage);
+    if coverage < 0.5 {
         discard;
     }
     let color = fogged(
@@ -280,6 +280,16 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
         false
     );
     return vec4(color.rgb,select(color.a,1.0,CAPTURE_OPAQUE_ALPHA));
+}
+
+@fragment
+fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
+    return masked_color(input, false);
+}
+
+@fragment
+fn fs_stage_mask_blend(input: VertexOut) -> @location(0) vec4<f32> {
+    return legacy_effect_output(masked_color(input, true));
 }
 
 @fragment

@@ -4,7 +4,7 @@ use jka_movement::{
 
 pub fn animations() -> PmoveContext {
     // Synthetic timings exercise transitions without redistributing game animation data.
-    let table = include_str!("../../vendor/openjk/codemp/cgame/animtable.h");
+    let table = include_str!("../../vendor/japro/codemp/cgame/animtable.h");
     let mut cfg = String::new();
     for line in table.lines() {
         if let Some(rest) = line.trim().strip_prefix("ENUM2STRING(") {

@@ -53,11 +53,24 @@ impl Renderer {
             )
     }
 
+    /// Reserve the shared GPU-light budget for gameplay transients first.
+    /// Previously 256 static map/emissive lights could fill the array before
+    /// a flag carrier, missile or saber was uploaded at all. Legacy/Vertex
+    /// dlights use another receiver path, so only Forward+/RT lost the light.
     pub(in crate::renderer) fn active_static_light_count(&self) -> usize {
         let Some(world) = self.world.as_ref() else {
             return 0;
         };
-        world.dynamic_lights.iter().enumerate().filter(|(index,light)| self.static_gpu_light_enabled(world,*index,light)).take(MAX_DYNAMIC_LIGHTS).count()
+        let priority_transients = if self.runtime_transient_lights_enabled() {
+            let rt = self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware;
+            self.transient_lights.iter()
+                .filter(|light| light.kind != crate::fx::system::FxLightKind::PromotedEffect)
+                .map(|light| if rt { light.blade_segments.as_ref().map_or(1, |v| v.len().max(1)) } else { 1 })
+                .sum::<usize>().min(MAX_DYNAMIC_LIGHTS)
+        } else { 0 };
+        world.dynamic_lights.iter().enumerate()
+            .filter(|(index,light)| self.static_gpu_light_enabled(world,*index,light))
+            .take(MAX_DYNAMIC_LIGHTS - priority_transients).count()
     }
 
     pub(in crate::renderer) fn active_transient_light_count(&self) -> usize {
@@ -157,7 +170,7 @@ impl Renderer {
                     crate::fx::system::FxLightKind::Saber => stats.saber_pairs += 1,
                     crate::fx::system::FxLightKind::SaberMark => stats.saber_mark_pairs += 1,
                     crate::fx::system::FxLightKind::AuthoredEffect
-                    | crate::fx::system::FxLightKind::PlayerPowerup
+                        | crate::fx::system::FxLightKind::PlayerPowerup
                     | crate::fx::system::FxLightKind::Missile
                     | crate::fx::system::FxLightKind::EntityConstant => stats.authored_fx_pairs += 1,
                     crate::fx::system::FxLightKind::PromotedEffect => stats.promoted_fx_pairs += 1,
@@ -171,13 +184,50 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn set_transient_lights(&mut self, lights: &[TransientLight]) {
-        if self.transient_lights == lights {
+        if self.transient_lights == lights || self.update_last_radial_light_intensity(lights) {
             return;
         }
         self.transient_lights.clear();
         self.transient_lights.extend_from_slice(lights);
         self.upload_light_buffer();
         self.update_lighting_settings();
+    }
+
+    /// Ninja Fire appends one radial point light after the other transients.
+    /// A stationary light's flicker leaves its GPU slot and receiver masks valid.
+    fn update_last_radial_light_intensity(&mut self, lights: &[TransientLight]) -> bool {
+        use crate::fx::system::FxLightKind::PromotedEffect;
+
+        let Some((next, prefix)) = lights.split_last() else { return false; };
+        if next.radial_exponent.is_none() || next.blade_segments.is_some()
+            || next.kind == PromotedEffect || !self.runtime_transient_lights_enabled()
+        {
+            return false;
+        }
+        let Some((previous, old_prefix)) = self.transient_lights.split_last() else { return false; };
+        let mut expected = previous.clone();
+        expected.intensity = next.intensity;
+        if &expected != next || old_prefix != prefix {
+            return false;
+        }
+
+        if let Some(world) = &self.world {
+            let rt = self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware;
+            // The full upload packs static lights first, then nonpromoted
+            // transients with any RT blade expansion, then promoted effects.
+            let before = prefix.iter().filter(|light| light.kind != PromotedEffect)
+                .map(|light| transient_light_samples(light, rt).len()).sum::<usize>();
+            let slot = self.active_static_light_count().saturating_add(before);
+            if slot < MAX_DYNAMIC_LIGHTS {
+                let offset = slot * std::mem::size_of::<GpuPointLight>()
+                    + std::mem::offset_of!(GpuPointLight, color_intensity)
+                    + 3 * std::mem::size_of::<f32>();
+                let intensity = next.intensity.max(0.0) * self.dynamic_light_brightness;
+                self.queue.write_buffer(&world.light_buffer, offset as u64, bytemuck::bytes_of(&intensity));
+            }
+        }
+        self.transient_lights[prefix.len()].intensity = next.intensity;
+        true
     }
 
     /// Hands this frame's runtime lights (the same list the BSP light buffer is
@@ -195,6 +245,7 @@ impl Renderer {
         if enabled {
             models.entity_dlights.extend(self.transient_lights.iter().take(MAX_ENTITY_DLIGHTS).map(|light| EntityDlight {
                 position:Vec3::from_array(light.position),color:Vec3::from_array(light.color)*(light.intensity.max(0.0)*brightness),radius:light.radius.max(0.0),
+                radial_exponent: light.radial_exponent,
             }));
         }
         if baked && !rt_per_pixel {
@@ -209,9 +260,9 @@ impl Renderer {
                         // add_entity_dlights adds 16 r^2 / d^2 grid units; this
                         // radius makes that exactly photons / d^2 (q3map units).
                         EntityDlight {position:Vec3::from_array(light.position),color:Vec3::from_array(light.color),
-                            radius:(light.intensity.max(0.0)*255.0/16.0).sqrt()}
+                            radius:(light.intensity.max(0.0)*255.0/16.0).sqrt(), radial_exponent: None}
                     } else {
-                        EntityDlight {position:Vec3::from_array(light.position),color:Vec3::from_array(light.color)*light.intensity.max(0.0)*0.35,radius:light.radius.max(0.0)}
+                        EntityDlight {position:Vec3::from_array(light.position),color:Vec3::from_array(light.color)*light.intensity.max(0.0)*0.35,radius:light.radius.max(0.0), radial_exponent: None}
                     }));
             }
         }
@@ -263,7 +314,9 @@ impl Renderer {
         // Legacy/Vertex/Clustered Lite intentionally exclude map point lights; they are
         // for runtime-authored RE_AddLightToScene/FX sources. Area lights remain independently gated.
         let mut gpu_lights = Vec::with_capacity(MAX_DYNAMIC_LIGHTS);
+        let static_budget = self.active_static_light_count();
         for (index, light) in world.dynamic_lights.iter().enumerate() {
+            if gpu_lights.len() >= static_budget { break; }
             let baked_layer = if self.baked_local_lightmap_active() { world.static_sun.local_lights.iter().position(|(source,_)|*source==index) } else { None };
             if !self.static_gpu_light_enabled(world,index,light) {continue;}
             let is_area=light.emitter_normal.iter().any(|v|v.abs()>1e-6);
@@ -334,7 +387,7 @@ impl Renderer {
                     0.0,
                 ],
             });
-            if gpu_lights.len() == MAX_DYNAMIC_LIGHTS {
+            if gpu_lights.len() == static_budget {
                 break;
             }
         }
@@ -359,6 +412,14 @@ impl Renderer {
                     1.0
                 };
             let rt = self.dynamic_lights_mode == DynamicLightsMode::RayTracedHardware;
+            let upload = |light: TransientLight| {
+                let scale = if light.radial_exponent.is_some() {
+                    self.dynamic_light_brightness
+                } else {
+                    transient_intensity_scale
+                };
+                transient_light_gpu(&light, scale, rt)
+            };
             // The cluster builder visits this nonpromoted range before static
             // lamps, then promoted EFX last. Retain the original single-pass
             // fast path when promotion is absent.
@@ -372,13 +433,13 @@ impl Renderer {
                         .filter(|light| (light.kind == crate::fx::system::FxLightKind::PromotedEffect) == promoted)
                         .flat_map(|light| transient_light_samples(light, rt))
                         .take(available)
-                        .map(|light| transient_light_gpu(&light, transient_intensity_scale, rt)));
+                        .map(upload));
                 }
             } else {
                 gpu_lights.extend(self.transient_lights.iter()
                     .flat_map(|light| transient_light_samples(light, rt))
                     .take(remaining)
-                    .map(|light| transient_light_gpu(&light, transient_intensity_scale, rt)));
+                    .map(upload));
             }
         }
         if gpu_lights.is_empty() {
@@ -484,7 +545,14 @@ impl Renderer {
                     2
                 } else {
                     0
-                }) | (if self.dynamic_light_debug { 0x100 } else { 0 })
+                }) | (if self.ninja_fire.hvol_cluster_lights { 0x1000 } else { 0 })
+                    // Runtime FX were uploaded with the Forward+/RT 2.43 gain;
+                    // HVOL undoes it (point mode 1 alone also covers map-light sim).
+                    | (if self.runtime_transient_lights_enabled() && matches!(
+                        self.dynamic_lights_mode,
+                        DynamicLightsMode::PerPixelForwardPlus | DynamicLightsMode::RayTracedHardware
+                    ) { 0x2000 } else { 0 })
+                    | (if self.dynamic_light_debug { 0x100 } else { 0 })
                     | (if self.tinted_glass_enabled { 0x200 } else { 0 })
                     | (if self.tinted_glass_debug == 1 { 0x400 } else { 0 })
                     | (if self.tinted_glass_debug == 2 { 0x800 } else { 0 })

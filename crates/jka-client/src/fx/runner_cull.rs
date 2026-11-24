@@ -226,6 +226,7 @@ mod tests {
             axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             fov_x: 90.0,
             seconds: 0.0,
+            identity_light: 1.0,
         }
     }
     fn sprite(x: f32) -> FxDraw {

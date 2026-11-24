@@ -682,7 +682,7 @@ impl MapEditor {
             rt_rigid: None,
             rt_skinned_key: None,
             ghoul2_gpu: None,
-            fx_gpu_sprites: None,
+            cloth_gpu: None, fx_gpu_sprites: None,
             texture: None,
             alpha_mode: DynamicModelAlphaMode::BlendUnlit,
 

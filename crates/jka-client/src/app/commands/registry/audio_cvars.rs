@@ -2,6 +2,32 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_S_RIVERVOLUME {
+        runtime: CvarDef::new("s_riverVolume", "1", "0..1", "Simulation-driven river ambience; scaled by s_volume. Zero disables acoustic sampling and playback.", CvarType::Float { min: 0.0, max: 1.0 }, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::Float(app.audio.river_volume),
+            |app, value| App::cvar_set_s_rivervolume(app, APP_S_RIVERVOLUME.entry.name, &value.to_string()))
+            .with_text_setter(App::cvar_set_s_rivervolume, None),
+        config: CvarBinding {
+            load_audio: Some(|settings, _, value| {
+                if let Some(level) = value.parse::<f32>().ok().filter(|n| n.is_finite()) {
+                    settings.river_volume = level.clamp(0.0, 1.0);
+                }
+            }),
+            archive: Some((27356, |state| format!("{:.3}", state.audio.river_volume))),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_s_rivervolume(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.audio.river_volume = Self::parse_cvar_finite(name, value)?.clamp(0.0, 1.0);
+                if let Some(sound) = self.game_session.as_mut().and_then(|session| session.sound_presenter.as_mut()) {
+                    sound.set_river_volume(self.audio.river_volume);
+                }
+                self.mark_config_dirty();
+                self.publish_ui();
+                Ok(())
+            }
+        }]
+    }
     APP_S_UNDERWATER {
         runtime: CvarDef::new("s_underwater", "2", "0..3",
             "Underwater gameplay audio: 0 off, 1 subtle (3500 Hz/-2 dB), 2 normal (1400 Hz/-5 dB), 3 heavy (650 Hz/-8 dB). Map music and UI are unaffected.",
@@ -238,7 +264,7 @@ app_cvars! {
     }
 
     APP_CG_BLOOD {
-        runtime: CvarDef::new("cg_blood", "", "0..2", "jaPRO gibs: 0 none (death voice instead), 1 skull or brain, 2 full gibs (needs the jaPRO models/gibs assets).", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_blood(app)), |app, value| App::cvar_set_cg_blood(app, APP_CG_BLOOD.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_blood, None),
+        runtime: CvarDef::new("cg_blood", "0", "0|1|2", "0: no blood (legacy marks); 1: Ninja blood, SkinGore, skull/brain on gib events; 2: same blood and complete TaystJK gib models, with Ninja blood instead of legacy gib decals.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_blood(app)), |app, value| App::cvar_set_cg_blood(app, APP_CG_BLOOD.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_blood, None),
         config: CvarBinding {
                 load_audio: Some(|settings, _name, value| {
                     settings.game.blood = int_in(value, 2).unwrap_or(settings.game.blood)
@@ -255,12 +281,19 @@ app_cvars! {
                     self.audio.game.blood.to_string()
                 }
                 fn cvar_set_cg_blood(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    {
-                        self.audio.game.blood = Self::parse_cvar_finite(name, value)?.clamp(0.0, 2.0) as u8;
-                        self.apply_game_sounds();
-                        self.mark_config_dirty();
-                        self.publish_ui();
+                    let blood = Self::parse_cvar_finite(name, value)?.clamp(0.0, 2.0) as u8;
+                    if self.audio.game.blood != blood {
+                        self.audio.game.blood = blood;
+                        crate::ninja_blood::set_enabled(blood != 0);
+                        if let Some(session) = &mut self.game_session {
+                            if let Err(error) = session.weapon_fx.reload_blood_assets(&self.base, self.game.as_deref()) {
+                                self.push_console_line(format!("^3[BLOOD]^7 {error}"));
+                            }
+                        }
                     }
+                    self.apply_game_sounds();
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }
@@ -524,7 +557,7 @@ app_cvars! {
     }
 
     APP_CG_GHOUL2MARKS {
-        runtime: CvarDef::new("cg_ghoul2Marks", "", "0..64", "Burn marks kept on each player model by blaster/rocket hits (0 disables). Needs GPU Ghoul2 skinning.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_ghoul2marks(app)), |app, value| App::cvar_set_cg_ghoul2marks(app, APP_CG_GHOUL2MARKS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_ghoul2marks, None),
+        runtime: CvarDef::new("cg_ghoul2Marks", "", "0..64", "Legacy burn marks kept per player model when cg_blood is 0 (0 disables). Requires GPU Ghoul2 skinning.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_ghoul2marks(app)), |app, value| App::cvar_set_cg_ghoul2marks(app, APP_CG_GHOUL2MARKS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_ghoul2marks, None),
         config: CvarBinding {
                 load_audio: Some(|settings, _name, value| {
                     {
@@ -1112,27 +1145,26 @@ app_cvars! {
         ]
     }
 
-    APP_S_EAL {
+    APP_S_ECHOFIELD {
         runtime: CvarDef::new(
-                "s_eal", "", "0..1",
-                "Use authored map .eal filtering, diffraction, room routing and reverb through OpenAL Soft. EAL-owned sources use one acoustic renderer.",
-                CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
-                |app| CvarValue::String(App::cvar_get_s_eal(app)),
-                |app, value| App::cvar_set_s_eal(app, APP_S_EAL.entry.name, &value.to_string()),
-            ).with_text_setter(App::cvar_set_s_eal, None),
+            "s_echoField", "0", "0..1",
+            "Enable Echofield Audio, including positional ambience and either authored EAGLE or static BSP acoustics.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.audio.echofield)),
+            |app, value| App::cvar_set_s_echofield(app, APP_S_ECHOFIELD.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_s_echofield, None),
         config: CvarBinding {
-            load_audio: Some(|settings, _name, value| {
-                settings.eal_enabled = parse_bool(value).unwrap_or(settings.eal_enabled);
+            load_audio: Some(|settings, _, value| {
+                settings.echofield = parse_bool(value).unwrap_or(settings.echofield);
             }),
-            archive: Some((430, |state| format!("{}", u8::from(state.audio.eal_enabled)))),
+            archive: Some((430, |state| bool_value(state.audio.echofield))),
             ..CvarBinding::NONE
         },
         implementations: [
             impl App {
-                fn cvar_get_s_eal(&self) -> String { bool_value(self.audio.eal_enabled) }
-                fn cvar_set_s_eal(&mut self, name: &str, value: &str) -> Result<(), String> {
+                fn cvar_set_s_echofield(&mut self, name: &str, value: &str) -> Result<(), String> {
                     let enabled = Self::parse_cvar_bool(name, value)?;
-                    self.audio.eal_enabled = enabled;
+                    self.audio.echofield = enabled;
                     if let Some(sound) = self.game_session.as_mut()
                         .and_then(|session| session.sound_presenter.as_mut()) {
                         sound.set_eal_enabled(enabled);
@@ -1143,6 +1175,23 @@ app_cvars! {
                 }
             }
         ]
+    }
+
+    APP_S_EAL {
+        runtime: CvarDef::new(
+            "s_eal", "0", "0..1",
+            "Legacy name for s_echoField. Echofield Audio is saved as s_echoField.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.audio.echofield)),
+            |app, value| App::cvar_set_s_echofield(app, APP_S_EAL.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_s_echofield, None),
+        config: CvarBinding {
+            load_audio: Some(|settings, _, value| {
+                settings.echofield = parse_bool(value).unwrap_or(settings.echofield);
+            }),
+            ..CvarBinding::NONE
+        },
+        implementations: []
     }
 
     APP_S_EALDEBUG {

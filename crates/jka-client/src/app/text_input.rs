@@ -1,4 +1,5 @@
 //! Text input.
+use super::chat::CHAT_INPUT_LIMIT;
 use crate::app::{App, ElementState, KeyCode, KeyEvent, OverlayMode};
 use std::time::{Duration, Instant};
 
@@ -23,15 +24,8 @@ impl App {
             let ch = char::from(byte);
             match self.overlay {
                 OverlayMode::Chat if editor_active => {
-                    let mut used = crate::cgame::unicode_input_wire_len(&self.chat_input);
-                    if self.chat_input_selected { used = 0; }
-                    if used + 1 > 160 { continue; }
-                    if self.chat_input_selected {
-                        self.chat_input.clear();
-                        self.chat_input_selected = false;
-                    }
-                    self.chat_input.push(ch);
-                    self.chat_player_completion = None;
+                    if self.chat_input_len_for_insert() >= CHAT_INPUT_LIMIT { continue; }
+                    self.insert_chat_at_cursor(ch.encode_utf8(&mut [0; 4]));
                     self.publish_ui();
                 }
                 OverlayMode::Console if editor_active && !matches!(byte, b'`' | b'~') => {
@@ -566,15 +560,35 @@ impl App {
         }
     }
 
+    fn insert_chat_text(&mut self, value: &str, paste: bool) -> bool {
+        let mut used = self.chat_input_len_for_insert();
+        let mut changed = false;
+        for ch in value.chars().filter(|ch| !ch.is_control()) {
+            let len = if ch as u32 <= 0xff { 1 } else { ch.len_utf8() };
+            if used + len > CHAT_INPUT_LIMIT {
+                if paste {
+                    break;
+                }
+                continue;
+            }
+            self.insert_chat_at_cursor(ch.encode_utf8(&mut [0; 4]));
+            used += len;
+            changed = true;
+        }
+        changed
+    }
+
     pub(in crate::app) fn handle_chat_key(&mut self, event: &KeyEvent, code: KeyCode) {
         if event.state != ElementState::Pressed {
             return;
         }
         // The two chatbox styles share this editor; the shortcuts must not
         // depend on cg_chatStyle or the renderer used for the field.
-        if self.modifiers.control_key() && !event.repeat {
+        let ctrl = self.modifiers.control_key();
+        if ctrl && !event.repeat {
             match code {
                 KeyCode::KeyA => {
+                    self.chat_cursor = self.chat_input.len();
                     self.chat_input_selected = !self.chat_input.is_empty();
                     self.chat_player_completion = None;
                     self.publish_ui();
@@ -593,11 +607,7 @@ impl App {
                 KeyCode::KeyX => {
                     if self.chat_input_selected && !self.chat_input.is_empty() {
                         match crate::clipboard::set_text(&self.chat_input) {
-                            Ok(()) => {
-                                self.chat_input.clear();
-                                self.chat_input_selected = false;
-                                self.chat_player_completion = None;
-                            }
+                            Ok(()) => self.clear_chat_input(),
                             Err(error) => {
                                 self.console_status = format!("CLIPBOARD ERROR: {error}");
                                 self.push_console_line(format!("^1{}", self.console_status));
@@ -607,38 +617,21 @@ impl App {
                     self.publish_ui();
                     return;
                 }
+                KeyCode::KeyV => {
+                    match crate::clipboard::get_text() {
+                        Ok(value) => {
+                            self.insert_chat_text(&value, true);
+                        }
+                        Err(error) => {
+                            self.console_status = format!("CLIPBOARD ERROR: {error}");
+                            self.push_console_line(format!("^1{}", self.console_status));
+                        }
+                    }
+                    self.publish_ui();
+                    return;
+                }
                 _ => {}
             }
-        }
-        if self.modifiers.control_key() && code == KeyCode::KeyV && !event.repeat {
-            match crate::clipboard::get_text() {
-                Ok(value) => {
-                    if self.chat_input_selected && value.chars().any(|ch| !ch.is_control()) {
-                        self.chat_input.clear();
-                        self.chat_input_selected = false;
-                    }
-                    let before = self.chat_input.len();
-                    let mut used = crate::cgame::unicode_input_wire_len(&self.chat_input);
-                    for ch in value.chars() {
-                        if ch.is_control() {
-                            continue;
-                        }
-                        let len = if ch as u32 <= 0xff { 1 } else { ch.len_utf8() };
-                        if used + len > 160 { break; }
-                        self.chat_input.push(ch);
-                        used += len;
-                    }
-                    if self.chat_input.len() != before {
-                        self.chat_player_completion = None;
-                    }
-                }
-                Err(error) => {
-                    self.console_status = format!("CLIPBOARD ERROR: {error}");
-                    self.push_console_line(format!("^1{}", self.console_status));
-                }
-            }
-            self.publish_ui();
-            return;
         }
         match code {
             KeyCode::Escape => {
@@ -650,9 +643,7 @@ impl App {
                     self.egui_repaint_requested = true;
                     return;
                 }
-                self.chat_input.clear();
-                self.chat_input_selected = false;
-                self.chat_player_completion = None;
+                self.clear_chat_input();
                 self.set_overlay(OverlayMode::None);
             }
             KeyCode::Enter | KeyCode::NumpadEnter if !event.repeat => self.submit_chat(),
@@ -665,43 +656,48 @@ impl App {
                     }
                 }
             }
-            KeyCode::Backspace => {
+            KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::Home | KeyCode::End => {
+                let input = &self.chat_input;
+                let cursor = self.chat_cursor;
+                self.chat_cursor = match code {
+                    KeyCode::Home => 0,
+                    KeyCode::End => input.len(),
+                    KeyCode::ArrowLeft if self.chat_input_selected => 0,
+                    KeyCode::ArrowRight if self.chat_input_selected => input.len(),
+                    KeyCode::ArrowLeft if ctrl => Self::console_word_left(input, cursor),
+                    KeyCode::ArrowRight if ctrl => Self::console_word_right(input, cursor),
+                    KeyCode::ArrowLeft => Self::console_prev_boundary(input, cursor),
+                    _ => Self::console_next_boundary(input, cursor),
+                };
+                self.chat_input_selected = false;
                 self.chat_player_completion = None;
+                self.note_chat_cursor_move();
+                self.publish_ui();
+            }
+            KeyCode::Backspace | KeyCode::Delete => {
                 if self.chat_input_selected {
-                    self.chat_input.clear();
-                    self.chat_input_selected = false;
-                } else if self.modifiers.control_key() {
-                    // Identical UTF-8/whitespace behavior to console Ctrl+Backspace.
-                    let start = Self::console_word_left(&self.chat_input, self.chat_input.len());
-                    self.chat_input.truncate(start);
+                    self.clear_chat_input();
                 } else {
-                    self.chat_input.pop();
+                    let input = &self.chat_input;
+                    let cursor = self.chat_cursor;
+                    let (start, end) = match (code, ctrl) {
+                        (KeyCode::Backspace, true) => (Self::console_word_left(input, cursor), cursor),
+                        (KeyCode::Backspace, false) => (Self::console_prev_boundary(input, cursor), cursor),
+                        (_, true) => (cursor, Self::console_word_right(input, cursor)),
+                        (_, false) => (cursor, Self::console_next_boundary(input, cursor)),
+                    };
+                    self.chat_input.replace_range(start..end, "");
+                    self.chat_cursor = start;
+                    self.chat_player_completion = None;
                 }
                 self.publish_ui();
             }
             _ => {
-                if self.modifiers.control_key() {
-                    return;
-                }
-                if let Some(value) = &event.text {
-                    if self.chat_input_selected && value.chars().any(|ch| !ch.is_control()) {
-                        self.chat_input.clear();
-                        self.chat_input_selected = false;
-                    }
-                    let mut changed = false;
-                    let mut used = crate::cgame::unicode_input_wire_len(&self.chat_input);
-                    for ch in value.chars() {
-                        let len = if ch as u32 <= 0xff { 1 } else { ch.len_utf8() };
-                        if !ch.is_control() && used + len <= 160
-                        {
-                            self.chat_input.push(ch);
-                            used += len;
-                            changed = true;
+                if !ctrl {
+                    if let Some(value) = &event.text {
+                        if self.insert_chat_text(value, false) {
+                            self.publish_ui();
                         }
-                    }
-                    if changed {
-                        self.chat_player_completion = None;
-                        self.publish_ui();
                     }
                 }
             }

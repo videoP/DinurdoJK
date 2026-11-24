@@ -370,6 +370,13 @@ impl GameSession {
     }
 
     pub(in crate::app) fn reset_demo_stream_for_seek(&mut self) {
+        crate::ninja_fire_debug::clear();
+        crate::ninja_fog_debug::clear();
+        // An active Ocean2 field shares the private Ninja timeline epoch with
+        // rivers. Seeking must invalidate it even without river actor capture.
+        if jka_river::river_ninja::actor_capture_requested() || jka_ninja::INCLUDED {
+            jka_river::river_ninja::invalidate_timeline();
+        }
         self.reader = DemoReader::new(Cursor::new(self.demo_bytes.clone()));
         self.decoder = ServerMessageDecoder::new();
         self.messages = 0;
@@ -1723,6 +1730,7 @@ impl App {
                 self.video.fx_count_scale,
                 self.video.fx_lod_scale,
             );
+            playback.weapon_fx.set_fx_smoke_duration_scale(self.video.fx_smoke_duration_scale);
             playback
                 .player_presenter
                 .set_skinning_mode(self.video.ghoul2_skinning);
@@ -1801,8 +1809,12 @@ impl App {
                 air_resistance: self.video.cloth_air_resistance,
                 turn_response: self.video.cloth_turn_response,
                 animation_influence: self.video.cloth_animation_influence,
+                stiffness: self.video.cloth_stiffness,
+                damping: self.video.cloth_damping,
+                stiffening: self.video.cloth_stiffening,
                 wind_velocity: [0.0; 3],
             });
+            playback.player_presenter.set_cloth_gpu_solver(self.video.cloth_solver == 1);
             playback.player_presenter.set_cloth_wind(
                 self.video
                     .cloth_wind
@@ -2101,6 +2113,8 @@ impl App {
             // FX sprites/lines face the final render view.
             let mut view = crate::fx::draw::FxView::from_camera(&self.camera);
             view.seconds = sample.presentation_time_ms as f32 * 0.001;
+            let jk2 = self.live_input.is_jk2() || self.fs_roots.active_jk2.is_some();
+            view.set_overbright(self.video.effective_overbright_bits(jk2), jk2, self.video.hdr);
             playback.weapon_fx.set_view(view.origin, view.axis[1]);
             if let Some(window) = self.window.as_ref() {
                 let size = window.inner_size();
@@ -2287,6 +2301,7 @@ impl App {
                     | crate::fx::system::FxDraw::Rope { .. } => playback.client_perf.fx_lines += 1,
                     crate::fx::system::FxDraw::Quad { .. } => playback.client_perf.fx_quads += 1,
                     crate::fx::system::FxDraw::Mesh { .. }
+                    | crate::fx::system::FxDraw::BakedLitMesh { .. }
                     | crate::fx::system::FxDraw::LitMesh { .. } => {
                         playback.client_perf.fx_meshes += 1
                     }
@@ -2501,8 +2516,30 @@ impl App {
                     // blends; waiting for every possible PSO would needlessly
                     // re-run the CPU reference interpolator forever.
                     let mut material_ready = std::collections::HashMap::<String, bool>::new();
+                    // Promoted EFX flame layers may have been GPU-resident
+                    // *before* the cvar was enabled. Exclude those resident
+                    // candidates as soon as NinjaFire ACKs the replacement;
+                    // the FX worker returns them to CPU simulation separately.
+                    let excluded_fire_ids: std::collections::HashSet<u64> = playback.gpu_pool.iter()
+                        .filter_map(|(_, spawn)| {
+                            if let crate::fx::system::FxClass::MapRunner(owner) = spawn.class {
+                                (crate::ninja_fire_debug::ready_runner(owner)
+                                    && crate::ninja_fire_debug::original_flame_shader(&spawn.shader))
+                                    .then_some(spawn.id)
+                            } else { None }
+                        }).collect();
+                    let excluded_smoke_ids: std::collections::HashSet<u64> = if crate::ninja_fire_debug::promote_smoke() {
+                        playback.gpu_pool.iter().filter_map(|(_, spawn)| {
+                            let crate::fx::system::FxClass::MapRunner(owner) = spawn.class else { return None; };
+                            crate::ninja_fire_debug::suppresses_smoke(owner, &spawn.shader).then_some(spawn.id)
+                        }).collect()
+                    } else {
+                        Default::default()
+                    };
+                    let excluded = |id| excluded_fire_ids.contains(id) || excluded_smoke_ids.contains(id);
                     let synthetic: Vec<_> = playback.gpu_pool.iter()
-                        .filter(|(_, spawn)| playback.gpu_owned.contains(&spawn.id)
+                        .filter(|(_, spawn)| !excluded(&spawn.id)
+                            && playback.gpu_owned.contains(&spawn.id)
                             && !cpu_ids.contains(&spawn.id)
                             && can_reside(spawn)
                             && (self.video.saber_impact_fx
@@ -2527,9 +2564,11 @@ impl App {
                         })
                         .collect();
                     let mut candidate_ids: Vec<(usize, u32, u64)> = playback.gpu_draw_indices
-                        .iter()
-                        .filter_map(|(index, id)| playback.gpu_pool.slot_for_id(*id)
-                            .map(|slot| (*index, slot, *id)))
+                        .iter().filter_map(|(index, id)| {
+                            if excluded(id) { return None; }
+                            playback.gpu_pool.slot_for_id(*id)
+                                .map(|slot| (*index, slot, *id))
+                        })
                         .collect();
                     for (id, slot, draw) in synthetic {
                         let index = playback.fx_draws.len();
@@ -2553,9 +2592,10 @@ impl App {
                     let mut next_owned: std::collections::HashSet<u64> = candidate_ids
                         .iter().filter(|(index, _, _)| warm.contains(index))
                         .map(|&(_, _, id)| id).collect();
-                    if !self.video.saber_impact_fx {
+                    if !self.video.saber_impact_fx || !excluded_smoke_ids.is_empty() {
                         for (_, spawn) in playback.gpu_pool.iter() {
-                            if spawn.class == crate::fx::system::FxClass::SaberImpact
+                            if ((!self.video.saber_impact_fx && spawn.class == crate::fx::system::FxClass::SaberImpact)
+                                || excluded_smoke_ids.contains(&spawn.id))
                                 && playback.gpu_owned.contains(&spawn.id) && can_reside(spawn) {
                                 next_owned.insert(spawn.id);
                             }
@@ -2579,6 +2619,35 @@ impl App {
                 playback.gpu_owned.clear();
                 playback.weapon_fx.set_gpu_owned(std::collections::HashSet::new());
                 playback.gpu_ready_modes.store(0, std::sync::atomic::Ordering::Release);
+            }
+            if crate::ninja_fire_debug::promotion_enabled()
+                && !playback.fx_runner_draws.is_empty()
+            {
+                let accepted: std::collections::HashSet<usize> = playback.fx_runner_draws.iter()
+                    .filter_map(|&(index, owner)| {
+                        use crate::fx::system::FxDraw;
+                        let draw = playback.fx_draws.get(index)?;
+                        let shader = match draw {
+                            FxDraw::Sprite { shader, .. } | FxDraw::OrientedQuad { shader, .. }
+                            | FxDraw::Billboard { shader, .. } => shader.as_ref(),
+                            _ => return None,
+                        };
+                        ((crate::ninja_fire_debug::original_flame_shader(shader)
+                            && crate::ninja_fire_debug::ready_runner(owner))
+                            || (matches!(draw, FxDraw::Sprite { .. })
+                                && crate::ninja_fire_debug::suppresses_smoke(owner, shader)))
+                            .then_some(index)
+                    })
+                    .collect();
+                if !accepted.is_empty() {
+                    crate::fx::runner_cull::remove_promoted(&mut playback.fx_runner_draws, &accepted);
+                    let mut index = 0;
+                    playback.fx_draws.retain(|_| {
+                        let keep = !accepted.contains(&index);
+                        index += 1;
+                        keep
+                    });
+                }
             }
             let fx_geometry_started = Instant::now();
             let mut fx_surfaces = if !crate::fx::render_enabled() {

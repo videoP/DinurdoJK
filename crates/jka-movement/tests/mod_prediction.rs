@@ -5,7 +5,6 @@ use support::{animations, player, Map};
 
 fn japro() -> PredictSettings {
     PredictSettings {
-        backend: 1,
         server_mod: 1,
         ..PredictSettings::default()
     }
@@ -43,7 +42,7 @@ fn cpm_physics_is_selected_only_for_japro() {
 }
 
 #[test]
-fn switching_native_backends_preserves_every_wire_slot() {
+fn reconfiguring_preserves_every_wire_slot() {
     let mut p = player(24.125);
     let mut state = p.network();
     state.fields = (0..state.fields.len() as u32)
@@ -90,9 +89,9 @@ fn race_collision_rules_do_not_leak_into_base() {
     mover.mover_class = 0;
     assert!(p.clips_prediction_entity(&mover)); // TR_SINE fallback
     // TaystJK cg_predict.c: only jaPRO race mode excludes moving movers.
-    p.configure(&PredictSettings { backend: 1, server_mod: 0, ..PredictSettings::default() }).unwrap();
+    p.configure(&PredictSettings { server_mod: 0, ..PredictSettings::default() }).unwrap();
     assert!(p.clips_prediction_entity(&mover));
-    p.configure(&PredictSettings { backend: 1, server_mod: 2, ..PredictSettings::default() }).unwrap();
+    p.configure(&PredictSettings { server_mod: 2, ..PredictSettings::default() }).unwrap();
     assert!(p.clips_prediction_entity(&mover));
     p.configure(&japro()).unwrap();
     assert!(p.clips_prediction_entity(&mover));
@@ -107,7 +106,7 @@ fn race_collision_rules_do_not_leak_into_base() {
 }
 
 #[test]
-fn player_styles_replay_deterministically_across_interleaved_backends() {
+fn player_styles_replay_deterministically_across_interleaved_server_identities() {
     let movement = animations();
     let mut world = Map::floor().world();
     let mut base = player(24.125);
@@ -163,10 +162,9 @@ fn player_styles_replay_deterministically_across_interleaved_backends() {
 }
 
 #[test]
-fn japlus_uses_tayst_backend_with_its_own_server_identity_and_cinfo() {
+fn japlus_has_its_own_server_identity_and_cinfo() {
     let mut p = player(24.125);
     let settings = PredictSettings {
-        backend: 1,
         server_mod: 2,
         cinfo: (1 << 0) | (1 << 3), // JA+ flipkick + fixroll3
         hook_pull: 800,

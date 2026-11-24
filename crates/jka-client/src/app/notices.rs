@@ -70,7 +70,7 @@ pub(in crate::app) struct ConsoleNotifyRecord {
 /// though the visible input has already been replaced by a completed name.
 pub(in crate::app) struct ChatPlayerCompletionCycle {
     pub(in crate::app) word_start: usize,
-    pub(in crate::app) candidates: Vec<String>,
+    pub(in crate::app) candidates: Vec<String>, // Full replacements, including any trailing space.
     pub(in crate::app) index: usize,
 }
 

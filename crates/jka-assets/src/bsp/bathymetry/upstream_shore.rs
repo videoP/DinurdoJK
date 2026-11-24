@@ -4,6 +4,9 @@ use super::Geometry;
 impl Geometry {
     /// Z-up/JKA XY samples at `origin + (x,y)*cell`, relative to `level`, in map units.
     /// Unknown or ambiguous columns remain NaN. The renderer leaves their waves unmodified.
+    /// `beach`: also read dry triangle terrain that rises above the water plane inside the
+    /// authored footprint (beaches whose water brush extends under the sand), when the
+    /// column has no downward-facing surface above the water (so bridge decks stay out).
     pub fn upstream_shore_heights(
         &self,
         origin: [f32; 2],
@@ -11,6 +14,7 @@ impl Geometry {
         cell: f32,
         level: f32,
         footprint: &[super::FootprintTriangle],
+        beach: bool,
     ) -> Result<Vec<f32>, String> {
         let [nx, ny] = size;
         if nx < 2
@@ -57,7 +61,26 @@ impl Geometry {
                 for y in y0..y1 {
                     for x in x0..x1 {
                         let at = [origin[0] + x as f32 * cell, origin[1] + y as f32 * cell];
-                        let column = self.column_with_sky(at, level, &solids, &triangles, true);
+                        let column = self.classify_column(at, level, &solids, &triangles, true);
+                        if beach && (column.overhang || column.bed.is_none()) {
+                            let lowest_up = triangles
+                                .iter()
+                                .filter_map(|&i| {
+                                    let t = &self.triangles[i];
+                                    (t.normal[2] > super::EPS).then(|| t.height(at)).flatten()
+                                })
+                                .filter(|h| *h >= f64::from(level))
+                                .min_by(f64::total_cmp);
+                            let roofed = |top: f64| triangles.iter().any(|&i| {
+                                let t = &self.triangles[i];
+                                t.normal[2] < -super::EPS
+                                    && t.height(at).is_some_and(|z| z >= f64::from(level) && z <= top)
+                            });
+                            if let Some(bank) = lowest_up.filter(|h| !roofed(*h)) {
+                                heights[y * nx + x] = bank as f32 - level;
+                                continue;
+                            }
+                        }
                         if !column.overhang {
                             let mut bed = column.bed;
                             if !water.iter().any(|t| super::contains(*t, at)) {

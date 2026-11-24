@@ -99,15 +99,12 @@ pub struct EyeWaveParams {
 pub struct NativeEyeParams {
     pub eye: [f32; 4],
     pub swell: [[f32; 4]; 2],
-    /// `r_oceanType 5`: [1 on, wave scale, seconds, 0] (`super::gerstner_uniform`).
-    pub godot: [f32; 4],
 }
 
 /// Everything the native solve needs from the Blue Water ocean.
 pub struct NativeProbeInput<'a> {
     pub swell: [[f32; 4]; 2],
     pub breaker_mode: u8,
-    pub godot: [f32; 4],
     pub waves_group: &'a wgpu::BindGroup,
     pub eye_xz_metres: [f32; 2],
     /// Grid spacing the mesh uses at the eye, metres (the finest ring).
@@ -183,6 +180,13 @@ enum Readback {
     Mapping(std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>),
 }
 
+/// A sample older than this (ocean seconds) does not classify the camera as clear of the water.
+pub const MAX_SAMPLE_AGE_S: f32 = 0.5;
+/// Headroom (m) over a sample's surface before the sea's own rise: Coast surges and readback jitter.
+pub const RISE_FLOOR_M: f32 = 1.5;
+/// Steepest surface slope assumed under the camera's movement since the sample.
+pub const MAX_SLOPE: f32 = 1.5;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EyeWaveSample {
     pub slot: usize,
@@ -192,6 +196,9 @@ pub struct EyeWaveSample {
     pub naive: f32,
     /// The surface the original mesh rasterizes over the eye, same units.
     pub native: Option<f32>,
+    /// Where (render x, z, JKA units) and when (ocean seconds) the solve ran.
+    pub eye_xz: [f32; 2],
+    pub time: f32,
 }
 
 impl EyeWaveSample {
@@ -226,9 +233,9 @@ pub struct EyeWaveProbe {
     readback: wgpu::Buffer,
     native: Option<NativePipeline>,
     state: Readback,
-    /// Pool the in-flight copy was dispatched for.
-    in_flight_slot: usize,
-    latest: Option<EyeWaveSample>,
+    /// Pool, optional Ocean2 field identity, eye xz and ocean time of the in-flight copy.
+    in_flight: Option<(usize, Option<wgpu::Buffer>, [f32; 2], f32)>,
+    latest: Option<(EyeWaveSample, Option<wgpu::Buffer>)>,
 }
 
 fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -341,7 +348,7 @@ impl EyeWaveProbe {
             readback,
             native,
             state: Readback::Idle,
-            in_flight_slot: 0,
+            in_flight: None,
             latest: None,
         }
     }
@@ -421,10 +428,12 @@ impl EyeWaveProbe {
     /// Forgets the last sample (camera left the pool or the mode no longer needs it).
     pub fn clear(&mut self) {
         self.latest = None;
+        self.in_flight = None;
     }
 
-    pub fn latest(&self, slot: usize) -> Option<EyeWaveSample> {
-        self.latest.filter(|sample| sample.slot == slot)
+    pub fn latest(&self, slot: usize, ninja_source: Option<&wgpu::Buffer>) -> Option<EyeWaveSample> {
+        let (sample, source) = self.latest.as_ref()?;
+        (sample.slot == slot && source.as_ref() == ninja_source).then_some(*sample)
     }
 
     /// Collects a finished readback, dispatches this frame's solves and, when no
@@ -436,6 +445,8 @@ impl EyeWaveProbe {
         params: &EyeWaveParams,
         native: Option<NativeProbeInput>,
         slot: usize,
+        ninja_source: Option<&wgpu::Buffer>,
+        custom: impl FnOnce(&mut wgpu::CommandEncoder, &wgpu::Buffer) -> bool,
     ) {
         if matches!(self.state, Readback::Copied) {
             let (send, receive) = std::sync::mpsc::channel();
@@ -447,7 +458,11 @@ impl EyeWaveProbe {
         if let Readback::Mapping(receive) = &self.state {
             if let Ok(status) = receive.try_recv() {
                 if status.is_ok() {
-                    if let Ok(view) = self.readback.slice(..).get_mapped_range() {
+                    let pending = self.in_flight.take()
+                        .filter(|(_, source, _, _)| source.as_ref() == ninja_source);
+                    if let (Some((sample_slot, source, eye_xz, time)), Ok(view)) =
+                        (pending, self.readback.slice(..).get_mapped_range())
+                    {
                         let value = |i: usize| f32::from_le_bytes(view[i * 4..i * 4 + 4].try_into().unwrap());
                         let (adapter, residual, valid, naive) = (value(0), value(1), value(2), value(3));
                         // The native solve works in upstream metres.
@@ -456,15 +471,23 @@ impl EyeWaveProbe {
                             (value(4) * metres, value(5) * metres, value(6));
                         let ok = |v: f32| v.is_finite();
                         // A failed solve keeps the previous sample (held, not zeroed to the flat plane).
-                        if valid > 0.5 && ok(adapter) && ok(naive) && ok(residual) && residual <= MAX_RESIDUAL_UNITS {
-                            let native = (native_valid > 0.5 && ok(native) && ok(native_residual)
-                                && native_residual <= MAX_RESIDUAL_UNITS)
-                                .then_some(native);
-                            self.latest = Some(EyeWaveSample { slot: self.in_flight_slot, adapter, naive, native });
+                        let native = (native_valid > 0.5 && ok(native) && ok(native_residual)
+                            && native_residual <= MAX_RESIDUAL_UNITS).then_some(native);
+                        if source.is_some() {
+                            if let Some(native) = native {
+                                let adapter = if ok(adapter) { adapter } else { 0.0 };
+                                let naive = if ok(naive) { naive } else { 0.0 };
+                                let sample = EyeWaveSample { slot: sample_slot, adapter, naive, native: Some(native), eye_xz, time };
+                                self.latest = Some((sample, source));
+                            }
+                        } else if valid > 0.5 && ok(adapter) && ok(naive) && ok(residual) && residual <= MAX_RESIDUAL_UNITS {
+                            let sample = EyeWaveSample { slot: sample_slot, adapter, naive, native, eye_xz, time };
+                            self.latest = Some((sample, None));
                         }
                     }
                     self.readback.unmap();
                 }
+                self.in_flight = None;
                 self.state = Readback::Idle;
             }
         }
@@ -479,12 +502,11 @@ impl EyeWaveProbe {
             pass.dispatch_workgroups(1, 1, 1);
         }
         // Without a native sample the previous native value must not be reused.
-        let mut native_ran = false;
+        let mut native_ran = ninja_source.is_some() && custom(encoder, &self.result);
         if let (Some(native_pipeline), Some(input)) = (self.native.as_ref(), native) {
             let eye = NativeEyeParams {
                 eye: [input.eye_xz_metres[0], input.eye_xz_metres[1], input.spacing_metres, f32::from(input.breaker_mode)],
                 swell: input.swell,
-                godot: input.godot,
             };
             queue.write_buffer(&native_pipeline.params, 0, bytemuck::bytes_of(&eye));
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -498,9 +520,12 @@ impl EyeWaveProbe {
             pass.dispatch_workgroups(1, 1, 1);
             native_ran = true;
         }
-        if matches!(self.state, Readback::Idle) {
+        if ninja_source.is_some() && !native_ran {
+            self.clear();
+        }
+        if matches!(self.state, Readback::Idle) && (ninja_source.is_none() || native_ran) {
             encoder.copy_buffer_to_buffer(&self.result, 0, &self.readback, 0, 32);
-            self.in_flight_slot = slot;
+            self.in_flight = Some((slot, ninja_source.cloned(), [params.eye[0], params.eye[1]], params.swell_motion[3]));
             self.state = Readback::Copied;
         }
         if !native_ran {

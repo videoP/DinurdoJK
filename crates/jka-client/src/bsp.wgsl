@@ -1025,6 +1025,11 @@ fn local_light_attenuation(light: PointLight, distance_to_light: f32) -> f32 {
     // Runtime/FX lights keep the engine's existing smooth finite-radius response.
     // Source-map q3map lights use q3map_light_scalar() instead.
     let radius = max(light.position_radius.w, 1.0);
+    if (light.shadow.y < 0.0) {
+        // UE DynamicLightingCommon.ush, RadialAttenuation.
+        let ratio = distance_to_light / radius;
+        return pow(max(1.0 - ratio * ratio, 0.0), -light.shadow.y);
+    }
     if (light.shadow.w >= 0.5 && !ENABLE_CLUSTERED_LITE_DLIGHTS) {
         // Runtime dlights (sabers, blasters, explosions) use the stock JKA
         // 1 - d^2/r^2 response. The steeper (1 - d/r)^2 below left them a
@@ -1073,6 +1078,9 @@ fn q3map_fast_contribution_visible(light_scalar: f32) -> bool {
 }
 
 fn local_light_surface_scale(light: PointLight) -> f32 {
+    if (light.shadow.y < 0.0) {
+        return 0.318309886; // Unreal's Diffuse_Lambert, 1 / PI.
+    }
     if (ENABLE_MAP_LIGHT_SIMULATION && light.shadow.y > 0.5) {
         return 1.0;
     }
@@ -1102,6 +1110,11 @@ fn transient_vertex_dlight(world_position: vec3<f32>, world_normal: vec3<f32>) -
         if (ndotl <= 0.0) { continue; }
         let emission_visibility = emitter_visibility(light, light_direction);
         if (emission_visibility <= 0.0) { continue; }
+        if (light.shadow.y < 0.0) {
+            result += light.color_intensity.rgb * light.color_intensity.a
+                * local_light_attenuation(light, distance_to_light) * ndotl * local_light_surface_scale(light);
+            continue;
+        }
         let falloff = max(1.0 - distance_to_light / radius, 0.0);
         result += light.color_intensity.rgb * light.color_intensity.a
             * (falloff * falloff) * ndotl * emission_visibility * 2.20;
@@ -2158,6 +2171,15 @@ fn legacy_dynamic_light(input: VertexOut) -> LegacyDynamicLighting {
         let radius = max(light.position_radius.w, 1.0);
         let radius_sq = radius * radius;
         let delta = light.position_radius.xyz - input.world_position;
+        if (light.shadow.y < 0.0) {
+            let distance = length(delta);
+            if (distance > 1.0e-5) {
+                let ndotl = max(dot(normalize(input.world_normal), delta / distance), 0.0);
+                result.diffuse_factor += light.color_intensity.rgb * light.color_intensity.a
+                    * local_light_attenuation(light, distance) * ndotl * local_light_surface_scale(light);
+            }
+            continue;
+        }
         let plane_distance = dot(plane_normal, delta);
         if (plane_distance <= 0.0 || plane_distance >= radius) { continue; }
 
@@ -2267,6 +2289,15 @@ fn openjk_projected_dlight_contribution(input: VertexOut) -> vec3<f32> {
         let radius = max(light.position_radius.w, 1.0);
         let radius_sq = radius * radius;
         let to_light = light.position_radius.xyz - input.world_position;
+        if (light.shadow.y < 0.0) {
+            let distance = length(to_light);
+            if (distance > 1.0e-5) {
+                let ndotl = max(dot(normalize(input.world_normal), to_light / distance), 0.0);
+                contribution += diffuse * light.color_intensity.rgb * light.color_intensity.a
+                    * local_light_attenuation(light, distance) * ndotl * local_light_surface_scale(light);
+            }
+            continue;
+        }
         let plane_distance = dot(plane_normal, to_light);
         // OpenJK rejects backfaces and triangles whose plane is outside radius.
         if (plane_distance <= 0.0 || plane_distance >= radius) {
@@ -2543,7 +2574,8 @@ fn pbr_surface_for_path(
     shared_frame: mat3x3<f32>,
     shared_surface: PbrSurface,
 ) -> PbrSurface {
-    if (PBR_SHARED_MATERIAL_EVAL) {
+    if (PBR_SHARED_MATERIAL_EVAL ||
+        (ENABLE_SURFACE_DEFORMATION && ninja_snow_receiver_active(input.shell_kind, material_flags_w(), material_tc_gen(), material_flags()))) {
         return shared_surface;
     }
     return evaluate_pbr_surface(input, albedo, uv, weather, shared_frame);
@@ -3011,11 +3043,11 @@ fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
     // again. Authored glow is replayed later into a separate bloom source and
     // must carry the same transmittance even in Legacy 1.
     if (surface_fog.flags.z > 1.5 || surface_fog.flags.y < -0.5) {
-        // Legacy 1 global fog is applied once at display-space composition.
-        // Only glow replay bypasses that final scene pass. Never fog a normal
-        // additive stage twice when its source uses BSP global fog.
-        if (drawfog_mode < 1.5 && surface_fog.flags.x > 0.5
-            && surface_fog.flags.y >= -0.5) {
+        // World additive stages are drawn before the fullscreen legacy global
+        // fog pass, which fogs them with the surface behind (both modes). Only
+        // glow replay bypasses that scene pass. Never fog a normal additive
+        // stage twice when its source uses BSP global fog.
+        if (surface_fog.flags.x > 0.5 && surface_fog.flags.y >= -0.5) {
             return color;
         }
         if ((map_has_authored_fog && !has_map_fog)
@@ -3030,14 +3062,14 @@ fn apply_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f32> {
     if (drawfog_mode < 1.5) {
         return color;
     }
-    // Legacy 2 uses fixed-function-style per-stage fog when the material can
-    // reproduce it exactly; that path is required for OpenJK's black/white fog
-    // overrides on additive/filter stages. Complex destination-dependent
-    // materials still fall back to the post-material geometry pass.
+    // Legacy 2 authored fog is never folded into material stages: global fog on
+    // depth-writing surfaces comes from the fullscreen legacy global fog pass,
+    // everything else from the post-material geometry pass. This must match
+    // bsp_lean.wgsl and specialized stage programs, or a surface drawn by one
+    // module and fog-redrawn by the other gets fog from neither path.
     if (drawfog_mode >= 1.5
         && map_has_authored_fog
-        && has_map_fog
-        && surface_fog.flags.z < 0.5) {
+        && has_map_fog) {
         return color;
     }
     // If this map has authored fog, the strength control scales that authored
@@ -3150,17 +3182,15 @@ fn legacy_separate_fog(world_position: vec3<f32>) -> vec4<f32> {
     if (!map_has_authored_fog && !has_override) {
         return vec4<f32>(0.0);
     }
-    // Legacy 1 global opaque/depth-writing geometry is fogged later in
-    // display-space to match OpenJK's old gamma/LDR framebuffer blend. Local
-    // fog and transparent-only global geometry still use this pass. Legacy 2
-    // uses it only when the material cannot safely reproduce fixed-function
-    // fog per stage.
-    let legacy1_geometry = drawfog_mode < 1.5
-        && (surface_fog.flags.x < 0.5 || surface_fog.flags.w < 0.5);
+    // Global fog on opaque/depth-writing geometry is applied by the fullscreen
+    // legacy global fog pass in both modes. Local fog and transparent-only
+    // global geometry still use this pass.
+    let geometry = surface_fog.flags.x < 0.5 || surface_fog.flags.w < 0.5;
+    let legacy1_geometry = drawfog_mode < 1.5 && geometry;
     let legacy2_geometry = drawfog_mode >= 1.5
         && map_has_authored_fog
         && has_map_fog
-        && surface_fog.flags.z < 0.5;
+        && geometry;
     let separate_pass = legacy1_geometry || legacy2_geometry;
     if (!separate_pass) {
         return vec4<f32>(0.0);
@@ -3241,10 +3271,8 @@ fn apply_ocean_legacy_fog(color: vec4<f32>, world_position: vec3<f32>) -> vec4<f
     if (!map_has_authored_fog && !has_override) {
         return color;
     }
-    // Legacy 1 authored global fog is composited in post from the depth prepass.
-    if (drawfog_mode < 1.5 && has_map_fog && surface_fog.flags.x > 0.5) {
-        return color;
-    }
+    // The ocean is drawn after the depth/policy prepass that drives the
+    // fullscreen global fog pass, so it fogs itself in both Legacy modes.
     let fog = legacy_fog_color_amount(world_position);
     return vec4<f32>(mix(color.rgb, fog.rgb, fog.a), color.a);
 }
@@ -4196,11 +4224,19 @@ fn light_bsp_surface(lightmap: vec3<f32>, flux: f32, input: VertexOut) -> vec3<f
     return remaining + lighting_settings.runtime_sun_radiance.rgb * facing * visibility;
 }
 
-fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
+fn shade_surface(vertex: VertexOut, front: bool) -> vec4<f32> {
+    var input = vertex;
     let classic_flags = select(0u, camera.render_flags.z, ENABLE_CLASSIC_RENDER_FLAGS);
     let classic_fullbright = (classic_flags & CLASSIC_FULLBRIGHT) != 0u;
     let classic_vertex_light = (classic_flags & CLASSIC_VERTEX_LIGHT) != 0u;
     let classic_lightmap_only = (classic_flags & CLASSIC_LIGHTMAP_ONLY) != 0u;
+    let ninja_snow = ENABLE_SURFACE_DEFORMATION && !classic_lightmap_only &&
+        ninja_snow_receiver_active(input.shell_kind, material_flags_w(), material_tc_gen(), material_flags());
+    var snow = NinjaSnowShading(vec3<f32>(1.0), input.world_normal, 1.0);
+    if (ninja_snow) {
+        snow = ninja_snow_material(input.world_position, input.world_normal, camera.camera_pos_time.xyz, camera.camera_forward.xyz);
+        input.world_normal = snow.normal;
+    }
     let explicit_lightmap_stage = (material_flags() & MATERIAL_FLAG_EXPLICIT_LIGHTMAP) != 0u;
     let has_lightmap = (material_flags() & MATERIAL_FLAG_HAS_LIGHTMAP) != 0u;
     let opaque_stage = (material_flags() & MATERIAL_FLAG_OPAQUE_STAGE) != 0u;
@@ -4300,7 +4336,7 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
         return vec4<f32>(selection_color, 1.0);
     }
 
-    let has_pbr_brdf_map = (material_flags() & (MATERIAL_FLAG_NORMAL_MAP | MATERIAL_FLAG_ROUGHNESS_MAP | MATERIAL_FLAG_METALLIC_MAP | MATERIAL_FLAG_SPECULAR_MAP)) != 0u;
+    let has_pbr_brdf_map = ninja_snow || (material_flags() & (MATERIAL_FLAG_NORMAL_MAP | MATERIAL_FLAG_ROUGHNESS_MAP | MATERIAL_FLAG_METALLIC_MAP | MATERIAL_FLAG_SPECULAR_MAP)) != 0u;
     let static_pbr_path = ENABLE_DELUXE
         && has_pbr_brdf_map
         && classic_flags == 0u
@@ -4474,6 +4510,7 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
         }
     }
     var base = source_sample * stage_color;
+    if (ninja_snow) { base = ninja_snow_apply_albedo(base, snow); }
     // An authored masked base with BSP vertex alpha 127/255 and GE128 cannot
     // seed depth. For the narrowly identified multi-stage depth-equal case,
     // test the source texture's alpha while retaining the vertex alpha for
@@ -4512,7 +4549,8 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
     }
     // Vertex RGB is baked illumination, not the metal's base reflectance.
     // Rend2 lightall samples diffuse/F0 before multiplying by vertex lighting.
-    let albedo = select(base.rgb, source_sample.rgb * material.color.rgb, vertex_baked_pbr);
+    let raw_albedo = select(source_sample.rgb, source_sample.rgb * snow.color_scale, ninja_snow && ninja_snow_composite_mode());
+    let albedo = select(base.rgb, raw_albedo * material.color.rgb, vertex_baked_pbr);
     let source_map_unbaked_receiver = ENABLE_SOURCE_MAP_WORLD
         && (material_flags() & MATERIAL_FLAG_DYNAMIC_RECEIVER) != 0u
         && input.lightmap_uv.x < 0.0
@@ -4529,6 +4567,11 @@ fn shade_surface(input: VertexOut, front: bool) -> vec4<f32> {
     var shared_pbr = default_pbr_surface(input, albedo, weather);
     if (PBR_SHARED_MATERIAL_EVAL && needs_pbr_surface) {
         shared_pbr = evaluate_pbr_surface(input, albedo, surface_uv, weather, shared_frame);
+    }
+    if (ninja_snow && ENABLE_PBR) {
+        shared_pbr.n = snow.normal;
+        shared_pbr.specular_n = weather_reflection_normal(snow.normal, weather);
+        shared_pbr.roughness = weather_wet_roughness(snow.roughness, weather);
     }
 
     // Bevy integrates irradiance volumes as diffuse indirect illumination:

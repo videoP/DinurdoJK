@@ -11,6 +11,8 @@ blue-water-sky = { path = "../blue-water-sky" }
 bytemuck = { version = "=1.25.2", features = ["derive", "min_const_generics"] }
 glam.workspace = true
 jka-assets = { path = "../jka-assets" }
+# Fluid Ninja river presentation (private implementation or public stub).
+jka-ninja = { path = "../jka-ninja" }
 jka-render-core = { path = "../jka-render-core" }
 jka-water = { path = "../jka-water" }
 serde = { version = "=1.0.228", features = ["derive"] }

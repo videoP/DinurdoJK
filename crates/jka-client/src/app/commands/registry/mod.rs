@@ -218,6 +218,7 @@ mod cvar_prelude {
 }
 
 pub(crate) mod audio_cvars;
+mod echofield_cvars;
 pub(crate) mod chat_llm_cvars;
 pub(crate) mod chat_translate_cvars;
 mod bindings;
@@ -249,6 +250,7 @@ pub(crate) mod network_cvars;
 pub(crate) mod filesystem_cvars;
 pub(crate) mod ocean_cvars;
 pub(crate) mod river_cvars;
+mod river_ninja_cvars;
 pub(crate) mod physics_cvars;
 pub(crate) mod postprocess_cvars;
 pub(crate) mod presentation_cvars;
@@ -347,6 +349,7 @@ pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
     DEFINITIONS.get_or_init(|| {
         let mut definitions = Vec::new();
         definitions.extend(audio_cvars::DEFINITIONS.iter());
+        definitions.extend(echofield_cvars::DEFINITIONS.iter());
         definitions.extend(client_cvars::DEFINITIONS.iter());
         definitions.extend(crosshair_cvars::DEFINITIONS.iter());
         definitions.extend(presentation_cvars::DEFINITIONS.iter());
@@ -367,6 +370,10 @@ pub(crate) fn cvar_definitions() -> &'static [&'static CvarDefinition] {
         definitions.extend(ocean_cvars::DEFINITIONS.iter());
         definitions.extend(ocean_cvars::SCALAR_DEFINITIONS.iter());
         definitions.extend(river_cvars::DEFINITIONS.iter());
+        if jka_river::river_ninja::FLUID_NINJA_INCLUDED {
+            definitions.extend(river_ninja_cvars::DEFINITIONS.iter());
+            definitions.extend(river_ninja_cvars::SCALAR_DEFINITIONS.iter());
+        }
         definitions.extend(renderer_cvars::DEFINITIONS.iter());
         definitions.extend(patch_cvars::DEFINITIONS.iter());
         definitions.extend(physics_cvars::DEFINITIONS.iter());
@@ -483,9 +490,7 @@ mod tests {
         use crate::config::cvars::{ArchiveState, VideoLoadState};
         // These used to have distinct parsing rules in the console and .cfg.
         for (name, valid, invalid) in [
-            ("r_lakeWindSpeed", "12.5", "NaN"),
             ("r_lakeDirection", "-45", "inf"),
-            ("r_lakeShader", "0", "9"),
             ("r_lakeSourceHints", "off", "maybe"),
             ("r_blueWaterSSRSteps", "32", "999999"),
         ] {
@@ -701,7 +706,7 @@ mod tests {
                 "{name}"
             );
         }
-        assert_eq!(cvar_registry().archived().count(), 424);
+        assert_eq!(cvar_registry().archived().count(), 425);
         for name in ["cg_debugEvents", "cg_eventWorkers", "cg_asyncAssets"] {
             assert!(!cvar_registry()
                 .find(name)

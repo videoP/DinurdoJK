@@ -1,22 +1,54 @@
 //! Developer "spawnriver" patches on the render thread: spawn, per-frame
 //! native solver encoding and the water body's per-frame inputs. See
 //! river_runtime.rs and river_surface.rs.
+use super::{batch_area_visible, effective_area_mask, PvsMode, WorldBatch, WorldGpu};
 use crate::river_runtime::LiveRiver;
 use crate::river_surface::{RiverSurface, ViewUniform};
+use jka_river::river_ninja::{RiverImage, RiverVolumeImage};
+
+pub(super) struct PromotionClaim {
+    pub(super) id: u64,
+    coarse: Vec<usize>,
+    full: Vec<usize>,
+}
+
+impl PromotionClaim {
+    /// A dense river draws as one body. Keep the authored pieces whenever
+    /// only part of the body is visible through the active PVS or area mask.
+    fn fully_visible(&self, world: &WorldGpu, mode: PvsMode, area_mask: Option<&[u8; 32]>) -> bool {
+        let cluster = world.last_cluster.flatten();
+        let area_mask = effective_area_mask(world, mode, area_mask);
+        let visible = |batches: &[WorldBatch], owned: &[usize], indices: Option<&[usize]>| {
+            owned.iter().all(|&index| {
+                indices.is_none_or(|list| list.binary_search(&index).is_ok())
+                    && batch_area_visible(&batches[index], area_mask)
+            })
+        };
+        if let Some(cluster) = cluster.filter(|_| mode != PvsMode::Off) {
+            if matches!(mode, PvsMode::Full | PvsMode::Auto) {
+                if let Some(indices) = world.full_visible_batches_by_cluster.get(cluster) {
+                    return visible(&world.full_batches, &self.full, Some(indices));
+                }
+            }
+            return visible(
+                &world.coarse_batches,
+                &self.coarse,
+                world
+                    .coarse_visible_batches_by_cluster
+                    .get(cluster)
+                    .map(Vec::as_slice),
+            );
+        }
+        true
+    }
+}
 
 /// A presented player as a JKA player hull (bg_public.h: mins -15,-15,-24;
 /// maxs 15,15,40, or 16 crouched) in map units. Actor origins and velocities
 /// are render space.
 fn river_body(actor: &crate::ocean::interaction::ActorSample) -> crate::river_runtime::MapBody {
-    use jka_render_core::coordinates::jka_position;
-    let origin = jka_position(actor.origin);
-    // CROUCH_VIEWHEIGHT is 12, DEFAULT_VIEWHEIGHT 36 (remote records use 26).
-    let top = if actor.head_height < 20.0 { 16.0 } else { 40.0 };
-    crate::river_runtime::MapBody {
-        mins: [origin[0] - 15.0, origin[1] - 15.0, origin[2] - 24.0],
-        maxs: [origin[0] + 15.0, origin[1] + 15.0, origin[2] + top],
-        velocity: actor.velocity.map_or([0.0; 3], jka_position),
-    }
+    let (mins, maxs, velocity) = actor.jka_hull();
+    crate::river_runtime::MapBody { mins, maxs, velocity }
 }
 
 /// `riverdump`: the previous dump of each river, for the volume change and
@@ -62,6 +94,204 @@ fn classify(dump: &jka_river::river_tiles::PoolDump, geometry: [f32; 4], state: 
     } else {
         DumpClass::Dry
     }
+}
+
+/// The Fluid Ninja river input images (`river_ninja::river_input_images`),
+/// loaded once per enable and dropped on disable or when rivers clear.
+pub(in crate::renderer) struct NinjaInputTextures {
+    pub images: Vec<super::textures::GpuImage>,
+}
+
+impl super::Renderer {
+    /// Exact VFS qpaths and sizes from the private preset table; linear or sRGB
+    /// per the UE asset setting, no mips (every read is an explicit mip 0), no
+    /// picmip. A missing or mis-sized image disables the feature (logged once).
+    fn load_ninja_input_textures(&self, images: &[RiverImage]) -> Result<NinjaInputTextures, String> {
+        if images.len() != 7 {
+            return Err("Fluid Ninja is not included in this build".into());
+        }
+        let mut assets = self.ninja_asset_path()?;
+        let decoded = images.iter().map(|spec| decode_ninja_image(&mut assets, spec)).collect::<Result<Vec<_>, _>>()?;
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let images = decoded.iter().map(|data| super::textures::upload_texture(&self.device, &self.queue, data)).collect();
+        jka_river::river_ninja::checked_scope(scope)?;
+        Ok(NinjaInputTextures { images })
+    }
+
+    fn ninja_asset_path(&self) -> Result<super::AssetSearchPath, String> {
+        super::AssetSearchPath::open_game(&self.base, self.detail_texture_game.as_deref())
+            .map_err(|error| error.to_string())
+    }
+
+    fn load_ninja_caustics(&self, spec: RiverVolumeImage) -> Result<wgpu::TextureView, String> {
+        let data = decode_ninja_image(&mut self.ninja_asset_path()?, &spec.image)?;
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let volume = upload_ninja_volume(&self.device, &self.queue, &data, &spec);
+        jka_river::river_ninja::checked_scope(scope)?;
+        volume
+    }
+
+    /// Ocean underwater mode 5 inputs, loaded once on first use (failures are kept,
+    /// so the ocean falls back to Blue Water's composite without retrying).
+    pub(in crate::renderer) fn ensure_ocean_ninja_underwater(&mut self) {
+        if self.ocean_ninja_underwater.is_some() {
+            return;
+        }
+        let loaded = jka_river::river_ninja::river_underwater_images().and_then(|specs| {
+            let [noise, gradient] = self.load_ninja_underwater_images(specs);
+            let caustics = jka_river::river_ninja::river_caustics_image().and_then(|spec| {
+                self.load_ninja_caustics(spec).map_err(|e| eprintln!("[OCEAN NINJA] underwater caustics unavailable: {e}")).ok()
+            });
+            Some(crate::ocean::NinjaUnderwaterTextures { noise: noise?, gradient: gradient?, caustics })
+        });
+        if loaded.is_none() {
+            eprintln!("[OCEAN NINJA] underwater inputs unavailable; Blue Water underwater composite retained");
+        }
+        self.ocean_ninja_underwater = Some(loaded);
+    }
+
+    fn load_ninja_underwater_images(&self, specs: [RiverImage; 2]) -> [Option<wgpu::TextureView>; 2] {
+        let mut assets = self.ninja_asset_path();
+        let surface_images = self.river_ninja_textures.as_ref().and_then(Option::as_ref);
+        let surface_specs = jka_river::river_ninja::river_input_images();
+        specs.map(|spec| {
+            if let Some(image) = surface_images.and_then(|textures| {
+                surface_specs.iter().position(|s| s == &spec).map(|i| &textures.images[i])
+            }) {
+                return Some(image.view.clone());
+            }
+            let result = assets.as_mut().map_err(|error| error.clone()).and_then(|assets| {
+                let data = decode_ninja_image(assets, &spec)?;
+                let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let image = super::textures::upload_texture(&self.device, &self.queue, &data);
+                jka_river::river_ninja::checked_scope(scope)?;
+                Ok(image.view.clone())
+            });
+            match result {
+                Ok(view) => Some(view),
+                Err(error) => {
+                    eprintln!("[RIVER NINJA] underwater texture unavailable: {error}");
+                    None
+                }
+            }
+        })
+    }
+}
+
+fn decode_ninja_image(
+    assets: &mut super::AssetSearchPath,
+    spec: &RiverImage,
+) -> Result<crate::materials::TextureData, String> {
+    let asset = assets.read(spec.qpath, 16 * 1024 * 1024).map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("required texture missing: {}", spec.qpath))?;
+    let data = crate::materials::decode_texture_data_with_color_space(spec.qpath, &asset.bytes, false, false, spec.srgb)?;
+    if [data.width, data.height] != spec.size {
+        return Err(format!("texture {} is {}x{}, expected {}x{}", spec.qpath, data.width, data.height, spec.size[0], spec.size[1]));
+    }
+    Ok(data)
+}
+
+fn upload_ninja_volume(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    data: &crate::materials::TextureData,
+    spec: &RiverVolumeImage,
+) -> Result<wgpu::TextureView, String> {
+    let [width, height] = spec.slice_size;
+    if !width.is_power_of_two() || !height.is_power_of_two()
+        || data.width % width != 0 || data.height % height != 0
+        || spec.image.srgb || data.rgba16f.is_some() || data.mip_level_count != 1
+    {
+        return Err(format!("invalid volume atlas: {}", data.label));
+    }
+    let [columns, rows] = [data.width / width, data.height / height];
+    let depth = columns * rows;
+    if !depth.is_power_of_two() {
+        return Err(format!("invalid volume depth: {}", data.label));
+    }
+    let extent = wgpu::Extent3d { width, height, depth_or_array_layers: depth };
+    let levels = width.max(height).max(depth).ilog2() + 1;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(&data.label),
+        size: extent,
+        mip_level_count: levels,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let row_bytes = data.width as usize * 4;
+    let slice_row_bytes = width as usize * 4;
+    let mut rgba = Vec::with_capacity(data.rgba.len());
+    for tile_y in 0..rows {
+        for tile_x in 0..columns as usize {
+            for y in 0..height {
+                let start = (tile_y * height + y) as usize * row_bytes + tile_x * slice_row_bytes;
+                rgba.extend_from_slice(&data.rgba[start..start + slice_row_bytes]);
+            }
+        }
+    }
+    let write_level = |level, size: [usize; 3], pixels: &[u8]| {
+        let [width, height, depth_or_array_layers] = size.map(|n| n as u32);
+        let mut target = texture.as_image_copy();
+        target.mip_level = level;
+        queue.write_texture(
+            target,
+            pixels,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width * 4), rows_per_image: Some(height) },
+            wgpu::Extent3d { width, height, depth_or_array_layers },
+        );
+    };
+    let mut size = [width as usize, height as usize, depth as usize];
+    write_level(0, size, &rgba);
+    let mut source: Vec<[f32; 4]> = rgba.chunks_exact(4)
+        .map(|p| [p[0], p[1], p[2], p[3]].map(f32::from)).collect();
+    for level in 1..levels {
+        source = downsample_volume_mip(&source, size, &spec.mip_filter);
+        size = size.map(|n| (n / 2).max(1));
+        rgba.clear();
+        rgba.extend(source.iter().flat_map(|p| p.map(|value| value.round() as u8)));
+        write_level(level, size, &rgba);
+    }
+    Ok(texture.create_view(&Default::default()))
+}
+
+/// Separable XY downsample with wrap, then average each pair of slices.
+/// Keep intermediate levels linear and unquantized while filtering.
+fn downsample_volume_mip(source: &[[f32; 4]], size: [usize; 3], kernel: &[f32; 8]) -> Vec<[f32; 4]> {
+    let [width, height, depth] = size;
+    let [dst_width, dst_height, dst_depth] = size.map(|n| (n / 2).max(1));
+    let mut mip = Vec::with_capacity(dst_width * dst_height * dst_depth);
+    let mut vertical = vec![[0.0; 4]; width];
+    for z in 0..dst_depth {
+        let z0 = z * 2;
+        let z1 = (z0 + 1).min(depth - 1);
+        for y in 0..dst_height {
+            for (x, color) in vertical.iter_mut().enumerate() {
+                *color = [0.0; 4];
+                for (tap, &weight) in kernel.iter().enumerate() {
+                    let row = (y * 2 + tap).wrapping_sub(3) & (height - 1);
+                    let a = source[(z0 * height + row) * width + x];
+                    let b = source[(z1 * height + row) * width + x];
+                    for channel in 0..4 {
+                        color[channel] += (a[channel] + b[channel]) * (weight * 0.5);
+                    }
+                }
+            }
+            for x in 0..dst_width {
+                let mut color = [0.0; 4];
+                for (tap, &weight) in kernel.iter().enumerate() {
+                    let column = (x * 2 + tap).wrapping_sub(3) & (width - 1);
+                    for channel in 0..4 {
+                        color[channel] += vertical[column][channel] * weight;
+                    }
+                }
+                mip.push(color);
+            }
+        }
+    }
+    mip
 }
 
 impl super::Renderer {
@@ -315,71 +545,7 @@ impl super::Renderer {
         let source = definition.source;
         let spawn_started = (crate::river_runtime::debug_mode() > 0).then(std::time::Instant::now);
         if spawn_started.is_some() { eprintln!("[RIVER DBG] preparing source center={:?} collision_triangles={} (render-thread spawn)", source.center, collision.surfaces.len()); }
-        if self.river_surface.is_none() {
-            let mut surface = match RiverSurface::new(&self.device, &self.queue) {
-                Ok(surface) => surface,
-                Err(error) => {
-                    if let Some(started) = spawn_started { eprintln!("[RIVER DBG] first-use resources failed after {:.2}ms", started.elapsed().as_secs_f64() * 1000.0); }
-                    eprintln!("[RIVER] water resources failed: {error}");
-                    return Err(error);
-                }
-            };
-            // An ordinary linear world texture: JKA decode, mip chain, r_picmip.
-            match super::textures::try_load_texture_asset(
-                &self.base,
-                self.detail_texture_game.as_deref(),
-                crate::river_surface::FOAM_DETAIL_TEXTURE,
-                false,
-                true,
-                false,
-                "River foam detail",
-            ) {
-                Some(data) => {
-                    let image = super::textures::upload_texture_picmip(
-                        &self.device,
-                        &self.queue,
-                        &data,
-                        self.picmip,
-                    );
-                    surface.set_foam_detail(image.view.clone());
-                }
-                None => eprintln!(
-                    "[RIVER] {} not found; water draws without foam",
-                    crate::river_surface::FOAM_DETAIL_TEXTURE
-                ),
-            }
-            // M_SimpleSpray's linear noise and normal map for the whitewater.
-            let spray = [
-                crate::river_surface::SPRAY_NOISE_TEXTURE,
-                crate::river_surface::SPRAY_NORMALS_TEXTURE,
-            ]
-            .map(|name| {
-                super::textures::try_load_texture_asset(&self.base, self.detail_texture_game.as_deref(), name, false, true, false, "River whitewater")
-                    .map(|data| super::textures::upload_texture_picmip(&self.device, &self.queue, &data, self.picmip).view.clone())
-            });
-            match spray {
-                [Some(noise), Some(normals)] => surface.set_spray_textures(noise, normals),
-                _ => eprintln!(
-                    "[RIVER] {} / {} not found; whitewater draws without its noise and normal map",
-                    crate::river_surface::SPRAY_NOISE_TEXTURE,
-                    crate::river_surface::SPRAY_NORMALS_TEXTURE
-                ),
-            }
-            self.river_surface = Some(surface);
-        }
-        if let Some(surface) = &mut self.river_surface {
-            let faces = self.world.as_ref().and_then(|world| {
-                world.primary_skybox.and_then(|indices| {
-                    let [Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)] =
-                        indices.map(|i| world.textures.get(i).map(|t| &t.view))
-                    else {
-                        return None;
-                    };
-                    Some([a, b, c, d, e, f])
-                })
-            });
-            surface.set_map_sky(&self.device, faces);
-        }
+        self.ensure_river_surface(spawn_started)?;
         let grid = self
             .world
             .as_ref()
@@ -423,6 +589,210 @@ impl super::Renderer {
         }
     }
 
+    fn ensure_river_surface(&mut self, spawn_started: Option<std::time::Instant>) -> Result<(), String> {
+        if self.river_surface.is_none() {
+            let mut surface = match RiverSurface::new(&self.device, &self.queue) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    if let Some(started) = spawn_started { eprintln!("[RIVER DBG] first-use resources failed after {:.2}ms", started.elapsed().as_secs_f64() * 1000.0); }
+                    eprintln!("[RIVER] water resources failed: {error}");
+                    return Err(error);
+                }
+            };
+            // M_SimpleSpray's linear noise and normal map for the whitewater.
+            let spray = [
+                crate::river_surface::SPRAY_NOISE_TEXTURE,
+                crate::river_surface::SPRAY_NORMALS_TEXTURE,
+            ]
+            .map(|name| {
+                super::textures::try_load_texture_asset(&self.base, self.detail_texture_game.as_deref(), name, false, true, false, "River whitewater")
+                    .map(|data| super::textures::upload_texture_picmip(&self.device, &self.queue, &data, self.picmip).view.clone())
+            });
+            match spray {
+                [Some(noise), Some(normals)] => surface.set_spray_textures(noise, normals),
+                _ => eprintln!(
+                    "[RIVER] {} / {} not found; whitewater draws without its noise and normal map",
+                    crate::river_surface::SPRAY_NOISE_TEXTURE,
+                    crate::river_surface::SPRAY_NORMALS_TEXTURE
+                ),
+            }
+            self.river_surface = Some(surface);
+        }
+        if let Some(surface) = &mut self.river_surface {
+            let faces = self.world.as_ref().and_then(|world| {
+                world.primary_skybox.and_then(|indices| {
+                    let [Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)] =
+                        indices.map(|i| world.textures.get(i).map(|t| &t.view))
+                    else {
+                        return None;
+                    };
+                    Some([a, b, c, d, e, f])
+                })
+            });
+            surface.set_map_sky(&self.device, faces);
+        }
+        Ok(())
+    }
+
+    pub(in crate::renderer) fn install_promoted_rivers(
+        &mut self,
+        plans: &[jka_river::river_promotion::Plan],
+        mode: u8,
+    ) {
+        if mode < 2 || plans.is_empty() {
+            return;
+        }
+        if let Err(error) = self.ensure_river_surface(None) {
+            eprintln!("[RIVER PROMOTION] resources unavailable: {error}");
+            return;
+        }
+        let Some(world) = self.world.as_ref() else {
+            return;
+        };
+        let grid = world.entity_light_grid.as_ref();
+        let replace = mode == 3;
+        for plan in plans {
+            let claim = if replace {
+                if !plan.replace || plan.world_ranges.is_empty() {
+                    continue;
+                }
+                let owns = |batch: &WorldBatch| batch.river_owner == Some(plan.id);
+                let mixed_recipe =
+                    world
+                        .auto4_variant_members
+                        .iter()
+                        .enumerate()
+                        .any(|(i, members)| {
+                            members
+                                .iter()
+                                .any(|&m| world.full_batches.get(m).is_some_and(owns))
+                                && !world
+                                    .auto4_batches
+                                    .get(world.auto4_variant_base + i)
+                                    .is_some_and(owns)
+                        });
+                let ocean_claim = world
+                    .coarse_batches
+                    .iter()
+                    .chain(&world.full_batches)
+                    .any(|batch| owns(batch) && batch.ocean_owners != 0);
+                let owned_indices = |batches: &[WorldBatch]| {
+                    batches
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, batch)| owns(batch).then_some(i))
+                        .collect::<Vec<_>>()
+                };
+                let coarse = owned_indices(&world.coarse_batches);
+                let full = owned_indices(&world.full_batches);
+                if mixed_recipe
+                    || ocean_claim
+                    || coarse.is_empty()
+                    || (!world.full_batches.is_empty() && full.is_empty())
+                {
+                    eprintln!(
+                        "[RIVER PROMOTION] {}: unsupported or competing draw ownership",
+                        plan.id
+                    );
+                    continue;
+                }
+                Some(PromotionClaim {
+                    id: plan.id,
+                    coarse,
+                    full,
+                })
+            } else {
+                None
+            };
+            match LiveRiver::spawn_promoted(
+                &self.device,
+                &self.queue,
+                plan,
+                replace,
+                |point| grid.and_then(|g| g.sample_classic_entity_light(point)),
+                grid.and_then(|g| g.map_toward_sun()),
+            ) {
+                Ok(river) => {
+                    if let Some(claim) = claim {
+                        self.river_promotion_claims.push(claim);
+                    }
+                    let role = if replace {
+                        "replacement candidate"
+                    } else {
+                        "preview"
+                    };
+                    eprintln!("[RIVER PROMOTION] prefilled {role} {}", plan.id);
+                    self.live_rivers.push(river);
+                }
+                Err(error) => eprintln!(
+                    "[RIVER PROMOTION] plan {} retained original: {error}",
+                    plan.id
+                ),
+            }
+        }
+    }
+
+    pub(in crate::renderer) fn refresh_river_ownership(
+        &mut self,
+        ready: bool,
+        area_mask: Option<&[u8; 32]>,
+    ) {
+        if self.river_promotion_claims.is_empty() && self.river_promotion_active == 0 {
+            return;
+        }
+        let claims = &self.river_promotion_claims;
+        let mut active = 0u8;
+        if let Some(world) = self.world.as_ref().filter(|_| ready) {
+            for (i, claim) in claims.iter().enumerate() {
+                if self
+                    .live_rivers
+                    .iter()
+                    .any(|r| r.id == claim.id && r.promoted_ready())
+                    && claim.fully_visible(world, self.pvs_mode, area_mask)
+                {
+                    active |= 1 << i;
+                }
+            }
+        }
+        if active == self.river_promotion_active {
+            return;
+        }
+        self.river_promotion_active = active;
+        let is_active = |id| {
+            claims
+                .iter()
+                .position(|claim| claim.id == id)
+                .is_some_and(|i| active & (1 << i) != 0)
+        };
+        for river in &mut self.live_rivers {
+            river.promotion_active = is_active(river.id);
+        }
+        if let Some(world) = self.world.as_mut() {
+            for batch in world
+                .coarse_batches
+                .iter_mut()
+                .chain(&mut world.full_batches)
+                .chain(&mut world.auto4_batches)
+            {
+                batch.river_replaced = batch.river_owner.is_some_and(is_active);
+            }
+        }
+        if let Some(surface) = &mut self.river_surface {
+            surface.reset_audio_probe();
+        }
+        eprintln!("[RIVER PROMOTION] active replacement mask {active:#x}");
+    }
+
+    pub(in crate::renderer) fn clear_promoted_rivers(&mut self) {
+        self.refresh_river_ownership(false, None);
+        self.river_promotion_claims.clear();
+        self.live_rivers
+            .retain(|r| !jka_river::river_promotion::is_promoted(r.id));
+        crate::river_runtime::set_audio_rivers_present(
+            self.live_rivers.iter().any(LiveRiver::audio_enabled),
+        );
+    }
+
     /// Replace every developer drain; live rivers keep their water.
     pub(in crate::renderer) fn set_river_drains(&mut self, drains: Vec<crate::river_runtime::LocalDrain>) {
         for river in &mut self.live_rivers {
@@ -432,9 +802,18 @@ impl super::Renderer {
     }
 
     pub(in crate::renderer) fn clear_live_rivers(&mut self) {
+        self.refresh_river_ownership(false, None);
+        self.river_promotion_claims.clear();
         self.live_rivers.clear();
+        self.river_ninja_history = None;
+        self.river_ninja_textures = None;
+        self.river_ninja_caustics = None;
+        self.river_ninja_entities = None;
         self.river_drains.clear();
-        if let Some(surface) = &mut self.river_surface { surface.reset_audio_probe(); }
+        if let Some(surface) = &mut self.river_surface {
+            surface.clear_ninja_underwater_inputs();
+            surface.reset_audio_probe();
+        }
         crate::river_runtime::set_audio_rivers_present(false);
     }
 
@@ -449,7 +828,53 @@ impl super::Renderer {
         camera: &super::Camera,
         scene_format: wgpu::TextureFormat,
         copyable: bool,
+        allow_replacement: bool,
+        area_mask: Option<&[u8; 32]>,
     ) {
+        let has_rivers = self.river_surface.is_some() && !self.live_rivers.is_empty();
+        let ninja_requested = has_rivers && jka_river::river_ninja::actor_capture_requested();
+        let underwater_specs = if has_rivers && copyable && self.live_rivers.iter().any(LiveRiver::uses_ninja_underwater) {
+            jka_river::river_ninja::river_underwater_images()
+        } else {
+            None
+        };
+        let underwater_requested = underwater_specs.is_some();
+        if !ninja_requested {
+            self.river_ninja_history = None;
+            self.river_ninja_textures = None;
+        } else if self.river_ninja_textures.is_none() {
+            // Keep failures until the renderer is rebuilt, rather than retrying every frame.
+            let loaded = self.load_ninja_input_textures(jka_river::river_ninja::river_input_images());
+            if let Err(error) = &loaded {
+                eprintln!("[RIVER NINJA] inputs unavailable: {error}");
+            }
+            self.river_ninja_textures = Some(loaded.ok());
+        }
+        if !underwater_requested && !self.river_ninja_textures.as_ref().is_some_and(Option::is_some) {
+            self.river_ninja_caustics = None;
+        } else if self.river_ninja_caustics.is_none() {
+            let volume = jka_river::river_ninja::river_caustics_image().and_then(|spec| {
+                match self.load_ninja_caustics(spec) {
+                    Ok(view) => Some(view),
+                    Err(error) => {
+                        eprintln!("[RIVER NINJA] caustics unavailable: {error}");
+                        None
+                    }
+                }
+            });
+            self.river_ninja_caustics = Some(volume);
+        }
+        if let Some(specs) = underwater_specs {
+            if !self.river_surface.as_ref().is_some_and(RiverSurface::has_ninja_underwater_inputs) {
+                let [noise, gradient] = self.load_ninja_underwater_images(specs);
+                let caustics = self.river_ninja_caustics.as_ref().and_then(Option::as_ref);
+                self.river_surface.as_mut().expect("checked above").set_ninja_underwater_inputs(
+                    &self.device, noise.as_ref(), gradient.as_ref(), caustics,
+                );
+            }
+        } else if let Some(water) = &mut self.river_surface {
+            water.clear_ninja_underwater_inputs();
+        }
         let Some(water) = self
             .river_surface
             .as_mut()
@@ -464,8 +889,15 @@ impl super::Renderer {
         };
         water.clock += f64::from(delta);
         let clock = water.clock;
+        let ninja_game_seconds = if ninja_requested || underwater_requested {
+            self.scene_time.map(f64::from).or_else(|| self.weather_server_time_ms.map(|t| f64::from(t) / 1000.0))
+        } else {
+            None
+        };
         if let Err(error) = water.encode_ocean(&self.device, encoder, clock as f32) {
             eprintln!("[RIVER] FFT detail failed, patches removed: {error}");
+            self.refresh_river_ownership(false, None);
+            self.river_promotion_claims.clear();
             self.live_rivers.clear();
             if let Some(surface) = &mut self.river_surface { surface.reset_audio_probe(); }
             crate::river_runtime::set_audio_rivers_present(false);
@@ -486,7 +918,6 @@ impl super::Renderer {
             self.targets._scene_texture.height(),
         ];
         let blue_water_ambient = (self.sun_override || self.sky_backend == 1) && self.blue_water_sky.is_some();
-        let foam = water.has_foam_detail();
         {
             let sun = self.river_scene_sun();
             let mut view = ViewUniform::new(
@@ -496,8 +927,13 @@ impl super::Renderer {
                 blue_water_ambient,
                 clock as f32,
                 delta.min(0.1),
-                foam,
             );
+            if ninja_requested || underwater_requested {
+                view.right[3] = ninja_game_seconds.unwrap_or(clock) as f32;
+            }
+            if underwater_requested {
+                view.up[3] = if self.river_ninja_caustics.as_ref().is_some_and(Option::is_some) { 2.0 } else { 1.0 };
+            }
             // Bed clamp, vertex half (not Unreal; River menu A/B).
             view.time[3] = if crate::river_runtime::bed_clamp() { 1.0 } else { 0.0 };
             // Render-only material LOD. Shared by the base, composite, and far draws.
@@ -506,6 +942,9 @@ impl super::Renderer {
             view.material_lod[2] = if crate::river_runtime::adaptive_ssr() { 1.0 } else { 0.0 };
             // r_underwaterReflections, shared with the ocean.
             view.material_lod[3] = if crate::ocean::underwater_reflections() { 1.0 } else { 0.0 };
+            if ninja_requested {
+                view.ninja_debug[0] = jka_river::river_ninja::material_debug();
+            }
             let water = self.river_surface.as_mut().expect("checked above");
             water.prepare(&self.device, &self.queue, size, self.msaa_samples, &view);
         }
@@ -538,9 +977,12 @@ impl super::Renderer {
         // Player wake: the Water menu's "Player water deformation" toggle and
         // "Deformation strength" (1 = native body velocity). Players are the
         // presented records the ocean reads (filled while cg_waterwake or
-        // ocean interaction is on); each is a JKA player hull.
+        // ocean interaction is on); each is a JKA player hull. The Fluid Ninja river
+        // also enables it: the Fluid Ninja field only shades, so without the
+        // solver's body collisions its wake would never move the mesh.
         {
-            let (enabled, strength) = self.river_interaction;
+            let (interaction, strength) = self.river_interaction;
+            let enabled = interaction || jka_river::river_ninja::actor_capture_requested();
             let bodies: Vec<crate::river_runtime::MapBody> = if enabled {
                 self.river_actors.iter().map(river_body).collect()
             } else {
@@ -558,6 +1000,23 @@ impl super::Renderer {
                 river.set_spray_view(Some(view));
             }
         }
+        let ninja_source = if ninja_requested {
+            let history = self.river_ninja_history.get_or_insert_with(Default::default);
+            let extras = self.river_ninja_entities.as_deref().map(Vec::as_slice).unwrap_or(&[]);
+            let tracks = history.update(extras.iter().copied().filter(|actor| actor.kind.has_river_contact_shape()));
+            let scene_revision = self.scene_time.map(|_| self.studio_revision);
+            let textures = self.river_ninja_textures.as_ref().and_then(Option::as_ref);
+            let images = textures.map(|t| std::array::from_fn(|i| &t.images[i].view));
+            let caustics = self.river_ninja_caustics.as_ref().and_then(Option::as_ref);
+            let debug = jka_river::river_ninja::wake_debug_enabled().then(|| {
+                if scene_revision.is_some() { Default::default() }
+                else { self.river_wake_debug_subject.unwrap_or_default() }
+            });
+            Some(jka_river::river_ninja::FrameSource { game_seconds: ninja_game_seconds, scene_revision, tracks, images, caustics, queue: &self.queue, debug })
+        } else {
+            self.river_ninja_history = None;
+            None
+        };
         let water = self.river_surface.as_ref();
         let device = &self.device;
         let profiler = &mut self.gpu_profiler;
@@ -565,7 +1024,7 @@ impl super::Renderer {
             profiler.write_encoder_timestamp(encoder, super::GpuPass::RiverSolve, end);
         };
         self.live_rivers.retain_mut(|river| {
-            match river.encode_frame(device, encoder, frame_delta, clock, water, &mut solve_timestamp) {
+            match river.encode_frame_with_ninja(device, encoder, frame_delta, clock, water, &mut solve_timestamp, ninja_source) {
                 Ok(()) => true,
                 Err(error) => {
                     eprintln!("[RIVER] patch removed: {error}");
@@ -573,9 +1032,14 @@ impl super::Renderer {
                 }
             }
         });
+        let ready = allow_replacement && copyable && self.river_surface.as_ref()
+            .is_some_and(|s| s.ready_for(scene_format, self.msaa_samples));
+        self.refresh_river_ownership(ready, area_mask);
+        let audible = self.live_rivers.iter().any(LiveRiver::audio_enabled);
+        crate::river_runtime::set_audio_rivers_present(audible);
         // Sample listener submersion from the solved and displaced river
         // height in one 1x1 GPU pass, no synchronous map or render stall.
-        if let Some(water) = &mut self.river_surface {
+        if let Some(water) = self.river_surface.as_mut().filter(|_| audible) {
             let environment = self.blue_water_sky.as_ref().filter(|_| self.sun_override || self.sky_backend == 1)
                 .map(|atmosphere| &atmosphere.sky.environment().bind_group);
             water.encode_audio_probe(
@@ -585,7 +1049,6 @@ impl super::Renderer {
                 environment, &self.live_rivers,
             );
         }
-        crate::river_runtime::set_audio_rivers_present(!self.live_rivers.is_empty());
         // Water mesh quadtree beyond the camera window: per-view traversal
         // (frustum side planes of this camera; depth planes are not tested).
         if let Some(water) = self.river_surface.as_ref() {
@@ -620,4 +1083,50 @@ impl super::Renderer {
             }
         }
     }
+}
+
+/// Ocean2 has a separate authoritative texture inventory. No PNG implies a
+/// color-space default: the metadata file is exported from the source UE project.
+/// `coast` selects the Fluid Ninja Coast inventory, whose color spaces are all
+/// established; its optional authority file only carries the host resolution.
+pub(in crate::renderer) fn load_ninja_ocean_assets(
+    device: &wgpu::Device, queue: &wgpu::Queue, base: &std::path::Path, game: Option<&std::path::Path>, coast: bool,
+) -> Result<crate::ocean::NinjaOceanAssets, String> {
+    let specs = if coast { jka_ninja::coast_images() } else { jka_ninja::ocean_images() }
+        .ok_or("Fluid Ninja private provider not included")?;
+    let mut assets = super::AssetSearchPath::open_game(base, game).map_err(|e|e.to_string())?;
+    let qpath = "textures/japro/ocean2_authority.json";
+    let meta = assets.read(qpath, 8192).map_err(|e|e.to_string())?;
+    let authority: crate::ocean::NinjaOceanAuthority = match meta {
+        Some(meta) => serde_json::from_slice(&meta.bytes).map_err(|e|format!("{qpath}: {e}"))?,
+        None if coast => crate::ocean::NinjaOceanAuthority::coast_reference(),
+        None => return Err(format!("missing {qpath}; run the UE Ocean2 authority exporter")),
+    };
+    authority.validate()?;
+    let mut images = Vec::with_capacity(8);
+    for spec in specs.simulation { images.push(decode_ninja_image(&mut assets, &spec)?); }
+    for (i, spec) in specs.material.into_iter().enumerate() {
+        let srgb = match spec.srgb { Some(v) => v, None if i == 2 => authority.tile1_srgb,
+            None if i == 3 => authority.tile2_srgb, None => return Err(format!("unresolved color space: {}",spec.qpath)) };
+        images.push(decode_ninja_image(&mut assets, &RiverImage { qpath:spec.qpath,size:spec.size,srgb })?);
+    }
+    let mem=device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let val=device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let views:Vec<_> = images.iter().map(|data| super::textures::upload_texture(device,queue,data).view.clone()).collect();
+    let a=jka_river::river_ninja::checked_scope(val);let m=jka_river::river_ninja::checked_scope(mem);a?;m?;
+    let [v0,v1,v2,v3,v4,v5,v6,v7]:[wgpu::TextureView;8]=views.try_into().map_err(|_|"Ocean2 texture inventory".to_string())?;
+    // Coast MI CausticsTileComponentVolumeTexture = T_Caustics_Animated_02, the
+    // same volume the river port builds from its 8-bit atlas.
+    let caustics = if !coast { None } else {
+        jka_river::river_ninja::river_caustics_image().and_then(|spec| {
+            let volume = decode_ninja_image(&mut assets, &spec.image).and_then(|data| {
+                let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let volume = upload_ninja_volume(device, queue, &data, &spec);
+                jka_river::river_ninja::checked_scope(scope)?;
+                volume
+            });
+            volume.map_err(|e| eprintln!("[OCEAN NINJA] Coast caustics unavailable: {e}")).ok()
+        })
+    };
+    Ok(crate::ocean::NinjaOceanAssets { simulation:[v0,v1,v2,v3],material:[v4,v5,v6,v7],authority,caustics })
 }

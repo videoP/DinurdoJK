@@ -18,13 +18,7 @@ fn convert(@builtin(global_invocation_id) id: vec3<u32>) {
     let d = textureLoad(displacement_in, p, layer, 0);
     let slope = textureLoad(derivatives_in, p, layer, 0);
     let extra = textureLoad(extras_in, p, layer, 0);
-    var horizontal = 1.0;
-    if crest.x > 0.5 {
-        var bound = dot(crest_bounds.xyz, vec3<f32>(1.732051, 1.732051, 1.0));
-        if crest.x > 1.5 && crest_bounds.w > 0.0 { bound = crest_bounds.w; }
-        let fft = bound * crest.y;
-        horizontal = min(1.0, select(0.9, 1.15, crest.x > 1.5) / max(fft + crest.z, 1e-5));
-    }
+    let horizontal = jka_crest_scale_from_bounds(crest_bounds, crest.y, crest.z, crest.x);
     // JKA's existing water vertex shader flips the sampled Z displacement;
     // its fragment shader flips the sampled Z slope. Preserve Blue Water's
     // +Z values after those existing operations.
@@ -78,6 +72,7 @@ pub struct BlueWaterOcean {
     last_step: f64,
     job: Option<FieldJob>,
     pub updated_this_frame: bool,
+    pub(super) wave_revision: u64,
     pub adapter_enabled: bool,
 }
 
@@ -174,7 +169,7 @@ impl BlueWaterOcean {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Blue Water JKA surface adapter"),
-            source: wgpu::ShaderSource::Wgsl(CONVERT.into()),
+            source: wgpu::ShaderSource::Wgsl(format!("{}\n{}", blue_water_gpu::CREST_MATH_WGSL, CONVERT).into()),
         });
         let pipe_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Blue Water JKA surface adapter"),
@@ -241,6 +236,7 @@ impl BlueWaterOcean {
             next_update: 0.0,
             last_step: 0.0,
             updated_this_frame: false,
+            wave_revision: 0,
             adapter_enabled: true,
             job: None,
         }
@@ -346,6 +342,7 @@ impl BlueWaterOcean {
     /// A finished field update: CPU wave copies and the JKA surface textures.
     fn publish(&mut self, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, time: f64, swell: [[f32; 4]; 2]) {
         self.updated_this_frame = true;
+        self.wave_revision = self.wave_revision.wrapping_add(1);
         self.surface_waves.write(queue, &self.field, time, 1.0, 1.0);
         for waves in self.shore_waves.iter().flatten() {waves.write_with_swell(queue,&self.field,time,1.0,1.0,swell);}
         if !self.adapter_enabled { return; }

@@ -291,12 +291,13 @@ pub fn build_crosshair_vertices(
     // cg_hudCrosshairName and normal gameplay remain unchanged.
     if ui.studio_hud_virtual_layout && out.len()>start && w>0 && h>0 {
         let layout=ui.hud_layout.crosshair_name;
+        let offset_px=super::layout::hud_offset_to_pixels(layout.offset, w, h);
         let center=screen_position.unwrap_or([w as f32*0.5,h as f32*0.5]);
         for v in &mut out[start..] {
             let x=(v.position[0]+1.0)*0.5*w as f32;
             let y=(1.0-v.position[1])*0.5*h as f32;
-            let x=center[0]+(x-center[0])*layout.scale+layout.offset[0];
-            let y=center[1]+(y-center[1])*layout.scale+layout.offset[1];
+            let x=center[0]+(x-center[0])*layout.scale+offset_px[0];
+            let y=center[1]+(y-center[1])*layout.scale+offset_px[1];
             v.position=[x*2.0/w as f32-1.0,1.0-y*2.0/h as f32];
         }
     }

@@ -634,6 +634,68 @@ pub(in crate::renderer) fn create_wireframe_pipeline(
     })
 }
 
+/// Fullscreen OpenJK BSP global fog, drawn inside the scene pass before the
+/// non-depth-writing entity FX. `format` is the UNORM alias of an sRGB scene
+/// (display-space blend, entry `fs_legacy_global_fog_encoded`) or the float
+/// scene format (entry `fs_legacy_global_fog_linear`).
+pub(in crate::renderer) fn create_legacy_global_fog_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    entry_point: &str,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("JKA legacy global fog (before entity FX)"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        // Runs inside a pass with the scene depth attachment; never test or
+        // write it. The fog depth comes from the independent prepass.
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: depth_format(),
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(entry_point),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                // RB_FogPass / GL fog: dst.rgb = mix(dst.rgb, fog, amount).
+                blend: Some(wgpu::BlendState {
+                    color: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::SrcAlpha,
+                        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                    alpha: wgpu::BlendComponent {
+                        src_factor: wgpu::BlendFactor::Zero,
+                        dst_factor: wgpu::BlendFactor::One,
+                        operation: wgpu::BlendOperation::Add,
+                    },
+                }),
+                write_mask: wgpu::ColorWrites::COLOR,
+            })],
+        }),
+        multiview_mask: None,
+        cache: crate::pipeline_cache::get().as_ref(),
+    })
+}
+
 /// Fullscreen multiply of the opaque scene *before* transparent shader stages.
 /// Uses the same cloud code as post; no scene sampling and no color copy.
 /// All inactive cloud feature paths are pruned from this specialized entry point.

@@ -180,6 +180,7 @@ fn run_range(batch: &WorldBatch) -> Option<std::ops::Range<u32>> {
 }
 
 /// Everything that can remove part of a world batch on the CPU path.
+#[derive(Clone, Copy)]
 pub(in crate::renderer) struct RunCull<'a> {
     pub camera: [f32; 3],
     /// Reject runs whose BSP face plane faces away (r_facePlaneCull).
@@ -225,6 +226,17 @@ pub(in crate::renderer) fn selection_stats(batch: &WorldBatch, cull: &RunCull) -
     }
     let Some(range) = run_range(batch) else { return (FacePlaneSelection::Keep, 0); };
     let count = range.end - range.start;
+    // Sky is never absorbed (seen through Snell's window it crosses only the water
+    // path to the surface): like the whole-batch test above, no run of a sky batch
+    // takes the water cull. Without this, sky faces past the radius dropped one
+    // by one and the window lost its sky at a Transparency threshold.
+    let sky_cull;
+    let cull = if batch.source.pipeline.class == DrawClass::Sky && cull.water.is_some() {
+        sky_cull = RunCull { water: None, ..*cull };
+        &sky_cull
+    } else {
+        cull
+    };
     if cull.water.is_none() {
         // Face planes alone never split a batch: the rasterizer already drops
         // back faces, so a partial cull would only trade them for extra draws

@@ -90,6 +90,27 @@ pub fn river_collision_triangles(
     })
 }
 
+/// Solid or terrain brushes from BSP world model 0 for the Flame MeshField.
+pub(crate) fn ninja_fire_world_brushes(
+    root: &Path,
+    game: Option<&Path>,
+    source: &MapSource,
+    allow_asset_overrides: bool,
+) -> Result<Vec<jka_assets::bsp::river::SolidBrush>, String> {
+    let MapSource::Bsp(name) = source else {
+        return Err("Fluid Ninja brush collision needs a compiled BSP map".into());
+    };
+    let asset_name = map_asset_name(name, "bsp")?;
+    let mut assets = AssetSearchPath::open_game(root, game).map_err(|e| e.to_string())?;
+    assets.set_allow_asset_overrides(allow_asset_overrides);
+    let asset = assets
+        .read(&asset_name, MAX_FILE_BYTES)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("Map {asset_name} not found"))?;
+    let bsp = Bsp::parse(&asset.bytes).map_err(|e| e.to_string())?;
+    jka_assets::bsp::river::solid_brushes(&bsp, 0)
+}
+
 pub(in crate::scene) fn bsp_physics_collision_mesh(
     bsp: &Bsp,
     mesh: &jka_assets::bsp::Mesh,

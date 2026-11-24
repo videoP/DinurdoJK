@@ -73,6 +73,9 @@ for typename, label in [("saberMoveName_t", "SABER_MOVES"), ("entity_event_t", "
                         ("statIndex_t", "STATS"), ("powerup_t", "POWERUPS")]:
     a, b = enum(jk2_bg, typename), enum(jka_bg, typename)
     aliases = {"HANDEXTEND_FORCEGRIP": "HANDEXTEND_FORCE_HOLD"}
+    # JK2-only events use an internal presentation ID, not a protocol-26 ID.
+    if label == "EVENTS":
+        b["EV_BODY_QUEUE_COPY"] = "crate::entity_event::EntityEvent::EV_JK2_BODY_QUEUE_COPY as i32"
     vals = [(value, b.get(aliases.get(name, name), -1), name) for name, value in a.items() if value >= 0]
     lines.append(f"pub const {label}: &[i32] = &[")
     lines.extend(f"    {v}, // {name}" for _, v, name in sorted(vals))

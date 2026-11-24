@@ -42,7 +42,7 @@ pub(crate) fn with_post_settings(base: &str) -> String {
             .replace("display_grade(", "bw_display_grade(")
             .replace("agx_contrast(", "bw_agx_contrast(")
             .replace("agx(", "bw_agx(");
-        base.replace(DISPLAY_MARKER, &library)
+        base.replace(DISPLAY_MARKER, &format!("{library}\n{}", jka_ninja::flame_demo_film_wgsl()))
     } else {
         base.to_owned()
     };

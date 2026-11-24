@@ -55,17 +55,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
     let motion = vec4<f32>(0.0, 0.0, 1.0, 0.0);
     let a = jka_crest_scale(wave, motion, 1.0);
     let b = jka_crest_scale(wave, motion, 2.0);
+    let c = jka_crest_scale(wave, motion, 3.0);
     let off = jka_crest_scale(wave, motion, 0.0);
     let j0 = (1.0 + dx.x) * (1.0 + dz.z) - dx.z * dz.x;
     let j1 = (1.0 + dx.x * a) * (1.0 + dz.z * a) - dx.z * dz.x * a * a;
     let j2 = (1.0 + dx.x * b) * (1.0 + dz.z * b) - dx.z * dz.x * b * b;
     let limited = raw * vec3<f32>(b, 1.0, b);
-    let i = (id.y * 128u + id.x) * 2u;
+    let j3 = (1.0 + dx.x * c) * (1.0 + dz.z * c) - dx.z * dz.x * c * c;
+    let i = (id.y * 128u + id.x) * 3u;
     result[i] = vec4<f32>(j0, j1, j2, a);
     result[i + 1u] = vec4<f32>(raw.y, limited.y, b, off);
+    result[i + 2u] = vec4<f32>(j3, c, (raw * vec3<f32>(c, 1.0, c)).y, jka_crest_spilling_cue(j0, raw.y, 55.8));
 }}
 "#,
-            include_str!("../src/crest_control.wgsl")
+            blue_water_gpu::CREST_CONTROL_WGSL
         );
         let mut composer = shader_composer::composer().unwrap();
         let module = composer
@@ -81,7 +84,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
             label: None,
             source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
         });
-        let bytes = 128 * 128 * 32;
+        let bytes = 128 * 128 * 48;
         let output = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: bytes,
@@ -160,7 +163,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
             "crest reduction GPU validation failed: {validation:?}"
         );
         let mapped = read.slice(..).get_mapped_range().unwrap();
-        let samples: &[[f32; 8]] = bytemuck::cast_slice(&mapped);
+        let samples: &[[f32; 12]] = bytemuck::cast_slice(&mapped);
         let folded = |column| samples.iter().filter(|s| s[column] < 0.0).count();
         let min_j = |column| {
             samples
@@ -170,9 +173,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
         };
         eprintln!(
             "crest A/B: folded samples {:?}; min Jacobian {:?}; horizontal scales {:?}",
-            [folded(0), folded(1), folded(2)],
-            [min_j(0), min_j(1), min_j(2)],
-            [samples[0][3], samples[0][6]]
+            [folded(0), folded(1), folded(2), folded(8)],
+            [min_j(0), min_j(1), min_j(2), min_j(8)],
+            [samples[0][3], samples[0][6], samples[0][9]]
         );
         assert!(samples.iter().flatten().all(|v| v.is_finite()));
         assert!(folded(0) > 20, "fixture must exercise the reported folding");
@@ -185,7 +188,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
             "spilling mode must bound the overlapping area"
         );
         assert!(min_j(2) > -0.25, "remaining overhangs must stay shallow");
+        assert!(folded(8) < folded(0) / 10 + 1, "conservative spill must remove most folds");
         for sample in samples {
+            assert!(sample[9] <= sample[3] + 1e-6);
+            assert_eq!(sample[4].to_bits(), sample[10].to_bits());
+            assert!((0.0..=1.0).contains(&sample[11]));
             assert_eq!(
                 sample[4].to_bits(),
                 sample[5].to_bits(),

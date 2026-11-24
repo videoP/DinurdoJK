@@ -32,6 +32,7 @@ jka-assets = { path = "../jka-assets" }
 jka-audio = { path = "../jka-audio" }
 jka-client-services = { path = "../jka-client-services" }
 jka-llm = { path = "../jka-llm" }
+jka-ninja = { path = "../jka-ninja" }
 jka-render-core = { path = "../jka-render-core" }
 jka-river = { path = "../jka-river" }
 jka-studio = { path = "../jka-studio" }

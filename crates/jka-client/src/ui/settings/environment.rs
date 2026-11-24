@@ -190,15 +190,19 @@ pub enum FootprintMode {
     TwoD,
     #[default]
     ThreeD,
+    Ninja,
+    NinjaComposite,
 }
 
 impl FootprintMode {
-    pub const ALL: [Self; 3] = [Self::Off, Self::TwoD, Self::ThreeD];
+    pub const ALL: [Self; 5] = [Self::Off, Self::TwoD, Self::ThreeD, Self::Ninja, Self::NinjaComposite];
     pub fn config_value(self) -> &'static str {
         match self {
             Self::Off => "off",
             Self::TwoD => "2d",
             Self::ThreeD => "3d",
+            Self::Ninja => "ninja",
+            Self::NinjaComposite => "ninja_composite",
         }
     }
     pub fn from_config(value: &str) -> Option<Self> {
@@ -206,6 +210,8 @@ impl FootprintMode {
             "off" | "0" | "false" => Some(Self::Off),
             "2d" | "2" | "legacy" | "mark" | "decal" => Some(Self::TwoD),
             "3d" | "3" | "deform" | "deformation" | "true" | "on" | "1" => Some(Self::ThreeD),
+            "ninja" => Some(Self::Ninja),
+            "ninja_composite" => Some(Self::NinjaComposite),
             _ => None,
         }
     }
@@ -214,6 +220,16 @@ impl FootprintMode {
             Self::Off => 0,
             Self::TwoD => 1,
             Self::ThreeD => 2,
+            Self::Ninja => 3,
+            Self::NinjaComposite => 4,
+        }
+    }
+
+    pub fn ninja_profile(self) -> Option<jka_ninja::SnowProfile> {
+        match self {
+            Self::Ninja => Some(jka_ninja::SnowProfile::Minimal),
+            Self::NinjaComposite => Some(jka_ninja::SnowProfile::Composite),
+            _ => None,
         }
     }
 }

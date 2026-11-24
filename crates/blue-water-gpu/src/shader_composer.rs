@@ -188,7 +188,7 @@ pub fn composer_with_footprint(cheap_noise: Option<()>, scale: u32) -> Result<Co
 pub fn composer_with_surface_probes(probe: u32, scale: u32) -> Result<Composer, Box<ComposerError>> {
     composer_with_options((probe & COST_PROBE_CHEAP_NOISE != 0).then_some(()), scale,
         probe & COST_PROBE_SERIAL_REFINEMENT != 0,
-        probe & COST_PROBE_SINGLE_WAVE_COPY != 0 && probe & SURFACE_GODOT_WATER == 0)
+        probe & COST_PROBE_SINGLE_WAVE_COPY != 0)
 }
 
 fn composer_with_options(cheap_noise: Option<()>, scale: u32, serial_refinement: bool, single_wave_copy: bool) -> Result<Composer, Box<ComposerError>> {
@@ -272,8 +272,6 @@ pub const COST_PROBE_ALL: u32 = (1 << 13) - 1;
 /// Same material expressions, computed after SSR to shorten temporary lifetimes.
 pub const COST_PROBE_DEFER_BODY: u32 = 1 << 13;
 /// Wave-sampling diagnostic: native FFT uses one coherent copy at every scale.
-/// The same bit already flattens the pixel wave frame for the Gerstner material;
-/// the SURFACE_GODOT_WATER tag distinguishes those mutually exclusive backends.
 /// Lossy: allows tile repetition and changes the sampled wave pattern.
 pub const COST_PROBE_SINGLE_WAVE_COPY: u32 = 1 << 14;
 /// Same eight bisections, reading only the selected quarter instead of both quarters.
@@ -329,10 +327,6 @@ pub const SURFACE_WAVE_STATISTICS_FOAM: u32 = 1 << 28;
 /// Diagnostic with `SURFACE_WAVE_STATISTICS`: the surface returns how statistical each cascade is (red the finest,
 /// green the middle, blue the largest) instead of its colour.
 pub const SURFACE_WAVE_STATISTICS_DEBUG: u32 = 1 << 29;
-/// `r_oceanType 5`: godot-water-shader's surface (`godot_water_surface.wgsl`) in place of Blue Water's FFT wave sample,
-/// water body and foam, lit by Blue Water. The vertex stage's waves are the uniform-driven `jka_hybrid.godot` path,
-/// shared by every Hybrid-family module.
-pub const SURFACE_GODOT_WATER: u32 = 1 << 30;
 /// Opt-in FFT Hybrid material with Godot-style GGX, simple foam and filtered
 /// environment reflection. Geometry and every displacement consumer stay native.
 pub const SURFACE_FAST_HYBRID: u32 = 1 << 31;
@@ -341,58 +335,6 @@ pub const SURFACE_FAST_HYBRID: u32 = 1 << 31;
 /// native wave-statistics transforms. This alias avoids widening the 32-bit
 /// pipeline-key mask or introducing new bind groups. Do not set it by itself.
 pub const SURFACE_ADAPTIVE_HYBRID: u32 = SURFACE_WAVE_STATISTICS_DEBUG;
-/// `SURFACE_GODOT_WATER` cost probe (a bit the Blue Water probes leave free): the per-pixel wave frame stubbed (flat).
-pub const COST_PROBE_GODOT_PIXEL: u32 = 1 << 14;
-/// The cost probes that rewrite the FFT wave sample or the foam stack, which `SURFACE_GODOT_WATER` has replaced.
-const GODOT_REPLACED_PROBES: u32 = COST_PROBE_WAVES | COST_PROBE_BAKED_READS | COST_PROBE_FOAM | COST_PROBE_FOAM_GALE
-    | COST_PROBE_PACK_HALF | COST_PROBE_PACK_HALF_WIDE | COST_PROBE_PACK_BITS;
-
-/// `SURFACE_GODOT_WATER` on the JKA surface source (after its JKA replacements, before the cost probes).
-fn jka_godot_material(source: &str, probe: u32) -> String {
-    // No FFT reads: a flat sample at upstream's ROUGHNESS 0.01 (slope variance ~1e-4); the slope is the vertex normal's.
-    let s = replace_once(source, "let sample = wave_surface(xz, wake.slick, input.world.xz);",
-        "let sample = WaveSample(vec3<f32>(0.0, 1.0, 0.0), vec2<f32>(0.0), 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1e-4, 1e-4, vec2<f32>(0.0));");
-    let s = replace_once(&s, "let legacy_slope = sample.slope * jka_hybrid.motion_mix.z + jka_hybrid_slope(xz);",
-        "let jka_godot = jka_godot_pixel(xz);\n    let legacy_slope = jka_godot.slope;");
-    // The waves the pixel averaged away widen the reflection lobe, as Blue Water's unresolved cascades do.
-    let s = replace_once(&s, "let variances = wind_variances(sample.unresolved_variance + footprint_variance(dry), wind_speed)",
-        "let variances = wind_variances(sample.unresolved_variance + jka_godot.variance + footprint_variance(dry), wind_speed)");
-    let s = replace_once(&s, "select(legacy_slope, sample.slope, jka_hybrid.breaker.x > 0.5)", "legacy_slope");
-    let s = replace_once(&s, "let crest = clamp(input.world.y / max(waves.sea.x, 0.1), 0.0, 1.0);",
-        "let crest = clamp(input.world.y / max(JKA_GODOT_CREST * jka_hybrid.godot.y, 0.1), 0.0, 1.0);");
-    let s = replace_once(&s, "let body = water_body(transmitted, deep, column_transmittance(attenuation, backscatter, through, view));",
-        "let body = jka_godot_body(xz, input.world, transmitted, through, select(ray_view_z * distance - scene_view_z, -1.0, depth <= 0.0),\n        \
-         up, sun_direction, sun_radiance, contact.irradiance, lit, jka_godot.jacobian);");
-    // Upstream paints its foam into the albedo (`jka_godot_body`); only a wake's churned water is laid over it.
-    let s = replace_span(&s, "    // Foam: the texture laid", "#ifdef POINT_LIGHTS", concat!(
-        "    // Foam: godot-water-shader's is in the body's albedo; a wake's churned water is laid over it.\n",
-        "    let stretch = surface.foam.x * 2.0 + 1.0;\n",
-        "    let patterns = foam_patterns(foam_map, foam_sampler, surface.foam.z, xz, heading, stretch, sun_direction);\n",
-        "    let lace = patterns.pattern.r;\n",
-        "    let sky_up = env_radiance(sky_atlas, sky_sampler, sky_env, normalize(vec3<f32>(up.x, max(up.y, 0.0), up.z)), 1.0);\n",
-        "    let foam_light = foam_radiance(sky_up * contact.sky_share, sun_radiance, up, sun_direction, lit);\n",
-        "    let churned = churned_water(wake.foam, wake.young, patterns.pattern, patterns.blur);\n",
-        "    let aerated = aeration_with_wake(0.0, wake.bubbles);\n",
-        "    let water = mix(bubble_cloud(body, aerated, foam_light, absorption), reflected, aerated_reflectance(reflectance, aerated));\n",
-        "    var above = water + direct * beam;\n",
-        "    let windrows = 0.0;\n",
-        "    let shore = 0.0;\n",
-        "    let breakers = 0.0;\n",
-        "    let white = billows(patterns.pattern.a, patterns.churn_sunward, lace, churned.dense, patterns.blur, absorption);\n",
-        "    above = foam_over(above, water, foam_light * surface.crest_foam.rgb * white, reflected, reflectance, churned.opacity);\n"));
-    const CREST_COVER: &str = "let crest_cover = clamp(max(max(whitecaps.opacity * surface.crest_foam.a, churned.opacity), breakers), 0.0, 1.0);";
-    assert!(s.contains(CREST_COVER), "Godot water anchor changed: {CREST_COVER}");
-    let s = s.replace(CREST_COVER, "let crest_cover = clamp(max(churned.opacity, breakers), 0.0, 1.0);");
-    // The FFT probe does not know these waves: the host's eye solve classifies the camera (`pigment.w` 2 submerged).
-    let s = replace_once(&s,
-        "    let submerged = select(surface.pigment.w > 0.5 && textureLoad(underwater_probe, vec2<i32>(0, 0), 0).g > 0.0, surface.pigment.w > 1.5, jka_hybrid.breaker.x > 0.5);",
-        "    let submerged = surface.pigment.w > 1.5;");
-    let s = if probe & COST_PROBE_GODOT_PIXEL != 0 {
-        replace_once(&s, "let jka_godot = jka_godot_pixel(xz);", "let jka_godot = JkaGodotPixel(vec2<f32>(0.0), 1.0, 0.0);")
-    } else { s };
-    format!("{s}\n{}", include_str!("godot_water_surface.wgsl"))
-}
-
 // The spread read's first line, and its groups' call (the vendored source is CRLF: anchors are single lines).
 const WAVE_STATS_SPREAD: &str = "        let spread = mix_mean(copies_grad(field_extras, copies, i, crestward * max(wide, CREST_SPREAD) / tile,";
 const WAVE_STATS_SPREAD_GROUPS: &str = "        let spread_shown = crests * breaking_group(xz, spread.y, spread.w, i) * detail;";
@@ -493,7 +435,7 @@ fn jka_cost_probe_source(source: &str, probe: u32) -> String {
     }
     if on(COST_PROBE_WAVES) {
         // The Hybrid breaker prepends its cofactor normal to the sample.
-        let normal = if s.contains("jka_normal: vec3<f32>,") { "vec3<f32>(0.0, 1.0, 0.0), " } else { "" };
+        let normal = if s.contains("jka_normal: vec3<f32>,") { "vec3<f32>(0.0, 1.0, 0.0), 1.0, " } else { "" };
         s = replace_once(&s, "let sample = wave_surface(xz, wake.slick, input.world.xz);",
             &format!("let sample = WaveSample({normal}vec2<f32>(0.0), 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01, 0.01, vec2<f32>(0.0));"));
     }
@@ -527,7 +469,7 @@ fn jka_cost_probe_source(source: &str, probe: u32) -> String {
         // What a baked world-space wave/foam cache would cost per pixel: the wave sample and the foam patterns each
         // replaced by four anisotropic reads at the pixel's own footprint (field_extras stands in for the cache).
         s = replace_once(&s, "#import naval_ocean::foam::{FOAM_GLOSS,", "#import naval_ocean::foam::{FoamPatterns, FOAM_GLOSS,");
-        let normal = if s.contains("jka_normal: vec3<f32>,") { "vec3<f32>(b0.xy, 1.0), " } else { "" };
+        let normal = if s.contains("jka_normal: vec3<f32>,") { "vec3<f32>(b0.xy, 1.0), 1.0, " } else { "" };
         s = replace_once(&s, "let sample = wave_surface(xz, wake.slick, input.world.xz);", &format!(concat!(
             "let bake_dx = dpdx(xz) / 64.0;\n",
             "    let bake_dy = dpdy(xz) / 64.0;\n",
@@ -730,8 +672,8 @@ pub fn underwater_module(composer: &mut Composer, pass: &str) -> Result<wgpu::na
 /// This shader is compiled only on explicit request, not during map load.
 pub fn jka_waterline_marker_module(composer: &mut Composer) -> Result<wgpu::naga::Module, Box<ComposerError>> {
     let source = format!("{}\n{}\n{}", include_str!("waterline_marker.wgsl"),
-        include_str!("surface_boundary.wgsl"), format!("{}\n{}\n{}", include_str!("crest_control.wgsl"),
-            include_str!("hybrid_gerstner.wgsl"), include_str!("godot_water.wgsl")));
+        include_str!("surface_boundary.wgsl"), format!("{}\n{}", crate::CREST_CONTROL_WGSL,
+            include_str!("hybrid_gerstner.wgsl")));
     composer.make_naga_module(NagaModuleDescriptor {
         source: &source,
         file_path: "JKA native wave line diagnostic",
@@ -744,10 +686,7 @@ pub fn jka_waterline_marker_module(composer: &mut Composer) -> Result<wgpu::naga
 /// One-thread compute probe: the height of the original surface mesh over a point,
 /// using the preserved upstream `displacement()`. Wave resources bind at group 2.
 pub fn eye_height_module(composer: &mut Composer) -> Result<wgpu::naga::Module, Box<ComposerError>> {
-    // The probe binds no noise texture: `r_oceanType 5`'s waves are read at the noise's mean, which drops only
-    // upstream's +-2.5 cm (times the wave scale) height jitter from the eye's waterline.
-    let source = format!("{}\n{}\n{}\nfn jka_godot_noise(uv: vec2<f32>) -> f32 {{ return 0.5; }}\n",
-        include_str!("eye_height.wgsl"), include_str!("crest_control.wgsl"), include_str!("godot_water.wgsl"));
+    let source = format!("{}\n{}\n", include_str!("eye_height.wgsl"), crate::CREST_CONTROL_WGSL);
     composer.make_naga_module(NagaModuleDescriptor {
         source: &source,
         file_path: "JKA native eye height probe",
@@ -767,23 +706,26 @@ fn jka_hybrid_surface_source(source: &str) -> String {
     assert_eq!(source.matches(VERTEX).count(), 1, "Hybrid source vertex changed upstream");
     assert_eq!(source.matches(NORMAL).count(), 1, "Hybrid source normal changed upstream");
     let source = source.replace(SKY_BINDING,
-        &format!("{SKY_BINDING}\n{}\n{}\n{}", include_str!("crest_control.wgsl"), include_str!("hybrid_gerstner.wgsl"),
-            include_str!("godot_water.wgsl")));
+        &format!("{SKY_BINDING}\n{}\n{}", crate::CREST_CONTROL_WGSL, include_str!("hybrid_gerstner.wgsl")));
     let replace = |text: String, from: &str, to: &str| {
         assert_eq!(text.matches(from).count(), 1, "Hybrid breaker anchor changed: {from}");
         text.replace(from, to)
     };
-    let source = replace(source, "struct WaveSample {", "struct WaveSample {\n    jka_normal: vec3<f32>,");
-    let source = replace(source, "    let xx = strain.x + 1.0;", r#"    if jka_hybrid.breaker.x > 0.5 {
+    let source = replace(source, "struct WaveSample {", "struct WaveSample {\n    jka_normal: vec3<f32>,\n    jka_raw_jacobian: f32,");
+    let source = replace(source, "    let xx = strain.x + 1.0;", r#"    var jka_raw_jacobian = 1.0;
+    if jka_hybrid.breaker.x > 0.5 {
         // Apply the same constant horizontal map as the vertices BEFORE
         // transforming the combined grid slope into a world normal.
         slope = slope * jka_hybrid.motion_mix.z + jka_hybrid_slope(xz);
-        strain = (strain * jka_hybrid.motion_mix.z + jka_hybrid_strain(xz)) * jka_hybrid_crest_scale();
+        let jka_raw_strain = strain * jka_hybrid.motion_mix.z + jka_hybrid_strain(xz);
+        if jka_hybrid.breaker.x > 2.5 { jka_raw_jacobian = jka_crest_jacobian(jka_raw_strain); }
+        strain = jka_raw_strain * jka_hybrid_crest_scale();
     }
     let xx = strain.x + 1.0;"#);
     let source = replace(source, "        world + ripple_slope + hulls.world,", r#"        vec3<f32>(-(zz * slope.x - cross_strain * slope.y), jacobian,
             -(xx * slope.y - cross_strain * slope.x))
             - vec3<f32>(ripple_slope.x + hulls.world.x, 0.0, ripple_slope.y + hulls.world.y) * jacobian,
+        jka_raw_jacobian,
         world + ripple_slope + hulls.world,"#);
     let source = replace(source, "    let dry = normalize(vec3<f32>(-total.x, 1.0, -total.y));", r#"    var dry = normalize(vec3<f32>(-total.x, 1.0, -total.y));
     if jka_hybrid.breaker.x > 0.5 {
@@ -798,13 +740,15 @@ fn jka_hybrid_surface_source(source: &str) -> String {
     if jka_hybrid.breaker.x > 0.5 {
         up = normalize(dry - vec3<f32>(rain.slope.x, 0.0, rain.slope.y) * abs(dry.y));
     }"#);
+    // Capture before diagnostic packing shadows the WaveSample later.
+    let source = replace(source, "let sample = wave_surface(xz, wake.slick, input.world.xz);",
+        "let sample = wave_surface(xz, wake.slick, input.world.xz);\n    let jka_raw_crest_jacobian = sample.jka_raw_jacobian;");
     let source = replace(source, "    let breakers = foam_share(sample.breakers.x, lace, patterns.blur, SURF_EDGE) * surface.crest_foam.a;", r#"    var crest_breaking = 0.0;
     if jka_hybrid.breaker.x > 1.5 {
         // Use the existing textured foam and persistent FFT whitecap history;
         // do not paint an opaque stripe or introduce another water surface.
-        let high = smoothstep(0.0, 0.22, input.world.y / max(waves.sea.x, 0.1));
-        let compressed = 1.0 - smoothstep(0.15, 0.7, sample.jacobian);
-        crest_breaking = compressed * high;
+        let crest_j = select(sample.jacobian, jka_raw_crest_jacobian, jka_hybrid.breaker.x > 2.5);
+        crest_breaking = jka_crest_spilling_cue(crest_j, input.world.y, waves.sea.x);
     }
     let breakers = foam_share(max(sample.breakers.x, crest_breaking), lace, patterns.blur, SURF_EDGE) * surface.crest_foam.a;"#);
     let source = replace(source,
@@ -857,7 +801,7 @@ fn compose_surface_probed(
         ("CASCADES".to_owned(), ShaderDefValue::UInt(3)),
         ("REFLECTION_STEPS".to_owned(), ShaderDefValue::UInt(reflection_steps)),
     ];
-    let fast_hybrid = cost_probe & SURFACE_FAST_HYBRID != 0 && cost_probe & SURFACE_GODOT_WATER == 0;
+    let fast_hybrid = cost_probe & SURFACE_FAST_HYBRID != 0;
     let adaptive_hybrid = fast_hybrid && cost_probe & SURFACE_ADAPTIVE_HYBRID != 0;
     if adaptive_hybrid {
         shader_defs.push(("JKA_ADAPTIVE_HYBRID".to_owned(), ShaderDefValue::UInt(1)));
@@ -904,13 +848,11 @@ fn compose_surface_probed(
         assert_eq!(original.matches(fog).count(), 1, "upstream surface fog contract changed");
         let original = original.replace(fog, "var color = jka_surface_legacy_fog(apply_fog(above, input.world), input.world);");
         let original = format!("{original}\n{}", include_str!("surface_fog.wgsl"));
-        let godot = cost_probe & SURFACE_GODOT_WATER != 0;
         // Cost probes alone (no lossless/lossy variant bits) decide whether reduced modes split the glints.
-        let probe_only = cost_probe & !SURFACE_GODOT_WATER;
+        let probe_only = cost_probe;
         let cost_probe = if fast_hybrid {
             cost_probe & (SURFACE_FAST_HYBRID | SURFACE_ADAPTIVE_HYBRID | COST_PROBE_SSR | COST_PROBE_FLOOR)
-        } else if godot { cost_probe & !GODOT_REPLACED_PROBES } else { cost_probe };
-        let original = if godot { jka_godot_material(&original, cost_probe) } else { original };
+        } else { cost_probe };
         // Reduced-resolution variants execute the original *entire* material
         // on a smaller attachment. Only the screen-space opaque scene lookup
         // needs remapping back to full-resolution source textures.
@@ -1055,10 +997,8 @@ fn fragment(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0
 pub fn jka_near_surface_module(
     composer: &mut Composer,
     reflection_steps: u32,
-    // `SURFACE_GODOT_WATER` or 0, as the main program.
-    variant: u32,
 ) -> Result<wgpu::naga::Module, Box<ComposerError>> {
-    compose_surface_probed(composer, false, true, reflection_steps.clamp(4, 32), 0, true, variant & SURFACE_GODOT_WATER, false)
+    compose_surface_probed(composer, false, true, reflection_steps.clamp(4, 32), 0, true, 0, false)
 }
 
 /// Full-resolution depth/coverage reconstruction. The original vertex stage
@@ -1084,10 +1024,8 @@ pub fn jka_adaptive_reconstruct_module(
 pub fn jka_adaptive_surface_module(
     composer: &mut Composer,
     reflection_steps: u32,
-    // `SURFACE_GODOT_WATER` or 0, as the main program.
-    variant: u32,
 ) -> Result<wgpu::naga::Module, Box<ComposerError>> {
-    compose_surface_probed(composer, false, true, reflection_steps.clamp(4, 32), 0, false, variant & SURFACE_GODOT_WATER, true)
+    compose_surface_probed(composer, false, true, reflection_steps.clamp(4, 32), 0, false, 0, true)
 }
 
 /// The reduced-resolution material (`r_oceanPixelDetail` 1-5) without its glints, plus what the full-resolution
@@ -1141,9 +1079,8 @@ fn jka_reduced_glints(source: &str, entry: &str, split: bool) -> String {
         rest = &rest[end..];
     }
     out.push_str(rest);
-    // Four foam layers and the spray veil (`SURFACE_GODOT_WATER`: the wake's one foam layer and the veil).
-    let expected = if out.contains("jka_godot_body(") { 2 } else { 5 };
-    assert_eq!(statements, expected, "glint transfer: upstream `above` statements changed");
+    // Four foam layers and the spray veil.
+    assert_eq!(statements, 5, "glint transfer: upstream `above` statements changed");
     let fog = "var color = jka_surface_legacy_fog(apply_fog(above, input.world), input.world);";
     let s = replace_once(&out, fog, &format!("{fog}\n    var jka_glint_transfer = \
         jka_surface_legacy_fog(apply_fog(jka_glint_above, input.world), input.world) - color;"));
@@ -1457,32 +1394,22 @@ mod tests {
         }
     }
 
-    /// `r_oceanType 5`: the Godot water material in every pixel-detail mode, with the far shader and the probes it
-    /// tolerates, its near and adaptive passes, and the eye and waterline probes that share its waves.
+    /// The near and adaptive passes and the eye, waterline and wireframe probes that share the Hybrid waves.
     #[test]
-    fn jka_godot_water_variants_validate() {
+    fn jka_hybrid_probe_modules_validate() {
         let validate = |module: wgpu::naga::Module, what: &str| {
             wgpu::naga::valid::Validator::new(wgpu::naga::valid::ValidationFlags::all(),
                 wgpu::naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32)
                 .validate(&module).unwrap_or_else(|error| panic!("{what} invalid: {error}"));
         };
-        for mode in 0..=5u8 {
-            for variant in [SURFACE_GODOT_WATER, SURFACE_GODOT_WATER | FAR_SHADER_DEFAULT,
-                SURFACE_GODOT_WATER | COST_PROBE_ALL & !COST_PROBE_FLOOR] {
-                let mut composer = composer_with_footprint(None, pixel_scale(mode)).expect("upstream modules");
-                let module = jka_surface_module_with_probe(&mut composer, 16, mode, variant)
-                    .unwrap_or_else(|error| panic!("godot mode {mode} {variant:#x}: {}", error.emit_to_string(&composer)));
-                validate(module, &format!("godot mode {mode} {variant:#x}"));
-            }
-        }
         let mut modules = composer().expect("upstream modules");
-        let near = jka_near_surface_module(&mut modules, 16, SURFACE_GODOT_WATER)
-            .unwrap_or_else(|error| panic!("godot near: {}", error.emit_to_string(&modules)));
-        validate(near, "godot near");
+        let near = jka_near_surface_module(&mut modules, 16)
+            .unwrap_or_else(|error| panic!("near: {}", error.emit_to_string(&modules)));
+        validate(near, "near");
         let mut modules = composer().expect("upstream modules");
-        let adaptive = jka_adaptive_surface_module(&mut modules, 16, SURFACE_GODOT_WATER)
-            .unwrap_or_else(|error| panic!("godot adaptive: {}", error.emit_to_string(&modules)));
-        validate(adaptive, "godot adaptive");
+        let adaptive = jka_adaptive_surface_module(&mut modules, 16)
+            .unwrap_or_else(|error| panic!("adaptive: {}", error.emit_to_string(&modules)));
+        validate(adaptive, "adaptive");
         let mut modules = composer().expect("upstream modules");
         let eye = eye_height_module(&mut modules)
             .unwrap_or_else(|error| panic!("eye height: {}", error.emit_to_string(&modules)));
@@ -1630,4 +1557,142 @@ mod tests {
             );
         });
     }
+}
+
+/// Dedicated Ocean2 variant. Preserve the vendor vertex entry and its parent
+/// triangle morph; discard the legacy surface fragment and its motion pass.
+pub fn ninja_ocean_module(material: &str, slw: &str, steps: u32, ssr: bool) -> Result<wgpu::naga::Module, String> {
+    ninja_surface_module(material, slw, steps, ssr, include_str!("ninja_ocean_surface.wgsl"), false, CoastVariant::Full)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CoastVariant { Full, Clipmap, Adaptive, Reduced, LateFft }
+
+/// Private Fluid Ninja Coast material on the same vendor vertex entry.
+/// `open_sea` (`r_ninjaCoastDeepWater` > 0) also compiles the compact (Optimized)
+/// Hybrid material as `jka_fast_fragment` and its `deep_fragment` entry for water past
+/// the shore band (`JKA_NINJA_OPEN_SEA`).
+pub fn ninja_coast_module(material: &str, slw: &str, steps: u32, ssr: bool, open_sea: bool) -> Result<wgpu::naga::Module, String> {
+    ninja_coast_variant(material, slw, steps, ssr, open_sea, CoastVariant::Full)
+}
+
+pub fn ninja_coast_clipmap_module(material: &str, slw: &str, steps: u32, ssr: bool) -> Result<wgpu::naga::Module, String> {
+    ninja_coast_variant(material, slw, steps, ssr, true, CoastVariant::Clipmap)
+}
+
+pub fn ninja_coast_adaptive_module(material: &str, slw: &str, steps: u32, ssr: bool, reduced: bool) -> Result<wgpu::naga::Module, String> {
+    let variant = if reduced { CoastVariant::Reduced } else { CoastVariant::Adaptive };
+    ninja_coast_variant(material, slw, steps, ssr, true, variant)
+}
+
+pub fn ninja_coast_late_fft_module(material: &str, slw: &str, steps: u32, ssr: bool) -> Result<wgpu::naga::Module, String> {
+    ninja_coast_variant(material, slw, steps, ssr, true, CoastVariant::LateFft)
+}
+
+fn ninja_coast_variant(material: &str, slw: &str, steps: u32, ssr: bool, open_sea: bool, variant: CoastVariant) -> Result<wgpu::naga::Module, String> {
+    if !open_sea {
+        return ninja_surface_module(material, slw, steps, ssr, include_str!("ninja_coast_surface.wgsl"), false, variant);
+    }
+    let entry = "@fragment\nfn fragment(input: VertexOut, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {";
+    let fast = include_str!("hybrid_fast_surface.wgsl").replace("\r\n", "\n");
+    if fast.matches(entry).count() != 1 { return Err("compact Hybrid fragment anchor changed".into()); }
+    // Deep-water pass colour match: the water body's upwelling light takes the Coast
+    // calibration gain (`NINJA_COAST_DEEP_TINT`); sky reflection, sun and foam keep theirs.
+    let body = "* (surface.transmission.rgb / JKA_FAST_TRANSMISSION);";
+    if fast.matches(body).count() != 1 { return Err("compact Hybrid upwelling anchor changed".into()); }
+    let fast = fast.replace(body, "* (surface.transmission.rgb / JKA_FAST_TRANSMISSION) * NINJA_COAST_DEEP_TINT;");
+    let tint = crate::original_surface::SurfaceAppearance::default().transmission;
+    let fast = fast.replace(entry, "fn jka_fast_fragment(input: VertexOut, front: bool) -> vec4<f32> {\n    let jka_admission = jka_water_sky_admission(input.grid);")
+        .replace("JKA_FAST_TRANSMISSION", &format!("vec3<f32>({}, {}, {})", tint[0], tint[1], tint[2]));
+    // Coast forces r_hybridBreaker 3 for its crest capture; the deep-water pass shades as
+    // Hybrid with breakers off (r_hybridBreaker 0), like the Optimized material at the
+    // user's settings: no spilling-crest or surf foam cue over open sea.
+    let mut fast = fast;
+    for from in ["jka_hybrid.breaker.x > 2.5", "jka_hybrid.breaker.x > 0.5"] {
+        if !fast.contains(from) { return Err(format!("compact Hybrid breaker anchor changed: {from}")); }
+        fast = fast.replace(from, "false");
+    }
+    let mut host = format!("{}\n{}\n{}\n{}", include_str!("hybrid_gerstner.wgsl"),
+        include_str!("surface_refraction.wgsl"), fast, include_str!("ninja_coast_surface.wgsl"));
+    host.push('\n');
+    host.push_str(match variant {
+        CoastVariant::Clipmap => include_str!("ninja_coast_wave_clipmap.wgsl"),
+        CoastVariant::Adaptive => include_str!("ninja_coast_adaptive.wgsl"),
+        CoastVariant::Full | CoastVariant::Reduced | CoastVariant::LateFft => "",
+    });
+    ninja_surface_module(material, slw, steps, ssr, &host, true, variant)
+}
+
+fn ninja_surface_module(material: &str, slw: &str, steps: u32, ssr: bool, host: &str, open_sea: bool, variant: CoastVariant) -> Result<wgpu::naga::Module, String> {
+    let scale = if variant == CoastVariant::Reduced { 2 } else { 1 };
+    let mut c = composer_with_footprint(None, scale).map_err(|e| format!("Ninja ocean imports: {e:?}"))?;
+    let upstream = include_str!("../../../vendor/blue-water-sea-and-sky/ocean/shaders/surface.wgsl").replace("\r\n", "\n");
+    let end = upstream.find("@fragment\nfn fragment(").ok_or("Ninja ocean upstream fragment anchor")?;
+    let mut source = upstream[..end].to_owned();
+    for (from,to) in [
+        ("let offset = displacement(grid, spacing);", "let offset = ninja_displacement(grid, spacing);"),
+        ("let da = displacement(pa, spacing);", "let da = ninja_displacement(pa, spacing);"),
+        ("let db = displacement(pb, spacing);", "let db = ninja_displacement(pb, spacing);"),
+        ("let dc = displacement(pc, spacing);", "let dc = ninja_displacement(pc, spacing);"),
+        (" + wake_height(grid)", ""), (" + wake_height(pa)", ""), (" + wake_height(pb)", ""), (" + wake_height(pc)", ""),
+        ("if (horizon || fan) && camera.curvature > 0.0 {", "{"),
+    ] {
+        if source.matches(from).count() != 1 { return Err(format!("Ocean2 upstream anchor changed: {from}")); }
+        source = source.replace(from,to);
+    }
+    if open_sea {
+        // The compact material's foam patterns (as its own Hybrid composition).
+        let from = "#import naval_ocean::foam::{FOAM_GLOSS,";
+        if source.matches(from).count() != 1 { return Err("Coast open-sea foam import anchor changed".into()); }
+        source = source.replace(from, "#import naval_ocean::foam::{FoamPatterns, FOAM_GLOSS,");
+    }
+    if matches!(variant, CoastVariant::Adaptive | CoastVariant::Reduced) {
+        source = jka_invariant_position(&source);
+    }
+    source.push_str(SURFACE_BOUNDARY_WGSL);
+    source.push_str(include_str!("surface_fog.wgsl"));
+    source.push_str(crate::CREST_CONTROL_WGSL);
+    source.push_str(material);
+    source.push_str(slw);
+    source.push_str(host);
+    let mut defs = std::collections::HashMap::from([
+        ("CASCADES".to_owned(), ShaderDefValue::UInt(3)),
+        ("REFLECTION_STEPS".to_owned(), ShaderDefValue::UInt(steps)),
+    ]);
+    if ssr { defs.insert("JKA_NINJA_SSR".to_owned(), ShaderDefValue::UInt(1)); }
+    let variant_def = match variant {
+        CoastVariant::Clipmap => Some("JKA_NINJA_WAVE_CLIPMAP"),
+        CoastVariant::Adaptive => Some("JKA_NINJA_ADAPTIVE"),
+        CoastVariant::Reduced => Some("JKA_NINJA_REDUCED"),
+        CoastVariant::LateFft => Some("JKA_NINJA_LATE_FFT"),
+        CoastVariant::Full => None,
+    };
+    if let Some(def) = variant_def { defs.insert(def.to_owned(), ShaderDefValue::Bool(true)); }
+    let source = full_resolution_footprint(&source, scale);
+    if open_sea {
+        defs.insert("JKA_NINJA_OPEN_SEA".to_owned(), ShaderDefValue::UInt(1));
+        // Optimized (r_hybridMaterial 1), not Adaptive: measured 2026-11-22 at costadelsol
+        // open sea, Adaptive 168 FPS vs Optimized 259 for the whole frame.
+        if ssr { defs.insert("JKA_FAST_SSR".to_owned(), ShaderDefValue::UInt(1)); }
+    }
+    c.make_naga_module(NagaModuleDescriptor { source: &source, file_path: "jka_ninja_ocean.wgsl",
+        shader_type: ShaderType::Wgsl, shader_defs: defs, ..Default::default() }).map_err(|e| e.emit_to_string(&c))
+}
+
+pub fn ninja_ocean_capture_module(material: &str) -> Result<wgpu::naga::Module, String> {
+    ninja_capture_module(material, include_str!("ninja_ocean_capture.wgsl"))
+}
+
+pub fn ninja_coast_capture_module(material: &str) -> Result<wgpu::naga::Module, String> {
+    ninja_capture_module(material, include_str!("ninja_coast_capture.wgsl"))
+}
+
+fn ninja_capture_module(material: &str, host: &str) -> Result<wgpu::naga::Module, String> {
+    let mut c = composer().map_err(|e| format!("Ninja ocean capture imports: {e:?}"))?;
+    // Imports need to precede declarations in naga_oil's preprocessor.
+    let source = format!("{}\n{}\n{}\n{}", host, crate::CREST_CONTROL_WGSL, material, include_str!("surface_boundary.wgsl"));
+    c.make_naga_module(NagaModuleDescriptor { source: &source, file_path: "jka_ninja_ocean_capture.wgsl",
+        shader_type: ShaderType::Wgsl,
+        shader_defs: [("CASCADES".to_owned(), ShaderDefValue::UInt(3))].into_iter().collect(), ..Default::default() })
+        .map_err(|e| e.emit_to_string(&c))
 }

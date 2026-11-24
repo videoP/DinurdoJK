@@ -625,7 +625,7 @@ impl GameSession {
         // OpenJK EV_DESTROY_WEAPON_MODEL mutates the target Ghoul2 model before
         // this frame's player/body rendering. Event-worker preparation never
         // owns or mutates presenter state; ordered application stays here.
-        self.player_presenter.apply_entity_event(&event);
+        self.player_presenter.apply_entity_event(&event, target_server_time);
         self.entity_presenter.note_shield_hit(&event);
         self.note_out_of_ammo(&event);
         self.note_view_kick(&event);

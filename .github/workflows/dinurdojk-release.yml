@@ -119,6 +119,32 @@ jobs:
           # No source content or key material is printed to Actions logs.
           Write-Host 'Restored private NWH module for release compilation.'
 
+      # Fluid Ninja (crates/jka-ninja) is implemented in a private repository.
+      # Clone it beside the checkout when the release environment grants access
+      # (secret DINURDOJK_NINJA_TOKEN: read-only token; variable
+      # DINURDOJK_NINJA_REPO: owner/name). Without them the public stub builds.
+      - name: Fetch private Fluid Ninja crate
+        if: steps.version.outputs.publish == 'true'
+        shell: bash
+        env:
+          DINURDOJK_NINJA_TOKEN: ${{ secrets.DINURDOJK_NINJA_TOKEN }}
+          DINURDOJK_NINJA_REPO: ${{ vars.DINURDOJK_NINJA_REPO }}
+        run: |
+          set -euo pipefail
+          dest="$GITHUB_WORKSPACE/../DinurdoJK-ninja"
+          if [ -e "$dest" ]; then echo "::error::$dest unexpectedly exists"; exit 1; fi
+          if [ -z "${DINURDOJK_NINJA_TOKEN:-}" ] || [ -z "${DINURDOJK_NINJA_REPO:-}" ]; then
+            echo "::notice::Fluid Ninja access not configured; building the public jka-ninja stub."
+            exit 0
+          fi
+          if ! git -c credential.helper= clone --quiet --depth 1 "https://x-access-token:${DINURDOJK_NINJA_TOKEN}@github.com/${DINURDOJK_NINJA_REPO}.git" "$dest" >/dev/null 2>&1; then
+            echo "::error::Could not clone the private Fluid Ninja repository."; exit 1
+          fi
+          rm -rf "$dest/.git"  # its remote URL contains the token
+          if [ ! -f "$dest/src/lib.rs" ]; then echo "::error::Private Fluid Ninja checkout has no src/lib.rs."; exit 1; fi
+          echo "DINURDOJK_NINJA=1" >> "$GITHUB_ENV"
+          echo "Fetched private Fluid Ninja crate."
+
       - name: Install Rust
         if: steps.version.outputs.publish == 'true'
         uses: dtolnay/rust-toolchain@stable
@@ -580,6 +606,32 @@ jobs:
           path.write_bytes(base64.b64decode(source, validate=True))
           PY
 
+      # Fluid Ninja (crates/jka-ninja) is implemented in a private repository.
+      # Clone it beside the checkout when the release environment grants access
+      # (secret DINURDOJK_NINJA_TOKEN: read-only token; variable
+      # DINURDOJK_NINJA_REPO: owner/name). Without them the public stub builds.
+      - name: Fetch private Fluid Ninja crate
+        if: steps.release.outputs.build == 'true'
+        shell: bash
+        env:
+          DINURDOJK_NINJA_TOKEN: ${{ secrets.DINURDOJK_NINJA_TOKEN }}
+          DINURDOJK_NINJA_REPO: ${{ vars.DINURDOJK_NINJA_REPO }}
+        run: |
+          set -euo pipefail
+          dest="$GITHUB_WORKSPACE/../DinurdoJK-ninja"
+          if [ -e "$dest" ]; then echo "::error::$dest unexpectedly exists"; exit 1; fi
+          if [ -z "${DINURDOJK_NINJA_TOKEN:-}" ] || [ -z "${DINURDOJK_NINJA_REPO:-}" ]; then
+            echo "::notice::Fluid Ninja access not configured; building the public jka-ninja stub."
+            exit 0
+          fi
+          if ! git -c credential.helper= clone --quiet --depth 1 "https://x-access-token:${DINURDOJK_NINJA_TOKEN}@github.com/${DINURDOJK_NINJA_REPO}.git" "$dest" >/dev/null 2>&1; then
+            echo "::error::Could not clone the private Fluid Ninja repository."; exit 1
+          fi
+          rm -rf "$dest/.git"  # its remote URL contains the token
+          if [ ! -f "$dest/src/lib.rs" ]; then echo "::error::Private Fluid Ninja checkout has no src/lib.rs."; exit 1; fi
+          echo "DINURDOJK_NINJA=1" >> "$GITHUB_ENV"
+          echo "Fetched private Fluid Ninja crate."
+
       - name: Compile native macOS binary
         if: steps.release.outputs.build == 'true'
         run: cargo build --locked --release -p DinurdoJK
@@ -776,6 +828,32 @@ jobs:
               raise SystemExit('Private NWH file unexpectedly exists')
           path.write_bytes(base64.b64decode(source, validate=True))
           PY
+
+      # Fluid Ninja (crates/jka-ninja) is implemented in a private repository.
+      # Clone it beside the checkout when the release environment grants access
+      # (secret DINURDOJK_NINJA_TOKEN: read-only token; variable
+      # DINURDOJK_NINJA_REPO: owner/name). Without them the public stub builds.
+      - name: Fetch private Fluid Ninja crate
+        if: steps.release.outputs.build == 'true'
+        shell: bash
+        env:
+          DINURDOJK_NINJA_TOKEN: ${{ secrets.DINURDOJK_NINJA_TOKEN }}
+          DINURDOJK_NINJA_REPO: ${{ vars.DINURDOJK_NINJA_REPO }}
+        run: |
+          set -euo pipefail
+          dest="$GITHUB_WORKSPACE/../DinurdoJK-ninja"
+          if [ -e "$dest" ]; then echo "::error::$dest unexpectedly exists"; exit 1; fi
+          if [ -z "${DINURDOJK_NINJA_TOKEN:-}" ] || [ -z "${DINURDOJK_NINJA_REPO:-}" ]; then
+            echo "::notice::Fluid Ninja access not configured; building the public jka-ninja stub."
+            exit 0
+          fi
+          if ! git -c credential.helper= clone --quiet --depth 1 "https://x-access-token:${DINURDOJK_NINJA_TOKEN}@github.com/${DINURDOJK_NINJA_REPO}.git" "$dest" >/dev/null 2>&1; then
+            echo "::error::Could not clone the private Fluid Ninja repository."; exit 1
+          fi
+          rm -rf "$dest/.git"  # its remote URL contains the token
+          if [ ! -f "$dest/src/lib.rs" ]; then echo "::error::Private Fluid Ninja checkout has no src/lib.rs."; exit 1; fi
+          echo "DINURDOJK_NINJA=1" >> "$GITHUB_ENV"
+          echo "Fetched private Fluid Ninja crate."
 
       - name: Compile Linux executable
         if: steps.release.outputs.build == 'true'

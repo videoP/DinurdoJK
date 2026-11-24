@@ -126,6 +126,44 @@ app_cvars! {
         ]
     }
 
+    APP_R_GRASSSTYLE {
+        runtime: CvarDef::new(
+            "r_grassStyle",
+            "",
+            "0|1",
+            "Procedural grass shading. 0 original blades, 1 Fluid Ninja shaded blades when local assets are available. Updates live.",
+            CvarType::String,
+            CvarFlags::ARCHIVE,
+            LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.grass_ninja_style)),
+            |app, value| App::cvar_set_r_grassstyle(app, APP_R_GRASSSTYLE.entry.name, &value.to_string()),
+        )
+        .with_text_setter(App::cvar_set_r_grassstyle, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.grass_ninja_style = matches!(value.trim(), "1");
+            }),
+            archive: Some((92, |state| bool_value(state.video.grass_ninja_style))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_grassstyle(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let enabled = match value.trim() {
+                        "0" => false,
+                        "1" => true,
+                        _ => return Err(format!("{name}: expected 0|1")),
+                    };
+                    self.video.grass_ninja_style = enabled;
+                    self.render_command(RenderCommand::SetGrassStyle(enabled));
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_GRASSFRONTTOBACK {
         runtime: CvarDef::new(
                 "r_grassFrontToBack",

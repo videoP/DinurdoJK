@@ -18,6 +18,9 @@ macro_rules! entity_events {
         pub enum EntityEvent {
             $($name,)+
             EV_NUM_ENTITY_EVENTS,
+            // Internal JK2 presentation event. Keep the protocol-26 sentinel,
+            // COUNT and ALL unchanged; this ID is never sent to a server.
+            EV_JK2_BODY_QUEUE_COPY,
         }
 
         impl EntityEvent {
@@ -37,6 +40,9 @@ macro_rules! entity_events {
 
             #[inline]
             pub fn from_i32(value: i32) -> Option<Self> {
+                if value == Self::EV_JK2_BODY_QUEUE_COPY as i32 {
+                    return Some(Self::EV_JK2_BODY_QUEUE_COPY);
+                }
                 usize::try_from(value)
                     .ok()
                     .and_then(|index| Self::ALL.get(index).copied())
@@ -47,6 +53,7 @@ macro_rules! entity_events {
                 match self {
                     $(Self::$name => stringify!($name),)+
                     Self::EV_NUM_ENTITY_EVENTS => "EV_NUM_ENTITY_EVENTS",
+                    Self::EV_JK2_BODY_QUEUE_COPY => "EV_BODY_QUEUE_COPY",
                 }
             }
         }
@@ -278,6 +285,8 @@ mod tests {
         assert_eq!(EntityEvent::EV_SHIELD_HIT.as_i32(), 110);
         assert_eq!(EntityEvent::EV_SIEGESPEC.as_i32(), 191);
         assert_eq!(EntityEvent::COUNT, 192);
+        assert_eq!(EntityEvent::EV_JK2_BODY_QUEUE_COPY.as_i32(), 193);
+        assert_eq!(EntityEvent::from_i32(193), Some(EntityEvent::EV_JK2_BODY_QUEUE_COPY));
     }
 
     #[test]

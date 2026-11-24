@@ -200,6 +200,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::SetPostEffects(..) => "SetPostEffects",
         RenderCommand::SetFootprintMode(..) => "SetFootprintMode",
         RenderCommand::SetGrassEnabled(..) => "SetGrassEnabled",
+        RenderCommand::SetGrassStyle(..) => "SetGrassStyle",
         RenderCommand::SetGrassPrecompute(..) => "SetGrassPrecompute",
         RenderCommand::SetGrassMidLod(..) => "SetGrassMidLod",
         RenderCommand::SetGrassFrontToBack(..) => "SetGrassFrontToBack",
@@ -809,6 +810,7 @@ pub(in crate::renderer) fn apply_scene_video_settings(renderer: &mut Renderer, v
         split_toning: video.split_toning,
     });
     renderer.set_grass_enabled(video.grass);
+    renderer.grass_renderer.set_ninja_style(video.grass_ninja_style);
     renderer.set_grass_precompute(video.grass_precompute);
     renderer.set_grass_mid_lod(video.grass_mid_lod);
     renderer.set_grass_front_to_back(video.grass_front_to_back);
@@ -972,6 +974,9 @@ pub(in crate::renderer) fn render_thread_main(
     renderer.set_jump_shade(snapshot.jump_shade);
     renderer.set_screen_fx(&snapshot.screen_fx);
     renderer.set_cloud_foreground(&snapshot.cloud_foreground);
+    renderer.set_ninja_fire_scene(snapshot.ninja_fire.clone(), snapshot.weather_server_time_ms);
+    renderer.set_ninja_blood_scene(snapshot.ninja_blood.clone());
+    renderer.ninja_fog.set_scene(snapshot.ninja_fog.as_ref());
     rverbose!(
         1,
         "[RENDER INIT] ready after applying video state {:.1} ms total",
@@ -1090,7 +1095,7 @@ pub(in crate::renderer) fn render_thread_main(
     // sample cannot tell a ~3ms cascade frame from a ~0.04ms idle frame, and
     // either one read alone gives the wrong answer about what the ocean costs.
     // Accumulate min/avg/max across the trace window for those passes instead.
-    const TRACE_GPU_PASSES: [GpuPass; 8] = [
+    const TRACE_GPU_PASSES: [GpuPass; 9] = [
         GpuPass::Frame,
         GpuPass::OceanSim,
         GpuPass::CoastalSim,
@@ -1101,6 +1106,8 @@ pub(in crate::renderer) fn render_thread_main(
         GpuPass::RiverSim,
         GpuPass::RiverSolve,
         GpuPass::RiverDraw,
+        // Native ocean prepare (Coast fluid sim ticks on some frames only).
+        GpuPass::OceanPrepare,
     ];
     let mut trace_gpu_sum = [0.0_f64; TRACE_GPU_PASSES.len()];
     let mut trace_gpu_min = [f64::INFINITY; TRACE_GPU_PASSES.len()];
@@ -1337,6 +1344,10 @@ pub(in crate::renderer) fn render_thread_main(
             let first_world_command_drain_started =
                 pending_world_uploaded.is_some().then(Instant::now);
             loop {
+                if crate::renderer::device_lost() {
+                    stop_for_device_loss(&proxy, renderer, companion_renderers);
+                    return;
+                }
                 let received = command_rx.try_recv();
                 if received.is_ok() && !matches!(received.as_ref(), Ok(RenderCommand::SetCombatUi { .. })) {
                     // Some commands mutate state owned by the render-snapshot
@@ -1680,6 +1691,9 @@ pub(in crate::renderer) fn render_thread_main(
                     Ok(RenderCommand::SetGrassEnabled(enabled)) => {
                         renderer.set_grass_enabled(enabled)
                     }
+                    Ok(RenderCommand::SetGrassStyle(enabled)) => {
+                        renderer.grass_renderer.set_ninja_style(enabled);
+                    }
                     Ok(RenderCommand::SetGrassPrecompute(enabled)) => {
                         renderer.set_grass_precompute(enabled)
                     }
@@ -1733,11 +1747,16 @@ pub(in crate::renderer) fn render_thread_main(
                         if let Some(river)=renderer.live_rivers.iter().find(|r|r.id==id) {river.set_settings(&renderer.queue,settings);}
                     }
                     Ok(RenderCommand::RiverRemove(id)) => {
+                        if jka_river::river_promotion::is_promoted(id) {
+                            renderer.refresh_river_ownership(false, None);
+                            renderer.river_promotion_claims.retain(|claim| claim.id != id);
+                        }
                         renderer.live_rivers.retain(|r|r.id!=id);
+                        jka_river::river_ambience::invalidate();
                         if renderer.live_rivers.is_empty() {
                             if let Some(surface) = &mut renderer.river_surface { surface.reset_audio_probe(); }
                         }
-                        crate::river_runtime::set_audio_rivers_present(!renderer.live_rivers.is_empty());
+                        crate::river_runtime::set_audio_rivers_present(renderer.live_rivers.iter().any(|r| r.audio_enabled()));
                     }
                     Ok(RenderCommand::RiverSource(id, controls)) => {
                         if let Some(river) = renderer.live_rivers.iter_mut().find(|r| r.id == id) {
@@ -2428,6 +2447,9 @@ pub(in crate::renderer) fn render_thread_main(
                 renderer.set_jump_shade(next.jump_shade);
                 renderer.set_screen_fx(&next.screen_fx);
                 renderer.set_cloud_foreground(&next.cloud_foreground);
+                renderer.set_ninja_fire_scene(next.ninja_fire.clone(), next.weather_server_time_ms);
+                renderer.set_ninja_blood_scene(next.ninja_blood.clone());
+                renderer.ninja_fog.set_scene(next.ninja_fog.as_ref());
                 snapshot = next;
             }
             loop_sections.mailbox_ms = lap(&mut loop_mark);
@@ -2559,9 +2581,11 @@ pub(in crate::renderer) fn render_thread_main(
             }
             renderer.model_frame_log.set_source(model_source);
             renderer.weather_server_time_ms = snapshot.weather_server_time_ms;
+            renderer.river_wake_debug_subject = snapshot.river_wake_debug_subject;
             renderer.studio_lens=snapshot.studio_lens;
             renderer.ocean_interaction.set_sources(&snapshot.ocean_actors);
             renderer.river_actors = Arc::clone(&snapshot.ocean_actors);
+            renderer.river_ninja_entities = snapshot.ninja_entities.clone();
             if let Some(ocean) = renderer.ocean.as_mut() {
                 ocean.set_lake_actors(&snapshot.ocean_actors);
             }
@@ -3606,7 +3630,7 @@ pub(in crate::renderer) fn render_thread_main(
             }
             if ocean.promoted_surfaces > 0 || ocean.authored_oceans > 0 || renderer.ocean_enabled {
                 println!(
-                    "[JKA OCEAN PERF] gates[cvar={} resources={} variant={} active={}] topology_cpu[last/avg/max]={:.4}/{:.4}/{:.4}ms samples={} avg/min/max_ms sim={} coastal={} surface={} optics={} frame={} surfaces[promoted={} authored={}] clipmaps[visible={} drawn={} analytic={} duplicate={} reject_area={} reject_frustum={}] samples_passed={} primed={} triangles={} lod[min_level={} half_cells={}] optics[active={} submerged={} pixels={} viewport={} rect={}x{}+{}+{} unbounded={} sim_hidden={}] settings[mesh_quality={} map_size={} updates={:.1} wind_foam={} sea_spray={} ab[optics_cull={} optics_scissor={} sim_when_hidden={}]]",
+                    "[JKA OCEAN PERF] gates[cvar={} resources={} variant={} active={}] topology_cpu[last/avg/max]={:.4}/{:.4}/{:.4}ms samples={} avg/min/max_ms sim={} coastal={} surface={} optics={} prepare={} frame={} surfaces[promoted={} authored={}] clipmaps[visible={} drawn={} analytic={} duplicate={} reject_area={} reject_frustum={}] samples_passed={} primed={} triangles={} lod[min_level={} half_cells={}] optics[active={} submerged={} pixels={} viewport={} rect={}x{}+{}+{} unbounded={} sim_hidden={}] settings[mesh_quality={} map_size={} updates={:.1} wind_foam={} sea_spray={} ab[optics_cull={} optics_scissor={} sim_when_hidden={}]]",
                     u8::from(renderer.ocean_enabled),
                     u8::from(ocean_resources),
                     u8::from(ocean_variant),
@@ -3619,6 +3643,7 @@ pub(in crate::renderer) fn render_thread_main(
                     gpu_window[2].as_str(),
                     gpu_window[3].as_str(),
                     gpu_window[4].as_str(),
+                    gpu_window[8].as_str(),
                     gpu_window[0].as_str(),
                     ocean.promoted_surfaces,
                     ocean.authored_oceans,

@@ -1613,6 +1613,7 @@ fn demo_force_powers_produce_fx() {
                         .count();
                     for request in presenter.drain_fx_requests() {
                         let key = match &request {
+                            PlayerFxRequest::RagdollBlood { .. } => "ragdoll blood".into(),
                             PlayerFxRequest::PowerupLight { .. } => "powerup light".into(),
                             PlayerFxRequest::Effect { name, .. } => name.to_string(),
                             PlayerFxRequest::ForceEffect { name, .. } => name.to_string(),

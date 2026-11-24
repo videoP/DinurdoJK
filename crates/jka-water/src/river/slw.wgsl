@@ -76,23 +76,35 @@ fn river_slw_bilateral(uv_in:vec2<f32>,size:vec2<f32>,depth4:vec4<f32>,mask4:vec
 }
 fn river_slw_uv_distortion(view_normal:vec3<f32>,view_vertex_normal:vec3<f32>,refraction:vec2<f32>,view_to_buffer:vec2<f32>,
     distortion:vec4<f32>,behind_depth:f32,surface_depth:f32)->vec2<f32> {
-    var uv=(view_vertex_normal.xy-view_normal.xy)*(refraction.x-1.0)*view_to_buffer;
+    let uv=(view_vertex_normal.xy-view_normal.xy)*(refraction.x-1.0)*view_to_buffer;
+    return river_slw_scale_distortion(uv,refraction.y,distortion,behind_depth-surface_depth);
+}
+
+// DistortionCommon.ush REFRACTION_USE_INDEX_OF_REFRACTION with the root
+// node override. The view and scene copy have the same size.
+fn river_slw_ior_uv_distortion(view_normal:vec3<f32>,ior:f32,distortion:vec4<f32>,
+    behind_depth:f32,surface_depth:f32)->vec2<f32> {
+    return river_slw_scale_distortion(view_normal.xy*(ior-1.0),0.0,distortion,behind_depth-surface_depth);
+}
+
+fn river_slw_scale_distortion(uv_in:vec2<f32>,depth_bias:f32,distortion:vec4<f32>,depth_gap:f32)->vec2<f32> {
+    var uv=uv_in;
     uv*=distortion.zw*vec2<f32>(0.00023,-0.00023)*vec2<f32>(distortion.x,distortion.y*distortion.x);
-    let bias=-refraction.y;
+    let bias=-depth_bias;
     let range=clamp(abs(bias*0.5),0.0,50.0);
     let inv_width=1.0/max(1.0,range);
-    uv*=saturate((behind_depth-surface_depth)*inv_width+bias);
+    uv*=saturate(depth_gap*inv_width+bias);
     uv*=4.0;
-    return uv*saturate((behind_depth-surface_depth)*1.0/30.0);
+    return uv*saturate(depth_gap*1.0/30.0);
 }
-struct RiverSlwVolume {luminance:vec3<f32>,water_to_scene:vec3<f32>,water_to_scene_to_light:vec3<f32>}
+struct RiverSlwVolume {luminance:vec3<f32>,water_to_scene:vec3<f32>,water_to_scene_to_light:vec3<f32>,in_scattering:vec3<f32>}
 // EvaluateWaterVolumeLighting after its samples; camera above water and the
 // main directional light not separated. Depths/heights in Unreal cm.
 fn river_slw_volume(c:RiverSlwCoefficients,water_surface_depth:f32,behind_depth:f32,behind_luminance:vec3<f32>,
     one_over_pre_exposure:f32,surface_z:f32,behind_z:f32,camera_vector:vec3<f32>,normal:vec3<f32>,ior:f32,
     light_direction:vec3<f32>,sun:vec3<f32>,ambient:vec3<f32>,env_brdf:vec3<f32>,shadow:f32,light_function:vec3<f32>,
     visibility:f32)->RiverSlwVolume {
-    var out=RiverSlwVolume(vec3<f32>(0.0),vec3<f32>(1.0),vec3<f32>(1.0));
+    var out=RiverSlwVolume(vec3<f32>(0.0),vec3<f32>(1.0),vec3<f32>(1.0),vec3<f32>(0.0));
     if !(visibility>0.0) {return out;}
     let depth=max(0.0,behind_depth-water_surface_depth);
     let scattering=max(vec3<f32>(0.0),c.scattering);
@@ -114,6 +126,7 @@ fn river_slw_volume(c:RiverSlwCoefficients,water_surface_depth:f32,behind_depth:
     let amount=saturate(scattering*(1.0-transmittance)/extinction_safe);
     let scattered=incoming*amount*(1.0-env_brdf);
     out.luminance=visibility*(scattered+transmittance*(behind*scale_behind));
+    out.in_scattering=visibility*scattered;
     out.water_to_scene=transmittance;
     out.water_to_scene_to_light=transmittance*mean_to_light;
     return out;

@@ -2,7 +2,7 @@
 use crate::app::egui_settings::{
     quality_table_row, segmented_row, theme, App, PHYS_CCD, PHYS_CLIENT_ENABLED,
     PHYS_CLOTH, PHYS_CLOTH_AIR, PHYS_CLOTH_ANIMATION, PHYS_CLOTH_BODY_COLLISION,
-    PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_BREAKABLES, PHYS_DEBRIS, PHYS_DEBRIS_LIFETIME,
+    PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_DAMPING, PHYS_CLOTH_GPU, PHYS_CLOTH_STIFFENING, PHYS_CLOTH_STIFFNESS, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_BREAKABLES, PHYS_DEBRIS, PHYS_DEBRIS_LIFETIME,
     PHYS_DEBRIS_MAX, PHYS_DEBUG_DRAW, PHYS_DISMEMBERMENT, PHYS_DISMEMBER_LIFETIME,
     PHYS_DISMEMBER_MAX, PHYS_EXPLOSION_IMPULSES, PHYS_FORCE_IMPULSES, PHYS_JIGGLE,
     PHYS_JIGGLE_BREAST, PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z, PHYS_JIGGLE_BREAST_REMESH_TOP_Z, PHYS_HAIR,
@@ -389,6 +389,15 @@ impl App {
             PHYS_CLOTH_BODY_COLLISION,
             self.video.cloth_body_collision,
         );
+        self.egui_physics_toggle(
+            ui,
+            "GPU cloth solver",
+            "Simulate cloth with the gpu-cloth-sim compute solver on the graphics card instead of \
+             the CPU worker, using the same cloth settings below. Needs GPU Ghoul2 skinning; \
+             otherwise the CPU solver runs.",
+            PHYS_CLOTH_GPU,
+            self.video.cloth_solver == 1,
+        );
 
         for (label, tip, field, current, maximum, cvar) in [
             ("Body clearance", "Additional gap between the fabric and the body, in JKA units.",
@@ -399,6 +408,12 @@ impl App {
                 PHYS_CLOTH_TURN, self.video.cloth_turn_response, 4.0, "r_clothTurnResponse"),
             ("Animation influence", "How closely free fabric follows skeletal animation. At 0 it follows its sewn attachments; at 1 it follows the full authored pose.",
                 PHYS_CLOTH_ANIMATION, self.video.cloth_animation_influence, 1.0, "r_clothAnimationInfluence"),
+            ("Stiffness", "Resistance to folding. Low drapes like silk, high behaves like canvas or leather. Above 10 the solver adds iterations, which costs CPU. Changing it restarts active cloth.",
+                PHYS_CLOTH_STIFFNESS, self.video.cloth_stiffness, 100.0, "r_clothStiffness"),
+            ("Damping", "How quickly fabric motion settles. Higher feels heavier; lower keeps swinging. Changing it restarts active cloth.",
+                PHYS_CLOTH_DAMPING, self.video.cloth_damping, 30.0, "r_clothDamping"),
+            ("Fold stiffening", "How much stiffer fabric gets as a fold sharpens. Gentle drape stays soft; hard creases and fold-overs resist. Changing it restarts active cloth.",
+                PHYS_CLOTH_STIFFENING, self.video.cloth_stiffening, 10.0, "r_clothStiffening"),
         ] {
             theme::row(ui, label, tip, theme::Reset::Physics(field), |ui| {
                 let mut value = current;
@@ -572,6 +587,7 @@ impl App {
             PHYS_CLOTH => self.video.cloth_physics = value,
             PHYS_CLOTH_BODY_COLLISION => self.video.cloth_body_collision = value,
             PHYS_CLOTH_WIND => self.video.cloth_wind = value,
+            PHYS_CLOTH_GPU => self.video.cloth_solver = u8::from(value),
             PHYS_PROPS => self.video.physics_props = value,
             PHYS_DEBRIS => self.video.physics_debris = value,
             PHYS_PLAYER_PUSH => self.video.physics_player_push = value,

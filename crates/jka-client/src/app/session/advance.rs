@@ -434,30 +434,56 @@ impl GameSession {
             else { self.current_snapshot.as_ref().map(|snapshot| snapshot.area_mask) },
         );
         let audio_started = Instant::now();
+        let fire_id = if sample_owns_camera && jka_ninja::INCLUDED {
+            crate::ninja_fire_debug::player_id()
+        } else {
+            None
+        };
+        let audio_eye = scene::jka_position(sample.eye_position);
+        let sound = self.sound_presenter.as_ref().filter(|_| !self.suppress_audio);
+        let bsp_audio_enabled = sound.is_some_and(|sound| sound.underwater_enabled());
+        let bsp_eye_wet = (bsp_audio_enabled || fire_id.is_some())
+            && self.player_presenter.audio_listener_in_bsp_water(audio_eye);
+        // OpenJK PM_WaterEvents samples the bottom hull for EV_WATER_TOUCH.
+        // Probe just above the sole and share river occupancy with player fire.
+        let foot = [sample.native_origin[0], sample.native_origin[1], sample.native_origin[2] - 22.0];
+        let river_contact = if sound.is_some() || fire_id.is_some() {
+            crate::river_runtime::listener_water_contact(audio_eye, foot)
+        } else {
+            None
+        };
+        let river_present = crate::river_runtime::audio_rivers_present();
+        self.ninja_fire_river_wet = fire_id.and_then(|id| {
+            if !river_present || sample.teleported || self.seeking_demo {
+                return None;
+            }
+            // Bridge gaps between asynchronous reads only for the same wearer.
+            river_contact.map(|water| (id, sample.client_num, water)).or_else(|| {
+                self.ninja_fire_river_wet.filter(|&(old_id, client, _)| {
+                    old_id == id && client == sample.client_num
+                })
+            })
+        });
+        let fire_river = self.ninja_fire_river_wet.map(|(_, _, water)| water);
+        let fire_submerged = fire_id.is_some()
+            && (bsp_eye_wet || fire_river.is_some_and(|water| water.eye));
+        let bsp_foot_wet = (fire_id.is_some() || (sound.is_some() && river_contact.is_some()))
+            && self.player_presenter.audio_listener_in_bsp_water(foot);
+        let cut_fire_wind = fire_id.is_some() && (fire_submerged || bsp_foot_wet
+            || fire_river.is_some_and(|water| water.foot || water.camera));
         if !self.suppress_audio {
-            let audio_eye = scene::jka_position(sample.eye_position);
-            let sound_present = self.sound_presenter.is_some();
-            let bsp_submerged = self.sound_presenter.as_ref().is_some_and(|s| s.underwater_enabled())
-                && self.player_presenter.audio_listener_in_bsp_water(audio_eye);
-            // OpenJK PM_WaterEvents uses the player's bottom hull (-24) for
-            // EV_WATER_TOUCH, not the ear. Sample just above the sole to
-            // account for the usual ground-plane contact offset.
-            let foot = [sample.native_origin[0], sample.native_origin[1], sample.native_origin[2] - 22.0];
-            let river_contact = sound_present.then(|| crate::river_runtime::listener_water_contact(audio_eye, foot)).flatten();
             let river_submerged = river_contact.is_some_and(|water| water.eye);
-            let bsp_foot_wet = river_contact.is_some() && self.player_presenter.audio_listener_in_bsp_water(foot);
             if let Some(sound) = &mut self.sound_presenter {
-                sound.update_river_foot_contact(river_contact.map(|water| water.foot), bsp_foot_wet,
+                sound.update_river_foot_contact(river_contact.map(|water| water.foot), river_contact.is_some() && bsp_foot_wet,
                     sample.native_origin, sample.client_num as u16,
-                    sample.teleported || self.seeking_demo || sample.following
-                        || !crate::river_runtime::audio_rivers_present());
+                    sample.teleported || self.seeking_demo || sample.following || !river_present);
                 sound.update_loops(
                     &self.client_game,
                     &self.siege_classes,
                     &self.presented_entities,
                     followed_entity.as_ref(),
                     sample.client_num as u16,
-                    scene::jka_position(sample.eye_position),
+                    audio_eye,
                     target_server_time,
                     self.presented_player_state.as_ref(),
                     sample.teleported || self.seeking_demo,
@@ -466,14 +492,14 @@ impl GameSession {
                 sound.frame(
                     crate::audio::Listener {
                         entity: sample.client_num as u16,
-                        origin: scene::jka_position(sample.eye_position),
+                        origin: audio_eye,
                         ahead: [yaw.cos(), yaw.sin(), 0.0],
                         up: [0.0, 0.0, 1.0],
                         left: [-yaw.sin(), yaw.cos(), 0.0],
                     },
                     &self.presented_entities,
                     followed_entity.as_ref(),
-                    bsp_submerged || river_submerged,
+                    (bsp_audio_enabled && bsp_eye_wet) || river_submerged,
                 );
                 // TaystJK CG_Init invokes CG_StartMusic(qfalse) from the
                 // initial CS_MUSIC gamestate. Live sessions previously never
@@ -594,6 +620,7 @@ impl GameSession {
             self.client_perf.event_sound_decode_jobs = 0;
             self.client_perf.event_sound_decode_parallel = false;
         }
+        self.player_presenter.size_skin_gore_hits();
         if !self.logged_entity_summary {
             let summary = self.client_game.summarize_entities();
             devprintln!(
@@ -653,12 +680,24 @@ impl GameSession {
         }
         self.client_perf.events_ms = events_started.elapsed().as_secs_f64() * 1000.0;
 
+        self.weapon_fx.update_local_ninja_blood(followed_entity.as_ref().filter(|_| !sample.following));
+        self.weapon_fx.disturb_ninja_blood(followed_entity.iter().chain(&self.presented_entities));
         self.player_position = Some(glam::Vec3::from_array(sample.player_position));
         // Presentation records, once per entity rather than once per model
         // surface. Explicit identity also covers first/third-person prediction.
         let actors = Arc::make_mut(&mut self.ocean_actors);
         actors.clear();
-        if self.ocean_interaction_enabled || self.lake_wakes_enabled || self.water_wake_mode != 0 {
+        let native_actors = self.ocean_interaction_enabled || self.lake_wakes_enabled || self.water_wake_mode != 0;
+        let fog_requested = crate::ninja_fog_debug::wants_actors();
+        // Shared Ninja wake (river + ocean): cg_waterwake gates it; the ocean
+        // consumes the same skeletal joints as rivers.
+        jka_river::river_ninja::set_wake_enabled(self.water_wake_mode != 0);
+        jka_river::river_ninja::set_ocean_requested(self.ocean_ninja_enabled);
+        let ninja_requested = jka_river::river_ninja::actor_capture_requested()
+            || fog_requested || self.ocean_ninja_enabled;
+        // The followed player owns the player-following Ninja fields (Coast, lake wake).
+        jka_river::river_ninja::set_wake_owner((sample.policy.pm_type < 2).then_some(sample.client_num as u16));
+        if native_actors || ninja_requested {
         if sample.policy.pm_type < 2 && self.presented_player_state.as_ref()
             .is_none_or(|ps| ps.field_i32("m_iVehicleNum").unwrap_or(0) == 0) {
             actors.push(crate::ocean::interaction::ActorSample {
@@ -683,6 +722,64 @@ impl GameSession {
             });
         }
         }
+        // River contact uses packed CG_ClipMoveToEntities shapes. Fog also
+        // accepts presented inline geometry and point tracks for missiles.
+        if ninja_requested {
+            use crate::cgame::EntityPresentationKind;
+            use jka_river::river_ninja::{ActorKind, ActorSample};
+            let records = Arc::make_mut(self.ninja_entities.get_or_insert_with(|| Arc::new(Vec::new())));
+            records.clear();
+            records.extend(actors.iter().map(|a| a.ninja_sample()));
+            for entity in &self.presented_entities {
+                let kind = match entity.presentation_kind() {
+                    EntityPresentationKind::Mover => ActorKind::Mover,
+                    EntityPresentationKind::Missile => ActorKind::Missile,
+                    _ => continue,
+                };
+                let (kind, origin, mins_map, maxs_map) = if entity.state.field_i32("solid").unwrap_or(0) == 0 {
+                    if !fog_requested || kind != ActorKind::Missile { continue; }
+                    (ActorKind::FogMissile, entity.origin, entity.origin, entity.origin)
+                } else {
+                    let native = crate::net::solid_entity_from_state(&entity.state, entity.origin, entity.angles, target_server_time);
+                    match native.clip {
+                        jka_movement::EntityClip::Box { mins, maxs, origin } => (
+                            kind, origin,
+                            std::array::from_fn(|a| origin[a] + mins[a]),
+                            std::array::from_fn(|a| origin[a] + maxs[a]),
+                        ),
+                        jka_movement::EntityClip::InlineModel { index, origin, angles } if fog_requested => {
+                            let Some((mins, maxs)) = self.weapon_fx.inline_model_bounds(index as usize) else { continue };
+                            let axis = crate::cgame::weapon_fx::angles_to_axis(angles);
+                            let half: [f32; 3] = std::array::from_fn(|i| (maxs[i] - mins[i]) * 0.5);
+                            let centre: [f32; 3] = std::array::from_fn(|i| (maxs[i] + mins[i]) * 0.5);
+                            let origin = std::array::from_fn(|i| origin[i] + (0..3).map(|j| axis[j][i] * centre[j]).sum::<f32>());
+                            let extent: [f32; 3] = std::array::from_fn(|i| (0..3).map(|j| axis[j][i].abs() * half[j]).sum());
+                            (ActorKind::FogMover, origin,
+                                std::array::from_fn(|i| origin[i] - extent[i]),
+                                std::array::from_fn(|i| origin[i] + extent[i]))
+                        }
+                        _ => continue,
+                    }
+                };
+                // Nonlinear trajectory delta is not the instantaneous velocity.
+                // Keep it unavailable; the painter can use actual recorded positions.
+                let velocity = match entity.state.field_i32("pos.trType") {
+                    Some(2) => match [entity.state.field_f32("pos.trDelta[0]"), entity.state.field_f32("pos.trDelta[1]"), entity.state.field_f32("pos.trDelta[2]")] {
+                        [Some(x), Some(y), Some(z)] => Some([x, y, z]), _ => None,
+                    },
+                    _ => None,
+                };
+                records.push(ActorSample { id: entity.number, kind,
+                    continuity: entity.state.field_i32("eFlags").unwrap_or(0) & 8,
+                    time_ms: target_server_time, origin_map: origin,
+                    mins_map, maxs_map,
+                    velocity_map_s: velocity, river_bones: None });
+            }
+        } else {
+            self.ninja_entities = None;
+        }
+        // Ninja-only capture must not activate native ocean or river wakes.
+        if !native_actors { actors.clear(); }
         self.update_race_timer(target_server_time);
         // CG_AddLagometerFrameInfo: cg.time - cg.latestSnapshotTime, where the latest
         // snapshot is the newest one received, not just the newest one read.
@@ -789,6 +886,20 @@ impl GameSession {
         );
         self.player_presenter
             .begin_physics_frame(target_server_time);
+        // Rapier and legacy fallback gibs feed the same cg_blood 1 fluid
+        // emitter. Only mode 2 opts in; mode 1 retains its original effects.
+        if self.weapon_fx.blood_gibs_enabled() {
+            let blood = self.player_presenter.physics_gib_blood_samples(target_server_time);
+            self.weapon_fx.bleed_physics_gibs(&blood);
+            let smears = self.player_presenter.physics_gib_smear_samples(target_server_time);
+            self.weapon_fx.smear_physics_gibs(&smears);
+        }
+        // Corpse segments physically displace existing Ninja density, even
+        // with cg_blood 1. Force Grip and living ragdolls are excluded.
+        if self.weapon_fx.blood_mode_enabled() {
+            let smears = self.player_presenter.physics_corpse_smear_samples(target_server_time);
+            self.weapon_fx.smear_physics_corpses(&smears);
+        }
 
         // TaystJK CG_General uses cg.refdef.viewangles for the local E-Web
         // gunner only in first person; snapshot owner angles for everybody else.
@@ -1131,6 +1242,16 @@ impl GameSession {
         }
         self.client_perf.followed_player_ms = followed_started.elapsed().as_secs_f64() * 1000.0;
 
+        // Transfer the evaluated player points into the same actor snapshot
+        // used for hydraulic contacts. Do this before presentation-only ghosts.
+        if let (Some(bones), Some(records)) = (&self.player_presenter.river_ninja_bones, &mut self.ninja_entities) {
+            for record in Arc::make_mut(records) {
+                if record.kind == jka_river::river_ninja::ActorKind::Player {
+                    record.river_bones = bones.get(&record.id).copied();
+                }
+            }
+        }
+
         // `/rGhost`: the reference player is presentation-only and is driven by
         // the live player's own duelTime race clock. It never enters collision,
         // prediction, entity dispatch, audio, events, or server-visible state.
@@ -1214,6 +1335,12 @@ impl GameSession {
                 .map(|(_, hand)| hand)
                 .or_else(|| self.player_presenter.grapple_hand(owner)),
         );
+        if let Some(pose) = &mut self.player_presenter.ninja_fire_pose {
+            if fire_submerged {
+                pose.emitting = false;
+            }
+            pose.suppress_wind = cut_fire_wind;
+        }
         let cosmetics = self.player_presenter.drain_cosmetic_draws();
         if !cosmetics.is_empty() {
             self.entity_presenter.set_material_eye(sphere_view_origin);
@@ -1233,6 +1360,7 @@ impl GameSession {
             .event_presenter
             .view_kick()
             .offset(target_server_time, !render_followed_body);
+        self.player_presenter.finish_saber_gore(target_server_time, &dynamic_models);
         self.dynamic_models = Arc::new(dynamic_models);
         if fx_cpu_trace {
             fx_cpu_times[0] = fx_cpu_stage.elapsed().as_secs_f64() * 1000.0;

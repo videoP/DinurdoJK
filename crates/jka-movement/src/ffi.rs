@@ -40,8 +40,6 @@ unsafe extern "C" {
     pub fn jka_sailing_sea(index: i32, params: *mut f32, waves: *mut f32, max_waves: i32) -> i32;
     #[cfg(test)]
     fn jka_contract(index: i32) -> i32;
-    #[cfg(test)]
-    fn japro_jka_contract(index: i32) -> i32;
     pub fn jka_load_animations(data: *const u8, length: i32) -> i32;
     pub fn jka_movement_error() -> *const c_char;
     pub fn jka_player_new(origin: *const f32, yaw: f32, spectator: i32) -> *mut c_void;
@@ -281,7 +279,6 @@ fn rust_bridge_layout_and_constants_match_original_headers() {
             expected,
             "bridge field {i}"
         );
-        assert_eq!(unsafe { japro_jka_contract(i as i32) }, expected, "JAPRO bridge field {i}");
     }
 }
 // Recursive locking allows a TraceWorld callback to query native BSP collision.

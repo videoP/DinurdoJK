@@ -2,20 +2,20 @@
 use super::{index, int, invalid, range, Result};
 use std::ops::Range;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CollisionNode {
     pub plane: usize,
     /// Negative children encode leaves as -(index + 1), exactly as in RBSP.
     pub children: [i32; 2],
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CollisionLeaf {
     pub cluster: i32,
     pub area: i32,
     pub brushes: Range<usize>,
     pub surfaces: Range<usize>,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CollisionTree {
     pub nodes: Vec<CollisionNode>,
     pub leaves: Vec<CollisionLeaf>,

@@ -21,7 +21,7 @@ pub(in crate::renderer) fn create_fast_world_bind_group(
     sun_aux: &[GpuImage],
     texture_clamp: &[bool],
     fallback_skybox: Option<[usize; 6]>,
-    footprint_marks: &[&GpuImage; 2],
+    footprint_marks: &[&wgpu::TextureView; 2],
     source: &DrawBatch,
     material_buffer: &UniformSlot,
     additive_uniforms: &[UniformSlot; 2],
@@ -159,11 +159,11 @@ pub(in crate::renderer) fn create_fast_world_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 22,
-                resource: wgpu::BindingResource::TextureView(&footprint_marks[0].view),
+                resource: wgpu::BindingResource::TextureView(footprint_marks[0]),
             },
             wgpu::BindGroupEntry {
                 binding: 23,
-                resource: wgpu::BindingResource::TextureView(&footprint_marks[1].view),
+                resource: wgpu::BindingResource::TextureView(footprint_marks[1]),
             },
             wgpu::BindGroupEntry {
                 binding: 24,
@@ -207,7 +207,7 @@ pub(in crate::renderer) fn create_world_bind_group(
     deluxemaps: &[GpuImage],
     texture_clamp: &[bool],
     fallback_skybox: Option<[usize; 6]>,
-    footprint_marks: &[&GpuImage; 2],
+    footprint_marks: &[&wgpu::TextureView; 2],
     reflection_probes: &ReflectionProbeGpuSet,
     source: &DrawBatch,
     material_buffer: &UniformSlot,
@@ -437,11 +437,11 @@ pub(in crate::renderer) fn create_world_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 22,
-                resource: wgpu::BindingResource::TextureView(&footprint_marks[0].view),
+                resource: wgpu::BindingResource::TextureView(footprint_marks[0]),
             },
             wgpu::BindGroupEntry {
                 binding: 23,
-                resource: wgpu::BindingResource::TextureView(&footprint_marks[1].view),
+                resource: wgpu::BindingResource::TextureView(footprint_marks[1]),
             },
             wgpu::BindGroupEntry {
                 binding: 24,
@@ -608,9 +608,7 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
     detail_texture: &GpuImage,
     detail_texture_auto: bool,
     detail_auto_textures: &HashMap<String, GpuImage>,
-    surface_deformation_buffer: &wgpu::Buffer,
-    deformation_field_views: [&wgpu::TextureView; 2],
-    deformation_field_sampler: &wgpu::Sampler,
+    surface_deformation: &crate::surface_deformation::SurfaceDeformationGpu,
     world: &mut WorldGpu,
 ) {
     let WorldGpu {
@@ -631,11 +629,15 @@ pub(in crate::renderer) fn rebuild_world_bind_groups(
     // `world.lightmaps` already contains the selected original or composed pages.
     // Inline BSP models must share those pages with the world so they do not
     // snap back to their authored/daytime lightmaps when relighting completes.
-    let footprint_marks: [&GpuImage; 2] = std::array::from_fn(|slot| {
-        footprint_mark_textures[slot]
+    let footprint_marks = surface_deformation.mark_views(std::array::from_fn(|slot| {
+        &footprint_mark_textures[slot]
             .and_then(|index| textures.get(index))
             .unwrap_or(white)
-    });
+            .view
+    }));
+    let surface_deformation_buffer = surface_deformation.buffer();
+    let deformation_field_views = surface_deformation.field_views();
+    let deformation_field_sampler = surface_deformation.field_sampler();
     // Resolve the cache/sun state once; the per-batch work below then only
     // reads shared wgpu handles and writes its own batch, so it runs on the
     // rayon pool. wgpu bind group creation is thread-safe, and a full rebuild

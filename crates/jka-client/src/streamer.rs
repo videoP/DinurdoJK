@@ -68,6 +68,7 @@ pub fn redact_stream_snapshot(snapshot: &mut UiSnapshot, options: StreamerSettin
     if options.hide_team_chat {
         if matches!(snapshot.chat_mode, crate::ui::ChatMode::Team) && !snapshot.chat_input.is_empty() {
             snapshot.chat_input = CONSOLE_MASK.to_owned();
+            snapshot.chat_cursor = snapshot.chat_input.len();
         }
         // A console command composed for team chat is also private to the stream.
         if is_team_chat_command(&snapshot.console_input) {
@@ -83,6 +84,7 @@ pub fn redact_stream_snapshot(snapshot: &mut UiSnapshot, options: StreamerSettin
     if options.hide_private_messages {
         if matches!(snapshot.chat_mode, crate::ui::ChatMode::Direct(_)) && !snapshot.chat_input.is_empty() {
             snapshot.chat_input = CONSOLE_MASK.to_owned();
+            snapshot.chat_cursor = snapshot.chat_input.len();
         }
         if is_private_message(&snapshot.console_input) {
             snapshot.console_input = CONSOLE_MASK.to_owned();

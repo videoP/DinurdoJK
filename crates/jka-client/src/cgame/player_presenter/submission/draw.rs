@@ -1,7 +1,7 @@
 //! Submission draw.
 use crate::cgame::player_presenter::{
-    blend_for_alpha, gpu_bones_with_heat_sources, skin_glm_surface, skin_surface_timed, specular_alpha, environment_uv,
-    stage_uv_affine, wave_value, Arc, ClothSurfaceFrame, ClothSystem, DynamicModelAlphaMode,
+    blend_for_alpha, cloth::ClothRemesh, gpu_bones_with_heat_sources, skin_glm_surface, skin_surface_timed, specular_alpha, environment_uv,
+    stage_uv_affine, wave_value, Arc, ClothSurfaceFrame, ClothSystem, DynamicModelAlphaMode, GlmSurface,
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, Ghoul2GpuSkinning,
     Ghoul2SkinnedSurface, Ghoul2SkinningMode, GlaAnimation, GlmModel, HashMap, HashSet, Instant,
     JiggleProfile, Matrix3x4, PlayerPresenter, PlayerSurfaceAsset, ResolvedStage, StageFrame,
@@ -246,13 +246,34 @@ impl PlayerPresenter {
             let (bones, heat_bone) = gpu_bones_with_heat_sources(pose, gla);
             let empty_vertices = Arc::new(Vec::new());
 
+            // r_clothSolver 1: the renderer's GPU cloth (gpu-cloth-sim port)
+            // replaces the CPU solver. A cloth surface that also carries jiggle
+            // deformation keeps the whole garment on the CPU path.
+            let gpu_cloth = self.cloth.gpu_tuning().filter(|_| {
+                !jobs.iter().any(|(_, surface, _)| {
+                    Self::cloth_surface_name(glm, surface)
+                        .is_some_and(ClothSystem::is_cloth_surface_name)
+                        && jiggle_profile.is_some_and(|profile| {
+                            profile.affects_surface(lod_index, surface.surface_index)
+                        })
+                })
+            });
+            let gpu_cloth_frame = gpu_cloth.and_then(|tuning| {
+                self.gpu_cloth_frame(
+                    entity_num, model_label, lod_index, &jobs, glm, surface_assets, gla, pose,
+                    &bones, axis, origin, tuning,
+                )
+            });
+
             // Cloth remains a CPU post-skin deformation path. Jiggle stays on
             // GPU whenever its profile fits the four-region vertex payload; only
             // cloth (or an oversized explicit jiggle profile) falls back to CPU.
             let mut deformed_skinned = HashMap::<usize, Ghoul2SkinnedSurface>::new();
             let mut cloth_frames = Vec::<ClothSurfaceFrame>::new();
-            for (_, surface, _) in &jobs {
+            let mut cloth_remeshes = HashMap::<usize, Arc<ClothRemesh>>::new();
+            for (_, surface, gpu_mesh) in &jobs {
                 let cloth_candidate = self.cloth.enabled()
+                    && gpu_cloth.is_none()
                     && Self::cloth_surface_name(glm, surface)
                         .is_some_and(ClothSystem::is_cloth_surface_name);
                 let jiggle_candidate = jiggle_profile.is_some_and(|profile| {
@@ -264,7 +285,13 @@ impl PlayerPresenter {
                     continue;
                 }
 
-                let mut skinned = skin_surface_timed(&mut self.perf, surface, pose)?;
+                // Jiggle deformation indexes the authored vertices, so a
+                // surface carrying both keeps its stock topology.
+                let remesh = (cloth_candidate && !jiggle_candidate)
+                    .then(|| self.cloth_remesh(surface, gpu_mesh))
+                    .flatten();
+                let skin_source: &GlmSurface = remesh.as_deref().map_or(*surface, |r| &r.surface);
+                let mut skinned = skin_surface_timed(&mut self.perf, skin_source, pose)?;
                 if jiggle_candidate {
                     if let (Some(profile), Some(offsets)) =
                         (jiggle_profile, jiggle_offsets.as_deref())
@@ -279,9 +306,13 @@ impl PlayerPresenter {
                     }
                 }
                 if cloth_candidate {
-                    if let Some(frame) = Self::cloth_surface_frame(glm, surface, &skinned, pose) {
+                    if let Some(frame) = Self::cloth_surface_frame(glm, skin_source, &skinned, pose)
+                    {
                         cloth_frames.push(frame);
                     }
+                }
+                if let Some(remesh) = remesh {
+                    cloth_remeshes.insert(surface.surface_index, remesh);
                 }
                 deformed_skinned.insert(surface.surface_index, skinned);
             }
@@ -337,7 +368,58 @@ impl PlayerPresenter {
                 };
                 let overlay_at = draws.len() + 1;
 
+                if let Some(cloth) = gpu_cloth_frame
+                    .as_ref()
+                    .and_then(|(frame, cloth_draws)| {
+                        Some((frame, cloth_draws.get(&surface.surface_index)?))
+                    })
+                {
+                    let (frame, cloth) = cloth;
+                    draws.push(DynamicModelSurface {
+                        geometry_source: crate::renderer::ModelGeometrySource::Ghoul2,
+                        authored_lighting: false,
+                        material_trace: None,
+                        entity_num,
+                        wireframe_class: DynamicWireframeClass::Player,
+                        raster_visible: true, portal_only: false,
+                        vertices: Arc::clone(&empty_vertices),
+                        indices: Arc::clone(&cloth.indices),
+                        lighting_origin: Some(origin),
+                        rt_rigid: None,
+                        rt_skinned_key: self.rt_shadow_casters_enabled.then(|| Arc::clone(&cloth.key)),
+                        ghoul2_gpu: None,
+                        cloth_gpu: Some(crate::renderer::ClothGpuSurface {
+                            frame: Arc::clone(frame),
+                            surface: cloth.ordinal,
+                            color: surface_rgba,
+                            uv_xform: [1.0, 1.0, 0.0, 0.0],
+                            uv_cross: [0.0; 4],
+                            specular: None,
+                        }),
+                        fx_gpu_sprites: None,
+                        authored_glow,
+                        texture,
+                        alpha_mode,
+                    });
+                    if tinted && asset.entity_tint {
+                        Self::push_tint_overlay(&mut draws, overlay_at, asset, rgba[3],
+                            jka_assets::shader::shader_time(stage_seconds, asset.shader_time_offset, asset.shader_clamp_time));
+                    }
+                    if custom_material.is_none() {
+                        Self::push_stage_draws(
+                            &mut draws,
+                            overlay_at,
+                            asset,
+                            rgba[3],
+                            jka_assets::shader::shader_time(stage_seconds, asset.shader_time_offset, asset.shader_clamp_time),
+                            &stage_frame,
+                        );
+                    }
+                    continue;
+                }
+
                 if let Some(skinned) = deformed_skinned.remove(&surface.surface_index) {
+                    let remesh = cloth_remeshes.get(&surface.surface_index);
                     let vertices = Self::cpu_surface_vertices_with_cloth(
                         skinned,
                         cloth_outputs.remove(&surface.surface_index),
@@ -354,14 +436,16 @@ impl PlayerPresenter {
                             wireframe_class: DynamicWireframeClass::Player,
                             raster_visible: true, portal_only: false,
                             vertices: Arc::new(vertices),
-                            indices: Arc::clone(&gpu_mesh.cpu_indices),
+                            indices: Arc::clone(
+                                remesh.map_or(&gpu_mesh.cpu_indices, |r| &r.indices),
+                            ),
                             lighting_origin: Some(origin),
                             rt_rigid: None,
-                            rt_skinned_key: self
-                                .rt_shadow_casters_enabled
-                                .then(|| Arc::clone(&gpu_mesh.base_key)),
+                            rt_skinned_key: self.rt_shadow_casters_enabled.then(|| {
+                                Arc::clone(remesh.map_or(&gpu_mesh.base_key, |r| &r.key))
+                            }),
                             ghoul2_gpu: None,
-                            fx_gpu_sprites: None,
+                            cloth_gpu: None, fx_gpu_sprites: None,
                             authored_glow,
                             texture,
                             alpha_mode,
@@ -401,7 +485,7 @@ impl PlayerPresenter {
                     lighting_origin: Some(origin),
                     rt_rigid: None,
                     rt_skinned_key: self.rt_shadow_casters_enabled.then(|| Arc::clone(draw_key)),
-                    ghoul2_gpu: Some(Ghoul2GpuSkinning { foliage_wind: false,
+                    ghoul2_gpu: Some(Ghoul2GpuSkinning { skin_gore: None, foliage_wind: false,
                         mesh_key: Arc::clone(draw_key),
                         vertices: Arc::clone(draw_vertices),
                         indices: Arc::clone(draw_indices),
@@ -423,7 +507,7 @@ impl PlayerPresenter {
                             .then(|| asset.source_material.clone())
                             .flatten(),
                     }),
-                    fx_gpu_sprites: None,
+                    cloth_gpu: None, fx_gpu_sprites: None,
                     authored_glow,
                     texture,
                     alpha_mode,
@@ -447,20 +531,42 @@ impl PlayerPresenter {
         }
 
         let preview_remesh = self.preview_cpu_remesh && self.jiggle_remesh != Default::default();
+        // Densified cloth topology; jiggle surfaces keep their authored vertices.
+        let cloth_remeshes = jobs
+            .iter()
+            .map(|(_, surface, gpu_mesh)| {
+                let cloth = self.cloth.enabled()
+                    && Self::cloth_surface_name(glm, surface)
+                        .is_some_and(ClothSystem::is_cloth_surface_name)
+                    && !jiggle_profile.is_some_and(|profile| {
+                        profile.affects_surface(lod_index, surface.surface_index)
+                    });
+                cloth.then(|| self.cloth_remesh(surface, gpu_mesh)).flatten()
+            })
+            .collect::<Vec<_>>();
+        let skin_sources = jobs
+            .iter()
+            .zip(&cloth_remeshes)
+            .map(|((_, surface, _), remesh)| remesh.as_deref().map_or(*surface, |r| &r.surface))
+            .collect::<Vec<&GlmSurface>>();
         let used_workers = !preview_remesh && self.skinning_mode == Ghoul2SkinningMode::CpuWorkers && jobs.len() > 1;
         let mut skinned = if used_workers {
             let started = Instant::now();
             let results = self.skinning_pool.install(|| {
-                jobs.par_iter()
-                    .map(|(_, surface, _)| skin_glm_surface(surface, pose))
+                skin_sources
+                    .par_iter()
+                    .map(|surface| skin_glm_surface(surface, pose))
                     .collect::<Vec<_>>()
             });
             self.perf.skin_ms += started.elapsed().as_secs_f64() * 1000.0;
             results
         } else {
             jobs.iter()
-                .map(|(_, surface, mesh)| {
-                    if preview_remesh && mesh.key != mesh.base_key {
+                .zip(&cloth_remeshes)
+                .map(|((_, surface, mesh), remesh)| {
+                    if let Some(remesh) = remesh {
+                        skin_surface_timed(&mut self.perf, &remesh.surface, pose)
+                    } else if preview_remesh && mesh.key != mesh.base_key {
                         skin_profile_promoted_mesh(surface.surface_index, mesh, pose)
                     } else {
                         skin_surface_timed(&mut self.perf, surface, pose)
@@ -493,9 +599,10 @@ impl PlayerPresenter {
         }
 
         let cloth_frames = if self.cloth.enabled() {
-            jobs.iter()
+            skin_sources
+                .iter()
                 .zip(skinned.iter())
-                .filter_map(|((_, surface, _), skinned)| {
+                .filter_map(|(surface, skinned)| {
                     let skinned = skinned.as_ref().ok()?;
                     Self::cloth_surface_frame(glm, surface, skinned, pose)
                 })
@@ -517,7 +624,9 @@ impl PlayerPresenter {
         );
 
         let mut draws = Vec::with_capacity(jobs.len());
-        for ((asset, surface, gpu_mesh), skinned) in jobs.into_iter().zip(skinned) {
+        for (((asset, surface, gpu_mesh), skinned), remesh) in
+            jobs.into_iter().zip(skinned).zip(&cloth_remeshes)
+        {
             let skinned = skinned?;
             let surface_rgba = if custom_material.is_none() && asset.fallback_gray {
                 [0.58, 0.58, 0.58, rgba[3]]
@@ -540,7 +649,9 @@ impl PlayerPresenter {
                 origin,
                 surface_rgba,
             );
-            let draw_indices = if preview_remesh && gpu_mesh.key != gpu_mesh.base_key {
+            let draw_indices = if let Some(remesh) = remesh {
+                &remesh.indices
+            } else if preview_remesh && gpu_mesh.key != gpu_mesh.base_key {
                 &gpu_mesh.indices
             } else {
                 &gpu_mesh.cpu_indices
@@ -572,11 +683,11 @@ impl PlayerPresenter {
                 indices: Arc::clone(draw_indices),
                 lighting_origin: Some(origin),
                 rt_rigid: None,
-                rt_skinned_key: self
-                    .rt_shadow_casters_enabled
-                    .then(|| Arc::clone(&gpu_mesh.base_key)),
+                rt_skinned_key: self.rt_shadow_casters_enabled.then(|| {
+                    Arc::clone(remesh.as_ref().map_or(&gpu_mesh.base_key, |r| &r.key))
+                }),
                 ghoul2_gpu: None,
-                fx_gpu_sprites: None,
+                cloth_gpu: None, fx_gpu_sprites: None,
                 authored_glow,
                 texture,
                 alpha_mode,
@@ -688,6 +799,13 @@ impl PlayerPresenter {
             skin.uv_cross = cross;
             skin.specular = specular;
             skin.env_map = stage.env_map;
+        } else if let Some(cloth) = surface.cloth_gpu.as_mut() {
+            // GPU cloth evaluates colour/UV/specular in its output pass, like
+            // ghoul2_skin_compute.wgsl (no environment mapping there either).
+            cloth.color = color;
+            cloth.uv_xform = xform;
+            cloth.uv_cross = cross;
+            cloth.specular = specular;
         } else {
             surface.vertices = Arc::new(
                 surface
@@ -775,7 +893,7 @@ impl PlayerPresenter {
         bulge_height: Option<f32>,
         env_map: Option<bool>,
     ) -> DynamicModelSurface {
-        let ghoul2_gpu = surface.ghoul2_gpu.as_ref().map(|skin| Ghoul2GpuSkinning { foliage_wind: skin.foliage_wind,
+        let ghoul2_gpu = surface.ghoul2_gpu.as_ref().map(|skin| Ghoul2GpuSkinning { skin_gore: None, foliage_wind: skin.foliage_wind,
             mesh_key: Arc::clone(&skin.mesh_key),
             vertices: Arc::clone(&skin.vertices),
             indices: Arc::clone(&skin.indices),
@@ -794,7 +912,13 @@ impl PlayerPresenter {
             // customShader), so it keeps none of the base one's VMT lighting.
             source_material: None,
         });
-        let vertices = if ghoul2_gpu.is_some() {
+        let cloth_gpu = surface.cloth_gpu.as_ref().map(|cloth| crate::renderer::ClothGpuSurface {
+            color,
+            uv_xform: uv_xform.map_or(cloth.uv_xform, |m| [m[0], m[3], m[4], m[5]]),
+            uv_cross: uv_xform.map_or(cloth.uv_cross, |m| [m[2], m[1], 0.0, 0.0]),
+            ..cloth.clone()
+        });
+        let vertices = if ghoul2_gpu.is_some() || cloth_gpu.is_some() {
             Arc::clone(&surface.vertices)
         } else {
             Arc::new(
@@ -828,7 +952,7 @@ impl PlayerPresenter {
             rt_rigid: surface.rt_rigid.clone(),
             rt_skinned_key: surface.rt_skinned_key.as_ref().map(Arc::clone),
             ghoul2_gpu,
-            fx_gpu_sprites: None,
+            cloth_gpu, fx_gpu_sprites: None,
             authored_glow: surface.authored_glow,
             texture,
             alpha_mode,

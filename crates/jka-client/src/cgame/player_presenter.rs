@@ -4,7 +4,7 @@ mod swim_tilt;
 mod swing_transition;
 pub(crate) use swing_transition::{animation_blend_enabled, set_animation_blend, saber_swing_fix, set_saber_swing_fix, jk2_angle_debug, set_jk2_angle_debug};
 mod move_lean;
-mod source_vtf;
+pub(crate) mod source_vtf;
 mod assets;
 pub(crate) use assets::types::EMOTE_GROUND_SHIFT_MAX;
 mod attachments;
@@ -231,7 +231,7 @@ pub struct PlayerPresenter {
     /// Opt-in CG_Trace for ground footfalls (no changes to movement prediction).
     footstep_trace: bool,
     /// Rebuilt for JK2's native CG_Trace footsteps, or JKA's optional A/B.
-    footstep_solids: Vec<crate::net::SolidEntity>,
+    presentation_solids: Vec<crate::net::SolidEntity>,
     /// This frame's footfalls that found ground (drained by the caller).
     footsteps: Vec<FootstepImpact>,
     /// This frame's JK2 footfalls (`CG_FootStep`): sound only, no dust or prints.
@@ -275,6 +275,8 @@ pub struct PlayerPresenter {
     /// What the viewer's model was told to play and the lerp frames it is on, for
     /// the `hitchmark` recorder.
     viewer_anim_debug: Option<ViewerAnimDebug>,
+    pub(crate) river_ninja_bones: Option<HashMap<u16, [Option<jka_river::river_ninja::RiverBone>; jka_river::river_ninja::RIVER_BONE_COUNT]>>,
+    pub(crate) ninja_fire_pose: Option<crate::ninja_fire_debug::PlayerPose>,
     /// jaPRO client options (`cg_stylePlayer`, cosmetics switches).
     japro: crate::japro_cg::JaproCgame,
     /// The viewer's state as `CG_Player` reads it to cull and restyle others.
@@ -340,8 +342,14 @@ pub struct PlayerPresenter {
     disintegration_smoke_last: HashMap<u16, i32>,
     /// `cg_ghoul2Marks`: burn marks kept per model (0 disables them).
     gore_limit: usize,
+    /// 0 off / 1 legacy / 2 upstream SkinGore damage maps.
+    skin_gore_enabled: bool,
+    skin_gore: crate::cgame::skin_gore::SkinGoreMaps,
     gore: Vec<super::player_gore::Gore>,
     pending_gore: Vec<super::player_gore::PendingGore>,
+    skin_gore_pains: Vec<(u16, i32, i32)>,
+    saber_gore_hits: HashMap<u16, bodies::gore::SaberGoreHit>,
+    saber_gore_blades: Vec<bodies::gore::SaberGoreBlade>,
     gore_next_id: u32,
     /// GPU-skinned body surfaces of each player's last presented frame.
     last_gpu: HashMap<u16, Vec<super::player_gore::GpuSnap>>,
@@ -399,6 +407,13 @@ pub struct PlayerPresenter {
     cloth: AsyncClothSystem,
     cloth_weather_wind: Option<crate::ocean::AtmosphericWind>,
     cloth_body_templates: HashMap<(String, usize, Vec<usize>), Vec<(usize, ClothCapsule)>>,
+    /// Densified cloth topology per authored GLM surface, keyed by the
+    /// surface's base mesh key (model path, LOD, surface, sidedness, shape).
+    /// `None` records a surface that is already fine enough.
+    cloth_remeshes: HashMap<Arc<str>, Option<Arc<cloth::ClothRemesh>>>,
+    /// r_clothSolver 1: static garments for the renderer's GPU cloth, keyed
+    /// by model/LOD/surface set and built once off the render thread.
+    cloth_gpu_garments: HashMap<Arc<str>, cloth::ClothGpuGarmentSlot>,
     /// Broadsword-compatible presentation seam backed by Rapier.
     ragdolls: RagdollWorld,
     /// Vanilla entityState does not transmit forceGripEntityNum. Preserve the

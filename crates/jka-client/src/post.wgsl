@@ -138,6 +138,9 @@ fn scene(uv: vec2<f32>) -> vec3<f32> {
 // BLUE_WATER_DISPLAY_LIBRARY
 
 fn display_mapping(color: vec3<f32>) -> vec3<f32> {
+    if (settings.color.y == 5.0) {
+        return ninja_demo_film(color);
+    }
     if (settings.color.y > 3.5) {
         return bw_agx(bw_display_grade(color, 1.0));
     }
@@ -440,54 +443,60 @@ fn ssr_receiver_at_pixel(pixel: vec2<i32>) -> bool {
     return textureLoad(reflection_policy_texture, clamp(pixel, vec2<i32>(0), maximum), 0).r >= 0.5;
 }
 
-fn apply_legacy1_global_fog(
-    color: vec3<f32>,
-    uv: vec2<f32>,
-    pixel: vec2<i32>,
-    radial_depth: f32
-) -> vec3<f32> {
-    let scale = settings.taa_params.w;
+// OpenJK BSP global fog (brushNum -1), drawn inside the scene pass after every
+// world stage and depth-writing entity and before non-depth-writing entity FX
+// (saber blades, sprites), which OpenJK never fogs: they have no fog pass. The
+// amount comes from the linear-depth/policy prepass; fixed-function SrcAlpha /
+// OneMinusSrcAlpha blending applies it without reading the scene attachment.
+// settings.taa_params.w is the strength scale, negative for r_drawfog 2 EXP2.
+fn legacy_global_fog_amount(position: vec2<f32>) -> f32 {
+    let scale = abs(settings.taa_params.w);
     let depth_for_opaque = settings.legacy_fog.w;
     if (scale <= 0.0 || depth_for_opaque <= 0.001) {
-        return color;
+        return 0.0;
     }
-    // The native ocean writes depth after the linear/policy prepass. Use its
-    // completed scene depth, so open sea takes fog and a submerged receiver
-    // does not incorrectly set the fog distance to the seabed.
-    let dims = vec2<i32>(textureDimensions(ssr_visibility_texture));
-    let p = clamp(vec2<i32>(uv * vec2<f32>(dims)), vec2<i32>(0), dims - 1);
-    let scene_depth = textureLoad(ssr_visibility_texture, p, 0).r;
-    var fog_depth = radial_depth;
-    var late_receiver = false;
-    if scene_depth > 0.0 {
-        let point = settings.inv_view_proj * vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, scene_depth, 1.0);
-        let actual = distance(point.xyz / point.w, settings.camera_pos_time.xyz);
-        late_receiver = !valid_depth(radial_depth) || actual + max(0.5, radial_depth * 0.005) < radial_depth;
-        if late_receiver { fog_depth = actual; }
+    let dims = textureDimensions(linear_depth_texture);
+    let pixel = clamp(
+        vec2<i32>(position),
+        vec2<i32>(0),
+        vec2<i32>(i32(dims.x) - 1, i32(dims.y) - 1)
+    );
+    let radial_depth = depth_at_pixel(pixel);
+    // Bit 1: the frontmost opaque surface takes global fog. The prepass writes
+    // it for fogged BSP surfaces (not q3map_nofog/sky) and for every
+    // depth-writing entity, which OpenJK assigns the world's global fog.
+    // Empty pixels beyond distanceCull already hold the fog-coloured clear.
+    if (!valid_depth(radial_depth) || (policy_bits(pixel) & 2u) == 0u) {
+        return 0.0;
     }
-    if !valid_depth(fog_depth) { return color; }
-    // Bit 1 says the frontmost opaque surface participates in global fog. The
-    // prepass writes it for fogged BSP surfaces (not q3map_nofog/sky) and for
-    // every depth-writing entity, which OpenJK assigns the world's global fog.
-    // radial_depth already is that surface's own depth, entity or BSP.
-    if ((policy_bits(pixel) & 2u) == 0u && !late_receiver) {
-        return color;
-    }
-
+    let uv = (vec2<f32>(pixel) + vec2<f32>(0.5)) / vec2<f32>(f32(dims.x), f32(dims.y));
     let ray = world_ray(uv);
     let camera_forward = world_ray(vec2<f32>(0.5));
-    let forward_distance = fog_depth * max(dot(ray, camera_forward), 0.0);
-    let amount = openjk_global_fog_alpha(
-        (forward_distance / depth_for_opaque) * scale
-    );
+    // GL fog uses eye-plane depth, not radial distance.
+    let forward_normalized = radial_depth * max(dot(ray, camera_forward), 0.0)
+        / depth_for_opaque * scale;
+    if (settings.taa_params.w < 0.0) {
+        // r_drawfog 2: GL_EXP2 with density logtestExp2 / depthForOpaque,
+        // i.e. transmittance 1/255 at depthForOpaque.
+        return clamp(1.0 - exp(-5.5412635 * forward_normalized * forward_normalized), 0.0, 1.0);
+    }
+    // r_drawfog 1: RB_FogPass' filtered *fog texture.
+    return openjk_global_fog_alpha(forward_normalized);
+}
 
-    // OpenJK's RB_FogPass blended into the legacy gamma-encoded LDR
-    // framebuffer. WGPU sRGB attachments blend in linear space, which made
-    // the same alpha look much denser in dark interiors. Emulate that old
-    // framebuffer blend explicitly, then return to linear for the sRGB target.
-    let encoded_scene = linear_to_srgb(color);
-    let encoded_fog = clamp(settings.legacy_fog.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
-    return srgb_to_linear(mix(encoded_scene, encoded_fog, amount));
+// sRGB scene: drawn through the UNORM alias, so the blend runs on the stored
+// display-space values exactly like OpenJK's LDR framebuffer.
+@fragment
+fn fs_legacy_global_fog_encoded(input: VertexOut) -> @location(0) vec4<f32> {
+    let color = clamp(settings.legacy_fog.rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(color, legacy_global_fog_amount(input.position.xy));
+}
+
+// Float scene: no display-space alias exists, so blend in linear space.
+@fragment
+fn fs_legacy_global_fog_linear(input: VertexOut) -> @location(0) vec4<f32> {
+    let color = srgb_to_linear(clamp(settings.legacy_fog.rgb, vec3<f32>(0.0), vec3<f32>(1.0)));
+    return vec4<f32>(color, legacy_global_fog_amount(input.position.xy));
 }
 
 fn camera_motion_blur(uv: vec2<f32>, color: vec3<f32>, depth: f32) -> vec3<f32> {
@@ -556,7 +565,12 @@ fn depth_of_field(uv: vec2<f32>, color: vec3<f32>, depth: f32) -> vec3<f32> {
     // five bilinear samples for modest blur, nine only when wide CoC would
     // otherwise reveal the sample spacing.
     let texel_y = 1.0 / max(settings.aa.z, 1.0);
-    let center = textureSample(dof_horizontal_texture, scene_sampler, uv).rgb;
+    // A dry river eye skips the horizontal draw, leaving zero alpha.
+    let horizontal = textureSample(dof_horizontal_texture, scene_sampler, uv);
+    if (horizontal.a < 0.5) {
+        return color;
+    }
+    let center = horizontal.rgb;
     var blurred: vec3<f32>;
     if (dof_use_high_quality(radius)) {
         let scale = radius / 7.30294072;
@@ -3156,7 +3170,6 @@ const POST_FEATURE_WEATHER_AIR: u32 = 32u;
 const POST_FEATURE_BLOOM: u32 = 64u;
 const POST_FEATURE_HALATION: u32 = 128u;
 const POST_FEATURE_NIGHT: u32 = 256u;
-const POST_FEATURE_LEGACY1_FOG: u32 = 512u;
 const POST_FEATURE_REFLECTION_DEBUG: u32 = 1024u;
 
 fn post_feature(bit: u32) -> bool {
@@ -3236,7 +3249,9 @@ fn full_post_common(input: VertexOut) -> vec4<f32> {
         color = apply_legacy_weather_air(color, input.uv, centre_depth);
     }
 
-    if (post_feature(POST_FEATURE_BLOOM) && bloom_enabled) {
+    if (settings.color.y == 5.0) {
+        color += textureSampleLevel(bloom_half_texture, scene_sampler, input.uv, 0.0).rgb;
+    } else if (post_feature(POST_FEATURE_BLOOM) && bloom_enabled) {
         let levels = bloom_levels(input.uv);
         // Rain scatters light: lamps and signs bloom wider in wet air.
         color += bloom_color(levels) * (0.32 * (1.0 + 0.6 * settings.weather_look.y));
@@ -3255,9 +3270,6 @@ fn full_post_common(input: VertexOut) -> vec4<f32> {
     color *= exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
     color = display_mapping(color);
 
-    if (post_feature(POST_FEATURE_LEGACY1_FOG)) {
-        color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
-    }
     color = output_gamma_color(color, gamma);
     color = purple_fringe_color(input.uv, color);
     color = apply_rain_grade(color, settings.weather_look.y);
@@ -3269,7 +3281,7 @@ fn full_post_common(input: VertexOut) -> vec4<f32> {
     color = film_grain(color, input.uv);
     // Final framebuffer overbright after all color transforms, as in #1349.
     color = post_overbright_gain(color);
-    if (settings.taa_params.x < 0.5) {
+    if (abs(settings.color.y - 3.0) > 0.25) {
         color = output_dither_srgb8(color, input.position.xy);
     }
     return vec4<f32>(color, 1.0);
@@ -3339,7 +3351,7 @@ fn fs_rain_only(input: VertexOut) -> @location(0) vec4<f32> {
         color *= 1.0 - edge * 0.28;
     }
     color = post_overbright_gain(color);
-    if (settings.taa_params.x < 0.5) {
+    if (abs(settings.color.y - 3.0) > 0.25) {
         color = output_dither_srgb8(color, input.position.xy);
     }
     return vec4<f32>(color, 1.0);
@@ -3417,7 +3429,9 @@ fn taa_post_common(input: VertexOut) -> TaaFragmentOut {
     color = render_clouds(color, input.uv);
     color = apply_legacy_weather_air(color, input.uv, centre_depth);
 
-    if (bloom_enabled) {
+    if (settings.color.y == 5.0) {
+        color += textureSampleLevel(bloom_half_texture, scene_sampler, input.uv, 0.0).rgb;
+    } else if (bloom_enabled) {
         let levels = bloom_levels(input.uv);
         // Rain scatters light: lamps and signs bloom wider in wet air.
         color += bloom_color(levels) * (0.32 * (1.0 + 0.6 * settings.weather_look.y));
@@ -3434,7 +3448,6 @@ fn taa_post_common(input: VertexOut) -> TaaFragmentOut {
     color *= exp2(settings.grain.w + (auto_exposure_state.exposure_ev * settings.exposure_controls.x));
     color = display_mapping(color);
 
-    color = apply_legacy1_global_fog(color, input.uv, pixel, centre_depth);
     color = output_gamma_color(color, gamma);
     color = purple_fringe_color(input.uv, color);
     color = apply_rain_grade(color, settings.weather_look.y);
@@ -3446,10 +3459,11 @@ fn taa_post_common(input: VertexOut) -> TaaFragmentOut {
     color = film_grain(color, input.uv);
     color = post_overbright_gain(color);
     var out: TaaFragmentOut;
-    // Dither LDR presentation only. HDR already preserved the fog gradient,
+    // Dither every SDR presentation (an Rgba16Float scene still quantizes at
+    // the 8-bit swapchain; only native HDR output, tone_mapping 3, skips it),
     // while temporal history must always stay free of the ordered pattern.
     var display_color = color;
-    if (settings.taa_params.x < 0.5) {
+    if (abs(settings.color.y - 3.0) > 0.25) {
         display_color = output_dither_srgb8(color, input.position.xy);
     }
     out.display = vec4<f32>(display_color, 1.0);

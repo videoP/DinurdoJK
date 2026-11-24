@@ -44,21 +44,23 @@ fn river_map_radiance(d:vec3<f32>,roughness:f32)->vec3<f32> {
     let fluid = river_live_field(sim_grid, input.uv);
     let masks = river_surface_masks(fluid.y, 1.0, input.uv, vec2<f32>(textureDimensions(sim_grid, 0)), 1.0, pixel_depth, 3.0e38);
 
-    // Primary foam and the detail-normal graph, both before the clip: their
-    // advected samples take fragment derivatives. Without the foam detail
-    // resource foam is absent (not substituted): zero total and opacity.
+    // The detail-normal graph, before the clip: its advected samples take
+    // fragment derivatives. Primary foam is zero (Fluid Ninja owns foam).
     let world_xy = input.world.xy;
     let time = river_view.time.x;
-    var foam = RiverFoam(vec3<f32>(0.0, 0.0, 1.0), 0.0, 0.0, 0.0, 0.0, vec3<f32>(0.0));
-    if river_view.time.y > 0.5 {
-        foam = river_live_grid_foam_lod(sim_grid, normals_rt, normal_sampler, foam_rt, foam_rt_sampler, foam_detail, foam_detail_sampler,
-            input.uv, world_xy, time, river_foam_advection(), river_foam_settings(), river_view.material_lod.xy);
-    }
+    let ninja_on = body.origin.w > 0.5;
+    let foam = RiverFoam(vec3<f32>(0.0, 0.0, 1.0), 0.0, 0.0, 0.0, 0.0, vec3<f32>(0.0));
     // FoamOpacity 1 (live instance); the normal gate takes the simulation mask.
-    let graph_normal = river_live_grid_normal_lod(sim_grid, normals_rt, normal_sampler, ocean_detail, ocean_sampler, input.uv, world_xy, time,
+    var graph_normal = river_live_grid_normal_lod(sim_grid, normals_rt, normal_sampler, ocean_detail, ocean_sampler, input.uv, world_xy, time,
         river_motion(river_view.time.z), river_wpo_advection(), river_detail_advection(), river_wave_height(),
         foam.normal, foam.total, river_foam_settings().shading.x, masks.simulation_mask, river_view.material_lod.xy);
-    if masks.material_mask < 0.3333 {
+    // Same FNL evaluation as the base pass (same field, same clock).
+    river_ninja = RiverNinjaSurface(0.0, vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0), 0.0, 0.0, 0.0, 1.0);
+    if ninja_on {
+        river_ninja = ninja_river_shade(input.uv, input.world, eye, pixel_depth, river_view.right.w, select(-1.0, 1.0, front));
+        graph_normal = river_ninja_world_normal(graph_normal, river_ninja.normal);
+    }
+    if masks.material_mask < 0.3333 || (ninja_on && river_view.ninja_debug.x == 5u) {
         discard;
     }
     let reflection = river_composite_pass(input.clip, input.world, front, graph_normal, foam, pixel_depth, slope);
@@ -79,8 +81,11 @@ fn river_composite_pass(clip: vec4<f32>, world: vec3<f32>, front: bool, graph_no
     let p = river_slw_parameters();
     let surface = river_slw_surface(p, n_dot_v, two_sided_sign, pixel_depth);
     // WaterAttributes, Water_Underside, then MF_ShallowWaterRiver's foam lerps.
-    let attributes = river_foam_attributes(
+    var attributes = river_foam_attributes(
         RiverFoamAttributes(surface.base_color, surface.roughness, surface.specular, surface.opacity), foam, river_foam_settings());
+    if river_ninja.enabled > 0.5 {
+        attributes = river_ninja_attributes(n_dot_v, p.fresnel.x);
+    }
     // The foam scattering only enters through WaterInfo velocity, which is
     // zero for spline-less (simulation-first) rivers.
 

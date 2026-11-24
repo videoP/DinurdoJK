@@ -347,6 +347,8 @@ pub struct Shader {
     /// TaystJK alphaGen portal range, also used by RB_RenderFlare as sprite radius.
     pub portal_range: Option<f32>,
     pub sky: bool,
+    /// A `skyParms` directive selects the runtime sky pass independently of `surfaceparm sky`.
+    pub sky_parms: bool,
     pub sky_box: Option<String>,
     /// `skyParms <outerbox> <cloudheight> <innerbox>`: height of the cloud layer
     /// that the shader's own stages are projected onto. Zero means the shader
@@ -419,8 +421,21 @@ pub struct Shader {
     pub auto_sprite: bool,
     /// `deformVertexes autoSprite2`: billboard rectangular quads about their long axis.
     pub auto_sprite2: bool,
+    /// DinurdoJK `q3map_dinurdoPromoted <system> [<shader>|none]`. While the
+    /// named promotion system is active, world surfaces using this shader draw
+    /// `target` instead, or nothing when `target` is None. Stock renderers and
+    /// q3map2 skip any `q3map*` line, so the directive is compatible.
+    pub promotion_overrides: Vec<PromotionOverride>,
     pub stages: Vec<Stage>,
     pub unsupported: Vec<String>,
+}
+
+/// One `q3map_dinurdoPromoted` line. `system` is lowercase; `target` is the
+/// authored replacement shader name, or None to hide the surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotionOverride {
+    pub system: String,
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1305,6 +1320,7 @@ fn parse_tokens_strict(tokens: &[String]) -> Result<BTreeMap<String, Shader>, St
                     },
                     "skyparms" => {
                         shader.sky = true;
+                        shader.sky_parms = true;
                         if first != "-" {
                             shader.sky_box = Some(first);
                         }
@@ -1346,6 +1362,14 @@ fn parse_tokens_strict(tokens: &[String]) -> Result<BTreeMap<String, Shader>, St
                             .filter(|value| value.is_finite() && *value > 0.0);
                     }
                     "q3map_nofog" => shader.no_fog = true,
+                    "q3map_dinurdopromoted" if !first.is_empty() => {
+                        // A second token other than `none`/`-` is the
+                        // replacement shader; keep its authored spelling.
+                        let target = args.get(1).filter(|name| {
+                            !name.eq_ignore_ascii_case("none") && name.as_str() != "-"
+                        }).cloned();
+                        shader.promotion_overrides.push(PromotionOverride { system: first, target });
+                    }
                     "noglfog" => shader.no_gl_fog = true,
                     "nomipmaps" => { shader.no_mipmaps = true; shader.no_picmip = true; },
                     "nopicmip" => shader.no_picmip = true,

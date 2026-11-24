@@ -1235,6 +1235,12 @@ fn label_default_channel() -> egui::Id {
     egui::Id::new("jka_row_label_default")
 }
 
+/// Whether the current settings-row label was double-clicked. Only valid
+/// while the row's control closure executes; `row_inner` clears this after.
+pub(super) fn row_label_double_clicked(ui: &egui::Ui) -> bool {
+    ui.ctx().data(|data| data.get_temp::<bool>(label_default_channel())).unwrap_or(false)
+}
+
 /// Width available to a meter or slider track inside a control column.
 pub(super) fn track_width(ui: &egui::Ui) -> f32 {
     (ui.available_width() - VALUE_W).clamp(120.0, 320.0)

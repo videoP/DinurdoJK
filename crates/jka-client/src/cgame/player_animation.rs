@@ -89,6 +89,9 @@ pub struct PlayerAnimationState {
     frames_seen: bool,
     /// The legs bone frames `CG_TriggerAnimSounds` compared on the last update.
     legs_step: Option<LegsFrameStep>,
+    // ET_BODY is CG_General in MVSDK, not CG_PlayerAnimation. Remember
+    // which one-shot corpse range was installed on this Ghoul2 instance.
+    jk2_body_animation: Option<i32>,
 }
 
 /// The legs bone went from `old_frame` to `frame` while playing `anim`.
@@ -135,6 +138,7 @@ impl PlayerAnimationState {
             no_lumbar: Ghoul2Animator::bone_index(gla, "lower_lumbar").is_none(),
             frames_seen: false,
             legs_step: None,
+            jk2_body_animation: None,
         }
     }
 
@@ -294,6 +298,53 @@ impl PlayerAnimationState {
         Ok(())
     }
 
+    /// MVSDK CG_BodyQueueCopy: continue at the copied client's last dead
+    /// torso frame + 1, then freeze at the authored end. When no source pose
+    /// is available, use the terminal frame (MVSDK's out-of-range fallback).
+    /// Never run the ordinary player lerp-frame state machine on this body:
+    /// CopyToBodyQue clears ANIM_TOGGLEBIT and copies legsAnim to torsoAnim.
+    pub fn update_jk2_body(
+        &mut self,
+        version: u8,
+        animation_id: i32,
+        animations: &AnimationSet,
+        gla: &GlaAnimation,
+        current_time: i32,
+        copied_dead_source: bool,
+    ) -> Result<(), String> {
+        if self.jk2_body_animation == Some(animation_id) {
+            return Ok(());
+        }
+        let anim = animations.get(animation_id)
+            .ok_or_else(|| format!("Bad JK2 corpse animation {animation_id}"))?;
+        let first = i32::from(anim.first_frame);
+        let end = first + i32::from(anim.num_frames);
+        if end <= first || anim.frame_lerp == 0 {
+            return Err(format!("Empty JK2 corpse animation {animation_id}"));
+        }
+        let source_frame = (copied_dead_source && self.torso.has_animation)
+            .then_some(self.torso.frame);
+        let start = jk2_body_start_frame(first, end, source_frame);
+        let speed = 50.0 / f32::from(anim.frame_lerp);
+        // MVSDK uses upper_lumbar, model_root and Motion even in 1.04.
+        // This animator also has the separate lower_lumbar channel installed
+        // by the 1.04 player path; replace it too so it cannot override the
+        // copied death range with an old independent torso animation.
+        for bone in ["upper_lumbar", "model_root", "Motion"] {
+            if Ghoul2Animator::bone_index(gla, bone).is_some() {
+                self.animator.set_bone_anim(gla, bone, start, end,
+                    BONE_ANIM_OVERRIDE_FREEZE, speed, current_time, None, 150)?;
+            }
+        }
+        if version != 2 && Ghoul2Animator::bone_index(gla, "lower_lumbar").is_some() {
+            self.animator.set_bone_anim(gla, "lower_lumbar", start, end,
+                BONE_ANIM_OVERRIDE_FREEZE, speed, current_time, None, 150)?;
+        }
+        self.legs_step = None;
+        self.jk2_body_animation = Some(animation_id);
+        Ok(())
+    }
+
     pub fn evaluate_pose_openjk_root(
         &mut self,
         gla: &GlaAnimation,
@@ -310,6 +361,7 @@ impl PlayerAnimationState {
     pub fn reset_player_entity(&mut self) {
         self.frames_seen = false;
         self.legs_step = None;
+        self.jk2_body_animation = None;
         self.legs = LerpFrameState::default();
         self.torso = LerpFrameState::default();
         self.animator.clear_bone_angle_overrides();
@@ -705,6 +757,14 @@ fn refresh_lerp_frames_from_ghoul2(
     Ok(())
 }
 
+fn jk2_body_start_frame(first: i32, end: i32, source_frame: Option<i32>) -> i32 {
+    let next = source_frame.map_or(end - 1, |frame| frame.saturating_add(1));
+    // Upstream clamps at end - 1 and falls back to it if the source frame
+    // is from the wrong clip. Clamp the firstFrame - 1 edge to a valid GLA
+    // frame rather than sampling the preceding animation.
+    if next < first - 1 { end - 1 } else { next.clamp(first, end - 1) }
+}
+
 /// MVSDK installs torso-only animations on `upper_lumbar` for 1.02 clients
 /// and `lower_lumbar` for 1.03/1.04 (`ci->jk2gameplay == VERSION_1_02`).
 fn jk2_torso_bone(version: u8) -> &'static str {
@@ -993,6 +1053,14 @@ fn field_i32(entity: &EntityState, name: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jk2_body_handoff_never_restarts_completed_death() {
+        assert_eq!(jk2_body_start_frame(100, 120, Some(119)), 119);
+        assert_eq!(jk2_body_start_frame(100, 120, Some(109)), 110);
+        assert_eq!(jk2_body_start_frame(100, 120, Some(90)), 119);
+        assert_eq!(jk2_body_start_frame(100, 120, None), 119);
+    }
 
     /// The two-frame TIE fighter GLA from `oktry2.dm_26` must not be treated
     /// as a humanoid with an unconditional 0..12 root animation.

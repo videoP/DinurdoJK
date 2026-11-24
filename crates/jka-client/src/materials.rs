@@ -1977,7 +1977,7 @@ fn build_normal_height_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec
 /// Box-filtered mip chain (2x2 average, truncating, edge texels repeated for odd
 /// sizes), stored base level first. Each level is written straight after the
 /// previous one in a single buffer, so nothing is cloned.
-fn build_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec<u8>, u32) {
+pub(crate) fn build_mip_chain(width: u32, height: u32, base: Vec<u8>) -> (Vec<u8>, u32) {
     let mut all = base;
     // reserve() grows geometrically (often 2x the base), retaining roughly 50%
     // slack after a square mip chain. Shared restart images keep this allocation
@@ -3055,7 +3055,9 @@ pub fn describe(
     let preferred_source = origin
         .filter(|origin| origin.mtr_override)
         .map(|origin| origin.source.as_path());
-    let sky = flags & SURF_SKY != 0 || definition.sky;
+    // TaystJK selects the sky pass from skyParms. Painted surfaces marked
+    // SURF_SKY still use their authored stages and world depth.
+    let sky = definition.sky_parms;
     // A `surfaceparm fog` shader without stages only defines a fog volume; the
     // engine never draws its brush faces or q3map2's fog hull. Without this the
     // stageless-shader fallback below turns the hull into an opaque white box

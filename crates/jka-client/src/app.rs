@@ -127,6 +127,7 @@ mod egui_model_placement;
 mod map_mod_ent;
 mod egui_emote_radial;
 mod shader_remap_editor;
+mod shader_promotion;
 mod egui_entity_graph;
 mod egui_menu;
 mod egui_pages;
@@ -1031,6 +1032,8 @@ pub struct App {
     console_search_index: Option<usize>,
     chat_mode: ChatMode,
     chat_input: String,
+    // UTF-8 byte offset in chat_input.
+    chat_cursor: usize,
     /// Ctrl+A selects the entire chat edit field; shared by Classic and Docked.
     chat_input_selected: bool,
     chat_emoji_picker: chat_emoji_picker::ChatEmojiPicker,
@@ -1115,6 +1118,7 @@ pub struct App {
     hdr_modes_known: bool,
     applied_resolution: [u32; 2],
     applied_resolution_desktop: bool,
+    applied_resolution_mode: i32,
     /// Captured before switching the monitor into Vulkan exclusive mode.
     desktop_resolution: Option<[u32; 2]>,
     applied_grass: bool,
@@ -1208,6 +1212,9 @@ pub struct App {
     /// Active OpenJK/TaystJK R_RemapShader state. Changes are resolved into a
     /// prepared-map upload, so ordinary frames pay no remap lookup cost.
     shader_remaps: scene::ShaderRemapState,
+    /// The loaded map's `q3map_dinurdoPromoted` directives and which promotion
+    /// systems are folded into `shader_remaps`' promotion layer.
+    shader_promotion: shader_promotion::ShaderPromotionState,
     /// The next LoadMap is a visual-only remap rebuild. Keep the cached map as
     /// the immutable unremapped source instead of replacing it with the derived
     /// presentation copy when WorldUploaded comes back.

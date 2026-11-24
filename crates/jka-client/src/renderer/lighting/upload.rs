@@ -41,6 +41,7 @@ pub(in crate::renderer) fn upload_reflection_probes(
         uploaded.push(GpuReflectionProbe {
             _texture: texture,
             view,
+            position: [0.0; 3],
             capture_position: None,
         });
     } else {
@@ -82,6 +83,7 @@ pub(in crate::renderer) fn upload_reflection_probes(
             uploaded.push(GpuReflectionProbe {
                 _texture: texture,
                 view,
+                position: probe.position,
                 capture_position: probe.rgba.is_empty().then_some(probe.position),
             });
         }

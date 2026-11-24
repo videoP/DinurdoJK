@@ -365,8 +365,8 @@ impl Renderer {
                 rverbose!(1, "[GPU] device destroyed: {message}");
             }
             reason => {
-                eprintln!("[GPU DEVICE LOST] reason={reason:?}: {message}");
                 super::note_device_lost(format!("{reason:?}: {message}"));
+                eprintln!("[GPU DEVICE LOST] reason={reason:?}: {message}");
             }
         });
 
@@ -758,7 +758,7 @@ impl Renderer {
             1,
             1,
             false,
-        );
+        )?;
         init_mark!("camera layouts/buffers/planar reflection");
         let planar_debug_shader = create_shader_module_timed(
             &device,
@@ -2484,6 +2484,7 @@ impl Renderer {
             studio_revision: 0,
             scene_time: None,
             weather_server_time_ms: None,
+            river_wake_debug_subject: None,
             studio_settings_signature: String::new(),
             scene_depth_capture: false,
             device,
@@ -2540,6 +2541,7 @@ impl Renderer {
             ocean_inert_bind_group,
             ocean_spray_albedo,
             lake_normal,
+            source_water_normal: None,
             detail_texture,
             detail_texture_auto,
             detail_texture_game: game.map(Path::to_path_buf),
@@ -2548,13 +2550,26 @@ impl Renderer {
             authored_oceans: Vec::new(),
             ocean_spray_pipeline: None,
             live_rivers: Vec::new(),
+            river_promotion_claims: Vec::new(),
+            river_promotion_active: 0,
+            ninja_blood: Default::default(),
+            ninja_fire: Default::default(),
+            ninja_fog: Default::default(),
+            ninja_snow_drift: Default::default(),
+            ninja_snow_berms: Default::default(),
             river_drains: Vec::new(),
             river_actors: Arc::new(Vec::new()),
+            river_ninja_history: None,
+            river_ninja_entities: None,
+            river_ninja_textures: None,
+            river_ninja_caustics: None,
+            ocean_ninja_underwater: None,
             river_interaction: (false, 1.0),
             river_surface: None,
             authored_ocean_definitions: Vec::new(),
             water_boxes: Vec::new(),
             camera_water_surface: NO_WATER_SURFACE,
+            camera_water: Default::default(),
             eye_wave_slot: None,
             eye_wave_offset: 0.0,
             eye_wave_correction: None,
@@ -2661,6 +2676,7 @@ impl Renderer {
             ui_keys_loaded: false,
             _ui_icons: ui_icons,
             ui_icons_loaded: false,
+            ui_icon_scope: None,
             _ui_team_icons: ui_team_icons,
             ui_team_icon_key: Vec::new(),
             _ui_ext_images: ui_ext_images,
@@ -3072,6 +3088,7 @@ impl Renderer {
             post_specialize: true,
             post_specialized: HashMap::new(),
             cloud_shadow_opaque_pipeline: None,
+            legacy_global_fog_pipeline: None,
             cloud_shadow_opaque_bind_group,
             rain_post_pipeline: None,
             taa_post_pipeline,

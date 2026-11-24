@@ -9,7 +9,7 @@ use crate::renderer::{
 };
 use wgpu::util::DeviceExt;
 use super::submission::{fx_runs, model_runs, model_phase_runs, compositing_requires_order, ModelPhaseCalls};
-use super::prepare::{pack_jobs, CpuPackJob, PreparePerf};
+use super::prepare::{pack_jobs, translate_vertices, CpuPackJob, PreparePerf};
 use std::time::Instant;
 
 impl DynamicModelRenderer {
@@ -99,6 +99,19 @@ impl DynamicModelRenderer {
         let instances = sprites.instances.as_slice();
         let first_instance = u32::try_from(fx_sprite_instances.len()).unwrap_or(u32::MAX);
         fx_sprite_instances.extend_from_slice(instances);
+        // Billboard extent: centre +/- both half-extent vectors, per axis.
+        let bounds = (!sprites.lightning && !sprites.rope).then(|| {
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            for instance in instances {
+                for axis in 0..3 {
+                    let reach = instance.left[axis].abs() + instance.up[axis].abs();
+                    min[axis] = min[axis].min(instance.origin[axis] - reach);
+                    max[axis] = max[axis].max(instance.origin[axis] + reach);
+                }
+            }
+            (min, max)
+        });
         self.fx_sprite_draws.push(FxGpuSpritePreparedDraw {
             entity_num: surface.entity_num,
             first_instance,
@@ -109,8 +122,34 @@ impl DynamicModelRenderer {
             authored_glow: surface.authored_glow,
             lightning: sprites.lightning,
             rope: sprites.rope,
+            bounds,
+            submerged: false,
         });
         return true;
+    }
+
+    /// Marks the translucent billboard draws lying wholly under an opaque
+    /// water surface (`under_water_plane`). Returns whether any do, so the
+    /// caller can skip the pre-water phase otherwise.
+    pub(in crate::renderer) fn classify_submerged_fx(
+        &mut self, volumes: &[crate::ocean::WaterVolume], crest: f32,
+    ) -> bool {
+        let mut any = false;
+        for draw in &mut self.fx_sprite_draws {
+            draw.submerged = !dynamic_model_writes_depth(draw.alpha_mode)
+                && draw.bounds.is_some_and(|(min, max)|
+                    crate::ocean::optics::under_water_plane(volumes, min, max, crest));
+            any |= draw.submerged;
+        }
+        any
+    }
+
+    fn fx_admitted(&self, draw: &FxGpuSpritePreparedDraw) -> bool {
+        match self.fx_water_split.get() {
+            super::types::FxWaterSplit::Off => true,
+            super::types::FxWaterSplit::SubmergedOnly => draw.submerged,
+            super::types::FxWaterSplit::DryOnly => !draw.submerged,
+        }
     }
 
     pub(in crate::renderer) fn upload_prepared_fx_sprites(
@@ -132,7 +171,7 @@ impl DynamicModelRenderer {
                 )
             });
             for alpha_mode in DYNAMIC_MODEL_ALPHA_ORDER {
-                if self.resident_fx_requested_modes & (1u16 << alpha_mode.index()) != 0 {
+                if u32::from(self.resident_fx_requested_modes) & (1u32 << alpha_mode.index()) != 0 {
                     resident.ensure_pipeline(jobs, device, alpha_mode,
                         self.fx_sprite_surface_format, self.fx_sprite_samples,
                         self.legacy_fog_compiled, self.fx_zero_alpha_discard);
@@ -189,12 +228,15 @@ impl DynamicModelRenderer {
         queue: &wgpu::Queue,
         surfaces: &[DynamicModelSurface],
         classic_grid: Option<&scene::ClassicEntityLightGrid>,
+        reflection_probes: Option<&crate::renderer::ReflectionProbeGpuSet>,
         separate_wireframe_classes: bool,
         ray_traced_shadows: bool,
         rt_receivers: bool,
         prepare_authored_glow: bool,
     ) {
         self.rt_prepared = false;
+        self.fx_water_split.set(super::types::FxWaterSplit::Off);
+        self.cloth_gpu.begin_frame();
         if let Some(fixtures) = &mut self.fixture_lighting { fixtures.raw_colors.clear(); }
         self.perf_phase_calls.set(ModelPhaseCalls::default());
         self.perf_phase_cpu_ms.set(0.0);
@@ -228,6 +270,7 @@ impl DynamicModelRenderer {
         self.resident_fx_requested_modes = 0;
         self.skin_draws.clear();
         self.skin_instance_entities.clear();
+        if let Some(gore) = self.skin_gore_gpu.as_mut() { gore.begin_frame(); }
         self.frame_texture_keys.clear();
         self.ghoul2_input_instances = 0;
         self.ghoul2_encoded_draws = 0;
@@ -268,11 +311,47 @@ impl DynamicModelRenderer {
         skin_pending.clear();
         skin_pending.reserve(surfaces.len());
         let mut light_memo = EntityLightMemo::default();
+        let mut gore_probe_memo: Option<([u32; 3], Option<&wgpu::TextureView>)> = None;
         let mut cpu_jobs = std::mem::take(&mut self.scratch_cpu_pack_jobs);
         cpu_jobs.clear();
         if self.model_prepare_threads != 0 { cpu_jobs.reserve(surfaces.len()); }
 
         for surface in surfaces {
+            let mut gore_has_probe = false;
+            let skin_gore = surface.ghoul2_gpu.as_ref().and_then(|skin| skin.skin_gore.as_ref().map(|gore| (skin, gore)));
+            if let Some((skin, gore)) = skin_gore {
+                if self.skin_gore_gpu.is_none() {
+                    self.skin_gore_gpu = super::skin_gore::SkinGoreGpu::new(device, queue,
+                        &self.camera_layout, &self.texture_layout, &self.skin_layout);
+                }
+                if let Some(gpu) = self.skin_gore_gpu.as_mut() {
+                    if gpu.pipeline.is_none() {
+                        gpu.pipeline = Some(super::pipelines::create_ghoul2_skin_gore_pipeline(
+                            device, &gpu.pipeline_layout, &self.skin_shader,
+                            self.fx_sprite_surface_format, self.fx_sprite_samples,
+                            self.legacy_fog_compiled, self.model_wet_compiled,
+                        ));
+                    }
+                    let origin_key = skin.origin.map(f32::to_bits);
+                    let probe = if let Some((_, probe)) = gore_probe_memo.filter(|(key, _)| *key == origin_key) {
+                        probe
+                    } else {
+                        let probe = reflection_probes.filter(|probes| probes.source_count != 0)
+                            .and_then(|probes| {
+                                let origin = Vec3::from_array(scene::render_position(skin.origin));
+                                let distance = |position| origin.distance_squared(Vec3::from_array(position));
+                                probes.probes.iter()
+                                    .filter(|probe| !probes.capture_pending || probe.capture_position.is_none())
+                                    .min_by(|a, b| distance(a.position).total_cmp(&distance(b.position)))
+                            })
+                            .map(|probe| &probe.view);
+                        gore_probe_memo = Some((origin_key, probe));
+                        probe
+                    };
+                    gore_has_probe = probe.is_some();
+                    gpu.update(device, queue, gore, probe);
+                }
+            }
             let source_material = surface
                 .ghoul2_gpu
                 .as_ref()
@@ -282,13 +361,17 @@ impl DynamicModelRenderer {
                 device,
                 queue,
                 surface.texture.as_ref(),
-                source_material.and_then(|material| material.normal_map.as_ref()),
+                if skin_gore.is_some() {
+                    crate::cgame::skin_gore::assets().map(|a| &a.normal)
+                } else {
+                    source_material.and_then(|material| material.normal_map.as_ref())
+                },
             );
             if self.prepare_fx_surface(surface, &texture_key, &mut vertices, &mut indices,
                 &mut fx_sprite_instances) {
                 continue;
             }
-            let classic_light = if (self.entity_ambient_lighting
+            let classic_light = if (skin_gore.is_some() || self.entity_ambient_lighting
                 == EntityAmbientLightingMode::BspLightgridClassic
                 || (surface.authored_lighting && self.entity_ambient_lighting == EntityAmbientLightingMode::Off))
                 && !matches!(
@@ -314,6 +397,42 @@ impl DynamicModelRenderer {
             } else {
                 None
             };
+            if let Some(cloth) = surface.cloth_gpu.as_ref() {
+                // GPU cloth: reserve this surface's range; the cloth output
+                // pass writes its finished vertices before any consumer runs.
+                let count = cloth.vertex_count();
+                if count == 0 || surface.indices.is_empty() {
+                    continue;
+                }
+                let base_vertex = vertices.len() as u32;
+                let first_index = indices.len() as u32;
+                vertices.resize(
+                    vertices.len() + count,
+                    <crate::renderer::DynamicModelVertex as bytemuck::Zeroable>::zeroed(),
+                );
+                if let Some(fixtures) = &mut self.fixture_lighting {
+                    fixtures.raw_colors.resize(base_vertex as usize, [0.0; 4]);
+                    let lit = surface.lighting_origin.is_some() || surface.authored_lighting;
+                    fixtures.raw_colors.extend(std::iter::repeat_n(
+                        if lit { cloth.color } else { [0.0; 4] }, count));
+                }
+                indices.extend(surface.indices.iter().map(|index| base_vertex.saturating_add(*index)));
+                let water = (surface.wireframe_class == crate::renderer::DynamicWireframeClass::Player)
+                    .then(|| self.entity_water.get(&surface.entity_num).copied())
+                    .flatten();
+                self.cloth_gpu.record(cloth, base_vertex, classic_light, water);
+                self.draws.push(DynamicPreparedDraw {
+                    entity_num: surface.entity_num, portal_only: surface.portal_only,
+                    first_index,
+                    index_count: surface.indices.len() as u32,
+                    base_vertex: 0,
+                    texture_key,
+                    alpha_mode: surface.alpha_mode,
+                    wireframe_class: surface.wireframe_class,
+                    authored_glow: surface.authored_glow,
+                });
+                continue;
+            }
             if let Some(skin) = surface.ghoul2_gpu.as_ref() {
                 if skin.vertices.is_empty() || skin.indices.is_empty() || skin.bones.is_empty() {
                     continue;
@@ -354,7 +473,7 @@ impl DynamicModelRenderer {
                 let uniform = Ghoul2GpuDrawUniform {
                     axis0: [skin.axis[0][0], skin.axis[0][1], skin.axis[0][2], if skin.foliage_wind { crate::foliage::model_tag(skin.origin) } else { 0.0 }],
                     axis1: [skin.axis[1][0], skin.axis[1][1], skin.axis[1][2], 0.0],
-                    axis2: [skin.axis[2][0], skin.axis[2][1], skin.axis[2][2], 0.0],
+                    axis2: [skin.axis[2][0], skin.axis[2][1], skin.axis[2][2], f32::from(u8::from(gore_has_probe))],
                     // w: thermal heat-source matrix index (ghoul2_skin.wgsl thermal_body_heat).
                     origin: [skin.origin[0], skin.origin[1], skin.origin[2], skin.heat_bone as f32],
                     color: skin.color,
@@ -425,6 +544,7 @@ impl DynamicModelRenderer {
                         .map_or(0, |texture| texture.binding_id)
                 };
                 let mut pending = Ghoul2PendingDraw {
+                    skin_gore: skin.skin_gore.as_ref().map(|g| Arc::clone(&g.key)),
                     entity_num: surface.entity_num, portal_only: surface.portal_only,
                     mesh_key,
                     texture_key,
@@ -439,6 +559,7 @@ impl DynamicModelRenderer {
                     batch_group_id: None,
                 };
                 if self.ghoul2_batch_key_cache && self.ghoul2_batch_draws != Ghoul2BatchMode::Off
+                    && pending.skin_gore.is_none()
                     && matches!(pending.alpha_mode, DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask)
                     && Some(pending.entity_num) != self.companion_excluded_entity
                 {
@@ -486,6 +607,7 @@ impl DynamicModelRenderer {
                     vertices: base_vertex as usize..vertices.len(),
                     indices: first_index as usize..indices.len(),
                     light: classic_light,
+                    translation: surface.vertex_translation(),
                     water: self.entity_water.get(&surface.entity_num).copied()
                         .filter(|_| surface.wireframe_class == crate::renderer::DynamicWireframeClass::Player),
                 });
@@ -502,6 +624,9 @@ impl DynamicModelRenderer {
                     }
                 } else {
                     vertices.extend_from_slice(surface.vertices.as_slice());
+                }
+                if let Some(offset) = surface.vertex_translation() {
+                    translate_vertices(&mut vertices[base_vertex as usize..], offset);
                 }
                 indices.extend(
                     surface
@@ -596,6 +721,7 @@ impl DynamicModelRenderer {
             Self::sort_ghoul2_pending(&mut skin_pending, prepare_authored_glow,
                 separate_wireframe_classes, self.companion_excluded_entity);
         }
+        if let Some(gore) = self.skin_gore_gpu.as_mut() { gore.finish_frame(); }
         // For an inactive adaptive frame, keep exact original submission order.
         let ordered_index = |index: usize| -> usize {
             if batching_active && cached_grouping { group_order[index] } else { index }
@@ -609,6 +735,7 @@ impl DynamicModelRenderer {
                     pending.alpha_mode,
                     DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask
                 )
+                && pending.skin_gore.is_none()
                 && Some(pending.entity_num) != self.companion_excluded_entity;
             let mut group_end = pending_index + 1;
             if candidate {
@@ -661,6 +788,7 @@ impl DynamicModelRenderer {
                     self.skin_instance_entities.push(item.entity_num);
                 }
                 self.skin_draws.push(Ghoul2PreparedDraw {
+                    skin_gore: pending.skin_gore.as_ref().map(Arc::clone),
                     entity_num: pending.entity_num, portal_only: pending.portal_only,
                     mesh_key: Arc::clone(&pending.mesh_key),
                     texture_key: pending.texture_key.as_ref().map(Arc::clone),
@@ -678,6 +806,7 @@ impl DynamicModelRenderer {
                     gpu_draw_data.push(item.uniform);
                     self.skin_instance_entities.push(item.entity_num);
                     self.skin_draws.push(Ghoul2PreparedDraw {
+                        skin_gore: item.skin_gore.as_ref().map(Arc::clone),
                         entity_num: item.entity_num, portal_only: item.portal_only,
                         mesh_key: Arc::clone(&item.mesh_key),
                         texture_key: item.texture_key.as_ref().map(Arc::clone),
@@ -700,11 +829,18 @@ impl DynamicModelRenderer {
         if let Some(started) = group_started { self.perf_prepare.ghoul2_group_ms = started.elapsed().as_secs_f64() * 1000.0; }
         let upload_started = self.capture_prepare.then(Instant::now);
 
+        self.cloth_gpu.prepare(jobs, device, queue, &mut vertices);
+        let cloth_storage = self.cloth_gpu.has_dispatches();
         let vertex_bytes = bytemuck::cast_slice(vertices.as_slice());
         let index_bytes = bytemuck::cast_slice(indices.as_slice());
-        let vertices_grew = vertex_bytes.len() as u64 > self.vertex_capacity;
+        // A buffer recreated for STORAGE starts empty: re-upload everything.
+        let vertices_grew = vertex_bytes.len() as u64 > self.vertex_capacity
+            || (cloth_storage && !self.vertex_buffer.usage().contains(wgpu::BufferUsages::STORAGE));
         let indices_grew = index_bytes.len() as u64 > self.index_capacity;
-        self.ensure_vertex_capacity(device, vertex_bytes.len() as u64);
+        self.ensure_vertex_capacity(device, vertex_bytes.len() as u64, cloth_storage);
+        if cloth_storage {
+            self.cloth_gpu.bind_output(device, &self.vertex_buffer);
+        }
         self.ensure_index_capacity(device, index_bytes.len() as u64);
         if self.md3_geometry_cache {
             self.perf_prepare.vertex_upload_bytes = super::md3_cache::upload_stream(
@@ -877,7 +1013,7 @@ impl DynamicModelRenderer {
             let mut current_mesh = None;
             let mut current_texture = None;
             for draw in &self.skin_draws {
-                if draw.alpha_mode != alpha_mode { continue; }
+                if draw.skin_gore.is_some() || draw.alpha_mode != alpha_mode { continue; }
                 let pipeline = if draw.source_material {
                     if mirror_winding { self.planar_skin_source_pipelines[alpha_mode.index()].as_ref() }
                     else { self.camera_portal_skin_source_pipelines[alpha_mode.index()].as_ref() }
@@ -943,7 +1079,10 @@ impl DynamicModelRenderer {
         // opaque/masked entities establish depth before the pre-water scene
         // capture, while saber glow, smoke and every other non-depth-writing FX
         // draw after the ocean surface/spray so water cannot paint over them.
-        if !self.draws.is_empty() {
+        // Only billboard FX sprites split around the water; the pre-water
+        // phase draws nothing else.
+        let sprites_only = self.fx_water_split.get() == super::types::FxWaterSplit::SubmergedOnly;
+        if !self.draws.is_empty() && !sprites_only {
             let (vertex_buffer, index_buffer) = self.prepared_dynamic_buffers();
             let mut cpu_buffers_bound = false;
 
@@ -1074,6 +1213,7 @@ impl DynamicModelRenderer {
         if legacy_effects != Some(true) {
             let has_fx_sprites_in_phase = self.fx_sprite_draws.iter().any(|draw| {
                 dynamic_model_writes_depth(draw.alpha_mode) == depth_writing_phase
+                    && self.fx_admitted(draw)
                     && Some(draw.entity_num) != excluded_entity
                     && (!authored_glow_only || draw.authored_glow)
             });
@@ -1101,6 +1241,7 @@ impl DynamicModelRenderer {
                     .filter(|(mode, _)| {
                         self.fx_sprite_draws.iter().any(|draw| {
                             draw.alpha_mode == *mode
+                                && self.fx_admitted(draw)
                                 && Some(draw.entity_num) != excluded_entity
                                 && (!authored_glow_only || draw.authored_glow)
                         })
@@ -1118,6 +1259,7 @@ impl DynamicModelRenderer {
                             let mut current_texture = None;
                             for (draw, instances) in fx_runs(self.fx_sprite_draws.iter().skip(draw_range.start).take(draw_range.end - draw_range.start).filter(|draw| {
                                 draw.alpha_mode == alpha_mode
+                                    && self.fx_admitted(draw)
                                     && Some(draw.entity_num) != excluded_entity
                                     && (!authored_glow_only || draw.authored_glow)
                             }), self.dynamic_batch_draws) {
@@ -1140,6 +1282,7 @@ impl DynamicModelRenderer {
                         let mut current_texture = None;
                         for (draw, instances) in fx_runs(self.fx_sprite_draws.iter().skip(draw_range.start).take(draw_range.end - draw_range.start).filter(|draw| {
                             draw.alpha_mode == alpha_mode
+                                && self.fx_admitted(draw)
                                 && Some(draw.entity_num) != excluded_entity
                                 && (!authored_glow_only || draw.authored_glow)
                         }), self.dynamic_batch_draws) {
@@ -1184,7 +1327,7 @@ impl DynamicModelRenderer {
             // GPU-resident effects use the SAME material group as FX sprites but
             // their independent group 2 binds persistent spawn data, draw slots and
             // the demo/FX clock. They never borrow Ghoul2's group 2 or weather's.
-            if let Some(resident) = self.resident_fx.as_ref() {
+            if let Some(resident) = self.resident_fx.as_ref().filter(|_| !sprites_only) {
                 let relevant = self.resident_fx_draws.iter().any(|draw| {
                     dynamic_model_writes_depth(draw.alpha_mode) == depth_writing_phase
                         && Some(draw.entity_num) != excluded_entity
@@ -1229,7 +1372,7 @@ impl DynamicModelRenderer {
 
         }
 
-        if !self.skin_draws.is_empty() {
+        if !self.skin_draws.is_empty() && !sprites_only {
             if capture_calls { calls.set_bind_group += 1; }
             pass.set_bind_group(0, camera, &[]);
             let preserve_order = !depth_writing_phase && self.skin_draws.iter().any(|draw| compositing_requires_order(draw.alpha_mode));
@@ -1281,6 +1424,7 @@ impl DynamicModelRenderer {
                     let mut current_mesh = None;
                     for draw in self.skin_draws.iter().skip(draw_range.start).take(draw_range.end - draw_range.start).filter(|draw| {
                         draw.alpha_mode == alpha_mode
+                            && draw.skin_gore.is_none()
                             && draw.source_material == source_material
                             && Some(draw.entity_num) != excluded_entity
                             && (!authored_glow_only || draw.authored_glow)
@@ -1320,6 +1464,39 @@ impl DynamicModelRenderer {
                             draw.first_instance
                                 ..draw.first_instance.saturating_add(draw.instance_count),
                         );
+                    }
+                }
+            }
+        }
+        // Draw the actual SkinGore UV-mask overlays only in the regular
+        // depth-writing model phase. The shader discards undamaged fragments;
+        // the stock JKA pipelines never see this additional material.
+        if depth_writing_phase && !authored_glow_only && legacy_effects.is_none() {
+            if let Some(gpu) = self.skin_gore_gpu.as_ref() {
+                if let Some(pipeline) = gpu.pipeline.as_ref() {
+                    let mut bound = false;
+                    for draw in self.skin_draws.iter().filter(|d| d.skin_gore.is_some()
+                        && !d.portal_only && Some(d.entity_num) != excluded_entity) {
+                        let Some(group) = draw.skin_gore.as_ref().and_then(|key| gpu.bind_group(key)) else { continue; };
+                        let Some(mesh) = self.ghoul2_meshes.get(&draw.mesh_key) else { continue; };
+                        if !bound {
+                            pass.set_pipeline(pipeline);
+                            pass.set_bind_group(0, camera, &[]);
+                            pass.set_bind_group(2, &self.skin_bind_group, &[]);
+                            if capture_calls { calls.set_pipeline += 1; calls.set_bind_group += 2; }
+                            bound = true;
+                        }
+                        let texture_group = draw.texture_key.as_ref()
+                            .and_then(|key| self.textures.get(key))
+                            .map_or(&self.fallback_bind_group, |texture| &texture.bind_group);
+                        pass.set_bind_group(1, texture_group, &[]);
+                        pass.set_bind_group(3, group, &[]);
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..mesh.index_count, 0,
+                            draw.first_instance..draw.first_instance.saturating_add(draw.instance_count));
+                        if capture_calls { calls.set_bind_group += 2; calls.set_vertex_buffer += 1;
+                            calls.set_index_buffer += 1; calls.skin_draw_indexed += 1; }
                     }
                 }
             }
@@ -1464,7 +1641,7 @@ impl DynamicModelRenderer {
             for draw in self
                 .skin_draws
                 .iter()
-                .filter(|draw| mask & draw.wireframe_class.mask_bit() != 0)
+                .filter(|draw| draw.skin_gore.is_none() && mask & draw.wireframe_class.mask_bit() != 0)
             {
                 let Some(mesh) = self.ghoul2_meshes.get(&draw.mesh_key) else {
                     continue;
@@ -1644,7 +1821,7 @@ impl DynamicModelRenderer {
                 for draw in self
                     .skin_draws
                     .iter()
-                    .filter(|draw| draw.alpha_mode == alpha_mode && !draw.portal_only)
+                    .filter(|draw| draw.skin_gore.is_none() && draw.alpha_mode == alpha_mode && !draw.portal_only)
                 {
                     let Some(mesh) = self.ghoul2_meshes.get(&draw.mesh_key) else {
                         continue;

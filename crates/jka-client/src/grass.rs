@@ -34,6 +34,9 @@ use std::{
 };
 use wgpu::util::DeviceExt;
 
+mod material;
+use material::NinjaGrass;
+
 /// The GodotGrass demo is authored in meters. Treat 64 JKA units as one Godot meter.
 const GODOT_WORLD_SCALE: f32 = 1.0 / 64.0;
 const SOURCE_REFERENCE_SPRITE_HEIGHT: f32 = 36.0;
@@ -199,6 +202,7 @@ pub struct GrassPreparedDraw {
     mid_total: u32,
     high_total: u32,
     gpu_precompute: bool,
+    ninja_style: bool,
     front_to_back: bool,
     // Normally None: a 1M-index persistent buffer covers ordinary scenes. If a
     // pathological view exceeds that, allocate one exact temporary buffer and use
@@ -206,20 +210,34 @@ pub struct GrassPreparedDraw {
     overflow_index_buffer: Option<wgpu::Buffer>,
 }
 
-pub struct GrassRenderer {
-    pipeline_layout: wgpu::PipelineLayout,
-    map_layout: wgpu::BindGroupLayout,
+struct GrassDrawPath {
+    layout: wgpu::PipelineLayout,
     shader: wgpu::ShaderModule,
-    // Lazy: compiled by `ensure_render_pipeline` the first frame a draw needs it.
-    pipeline: Option<wgpu::RenderPipeline>,
-    wireframe_pipeline: Option<wgpu::RenderPipeline>,
-    prepared_pipeline_layout: wgpu::PipelineLayout,
+    color: Option<wgpu::RenderPipeline>,
+    wireframe: Option<wgpu::RenderPipeline>,
+}
+
+impl GrassDrawPath {
+    fn new(layout: wgpu::PipelineLayout, shader: wgpu::ShaderModule) -> Self {
+        Self {
+            layout,
+            shader,
+            color: None,
+            wireframe: None,
+        }
+    }
+}
+
+pub struct GrassRenderer {
+    // Indexed by GPU precompute off/on.
+    draw_paths: [GrassDrawPath; 2],
+    ninja: Option<Box<NinjaGrass>>,
+    ninja_requested: bool,
+    ninja_load_attempted: bool,
+    map_layout: wgpu::BindGroupLayout,
     prepared_layout: wgpu::BindGroupLayout,
-    prepared_shader: wgpu::ShaderModule,
-    prepared_pipeline: Option<wgpu::RenderPipeline>,
     pipeline_format: wgpu::TextureFormat,
     pipeline_samples: u32,
-    prepared_wireframe_pipeline: Option<wgpu::RenderPipeline>,
     shadow_pipeline: wgpu::RenderPipeline,
     bevy_shadow_pipeline: wgpu::RenderPipeline,
     prepare_layout: wgpu::BindGroupLayout,
@@ -551,18 +569,17 @@ impl GrassRenderer {
         );
 
         Self {
-            pipeline_layout,
+            draw_paths: [
+                GrassDrawPath::new(pipeline_layout, shader),
+                GrassDrawPath::new(prepared_pipeline_layout, prepared_shader),
+            ],
+            ninja: None,
+            ninja_requested: false,
+            ninja_load_attempted: false,
             map_layout,
-            shader,
-            pipeline: None,
-            wireframe_pipeline: None,
-            prepared_pipeline_layout,
             prepared_layout,
-            prepared_shader,
-            prepared_pipeline: None,
             pipeline_format: surface_format,
             pipeline_samples: msaa_samples,
-            prepared_wireframe_pipeline: None,
             shadow_pipeline,
             bevy_shadow_pipeline,
             prepare_layout,
@@ -599,14 +616,16 @@ impl GrassRenderer {
         surface_format: wgpu::TextureFormat,
         msaa_samples: u32,
     ) {
-        self.wireframe_pipeline = None;
-        self.prepared_wireframe_pipeline = None;
         self.pipeline_format = surface_format;
         self.pipeline_samples = msaa_samples;
         // Lazy: `prepare_draw` recompiles whichever variant the next grass
         // draw actually needs via `ensure_render_pipeline`.
-        self.pipeline = None;
-        self.prepared_pipeline = None;
+        for path in self.draw_paths.iter_mut().chain(
+            self.ninja.iter_mut().flat_map(|material| material.draw_paths.iter_mut()),
+        ) {
+            path.color = None;
+            path.wireframe = None;
+        }
     }
 
     fn ensure_render_pipeline(
@@ -614,42 +633,39 @@ impl GrassRenderer {
         jobs: &mut PipelineJobManager,
         device: &wgpu::Device,
         gpu_precompute: bool,
-    ) {
-        let slot = u32::from(gpu_precompute);
+        ninja_style: bool,
+    ) -> bool {
+        let slot = u32::from(gpu_precompute) + 2 * u32::from(ninja_style);
         let key = PipelineJobKey::new(
             "grass-color",
             slot,
             pipeline_hash(&(self.pipeline_format, self.pipeline_samples, self.legacy_fog_compiled)),
         );
-        let target = if gpu_precompute {
-            &mut self.prepared_pipeline
-        } else {
-            &mut self.pipeline
-        };
-        if target.is_some() {
-            return;
-        }
-        if let Some(pipeline) = jobs.take_ready(key) {
-            *target = Some(pipeline);
-            return;
-        }
-        let device = device.clone();
         let format = self.pipeline_format;
         let samples = self.pipeline_samples;
         let legacy_fog = self.legacy_fog_compiled;
+        let path = self.draw_path_mut(gpu_precompute, ninja_style);
+        if path.color.is_some() {
+            return true;
+        }
+        if let Some(pipeline) = jobs.take_ready(key) {
+            path.color = Some(pipeline);
+            return true;
+        }
+        let device = device.clone();
+        let layout = path.layout.clone();
+        let shader = path.shader.clone();
+        let fragment_entry = if ninja_style { "fs_ninja" } else { "fs_main" };
         if gpu_precompute {
-            let layout = self.prepared_pipeline_layout.clone();
-            let shader = self.prepared_shader.clone();
             jobs.request(key, "grass prepared color", move || {
-                create_prepared_pipeline(&device, &layout, &shader, format, samples, legacy_fog)
+                create_prepared_pipeline(&device, &layout, &shader, format, samples, legacy_fog, fragment_entry)
             });
         } else {
-            let layout = self.pipeline_layout.clone();
-            let shader = self.shader.clone();
             jobs.request(key, "grass color", move || {
-                create_pipeline(&device, &layout, &shader, format, samples, legacy_fog)
+                create_pipeline(&device, &layout, &shader, format, samples, legacy_fog, fragment_entry)
             });
         }
+        false
     }
 
     pub fn ensure_wireframe_pipeline_for_draw(
@@ -660,34 +676,28 @@ impl GrassRenderer {
         msaa_samples: u32,
         prepared: &GrassPreparedDraw,
     ) {
-        let slot = u32::from(prepared.gpu_precompute);
+        let slot = u32::from(prepared.gpu_precompute) + 2 * u32::from(prepared.ninja_style);
         let key = PipelineJobKey::new(
             "grass-wireframe",
             slot,
             pipeline_hash(&(surface_format, msaa_samples)),
         );
-        let target = if prepared.gpu_precompute {
-            &mut self.prepared_wireframe_pipeline
-        } else {
-            &mut self.wireframe_pipeline
-        };
-        if target.is_some() {
+        let path = self.draw_path_mut(prepared.gpu_precompute, prepared.ninja_style);
+        if path.wireframe.is_some() {
             return;
         }
         if let Some(pipeline) = jobs.take_ready(key) {
-            *target = Some(pipeline);
+            path.wireframe = Some(pipeline);
             return;
         }
         let device = device.clone();
+        let layout = path.layout.clone();
+        let shader = path.shader.clone();
         if prepared.gpu_precompute {
-            let layout = self.prepared_pipeline_layout.clone();
-            let shader = self.prepared_shader.clone();
             jobs.request(key, "grass prepared wireframe", move || {
                 create_prepared_grass_wireframe_pipeline(&device, &layout, &shader, surface_format, msaa_samples)
             });
         } else {
-            let layout = self.pipeline_layout.clone();
-            let shader = self.shader.clone();
             jobs.request(key, "grass wireframe", move || {
                 create_grass_wireframe_pipeline(&device, &layout, &shader, surface_format, msaa_samples)
             });
@@ -934,6 +944,7 @@ impl GrassRenderer {
         enable_precompute: bool,
         enable_mid_lod: bool,
         enable_front_to_back: bool,
+        bevy_reverse_z: bool,
     ) -> GrassPreparedDraw {
         let started = Instant::now();
         let mut stats = GrassDrawStats {
@@ -1179,8 +1190,14 @@ impl GrassRenderer {
         }
 
         stats.cpu_ms = started.elapsed().as_secs_f64() * 1000.0;
-        if total_visible != 0 {
-            self.ensure_render_pipeline(jobs, device, gpu_precompute);
+        let mut ninja_style = total_visible != 0 && self.ninja_requested && self.ninja.is_some()
+            && self.ensure_render_pipeline(jobs, device, gpu_precompute, true);
+        if ninja_style && gpu_precompute && high_total != 0 {
+            ninja_style = self.ninja.as_mut().unwrap()
+                .ensure_shadow_pipeline(jobs, device, bevy_reverse_z);
+        }
+        if total_visible != 0 && !ninja_style {
+            self.ensure_render_pipeline(jobs, device, gpu_precompute, false);
         }
         GrassPreparedDraw {
             stats,
@@ -1190,6 +1207,7 @@ impl GrassRenderer {
             mid_total,
             high_total,
             gpu_precompute,
+            ninja_style,
             front_to_back: enable_front_to_back,
             overflow_index_buffer,
         }
@@ -1243,7 +1261,14 @@ impl GrassRenderer {
         if !prepared.gpu_precompute || prepared.high_total == 0 {
             return;
         }
-        pass.set_pipeline(if bevy_reverse_z { &self.bevy_shadow_pipeline } else { &self.shadow_pipeline });
+        if prepared.ninja_style {
+            let ninja = self.ninja.as_ref().unwrap();
+            let pipeline = ninja.shadows[usize::from(bevy_reverse_z)].as_ref().unwrap();
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(2, &ninja.bind_group, &[]);
+        } else {
+            pass.set_pipeline(if bevy_reverse_z { &self.bevy_shadow_pipeline } else { &self.shadow_pipeline });
+        }
         pass.set_bind_group(0, shadow_caster_bind_group, &[]);
         pass.set_bind_group(1, &map.prepared_bind_group, &[]);
         pass.set_vertex_buffer(0, self.low_vertex_buffer.slice(..));
@@ -1268,16 +1293,16 @@ impl GrassRenderer {
         if map.blade_count == 0 || prepared.total_visible == 0 {
             return stats;
         }
+        let Some(pipeline) = self.draw_path(prepared).color.as_ref() else {
+            return stats;
+        };
 
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, camera_bind_group, &[]);
-        pass.set_bind_group(1, &self.bind_group, &[]);
+        pass.set_bind_group(1, self.draw_bind_group(prepared), &[]);
         pass.set_bind_group(2, shadow_bind_group, &[]);
 
         if prepared.gpu_precompute {
-            let Some(prepared_pipeline) = self.prepared_pipeline.as_ref() else {
-                return stats;
-            };
-            pass.set_pipeline(prepared_pipeline);
             pass.set_bind_group(3, &map.prepared_bind_group, &[]);
 
             // Grass is opaque/depth-writing. High-detail blades are overwhelmingly
@@ -1358,10 +1383,6 @@ impl GrassRenderer {
 
         // Fallback for an unusually large visible set that exceeds the compact
         // prepared buffer. This retains the exact faithful per-vertex source math.
-        let Some(pipeline) = self.pipeline.as_ref() else {
-            return stats;
-        };
-        pass.set_pipeline(pipeline);
         let visible_buffer = prepared
             .overflow_index_buffer
             .as_ref()
@@ -1456,16 +1477,16 @@ impl GrassRenderer {
         if map.blade_count == 0 || prepared.total_visible == 0 {
             return;
         }
+        let Some(pipeline) = self.draw_path(prepared).wireframe.as_ref() else {
+            return;
+        };
 
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, camera_bind_group, &[]);
-        pass.set_bind_group(1, &self.bind_group, &[]);
+        pass.set_bind_group(1, self.draw_bind_group(prepared), &[]);
         pass.set_bind_group(2, shadow_bind_group, &[]);
 
         if prepared.gpu_precompute {
-            let Some(pipeline) = self.prepared_wireframe_pipeline.as_ref() else {
-                return;
-            };
-            pass.set_pipeline(pipeline);
             pass.set_bind_group(3, &map.prepared_bind_group, &[]);
 
             if prepared.low_total != 0 {
@@ -1495,10 +1516,6 @@ impl GrassRenderer {
             return;
         }
 
-        let Some(pipeline) = self.wireframe_pipeline.as_ref() else {
-            return;
-        };
-        pass.set_pipeline(pipeline);
         let visible_buffer = prepared
             .overflow_index_buffer
             .as_ref()
@@ -2336,6 +2353,7 @@ fn create_prepared_pipeline(
     surface_format: wgpu::TextureFormat,
     msaa_samples: u32,
     legacy_fog: bool,
+    fragment_entry: &'static str,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("GodotGrass GPU-prepared per-blade pipeline"),
@@ -2372,7 +2390,7 @@ fn create_prepared_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fragment_entry),
             compilation_options: wgpu::PipelineCompilationOptions {
                 constants: &[("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog)))],
                 ..Default::default()
@@ -2395,6 +2413,7 @@ fn create_pipeline(
     surface_format: wgpu::TextureFormat,
     msaa_samples: u32,
     legacy_fog: bool,
+    fragment_entry: &'static str,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("GodotGrass per-blade pipeline"),
@@ -2438,7 +2457,7 @@ fn create_pipeline(
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some("fs_main"),
+            entry_point: Some(fragment_entry),
             compilation_options: wgpu::PipelineCompilationOptions {
                 constants: &[("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog)))],
                 ..Default::default()

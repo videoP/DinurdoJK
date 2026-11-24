@@ -10,6 +10,7 @@ macro_rules! eprintln {
 }
 
 mod river_audio_probe;
+pub mod river_ambience;
 pub mod river_authoring;
 pub mod river_blocks;
 pub mod river_capture;
@@ -21,6 +22,7 @@ pub mod river_gpu;
 pub mod river_grid_mesh;
 pub mod river_map;
 pub mod river_material;
+pub mod river_ninja;
 pub mod river_ocean;
 pub mod river_quadtree;
 pub mod river_reach;
@@ -32,3 +34,4 @@ pub mod river_surface;
 pub mod river_tiles;
 pub mod river_water_info;
 pub mod river_water_info_capture;
+pub mod river_promotion;

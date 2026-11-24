@@ -1,7 +1,7 @@
 //! Diagnostics profiling.
 use crate::renderer::{mpsc, Receiver, TryRecvError};
 
-pub(in crate::renderer) const GPU_PASS_COUNT: usize = 53;
+pub(in crate::renderer) const GPU_PASS_COUNT: usize = 54;
 
 pub(in crate::renderer) const GPU_QUERY_COUNT: u32 = (GPU_PASS_COUNT * 2) as u32;
 
@@ -113,6 +113,9 @@ pub(in crate::renderer) enum GpuPass {
     RiverSim = 50,
     RiverSolve = 51,
     RiverDraw = 52,
+    // Native ocean prepare compute (Coast fluid sim tick, whitewater particles,
+    // eye/probe solves) encoded before the world. Diagnostic only.
+    OceanPrepare = 53,
 }
 
 impl GpuPass {
@@ -176,6 +179,7 @@ impl GpuPass {
         Self::RiverSim,
         Self::RiverSolve,
         Self::RiverDraw,
+        Self::OceanPrepare,
     ];
 
     pub(in crate::renderer) fn label(self) -> &'static str {
@@ -233,6 +237,7 @@ impl GpuPass {
             Self::RiverSim => "river_sim",
             Self::RiverSolve => "river_solve",
             Self::RiverDraw => "river_draw",
+            Self::OceanPrepare => "ocean_prepare",
         }
     }
 }

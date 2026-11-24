@@ -1,7 +1,7 @@
 //! Events.
 use crate::cgame::player_presenter::{
     body_queue_model1_weapon, BodyQueueCopyState, EntityEvent, Ghoul2ServerCommand,
-    PlayerPresenter, PresentationEvent, ET_BODY, WP_SABER,
+    PlayerPresenter, PresentationEvent, ET_BODY, MAX_CLIENTS, WP_SABER,
 };
 
 impl PlayerPresenter {
@@ -50,6 +50,20 @@ impl PlayerPresenter {
                 // then applies knownWeapon only to model index 1.
                 // A reused body-queue slot starts a fresh life.
                 self.entities.insert(body_entity, body_runtime);
+                // Duplicate the persistent UV injuries with the corpse, then
+                // reset the live player's damage for its next spawn.
+                self.skin_gore.body_queue_copy(source_client, body_entity);
+                self.gore.retain(|mark| mark.entity != body_entity);
+                for mark in &mut self.gore {
+                    if mark.entity == source_client {
+                        mark.entity = body_entity;
+                    }
+                }
+                self.pending_gore.retain(|hit| hit.entity != body_entity && hit.entity != source_client);
+                self.saber_gore_hits.retain(|attacker, hit| {
+                    ![source_client, body_entity].contains(attacker)
+                        && ![source_client, body_entity].contains(&hit.target)
+                });
                 self.body_fade.remove(&body_entity);
                 self.disintegration_start.remove(&body_entity);
                 self.disintegration_smoke_last.remove(&body_entity);
@@ -90,6 +104,10 @@ impl PlayerPresenter {
                 source.cent_weapon = 0;
                 source.ghoul2_weapon = None;
                 self.thrown_sabers.remove(&source_client);
+                self.skin_gore.clear_entity(source_client);
+                self.gore.retain(|mark| mark.entity != source_client);
+                self.pending_gore.retain(|hit| hit.entity != source_client);
+                self.saber_gore_hits.retain(|attacker, hit| *attacker != source_client && hit.target != source_client);
                 // CG_ReattachLimb restores the live player's original Ghoul2
                 // surface flags after the body queue copy. The corpse retains
                 // the cloned cut state above.
@@ -119,6 +137,10 @@ impl PlayerPresenter {
                 self.previous_impulse_velocity.remove(&entity);
                 self.force_gesture_anim.remove(&entity);
                 self.last_gpu.remove(&entity);
+                self.skin_gore.clear_entity(entity);
+                self.gore.retain(|mark| mark.entity != entity);
+                self.pending_gore.retain(|hit| hit.entity != entity);
+                self.saber_gore_hits.retain(|attacker, hit| *attacker != entity && hit.target != entity);
                 self.vehicle_snaps.remove(&entity);
                 // CG_KillGhoul2_f invalidates the Ghoul2 instance and its
                 // animation channels. Do not let a recycled entity slot reuse
@@ -129,12 +151,43 @@ impl PlayerPresenter {
         }
     }
 
-    /// OpenJK EV_DESTROY_WEAPON_MODEL removes Ghoul2 model index 1 only.
-    pub fn apply_entity_event(&mut self, event: &PresentationEvent) {
+    /// Apply server events that affect Ghoul2 presentation and its marks.
+    pub fn apply_entity_event(&mut self, event: &PresentationEvent, current_time: i32) {
         self.observe_impulse_event(event);
         let state = &event.state;
         let until = event.server_time.saturating_add(1000);
         match event.event {
+            EntityEvent::EV_JK2_BODY_QUEUE_COPY => {
+                // MVSDK CG_EntityEvent: eventParm is the source client;
+                // the event rides on the destination ET_BODY. The adapter
+                // already translated knownWeapon into presentation IDs.
+                if self.assets.jk2_version().is_none()
+                    || state.field_i32("eType") != Some(ET_BODY as i32)
+                {
+                    return;
+                }
+                let Ok(source_client) = u16::try_from(event.parm) else { return; };
+                let body_entity = event.entity_num;
+                if usize::from(source_client) >= MAX_CLIENTS
+                    || usize::from(body_entity) < MAX_CLIENTS
+                {
+                    return;
+                }
+                // MVSDK cleans the destination Ghoul2 even when the source
+                // is unavailable (e.g. first snapshot or entering PVS).
+                self.apply_ghoul2_server_command(Ghoul2ServerCommand::KillEntity {
+                    entity: body_entity,
+                });
+                self.apply_ghoul2_server_command(Ghoul2ServerCommand::BodyQueueCopy {
+                    source_client,
+                    body_entity,
+                    known_weapon: state.field_i32("weapon").unwrap_or(0),
+                    light_side: false, // JK2 has no JKA body-fade side parameter.
+                });
+                // CG_ReattachLimb: only the copied corpse retains severed limbs.
+                self.dismembered.remove(&source_client);
+                return;
+            }
             EntityEvent::EV_FORCE_DRAINED => {
                 if let Ok(owner) = u16::try_from(state.field_i32("owner").unwrap_or(-1)) {
                     self.team_power.insert(owner, (until, 2));
@@ -164,6 +217,36 @@ impl PlayerPresenter {
                 return;
             }
             EntityEvent::EV_GHOUL2_MARK => {
+                self.add_gore_mark(event);
+                return;
+            }
+            EntityEvent::EV_SABER_HIT => {
+                self.note_saber_gore_hit(event, current_time);
+                return;
+            }
+            EntityEvent::EV_PAIN
+                if self.skin_gore_enabled
+                    && matches!(
+                        state.field_i32("eType"),
+                        Some(crate::cgame::ET_PLAYER | crate::cgame::ET_NPC)
+                    ) =>
+            {
+                let victim = event.entity_num;
+                let time = event.server_time;
+                if !self.skin_gore_pains.iter().any(|&(number, stamp, _)| {
+                    number == victim && stamp == time
+                }) {
+                    self.skin_gore_pains.push((victim, time, event.parm));
+                }
+                return;
+            }
+            // TaystJK/OpenJK CG_EntityEvent also invokes CG_G2MarkEvent for
+            // flagged projectile hits and misses (cg_event.c). These are NOT
+            // necessarily accompanied by an EV_GHOUL2_MARK event. Without
+            // this path normal blaster hits on players/NPCs never leave marks.
+            EntityEvent::EV_MISSILE_HIT | EntityEvent::EV_MISSILE_MISS
+                if state.field_i32("trickedentindex").unwrap_or(0) != 0 =>
+            {
                 self.add_gore_mark(event);
                 return;
             }

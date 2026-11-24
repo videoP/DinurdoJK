@@ -130,7 +130,10 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", jk2_lean_fix: false", "")
         .replace(", fx_fps_game: 0", "")
         .replace(", underwater: 2", "")
+        .replace(", river_volume: 1.0", "")
         .replace(", footstep_trace: false", "")
+        .replace(", cloth_stiffness: 2.0, cloth_damping: 8.0, cloth_stiffening: 3.0", "")
+        .replace(", cloth_solver: 0", "")
         .replace(", chat_translate: Settings { mode: Off, target: \"\", display: Translated, provider: MyMemory, libre_url: \"\", team: false, demos: false, codepage: Auto, max_chars: 300 }", "")
         .replace(", chat_llm: Settings { translate_url: \"\", translate_prompt: \"\", censor: false, censor_hold: true, censor_severity: 3, censor_action: Cleanse, censor_ragebait: false, assist_url: \"\", censor_prompt: \"\", summary_prompt: \"\", threads: 0, translate_ignore_self: true }", "");
     for byte in projected.bytes() {
@@ -183,6 +186,7 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta cg_thirdPersonFlagAlpha ")
                     && !line.starts_with("seta cg_scoreSpectatorGuess ")
                     && !line.starts_with("seta s_underwater ")
+                    && !line.starts_with("seta s_riverVolume ")
                     && !line.starts_with("seta s_steamAudioHrtfInterpolation ")
                     && !line.starts_with("seta r_jiggleBreastRemeshBottomZ ")
                     && !line.starts_with("seta r_jiggleBreastRemeshTopZ ")
@@ -232,6 +236,10 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta cg_gunAlpha ")
                     && !line.starts_with("seta cg_jk2LeanFix ")
                     && !line.starts_with("seta cg_fxFPSGame ")
+                    && !line.starts_with("seta r_clothStiffness ")
+                    && !line.starts_with("seta r_clothSolver ")
+                    && !line.starts_with("seta r_clothDamping ")
+                    && !line.starts_with("seta r_clothStiffening ")
                     && !line.starts_with("seta cg_chatTranslate")
             })
             .map(|line| format!("{line}\n"))
@@ -696,15 +704,14 @@ fn shared_auto_lod_default_and_archive_round_trip() {
 }
 
 #[test]
-fn cheapwater_promoted_defaults_match_console_resets_and_archive_without_overriding_saved_choices() {
+fn lake_promoted_defaults_match_console_resets_and_archive_without_overriding_saved_choices() {
     let defaults = crate::ui::VideoSettings::default();
     assert!(defaults.ocean);
     assert_eq!(defaults.ocean_settings.backend, 3);
-    assert_eq!(defaults.ocean_settings.lake.shader, 1);
     assert_eq!(defaults.ocean_settings.map_size, 128);
     assert_eq!(crate::app::cvar_registry().find("r_oceanType").unwrap().entry.default, "4");
     let fixture = Fixture::new();
-    let path = fixture.0.join("cheapwater.cfg");
+    let path = fixture.0.join("lakes.cfg");
     let mut from_console = defaults;
     let mut context = config::cvars::VideoLoadState::default();
     for def in crate::app::cvar_definitions().iter().filter(|d|
@@ -713,7 +720,7 @@ fn cheapwater_promoted_defaults_match_console_resets_and_archive_without_overrid
         def.config.load_video.unwrap()(&mut from_console, cvar.entry.name, cvar.entry.default, &mut context);
     }
     assert_eq!(from_console.ocean_settings.lake, defaults.ocean_settings.lake,
-        "console resets and slider resets must select the same Cheapwater preset");
+        "console resets and slider resets must select the same lake preset");
     config::save_video_settings(&path, defaults, &crate::keybinds::Bindings::default(),
         &config::ClientPresentationSettings::default(), &config::AudioSettings::default()).unwrap();
     let loaded = config::load_video_settings(&path);
@@ -724,7 +731,7 @@ fn cheapwater_promoted_defaults_match_console_resets_and_archive_without_overrid
     fs::write(&path, "seta r_oceanType \"1\"\nseta r_lakeShader \"0\"\nseta r_lakeAmplitude \"2\"\n").unwrap();
     let previous = config::load_video_settings(&path);
     assert_eq!(previous.ocean_settings.backend, 0, "keep an explicitly saved Godot selection");
-    assert_eq!(previous.ocean_settings.lake.shader, 0);
+    // A stale r_lakeShader line from older configs is ignored.
     assert_eq!(previous.ocean_settings.lake.amplitude, 2.0);
 }
 

@@ -26,7 +26,7 @@ pub struct RippleAtlas {
 impl RippleAtlas {
     pub fn new(device: &wgpu::Device) -> Self {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Cheapwater local ripple normals"),
+            label: Some("lake local ripple normals"),
             size: wgpu::Extent3d {
                 width: SIZE,
                 height: SIZE,
@@ -56,13 +56,13 @@ impl RippleAtlas {
             })
             .collect();
         let instances = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Cheapwater bounded ripple stamps"),
+            label: Some("lake bounded ripple stamps"),
             size: (LAYERS as usize * MAX_STAMPS * std::mem::size_of::<Stamp>()) as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Cheapwater expanding ripple normals"),
+            label: Some("lake expanding ripple normals"),
             source: wgpu::ShaderSource::Wgsl(include_str!("lake_ripples.wgsl").into()),
         });
         let add = wgpu::BlendComponent {
@@ -71,7 +71,7 @@ impl RippleAtlas {
             operation: wgpu::BlendOperation::Add,
         };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Cheapwater ripple stamps"),
+            label: Some("lake ripple stamps"),
             layout: None,
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -128,7 +128,7 @@ impl RippleAtlas {
             queue.write_buffer(&self.instances, start, bytemuck::cast_slice(stamps));
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Cheapwater local wake normals"),
+            label: Some("lake local wake normals"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 resolve_target: None,

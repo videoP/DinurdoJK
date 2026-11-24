@@ -89,6 +89,42 @@ pub(crate) fn flag_status_icon(team: i32, status: i32) -> Option<&'static str> {
     let index = match team { 1 => 0, 2 => 1, 0 => 2, _ => return None };
     Some(if status == 1 { JK2_FLAG_TAKEN[index] } else { JK2_FLAG_ICONS[index] })
 }
+// MVSDK CG_DrawEnhancedFlagStatus chooses the home team's crossed-out flag
+// and the opposing flag's normal (or CTY Ysalimari) image. It only crosses
+// out an opposing flag when a *known opposing carrier* holds that flag.
+// FLAG_TAKEN alone is not sufficient: the usual friendly capture is plain.
+const JK2_FLAG_YSAL: [&str; 2] = ["gfx/hud/mpi_rflag_ys", "gfx/hud/mpi_bflag_ys"];
+
+fn enhanced_flag_icon(
+    flag_team: i32, status: i32, carrier_team: Option<i32>,
+    viewer_team: i32, cty: bool,
+) -> Option<&'static str> {
+    let index = match flag_team { 1 => 0, 2 => 1, 0 => 2, _ => return None };
+    // From Bucky MVSDK's CG_DrawEnhancedFlagStatus: the viewer's own flag
+    // uses flagShaderTaken even when dropped, while the opponent's starts
+    // as flagShader (or flagShaderYsal in CTY).
+    let hostile_carrier = status == 1
+        && carrier_team.is_some_and(|team| team != viewer_team);
+    Some(if flag_team == viewer_team || hostile_carrier {
+        JK2_FLAG_TAKEN[index]
+    } else if cty && index < 2 {
+        JK2_FLAG_YSAL[index]
+    } else {
+        JK2_FLAG_ICONS[index]
+    })
+}
+
+// CG_DrawEnhancedFlagStatus emits enemy first at y=365 and then decrements
+// the draw Y by 34, so the *visual* top-down order is home flag, enemy flag.
+// The optional CTF3 yellow flag is the bottom row for red/blue viewers.
+fn enhanced_flag_order(viewer_team: i32) -> [i32; 3] {
+    match viewer_team {
+        1 => [1, 2, 0],
+        0 => [0, 1, 2],
+        _ => [2, 1, 0],
+    }
+}
+
 const WHITE: [f32; 4] = [1.0; 4];
 const GREEN: [f32; 4] = [0.0, 0.613, 0.097, 1.0];
 const RED: [f32; 4] = [0.835, 0.015, 0.015, 1.0];
@@ -184,8 +220,12 @@ pub(crate) fn append_flag_status_images(images: &mut Vec<String>) {
 
 pub(crate) fn append_jk2_ctf_images(images: &mut Vec<String>) {
     for name in JK2_FLAG_ICONS.into_iter().chain(JK2_FLAG_TAKEN)
+        .chain(JK2_FLAG_YSAL)
         .chain(JK2_ITEM_ICONS.into_iter().filter(|name| !name.is_empty()))
         .chain([JK2_WEAPON_ICONS[12]])
+        // MVSDK CG_DrawInventory uses CG_DrawNumField(NUM_FONT_SMALL)
+        // in every HUD style, not just the retail status-panel style.
+        .chain(NUMBERS)
     {
         if !images.iter().any(|present| present == name) {
             images.push(name.to_owned());
@@ -393,14 +433,22 @@ pub(in crate::ui) fn build_enhanced_flag_status(
     // Also show the at-base flags as editing placeholders, so the element
     // remains visible and draggable even when no player has taken a flag.
     let edit_preview = ui.mode == crate::ui::OverlayMode::HudEdit;
-    for (row, flag) in ui.jk2_flags.iter().filter(|flag| matches!(flag.status, 1 | 4)
-        || (edit_preview && flag.status == 0)).enumerate()
-    {
-        // JKA reuses its known scoreboard icons. JK2 uses MVSDK's carried
-        // *_x variant when the flag is taken.
-        let Some(icon) = (if ui.jk2_mode { flag_status_icon(flag.team, flag.status) }
-            else { flag_carrier_icon(flag.team) }) else { continue };
-        let y = 66.0 + 38.0 * row as f32;
+    // Bucky MVSDK uses the snapshot player's PERS_TEAM to select both the
+    // flag art and draw order. Keep JKA's independent overlay unchanged.
+    let viewer_team = ui.hud.map_or(2, |hud| hud.team);
+    let order = if ui.jk2_mode { enhanced_flag_order(viewer_team) }
+        else { [1, 2, 0] };
+    let cty = ui.hud.is_some_and(|hud| hud.gametype == 9);
+    let mut row = 0;
+    for team in order {
+        let Some(flag) = ui.jk2_flags.iter().find(|flag| flag.team == team
+            && (matches!(flag.status, 1 | 4) || (edit_preview && flag.status == 0)))
+        else { continue };
+        let Some(icon) = (if ui.jk2_mode {
+            enhanced_flag_icon(flag.team, flag.status, flag.carrier_team, viewer_team, cty)
+        } else { flag_carrier_icon(flag.team) }) else { continue };
+        let y = 66.0 + 34.0 * row as f32;
+        row += 1;
         {
             let mut painter = Painter {
                 out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags,
@@ -451,18 +499,32 @@ pub(in crate::ui) fn build_persistent_inventory(
     let mut painter = Painter {
         out, images: &ui.extension_images, shader_flags: &ui.extension_shader_flags,
         uvs: &ui.extension_image_uvs, screen: [w, h],
-        origin: [w as f32 - 42.0 * scale, 0.0], unit: scale,
+        // MVSDK: xAlign = cgs.screenWidth - ico_size * 1.1f, ico_size=32.
+        origin: [w as f32 - 35.2 * scale, 0.0], unit: scale,
     };
+    // The upstream y is inherited from CG_DrawUpperRight's preceding overlays.
+    // This HUD currently has an independent right-stack anchor at 80 virtual px.
     let mut y = 80.0;
-    for (tag, icon) in JK2_ITEM_ICONS.iter().enumerate().skip(1) {
-        if icon.is_empty() || inventory.owned_bits & (1_u32 << tag) == 0 {
-            continue;
-        }
-        painter.image(icon, 0.0, y, 32.0, 32.0, WHITE);
-        y += 35.0;
-    }
+    // MVSDK CG_DrawInventory renders the tripmine weapon *before* holdables.
     if inventory.trip_mines > 0 {
         painter.image(JK2_WEAPON_ICONS[12], 0.0, y, 32.0, 32.0, WHITE);
+        // CG_DrawNumField(xAlign, y, 2, ammo, 6, 12, NUM_FONT_SMALL, qfalse).
+        // A non-zero-filled, two-digit field is right-aligned *over the icon*,
+        // using the original JK2 glyph textures. Values saturate at 99.
+        let digits = inventory.trip_mines.min(99).to_string();
+        let mut x = 2.0 + 6.0 * (2 - digits.len()) as f32;
+        for digit in digits.bytes() {
+            painter.image(NUMBERS[(digit - b'0') as usize], x, y, 6.0, 12.0, WHITE);
+            x += 7.0; // CG_DrawNumField: charWidth=6, plus one-pixel gap
+        }
+        y += 32.0;
+    }
+    for (tag, icon) in JK2_ITEM_ICONS.iter().enumerate().skip(1) {
+        if inventory.owned_bits & (1_u32 << tag) == 0 { continue; }
+        if !icon.is_empty() {
+            painter.image(icon, 0.0, y, 32.0, 32.0, WHITE);
+        }
+        y += 32.0; // MVSDK increments even if the registered icon is empty
     }
 }
 
@@ -668,6 +730,38 @@ mod tests {
         assert_eq!(images[0], "my/custom/hud");
         append_jk2_hud_images(&mut images, 1);
         assert_eq!(images.len(), 76);
+    }
+
+    #[test]
+    fn jk2_mvsdk_inventory_renders_tripmine_digits_over_icon_before_holdables() {
+        let mut ui = UiSnapshot::default();
+        ui.jk2_mode = true;
+        ui.video.jk2_draw_inventory = true;
+        append_jk2_ctf_images(&mut ui.extension_images);
+        // Number art is present even if the native status HUD is not selected.
+        assert!(ui.extension_images.iter().any(|name| name == NUMBERS[1]));
+        ui.jk2_inventory = Some(crate::ui::Jk2InventoryUi {
+            owned_bits: 1 << 2, trip_mines: 7,
+        });
+        let mut vertices = Vec::new();
+        build_persistent_inventory(&mut vertices, &ui, 640, 480);
+        // Tripmine icon + one digit + shieldwall icon, six vertices each.
+        assert_eq!(vertices.len(), 18);
+        let px = |i: usize| (vertices[i].position[0] + 1.0) * 320.0;
+        let py = |i: usize| (1.0 - vertices[i].position[1]) * 240.0;
+        let x_align = 640.0 - 35.2;
+        assert!((px(0) - x_align).abs() < 0.01); // mine icon
+        assert!((px(6) - (x_align + 8.0)).abs() < 0.01); // 1 digit
+        assert!((py(0) - py(6)).abs() < 0.01); // number overlays top of icon
+        assert!((py(12) - (py(0) + 32.0)).abs() < 0.01); // holdable follows
+
+        vertices.clear();
+        ui.jk2_inventory.as_mut().unwrap().trip_mines = 12;
+        build_persistent_inventory(&mut vertices, &ui, 640, 480);
+        assert_eq!(vertices.len(), 24); // icon + 2 digits + holdable
+        let px = |i: usize| (vertices[i].position[0] + 1.0) * 320.0;
+        assert!((px(6) - (x_align + 2.0)).abs() < 0.01);
+        assert!((px(12) - (x_align + 9.0)).abs() < 0.01);
     }
 
     #[test]
@@ -904,6 +998,30 @@ mod tests {
             assert_eq!(out.len(), if w as f32 > 640.0 * unit { 48 } else { 24 });
             assert!((px(out[0].position[0]) - 90.0 * unit).abs() < 0.01);
         }
+    }
+
+    #[test]
+    fn mvsdk_enhanced_flags_depend_on_viewer_and_carrier_not_taken_alone() {
+        // RED player: BLUE flag carried by RED teammate is plain, RED's flag
+        // stolen by BLUE is crossed out. Invert for BLUE player.
+        assert_eq!(enhanced_flag_order(1), [1, 2, 0]);
+        assert_eq!(enhanced_flag_icon(2, 1, Some(1), 1, false), Some("gfx/hud/mpi_bflag"));
+        assert_eq!(enhanced_flag_icon(1, 1, Some(2), 1, false), Some("gfx/hud/mpi_rflag_x"));
+        assert_eq!(enhanced_flag_order(2), [2, 1, 0]);
+        assert_eq!(enhanced_flag_icon(1, 1, Some(2), 2, false), Some("gfx/hud/mpi_rflag"));
+        assert_eq!(enhanced_flag_icon(2, 1, Some(1), 2, false), Some("gfx/hud/mpi_bflag_x"));
+        // Unknown carriers must not invent an enemy takeover; an actual
+        // hostile carrier of the other team's flag gets the taken variant.
+        assert_eq!(enhanced_flag_icon(1, 1, None, 2, false), Some("gfx/hud/mpi_rflag"));
+        assert_eq!(enhanced_flag_icon(1, 1, Some(1), 2, false), Some("gfx/hud/mpi_rflag_x"));
+        // MVSDK's home flag is still crossed out when dropped; enemy is not.
+        assert_eq!(enhanced_flag_icon(2, 4, None, 2, false), Some("gfx/hud/mpi_bflag_x"));
+        assert_eq!(enhanced_flag_icon(1, 4, None, 2, false), Some("gfx/hud/mpi_rflag"));
+        // CTY uses the native Ysalimari icon for the opposing flag.
+        assert_eq!(enhanced_flag_icon(1, 1, Some(2), 2, true), Some("gfx/hud/mpi_rflag_ys"));
+        // MVSDK's optional CTF3 mode has its own explicit order.
+        assert_eq!(enhanced_flag_order(0), [0, 1, 2]);
+        assert_eq!(enhanced_flag_icon(0, 1, Some(0), 0, false), Some("icons/iconf_neutral1_x"));
     }
 
     #[test]

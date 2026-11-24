@@ -273,7 +273,9 @@ impl crate::renderer::Renderer {
         let mut count = 0;
         let mut gpu_index = 0;
         let mut all_baked = self.active_transient_light_count() == 0;
+        let static_budget = self.active_static_light_count();
         for (index, light) in world.dynamic_lights.iter().enumerate() {
+            if gpu_index >= static_budget { break; }
             if !self.static_gpu_light_enabled(world, index, light) {
                 continue;
             }
@@ -288,7 +290,7 @@ impl crate::renderer::Renderer {
                 && count < 4
                 && gpu_index < 255
             {
-                ids[count] = gpu_index + 1;
+                ids[count] = (gpu_index + 1) as u32;
                 count += 1;
             }
             gpu_index += 1;

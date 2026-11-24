@@ -538,6 +538,7 @@ app_cvars! {
                     if let Ok(height) = value.parse::<u32>() {
                         settings.resolution[1] = height.max(240);
                         settings.resolution_desktop = false;
+                        settings.resolution_mode = -1;
                     }
                 }),
                 archive: Some((2, |state| {
@@ -564,6 +565,7 @@ app_cvars! {
                             self.video.resolution[1] = parsed.max(240);
                         }
                         self.video.resolution_desktop = false;
+                        self.video.resolution_mode = -1;
                         self.mark_config_dirty();
                         self.console_status = format!(
                             "RESOLUTION: {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
@@ -609,6 +611,7 @@ app_cvars! {
                     if let Ok(width) = value.parse::<u32>() {
                         settings.resolution[0] = width.max(320);
                         settings.resolution_desktop = false;
+                        settings.resolution_mode = -1;
                     }
                 }),
                 archive: Some((1, |state| {
@@ -635,6 +638,7 @@ app_cvars! {
                             self.video.resolution[1] = parsed.max(240);
                         }
                         self.video.resolution_desktop = false;
+                        self.video.resolution_mode = -1;
                         self.mark_config_dirty();
                         self.console_status = format!(
                             "RESOLUTION: {}X{} (PRESS APPLY VIDEO SETTINGS OR RUN VID_RESTART)",
@@ -3385,8 +3389,8 @@ app_cvars! {
         runtime: CvarDef::new(
                 "r_footprints",
                 "",
-                "off|2d|3d",
-                "Footprints: off, stock JKA 2D mark shader, or 3D snow deformation.",
+                "off|2d|3d|ninja|ninja_composite",
+                "Footprints: off, stock JKA marks, Snowflow 3D, or Fluid Ninja painter and composite snow.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -3417,7 +3421,7 @@ app_cvars! {
                 fn cvar_set_r_footprints(&mut self, name: &str, value: &str) -> Result<(), String> {
                     {
                         self.video.footprints = FootprintMode::from_config(value)
-                            .ok_or_else(|| format!("{name}: expected off|2d|3d"))?;
+                            .ok_or_else(|| format!("{name}: expected off|2d|3d|ninja|ninja_composite"))?;
                         self.render_command(RenderCommand::SetFootprintMode(self.video.footprints));
                         self.footprints_chosen();
                         self.mark_config_dirty();
@@ -5453,9 +5457,9 @@ app_cvars! {
         runtime: CvarDef::new(
                 "r_mode",
                 "",
-                "-2|-1",
-                "Resolution selection: -2 desktop (automatic), -1 custom r_customwidth/r_customheight. Apply required.",
-                CvarType::Enum(&["-2", "-1"]),
+                "-2|-1|0..12",
+                "OpenJK resolution index: -2 desktop, -1 custom r_customwidth/r_customheight, 0..12 stock presets. Apply required.",
+                CvarType::Enum(&["-2", "-1", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"]),
                 CvarFlags::ARCHIVE,
                 LatchScope::VidRestart,
                 |app| CvarValue::String(App::cvar_get_r_mode(app)),
@@ -5464,37 +5468,58 @@ app_cvars! {
             .with_text_setter(
                 App::cvar_set_r_mode,
                 Some(|name, value| match value.trim() {
-                    "-2" | "-1" => Ok(value.trim().to_owned()),
-                    _ => Err(format!("{name}: expected -2 (desktop) or -1 (custom)")),
+                    "-2" | "-1" | "0" | "1" | "2" | "3" | "4" | "5" |
+                    "6" | "7" | "8" | "9" | "10" | "11" | "12" => Ok(value.trim().to_owned()),
+                    _ => Err(format!("{name}: expected -2, -1 or OpenJK mode 0..12")),
                 }),
             ),
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, context| {
-                    if matches!(value.trim(), "-2" | "-1") {
-                        context.resolution_mode_seen = true;
-                        settings.resolution_desktop = value.trim() == "-2";
+                    if let Ok(mode) = value.trim().parse::<i32>() {
+                        if mode == -2 || mode == -1 || (0..crate::ui::OPENJK_R_MODES.len() as i32).contains(&mode) {
+                            context.resolution_mode_seen = true;
+                            settings.resolution_mode = mode;
+                            settings.resolution_desktop = mode == -2;
+                            if mode >= 0 {
+                                settings.resolution = crate::ui::OPENJK_R_MODES[mode as usize];
+                            }
+                        }
                     }
                 }),
                 apply_latched: Some(|settings, value| {
-                    if matches!(value.trim(), "-2" | "-1") {
-                        settings.resolution_desktop = value.trim() == "-2";
+                    if let Ok(mode) = value.trim().parse::<i32>() {
+                        if mode == -2 || mode == -1 || (0..crate::ui::OPENJK_R_MODES.len() as i32).contains(&mode) {
+                            settings.resolution_mode = mode;
+                            settings.resolution_desktop = mode == -2;
+                            if mode >= 0 {
+                                settings.resolution = crate::ui::OPENJK_R_MODES[mode as usize];
+                            }
+                        }
                     }
                 }),
                 archive: Some((0, |state| {
-                    if state.video.resolution_desktop { "-2".to_owned() } else { "-1".to_owned() }
+                    state.video.resolution_mode.to_string()
                 })),
                 ..CvarBinding::NONE
             },
         implementations: [
             impl App {
                 fn cvar_get_r_mode(&self) -> String {
-                    if self.video.resolution_desktop { "-2" } else { "-1" }.to_owned()
+                    self.video.resolution_mode.to_string()
                 }
                 fn cvar_set_r_mode(&mut self, name: &str, value: &str) -> Result<(), String> {
                     match value.trim() {
                         "-2" => self.set_desktop_resolution(),
                         "-1" => self.set_custom_resolution(self.video.resolution),
-                        _ => return Err(format!("{name}: expected -2 (desktop) or -1 (custom)")),
+                        _ => {
+                            let index = value.trim().parse::<usize>().map_err(|_| {
+                                format!("{name}: expected -2, -1 or OpenJK mode 0..12")
+                            })?;
+                            if index >= crate::ui::OPENJK_R_MODES.len() {
+                                return Err(format!("{name}: expected -2, -1 or OpenJK mode 0..12"));
+                            }
+                            self.set_preset_resolution(index);
+                        }
                     }
                     Ok(())
                 }

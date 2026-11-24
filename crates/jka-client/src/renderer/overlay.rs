@@ -514,6 +514,27 @@ impl Renderer {
     /// own frame / phone jack, the old speed graph's frame, an image crosshair,
     /// or a weapon / Force selection strip.
     pub(in crate::renderer) fn load_ui_icons_if_needed(&mut self) {
+        // The native icon atlas used to live for the whole renderer lifetime.
+        // JK2 and JKA share weapon-icon qpaths, but they resolve to different
+        // source bytes. An extension-atlas reload alone cannot replace the
+        // native weapon atlas, leaving JKA's pistol invisible after JK2.
+        let scope = (
+            self.detail_texture_game.clone(),
+            jka_assets::pk3::configured_filesystem_roots(&self.base).active_jk2,
+        );
+        if self.ui_icons_loaded && self.ui_icon_scope.as_ref() != Some(&scope) {
+            self.ui_icons_loaded = false;
+            self.ui_icon_scope = None;
+            self.ui_state.icon_atlas_uvs.clear();
+            self.ui_state.icon_shader_flags.clear();
+            self.ui_icon_shader_resolver = None;
+            self.ui_icon_shader_materials.retain(|&index, _| index >= ui::ICON_NAMES.len());
+            self._ui_icons = upload_texture(
+                &self.device, &self.queue, &blank_ui_extension_atlas(),
+            );
+            self.rebuild_ui_bind_group();
+            rverbose!(1, "UI native icons: reset on game/JK2 asset namespace switch");
+        }
         if self.ui_icons_loaded {
             return;
         }
@@ -558,8 +579,9 @@ impl Renderer {
         self.ui_state.icon_atlas_uvs = uvs;
         self.ui_state.icon_shader_flags = flags;
         self.ui_icon_shader_resolver = None;
-        self.ui_icon_shader_materials.clear();
+        self.ui_icon_shader_materials.retain(|&index, _| index >= ui::ICON_NAMES.len());
         self.ui_icons_loaded = true;
+        self.ui_icon_scope = Some(scope);
         self.rebuild_ui_bind_group();
         rverbose!(
             1,

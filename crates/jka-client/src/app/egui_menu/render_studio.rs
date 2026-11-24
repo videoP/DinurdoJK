@@ -142,13 +142,11 @@ fn studio_hud_reference_rect(
     id: crate::ui::HudElementId, layout: crate::ui::HudElementLayout,
     ctx: &crate::ui::HudRectContext, w: u32, h: u32,
 ) -> crate::ui::HudRect {
-    let mut native_layout = layout;
-    native_layout.offset[0] *= w as f32 / 1280.0;
-    native_layout.offset[1] *= h as f32 / 720.0;
-    let mut r = crate::ui::hud_element_rect(id, native_layout, ctx, w, h);
+    let mut r = crate::ui::hud_element_rect(id, layout, ctx, w, h);
     if id == crate::ui::HudElementId::CrosshairName {
-        r.x = w as f32 * 0.5 + native_layout.offset[0] - 22.0 * layout.scale;
-        r.y = h as f32 * 0.5 + native_layout.offset[1] - 22.0 * layout.scale;
+        let offset_px = crate::ui::hud_offset_to_pixels(layout.offset, w, h);
+        r.x = w as f32 * 0.5 + offset_px[0] - 22.0 * layout.scale;
+        r.y = h as f32 * 0.5 + offset_px[1] - 22.0 * layout.scale;
         r.width = 44.0 * layout.scale;
         r.height = 44.0 * layout.scale;
     }
@@ -217,7 +215,7 @@ impl App {
             let s=window.inner_size();(s.width.max(1),s.height.max(1))
         }).unwrap_or((1280,720));
         let virtual_layout=self.render_studio.hud_layout;
-        let actual_layout=virtual_layout.studio_for_frame(w,h);
+        let actual_layout=virtual_layout;
         let video=crate::ui::VideoSettings {draw_fps:0,draw_timer:false,..self.video};
         let score_mode=self.render_studio.sources.first()
             .map_or(2,|source|if source.playback.client_game.gametype()==3 {3}else{2});
@@ -258,8 +256,9 @@ impl App {
             let mut native=crate::ui::hud_element_rect(id,actual_layout.element(id),&ctx,w,h);
             if id==HudElementId::CrosshairName {
                 let layout=actual_layout.element(id);
-                native.x=w as f32*0.5+layout.offset[0]-22.0*layout.scale;
-                native.y=h as f32*0.5+layout.offset[1]-22.0*layout.scale;
+                let offset_px=crate::ui::hud_offset_to_pixels(layout.offset,w,h);
+                native.x=w as f32*0.5+offset_px[0]-22.0*layout.scale;
+                native.y=h as f32*0.5+offset_px[1]-22.0*layout.scale;
                 native.width=44.0*layout.scale;
                 native.height=44.0*layout.scale;
             }
@@ -419,10 +418,7 @@ impl App {
             "Drag on the Program Preview. This layout is saved to the selected Studio CFG, never to gameplay.");
         ui.horizontal_wrapped(|ui| {
             if ui.small_button("Copy gameplay").clicked() {
-                let (w,h)=self.window.as_ref().map(|window|{
-                    let size=window.inner_size();(size.width,size.height)
-                }).unwrap_or((1280,720));
-                let mut copied=self.hud_layout.studio_from_frame(w,h);
+                let mut copied=self.hud_layout;
                 // CrosshairName becomes the crosshair itself only inside Studio.
                 copied.crosshair_name=HudLayout::default().crosshair_name;
                 self.render_studio.hud_layout=copied;

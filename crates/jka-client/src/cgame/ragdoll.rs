@@ -263,6 +263,18 @@ struct SoftJoint {
     effective_inertia: f32,
 }
 
+/// Samples a few actual Rapier ragdoll segments, not the entity origin.
+/// Each point follows the bottom of the collider's ball/capsule so a corpse
+/// rolling or being pushed leaves ink only at actual ground-level contacts.
+#[derive(Debug)]
+struct CorpseSmearPoint {
+    body: RigidBodyHandle,
+    /// The same local-space capsule endpoint that was passed to Rapier.
+    endpoint: Vector,
+    radius_jka: f32,
+    last: Option<([f32; 3], i32)>,
+}
+
 #[derive(Debug)]
 struct RagdollInstance {
     model_key: String,
@@ -289,6 +301,8 @@ struct RagdollInstance {
     last_applied_pose: Vec<Matrix3x4>,
     driven: Vec<DrivenBone>,
     soft_joints: Vec<SoftJoint>,
+    corpse_smear_points: Vec<CorpseSmearPoint>,
+    next_corpse_smear_ms: i32,
 }
 
 /// Stable identity of one server-authored `G2_MODEL_PART` presentation entity.
@@ -331,6 +345,13 @@ struct DebrisBody {
     qpath: String,
     scale: f32,
     expires_at: i32,
+    /// Non-breakable EV_GIB_PLAYER fragments may feed existing Ninja blood.
+    gib: bool,
+    radius_jka: f32,
+    spawned_at: i32,
+    next_blood_ms: i32,
+    next_smear_ms: i32,
+    last_smear_origin: Option<([f32; 3], i32)>,
 }
 
 /// Glass is still rendered as the original FX quad. Only its transform is
@@ -469,11 +490,14 @@ impl RagdollWorld {
                 && (!self.debris.is_empty() || self.glass.iter().any(|g| g.body.is_some())))
     }
 
-    /// A live server-event breakable can be pushed even with r_ragdolls 0.
-    /// Do not create or update kinematic player proxies with no bodies to touch.
+    /// Player capsules also push Rapier gib fragments when ragdolls and
+    /// enhanced breakables are off. Other ordinary debris stays world-only.
+    /// Do not create kinematic proxies unless a contactable body exists.
     pub(crate) fn wants_player_contacts(&self) -> bool {
-        self.active() || (self.breakables_active()
-            && (!self.debris.is_empty() || !self.glass.is_empty()))
+        self.active()
+            || (self.breakables_active()
+                && (!self.debris.is_empty() || !self.glass.is_empty()))
+            || (self.debris_active() && self.debris.iter().any(|fragment| fragment.gib))
     }
 
     pub fn debug_enabled(&self) -> bool {
@@ -588,8 +612,8 @@ impl RagdollWorld {
         }
         if !self.breakables_active() {
             self.missile_samples.clear();
-            if !self.active() { self.clear_player_colliders(); }
         }
+        if !self.wants_player_contacts() { self.clear_player_colliders(); }
         self.trim_to_budget();
         self.trim_detached_to_budget();
         self.trim_debris_to_budget();
@@ -1238,6 +1262,7 @@ impl RagdollWorld {
             .collect::<Vec<_>>();
         let mut driven = Vec::new();
         let mut soft_joints = Vec::new();
+        let mut corpse_smear_points = Vec::new();
         let mut handles_by_bone = HashMap::<usize, RigidBodyHandle>::new();
 
         for spec in BODY_SPECS {
@@ -1277,17 +1302,18 @@ impl RagdollWorld {
             if self.config.self_collision { filter |= Group::GROUP_2; }
             if kind == RagdollKind::Corpse { filter |= Group::GROUP_3; }
             let dynamic_groups = InteractionGroups::new(Group::GROUP_2, filter, InteractionTestMode::default());
-            let collider = if let Some(end_name) = spec.end {
-                let endpoint = bone_index(gla, end_name)
+            // Match the solver's capsule endpoints exactly when sampling
+            // ground contact for a dragged corpse later on.
+            let endpoint = spec.end.map(|end_name| {
+                let point = bone_index(gla, end_name)
                     .and_then(|end_index| posed_bone_matrix(gla, pose, end_index))
                     .and_then(|end_pose| local_bone_endpoint(&bone_pose, &end_pose))
                     .unwrap_or([0.0, 0.0, spec.radius * 2.0]);
-                let endpoint = Vector::new(endpoint[0], endpoint[1], endpoint[2])
-                    * (JKA_TO_RAPIER * model_scale);
+                Vector::new(point[0], point[1], point[2]) * (JKA_TO_RAPIER * model_scale)
+            });
+            let collider = if let Some(endpoint) = endpoint {
                 ColliderBuilder::capsule_from_endpoints(
-                    Vector::ZERO,
-                    endpoint,
-                    spec.radius * JKA_TO_RAPIER * model_scale,
+                    Vector::ZERO, endpoint, spec.radius * JKA_TO_RAPIER * model_scale,
                 )
             } else {
                 ColliderBuilder::ball(spec.radius * JKA_TO_RAPIER * model_scale)
@@ -1302,6 +1328,17 @@ impl RagdollWorld {
                 &mut self.bodies,
             );
             handles_by_bone.insert(spec_bone_index, body);
+            // A small bounded selection of surface-facing segments. The
+            // torso, head, hands and feet can touch the ground when rolled;
+            // never treat a living Force Grip/impulse ragdoll as a corpse.
+            if kind == RagdollKind::Corpse && matches!(spec.name,
+                "pelvis" | "thoracic" | "cranium" | "rhand" | "lhand" | "rtalus" | "ltalus")
+            {
+                corpse_smear_points.push(CorpseSmearPoint {
+                    body, endpoint: endpoint.unwrap_or(Vector::ZERO),
+                    radius_jka: spec.radius * model_scale, last: None,
+                });
+            }
             driven.push(DrivenBone {
                 bone_index: spec_bone_index,
                 body,
@@ -1479,6 +1516,8 @@ impl RagdollWorld {
             spawn_pose,
             driven,
             soft_joints,
+            corpse_smear_points,
+            next_corpse_smear_ms: current_time,
         })
     }
 
@@ -1992,14 +2031,15 @@ impl RagdollWorld {
             if let Some(rigid) = self.bodies.get(body) {
                 self.previous_body_poses.insert(body, rigid.position().clone());
             }
-            // The collision shape is deliberately a cheap proxy. MD3 fragments
-            // retain their original rendered geometry, without expensive hull
-            // extraction during a burst. GROUP_2 can contact the world, while
-            // enabling debris-debris contacts without forcing ragdoll coupling.
+            // Use the existing inexpensive spherical proxy; original MD3
+            // geometry remains visual-only. GIB and enhanced breakable bodies
+            // accept the GROUP_3 kinematic player hull, but ordinary debris
+            // keeps its world/debris-only collision behavior.
+            let gib = !breakable && spec.qpath.starts_with("models/gibs/");
             let radius = (3.0 * spec.scale).clamp(0.5, 12.0) * JKA_TO_RAPIER;
             let groups = InteractionGroups::new(
                 Group::GROUP_2, Group::GROUP_1 | Group::GROUP_2
-                    | (if breakable { Group::GROUP_3 } else { Group::empty() }),
+                    | (if breakable || gib { Group::GROUP_3 } else { Group::empty() }),
                 InteractionTestMode::default(),
             );
             self.colliders.insert_with_parent(
@@ -2012,11 +2052,24 @@ impl RagdollWorld {
                 body,
                 &mut self.bodies,
             );
+            // Preserve configurable lifetime for other debris, while gib
+            // LE_FRAGMENT uses the doubled 10–16 s lifetime from gib_specs.
+            let default_life_ms = if gib {
+                spec.life_ms
+            } else {
+                (self.config.debris_lifetime_seconds * 1000.0) as i32
+            };
             self.debris.push(DebrisBody {
                 body,
                 qpath: spec.qpath.clone(),
                 scale: spec.scale,
-                expires_at: now.saturating_add(life_ms.unwrap_or((self.config.debris_lifetime_seconds * 1000.0) as i32)),
+                expires_at: now.saturating_add(life_ms.unwrap_or(default_life_ms)),
+                gib,
+                radius_jka: radius * RAPIER_TO_JKA,
+                spawned_at: now,
+                next_blood_ms: now,
+                next_smear_ms: now,
+                last_smear_origin: None,
             });
             self.trim_debris_to_budget();
         }
@@ -2279,6 +2332,77 @@ impl RagdollWorld {
         for glass in old {
             if let Some(handle) = glass.body { self.remove_body(handle); }
         }
+    }
+
+    /// Sample actual Rapier gib poses for the *existing* Ninja droplet
+    /// emitter. Called once after a physics frame; no extra raycasts, no Q3
+    /// blood shaders, and no new collision authority.
+    pub(crate) fn gib_blood_samples(&mut self, now: i32) -> Vec<([f32; 3], [f32; 3])> {
+        let bodies = &self.bodies;
+        self.debris.iter_mut().filter_map(|fragment| {
+            if !fragment.gib || fragment.expires_at <= now
+                || now < fragment.next_blood_ms
+                || now >= fragment.spawned_at.saturating_add(super::weapon_fx::GIB_BLEED_DURATION_MS)
+            { return None; }
+            let body = bodies.get(fragment.body)?;
+            let p = body.translation() * RAPIER_TO_JKA;
+            let v = body.linvel() * RAPIER_TO_JKA;
+            fragment.next_blood_ms = now.saturating_add(super::weapon_fx::GIB_BLEED_INTERVAL_MS);
+            Some(([p.x, p.y, p.z], [v.x, v.y, v.z]))
+        }).collect()
+    }
+
+    /// Track each gib's actual spherical Rapier collider bottom so only
+    /// grounded motion feeds the same Ninja brush used by player footsteps.
+    pub(crate) fn gib_smear_samples(&mut self, now: i32) -> Vec<crate::ninja_blood::BloodDragSample> {
+        let bodies = &self.bodies;
+        self.debris.iter_mut().filter_map(|fragment| {
+            if !fragment.gib || now >= fragment.expires_at || now < fragment.next_smear_ms {
+                return None;
+            }
+            let body = bodies.get(fragment.body)?;
+            let p = body.translation() * RAPIER_TO_JKA;
+            let point = [p.x, p.y, p.z - fragment.radius_jka];
+            fragment.next_smear_ms = now.saturating_add(super::weapon_fx::GIB_SMEAR_INTERVAL_MS);
+            let old = fragment.last_smear_origin.replace((point, now))?;
+            // Every grounded sample lays a continuous smear stroke.
+            let width_cm = super::weapon_fx::ground_deposit_size_cm(
+                now.saturating_sub(fragment.spawned_at),
+                super::weapon_fx::GIB_GROUND_BLEED_DURATION_MS, super::weapon_fx::GIB_SMEAR_WIDTH_CM,
+            );
+            Some((old.0, point, now.saturating_sub(old.1), width_cm))
+        }).collect()
+    }
+
+    /// Sample dragged/rolling *dead* ragdoll collider bottoms after Rapier.
+    /// A real BSP floor contact is still required before disturbing a pool.
+    pub(crate) fn corpse_smear_samples(&mut self, now: i32) -> Vec<crate::ninja_blood::BloodDragSample> {
+        if !self.active() { return Vec::new(); }
+        let bodies = &self.bodies;
+        let mut samples = Vec::new();
+        for instance in self.instances.values_mut() {
+            if instance.kind != RagdollKind::Corpse || now < instance.next_corpse_smear_ms {
+                continue;
+            }
+            instance.next_corpse_smear_ms = now.saturating_add(super::weapon_fx::GIB_SMEAR_INTERVAL_MS);
+            for point in &mut instance.corpse_smear_points {
+                let Some(body) = bodies.get(point.body) else { continue; };
+                let pose = body.position();
+                let a = pose.translation;
+                let b = a + pose.rotation * point.endpoint;
+                let low = if a.z <= b.z { a } else { b };
+                let contact = low * RAPIER_TO_JKA - Vector::Z * point.radius_jka;
+                let current = [contact.x, contact.y, contact.z];
+                if let Some((previous, sampled_at)) = point.last.replace((current, now)) {
+                    let width_cm = super::weapon_fx::ground_deposit_size_cm(
+                        now.saturating_sub(instance.spawned_at),
+                        super::weapon_fx::CORPSE_GROUND_BLEED_DURATION_MS, super::weapon_fx::CORPSE_SMEAR_WIDTH_CM,
+                    );
+                    samples.push((previous, current, now.saturating_sub(sampled_at), width_cm));
+                }
+            }
+        }
+        samples
     }
 
     pub(crate) fn debris_models(&self, now: i32) -> Vec<ChunkModel> {
@@ -3053,6 +3177,50 @@ mod tests {
         world.begin_frame(16_001);
         assert!(world.glass.is_empty());
         assert!(world.debris.is_empty());
+    }
+
+    #[test]
+    fn gib_fragments_contact_players_without_ragdolls_and_keep_doubled_lifetime() {
+        let mut world = RagdollWorld::new();
+        let config = RagdollConfig {
+            physics_enabled: true, enabled: false, debris_enabled: true,
+            breakables_enhanced: false, max_debris: 16,
+            ..RagdollConfig::default()
+        };
+        world.set_config(config);
+        let mesh = PhysicsMapMesh::from_jka_mesh(
+            vec![[-256., -256., 0.], [256., -256., 0.], [0., 256., 0.]],
+            vec![[0, 1, 2]],
+        ).unwrap();
+        world.set_map_mesh(&mesh).unwrap();
+        assert!(!world.wants_player_contacts());
+        let gib = ChunkSpec {
+            qpath: "models/gibs/chest.md3".into(),
+            origin: [28., 0., 24.], velocity: [0.; 3],
+            angles: [0.; 3], angle_velocity: [0.; 3],
+            life_ms: 12_000, bounce_factor: 0.6, scale: 1.0,
+        };
+        assert!(world.spawn_debris(&[gib], 1_000));
+        assert!(!world.active(), "no ragdolls needed for player-gib contact");
+        assert!(world.wants_player_contacts());
+        assert_eq!(world.debris[0].expires_at, 13_000);
+        let handle = world.debris[0].body;
+        let collider = world.bodies[handle].colliders()[0];
+        let groups = world.colliders[collider].collision_groups();
+        assert!(groups.filter.contains(Group::GROUP_3), "gib accepts player hull");
+        world.set_players(&[contact_player(0.0)], 1_000);
+        assert!(world.player_colliders.contains_key(&0));
+        // Frame-to-frame settings refresh must not delete a needed player hull.
+        world.set_config(config);
+        assert!(world.player_colliders.contains_key(&0));
+        world.begin_frame(1_000);
+        world.begin_frame(12_999);
+        assert_eq!(world.debris.len(), 1);
+        world.begin_frame(13_000);
+        assert!(world.debris.is_empty());
+        assert!(!world.wants_player_contacts());
+        world.set_players(&[], 13_001);
+        assert!(world.player_colliders.is_empty());
     }
 
     #[test]

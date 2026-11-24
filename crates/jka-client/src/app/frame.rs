@@ -17,6 +17,15 @@ fn frontend_scene_camera(mut camera: crate::camera::Camera) -> crate::camera::Ca
     camera
 }
 
+fn ninja_fog_pawn(session: &super::GameSession) -> Option<(&str, glam::Vec3, f32)> {
+    let player = session.presented_player_state()?;
+    if player.field_i32("pm_type")? >= 2 || player.field_i32("pm_flags").unwrap_or(0) & 4096 != 0 {
+        return None;
+    }
+    let eye_height = player.field_i32("viewheight").unwrap_or(26) as f32;
+    Some((session.map_name.as_deref()?, session.player_position?, eye_height))
+}
+
 impl App {
     pub(in crate::app) fn frontend_scene_page_active(&self) -> bool {
         self.front_end && !self.profile_preview_active && self.loading.is_none()
@@ -265,6 +274,15 @@ impl App {
         };
         RenderSnapshot {
             frontend_scene: self.frontend_scene_token(),
+            river_wake_debug_subject: if !isolated_preview && !self.front_end && jka_river::river_ninja::wake_debug_active() {
+                self.game_session.as_ref().map(|session| jka_river::river_ninja::WakeDebugSubject {
+                    client: session.presented_player_state().and_then(|ps| ps.field_i32("clientNum"))
+                        .and_then(|client| u16::try_from(client).ok()),
+                    position_map: session.player_position.map(|p| jka_render_core::coordinates::jka_position(p.to_array())),
+                })
+            } else {
+                None
+            },
             weather_server_time_ms: (!isolated_preview && !self.front_end).then(|| {
                 self.game_session.as_ref().and_then(|session| {
                     session.current_snapshot.as_ref().map(|_| session.cgame_time)
@@ -300,7 +318,7 @@ impl App {
                         inline_models:Arc::clone(&world.inline_models),
                         lights:Arc::new(timeline.lights_at(time)),
                         screen_fx:Arc::new(Vec::new()),cloud_foreground:Arc::new(Vec::new()),
-                        ocean_actors:Arc::new(Vec::new()),hud:None,
+                        ocean_actors:Arc::new(Vec::new()),ninja_entities:None,hud:None,
                     },
                     incoming:None,effect:0,progress:0.0,video:self.video,
                     offline_capture:self.render_studio.export.is_some() || self.render_studio.still.is_some(),
@@ -354,6 +372,7 @@ impl App {
                 .or_else(|| self.local_server.as_ref().map(LocalServer::world_position)),
             ocean_actors: self.game_session.as_ref().map_or_else(
                 || Arc::new(Vec::new()), |s| Arc::clone(&s.ocean_actors)),
+            ninja_entities: self.game_session.as_ref().and_then(|s| s.ninja_entities.clone()),
             area_mask: self
                 .game_session
                 .as_ref()
@@ -409,6 +428,36 @@ impl App {
                 self.game_session
                     .as_ref()
                     .and_then(|playback| playback.event_presenter.camera_shake())
+            },
+            ninja_blood: if isolated_preview || self.front_end {
+                None
+            } else {
+                self.game_session
+                    .as_ref()
+                    .and_then(|session| session.weapon_fx.ninja_blood_scene())
+            },
+            ninja_fog: if isolated_preview || self.front_end {
+                None
+            } else {
+                crate::ninja_fog_debug::placement(
+                    self.game_session.as_ref().and_then(|session| session.map_name.as_deref()),
+                    self.game_session.as_ref().and_then(ninja_fog_pawn).map(|(_, origin, _)| origin),
+                )
+            },
+            ninja_fire: if isolated_preview || self.front_end {
+                None
+            } else {
+                crate::ninja_fire_debug::scene(
+                    self.game_session.as_ref().and_then(|session| session.map_name.as_deref()),
+                    self.game_session.as_ref().and_then(|session| {
+                        session.player_presenter.ninja_fire_pose
+                            .filter(|pose| pose.time_ms == session.cgame_time)
+                    }),
+                    self.game_session.as_ref().map(|session| session.cgame_time),
+                    self.camera.position,
+                    self.video.fx_lod,
+                    self.video.fx_lod_scale,
+                )
             },
         }
     }
@@ -474,6 +523,17 @@ impl App {
     pub(in crate::app) fn publish_snapshot(&self) {
         if let Some(render) = &self.render {
             render.publish(self.render_snapshot());
+        }
+    }
+
+    pub(in crate::app) fn refresh_ninja_fog_surface(&mut self) {
+        if !crate::ninja_fog_debug::wants_actors() {
+            return;
+        }
+        let Some((map, origin, eye_height)) = self.game_session.as_ref().and_then(ninja_fog_pawn)
+            else { return };
+        if let Some(world) = self.map_collision.as_mut() {
+            crate::ninja_fog_debug::refresh_mist_surface(map, origin, eye_height, world);
         }
     }
 

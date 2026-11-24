@@ -45,6 +45,9 @@ pub struct FxView {
     pub fov_x: f32,
     /// CGame presentation time, for authored texture animation.
     pub seconds: f32,
+    /// Legacy identityLight in the scene's working colour space. The GPU
+    /// resident stage draw uses the same factor as the ordinary geometry.
+    pub identity_light: f32,
 }
 
 impl FxView {
@@ -61,7 +64,15 @@ impl FxView {
             axis: [forward, left, up],
             fov_x: 90.0,
             seconds: 0.0,
+            identity_light: 1.0,
         }
+    }
+
+    pub fn set_overbright(&mut self, bits: u8, jk2: bool, hdr: bool) {
+        self.identity_light = if bits == 0 { 1.0 }
+            // Match the existing BSP identityLight conversion for JK2 SDR.
+            else if jk2 && !hdr { 0.214_041_14 }
+            else { 0.5 };
     }
 }
 
@@ -102,7 +113,9 @@ impl FxBlend {
             ["filter"] | ["gl_dst_color", "gl_zero"] | ["gl_zero", "gl_src_color"] => Self::Modulate,
             ["gl_dst_color", "gl_src_color"] => Self::Modulate2x,
             ["gl_zero", "gl_one_minus_src_color"] => Self::Darken,
-            ["gl_one", "gl_one_minus_src_color"] => Self::Screen,
+            // Algebraic equality: src * (1 - dst) + dst == src + dst * (1 - src).
+            // Authored health_field uses the former, existing Screen PSO the latter.
+            ["gl_one_minus_dst_color", "gl_one"] | ["gl_one", "gl_one_minus_src_color"] => Self::Screen,
             // GL_ONE GL_ZERO replaces the framebuffer: opaque whatever the texture alpha
             // (player entity-tint stages rely on this to keep their alpha mask unblended).
             [] | ["gl_one", "gl_zero"] => Self::Opaque,
@@ -158,6 +171,9 @@ pub struct FxMaterial {
     pub blend: FxBlend,
     /// rgbGen vertex/exactVertex (FX shaders normally use vertex color).
     pub rgb_vertex: bool,
+    /// CGEN_IDENTITY_LIGHTING, CGEN_VERTEX or CGEN_ONE_MINUS_VERTEX (not
+    /// CGEN_IDENTITY, CGEN_EXACT_VERTEX or CGEN_ENTITY).
+    pub rgb_identity_light: bool,
     pub alpha_vertex: bool,
     pub rgb_const: [f32; 3],
     pub alpha_const: f32,
@@ -230,6 +246,36 @@ impl FxMaterial {
             f32::from(rgba[2]) / 255.0,
             f32::from(rgba[3]) / 255.0,
         ], seconds)
+    }
+
+    /// Apply overbright only for world-space stages. The dedicated encoded
+    /// additive/destination shell pass has different tint-space semantics;
+    /// leave those modes untouched rather than applying a linear multiplier
+    /// to a tint which is consumed in encoded space.
+    fn world_identity_light(&self, view: &FxView) -> f32 {
+        if self.rgb_identity_light && !matches!(self.blend, FxBlend::Add | FxBlend::DstColorAdd) {
+            view.identity_light
+        } else { 1.0 }
+    }
+
+    fn world_vertex_color(&self, rgba: [u8; 4], seconds: f32, view: &FxView) -> [f32; 4] {
+        let mut color = self.vertex_color(rgba, seconds);
+        let scale = self.world_identity_light(view);
+        if scale != 1.0 {
+            for channel in &mut color[..3] { *channel *= scale; }
+        }
+        color
+    }
+
+    /// Pack a material-stage tint scale in the two high bits of the resident
+    /// draw indirection, without changing the per-birth particle state or
+    /// its slot index. The pool is capped at 1800 slots.
+    fn resident_slot(&self, slot: u32, view: &FxView) -> u32 {
+        match self.world_identity_light(view) {
+            x if x < 0.5 => slot | (1 << 31),
+            x if x < 1.0 => slot | (1 << 30),
+            _ => slot,
+        }
     }
 
     /// The screen-space UI fallback has no shader clock; authored FX geometry
@@ -366,7 +412,7 @@ fn shitter_blade_surface(batch: Batch) -> Option<DynamicModelSurface> {
         rt_rigid: None,
         rt_skinned_key: None,
         ghoul2_gpu: None,
-        fx_gpu_sprites: None,
+        cloth_gpu: None, fx_gpu_sprites: None,
         texture: None,
         alpha_mode: DynamicModelAlphaMode::Opaque,
         authored_glow: false,
@@ -442,7 +488,7 @@ fn tessellate_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             | FxDraw::Cylinder { shader, .. }
             | FxDraw::Billboard { shader, .. } => shader.as_ref(),
             FxDraw::Line { shader, .. } | FxDraw::Rope { shader, .. } => shader.as_ref(),
-            FxDraw::LitMesh { .. } => {
+            FxDraw::LitMesh { .. } | FxDraw::BakedLitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
             }
@@ -472,7 +518,7 @@ fn tessellate_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             rt_rigid: None,
             rt_skinned_key: None,
             ghoul2_gpu: None,
-            fx_gpu_sprites: None,
+            cloth_gpu: None, fx_gpu_sprites: None,
             texture: slot_texture(&mat, slot, view.seconds),
             alpha_mode: mat.blend.alpha_mode(),
             authored_glow: mat.authored_glow,
@@ -537,7 +583,7 @@ fn tessellate_workers_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             | FxDraw::Cylinder { shader, .. }
             | FxDraw::Billboard { shader, .. } => shader.as_ref(),
             FxDraw::Line { shader, .. } | FxDraw::Rope { shader, .. } => shader.as_ref(),
-            FxDraw::LitMesh { .. } => {
+            FxDraw::LitMesh { .. } | FxDraw::BakedLitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
             }
@@ -600,7 +646,7 @@ fn tessellate_workers_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
                 rt_rigid: None,
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
-                fx_gpu_sprites: None,
+                cloth_gpu: None, fx_gpu_sprites: None,
                 texture: slot_texture(&mat, slot, view.seconds),
                 alpha_mode: mat.blend.alpha_mode(),
                 authored_glow: mat.authored_glow,
@@ -688,7 +734,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             | FxDraw::Cylinder { shader, .. }
             | FxDraw::Billboard { shader, .. } => shader.as_ref(),
             FxDraw::Line { shader, .. } | FxDraw::Rope { shader, .. } => shader.as_ref(),
-            FxDraw::LitMesh { .. } => {
+            FxDraw::LitMesh { .. } | FxDraw::BakedLitMesh { .. } => {
                 lit_surfaces.extend(lit_mesh_surface(draw));
                 continue;
             }
@@ -720,7 +766,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
                         origin: [start[0], start[1], start[2], layer],
                         left: [end[0], end[1], end[2], *phase],
                         up: [spring[0], spring[1], spring[2], *speed],
-                        color: mat.vertex_color(rgba, view.seconds),
+                        color: mat.world_vertex_color(rgba, view.seconds, view),
                     });
                 }
                 continue;
@@ -731,7 +777,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
                 let instances = &mut sprite_batches
                     .entry((shader_index, stage_index, frame_slot(draw, view, mat), true, false))
                     .or_insert_with(|| (mat.clone(), Vec::new())).1;
-                let color = mat.vertex_color(*rgba, view.seconds);
+                let color = mat.world_vertex_color(*rgba, view.seconds, view);
                 let a = scene::render_position(*start);
                 let b = scene::render_position(*end);
                 let sample_seconds = lightning_sample_seconds(view.seconds);
@@ -762,7 +808,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
                     .entry((shader_index, stage_index, frame_slot(draw, view, mat), false, false))
                     .or_insert_with(|| (mat.clone(), Vec::new()))
                     .1;
-                let color = mat.vertex_color(*rgba, view.seconds);
+                let color = mat.world_vertex_color(*rgba, view.seconds, view);
                 let mut distance = *length;
                 let mut glow_radius = *radius;
                 while distance > 0.0 {
@@ -810,7 +856,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
                     .entry((shader_index, stage_index, frame_slot(draw, view, mat), false, false))
                     .or_insert_with(|| (mat.clone(), Vec::new()))
                     .1
-                    .push(fx_gpu_quad_instance(origin, left, up, mat.vertex_color(rgba, draw_seconds(draw, view))));
+                    .push(fx_gpu_quad_instance(origin, left, up, mat.world_vertex_color(rgba, draw_seconds(draw, view), view)));
             } else {
                 let entry = cpu_batches
                     .entry((shader_index, stage_index, frame_slot(draw, view, mat)))
@@ -836,7 +882,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
             rt_rigid: None,
             rt_skinned_key: None,
             ghoul2_gpu: None,
-            fx_gpu_sprites: None,
+            cloth_gpu: None, fx_gpu_sprites: None,
             texture: slot_texture(&mat, slot, view.seconds),
             alpha_mode: mat.blend.alpha_mode(),
             authored_glow: mat.authored_glow,
@@ -860,7 +906,7 @@ fn tessellate_gpu_particles_impl<const FILTER: bool, D: FxDrawSource + ?Sized>(
                 rt_rigid: None,
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
-                fx_gpu_sprites: Some(FxGpuSprites {
+                cloth_gpu: None, fx_gpu_sprites: Some(FxGpuSprites {
                 resident: None, instances: Arc::new(instances), blob_shadow: false, lightning, rope }),
                 texture: slot_texture(&mat, slot, view.seconds),
                 alpha_mode: mat.blend.alpha_mode(),
@@ -925,11 +971,11 @@ pub fn tessellate_resident_sprites(
             let entry = batches.entry((key.clone(), stage)).or_insert_with(|| {
                 (mat.clone(), Vec::new(), Vec::new())
             });
-            entry.1.push(slot);
+            entry.1.push(mat.resident_slot(slot, view));
             if let Some((left, up)) = basis {
                 if ready & (1u16 << mat.blend.alpha_mode().index()) == 0 {
                     entry.2.push(fx_gpu_quad_instance(*origin, left, up,
-                        mat.vertex_color(*rgba, view.seconds)));
+                        mat.world_vertex_color(*rgba, view.seconds, view)));
                 }
             }
         }
@@ -950,7 +996,7 @@ pub fn tessellate_resident_sprites(
             rt_rigid: None,
             rt_skinned_key: None,
             ghoul2_gpu: None,
-            fx_gpu_sprites: Some(FxGpuSprites {
+            cloth_gpu: None, fx_gpu_sprites: Some(FxGpuSprites {
                 resident: Some(crate::renderer::FxGpuResidentSprites {
                     frame: Arc::clone(&frame), slots: Arc::new(slots),
                 }),
@@ -981,7 +1027,7 @@ pub fn tessellate_resident_sprites(
             rt_rigid: None,
             rt_skinned_key: None,
             ghoul2_gpu: None,
-            fx_gpu_sprites: Some(FxGpuSprites {
+            cloth_gpu: None, fx_gpu_sprites: Some(FxGpuSprites {
                 resident: Some(crate::renderer::FxGpuResidentSprites {
                     frame: Arc::clone(&frame), slots: Arc::new(Vec::new()),
                 }),
@@ -1000,6 +1046,11 @@ pub fn tessellate_resident_sprites(
 /// real normals and a lighting origin, which the shared unlit FX batches lack.
 /// Back-face culling is on in the dynamic pipeline, so one winding is enough.
 fn lit_mesh_surface(draw: &FxDraw) -> Option<DynamicModelSurface> {
+    if let FxDraw::BakedLitMesh { vertices, indices, lighting_origin } = draw {
+        let mut surface = opaque_fx_surface(Arc::clone(vertices), Arc::clone(indices), *lighting_origin);
+        surface.geometry_source = crate::renderer::ModelGeometrySource::TranslatedFx;
+        return Some(surface);
+    }
     let FxDraw::LitMesh { positions, normals, rgba, indices, lighting_origin } = draw else {
         return None;
     };
@@ -1035,25 +1086,33 @@ fn lit_mesh_surface(draw: &FxDraw) -> Option<DynamicModelSurface> {
         .flatten()
         .copied()
         .collect();
-    (!indices.is_empty()).then(|| DynamicModelSurface {
+    (!indices.is_empty()).then(|| opaque_fx_surface(Arc::new(vertices), Arc::new(indices), *lighting_origin))
+}
+
+fn opaque_fx_surface(
+    vertices: Arc<Vec<DynamicModelVertex>>,
+    indices: Arc<Vec<u32>>,
+    lighting_origin: [f32; 3],
+) -> DynamicModelSurface {
+    DynamicModelSurface {
         geometry_source: crate::renderer::ModelGeometrySource::Fx,
         authored_lighting: false,
         material_trace: None,
         entity_num: FX_ENTITY_NUM,
         wireframe_class: DynamicWireframeClass::Effect,
         raster_visible: true, portal_only: false,
-        vertices: Arc::new(vertices),
-        indices: Arc::new(indices),
-        lighting_origin: Some(*lighting_origin),
+        vertices,
+        indices,
+        lighting_origin: Some(lighting_origin),
         rt_rigid: None,
         rt_skinned_key: None,
         ghoul2_gpu: None,
-        fx_gpu_sprites: None,
+        cloth_gpu: None, fx_gpu_sprites: None,
         texture: None,
         alpha_mode: DynamicModelAlphaMode::Opaque,
 
         authored_glow: false,
-    })
+    }
 }
 
 /// Shader clock for one draw: refdef time minus refEntity_t::shaderTime.
@@ -1132,7 +1191,7 @@ fn append_grapple_rope_cpu(batch: &mut Batch, view: &FxView, mat: &FxMaterial,
     // Contiguous indexed strips; two layers share a centerline but have
     // independent widths/colors. Both sides are drawn by Batch::triangle.
     for (width, rgba) in [(2.05, [255, 28, 35, 68]), (0.95, [235, 48, 49, 235])] {
-        let color = mat.vertex_color(rgba, seconds);
+        let color = mat.world_vertex_color(rgba, seconds, view);
         let mut nodes = [[0u32; 2]; GRAPPLE_ROPE_SEGMENTS + 1];
         for i in 0..=GRAPPLE_ROPE_SEGMENTS {
             let prev = points[i.saturating_sub(1)];
@@ -1162,14 +1221,14 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
     match draw {
         FxDraw::Sprite { origin, radius, rotation, rgba, .. } => {
             let (left, up) = rotated_frame(view.axis[1], view.axis[2], *radius, *rotation);
-            batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba, seconds));
+            batch.quad_stamp(*origin, left, up, mat.world_vertex_color(*rgba, seconds, view));
         }
         FxDraw::SaberGlow { origin, direction, length, radius, hilt_radius, rgba, .. } => {
             // TaystJK/OpenJK RB_SurfaceSaberGlow. The renderer receives one
             // RT_SABER_GLOW entity, then walks billboards from blade tip back
             // toward the hilt. Radius grows by exactly 0.017 per blob and the
             // step is exactly 65% of the current radius; do not clamp it here.
-            let color = mat.vertex_color(*rgba, seconds);
+            let color = mat.world_vertex_color(*rgba, seconds, view);
             let mut distance = *length;
             let mut glow_radius = *radius;
             while distance > 0.0 {
@@ -1188,7 +1247,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
             }
         }
         FxDraw::Billboard { origin, half, rotation, uv, rgba, align, facing, ground, pivot, .. } => {
-            let color = mat.vertex_color(*rgba, seconds);
+            let color = mat.world_vertex_color(*rgba, seconds, view);
             let (left, up) = match (facing, align) {
                 // Custom facing: quad in the plane perpendicular to the facing
                 // vector; long axis from the alignment, else rotation about it.
@@ -1229,13 +1288,13 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
         }
         FxDraw::OrientedQuad { origin, axis, radius, rotation, rgba, .. } => {
             let (left, up) = rotated_frame(axis[1], axis[2], *radius, *rotation);
-            batch.quad_stamp(*origin, left, up, mat.vertex_color(*rgba, seconds));
+            batch.quad_stamp(*origin, left, up, mat.world_vertex_color(*rgba, seconds, view));
         }
         FxDraw::Lightning { start, end, width, chaos, seed, rgba, .. } => {
             // Reference CPU/workers fallback for users who don't select GPU
             // geometry: still a jagged discharge, never a straight beam.
             // Vertices share their generated endpoints to avoid gaps.
-            let color = mat.vertex_color(*rgba, seconds);
+            let color = mat.world_vertex_color(*rgba, seconds, view);
             let ray = sub(*end, *start);
             let ray_len = length(ray);
             if ray_len <= 0.01 { return; }
@@ -1278,7 +1337,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
         FxDraw::Line { start, end, width, rgba, .. } => {
             // RB_SurfaceLine: right = normalize((start-view) x (end-view)).
             let right = normalize(cross(sub(*start, view.origin), sub(*end, view.origin)));
-            let color = mat.vertex_color(*rgba, seconds);
+            let color = mat.world_vertex_color(*rgba, seconds, view);
             let v0 = batch.vertex(add(*start, scale(right, *width)), [0.0, 0.0], color);
             let v1 = batch.vertex(sub(*start, scale(right, *width)), [1.0, 0.0], color);
             let v2 = batch.vertex(add(*end, scale(right, *width)), [0.0, 1.0], color);
@@ -1290,7 +1349,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
             append_grapple_rope_cpu(batch, view, mat, *start, *end, *spring, *phase, *speed, seconds);
         }
         FxDraw::Quad { positions, uvs, rgba, .. } => {
-            let color = mat.vertex_color(*rgba, seconds);
+            let color = mat.world_vertex_color(*rgba, seconds, view);
             let v0 = batch.vertex(positions[0], uvs[0], color);
             let v1 = batch.vertex(positions[1], uvs[1], color);
             let v2 = batch.vertex(positions[2], uvs[2], color);
@@ -1306,7 +1365,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
             }
             let base = batch.vertices.len() as u32;
             for ((position, uv), color) in positions.iter().zip(uvs).zip(rgba) {
-                batch.vertex(*position, *uv, mat.vertex_color(*color, seconds));
+                batch.vertex(*position, *uv, mat.world_vertex_color(*color, seconds, view));
             }
             for triangle in indices.chunks_exact(3) {
                 let [a, b, c] = [triangle[0], triangle[1], triangle[2]];
@@ -1316,9 +1375,9 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
             }
         }
         // Built into its own lit surface by the tessellators, never batched.
-        FxDraw::LitMesh { .. } => {}
+        FxDraw::LitMesh { .. } | FxDraw::BakedLitMesh { .. } => {}
         FxDraw::Cylinder { start, end, axis, start_radius, end_radius, rgba, .. } => {
-            cylinder(batch, *start, *end, *axis, *start_radius, *end_radius, mat.vertex_color(*rgba, seconds), view);
+            cylinder(batch, *start, *end, *axis, *start_radius, *end_radius, mat.world_vertex_color(*rgba, seconds, view), view);
         }
     }
     for modifier in &mat.tc_mods {
@@ -1334,7 +1393,7 @@ fn append_draw(draw: &FxDraw, view: &FxView, mat: &FxMaterial, batch: &mut Batch
 }
 
 // Evaluate authored stretch waveforms on the FX CPU vertex path.
-fn fx_wave_phase(wave: jka_assets::shader::Wave, seconds: f32) -> f32 {
+pub(crate) fn fx_wave_phase(wave: jka_assets::shader::Wave, seconds: f32) -> f32 {
     if matches!(wave.func, jka_assets::shader::WaveFunc::Noise) {
         (seconds + wave.phase) * wave.frequency
     } else {
@@ -1342,7 +1401,7 @@ fn fx_wave_phase(wave: jka_assets::shader::Wave, seconds: f32) -> f32 {
     }
 }
 
-fn fx_wave(kind: jka_assets::shader::WaveFunc, phase: f32) -> f32 {
+pub(crate) fn fx_wave(kind: jka_assets::shader::WaveFunc, phase: f32) -> f32 {
     use jka_assets::shader::WaveFunc;
     let x = phase.rem_euclid(1.0);
     match kind {
@@ -1666,7 +1725,7 @@ mod tests {
     }
 
     fn white(blend: FxBlend) -> FxMaterial {
-        FxMaterial { animation: None, texture: None, blend, rgb_vertex: true, alpha_vertex: true, rgb_const: [1.0; 3], alpha_const: 1.0, rgb_wave: None, alpha_wave: None, rgb_one_minus_vertex: false, alpha_one_minus_vertex: false, tc_mods: Vec::new(), shader_time_offset: 0.0, shader_clamp_time: None, authored_glow: false, alpha_test: 0.0 }
+        FxMaterial { animation: None, texture: None, blend, rgb_vertex: true, rgb_identity_light: false, alpha_vertex: true, rgb_const: [1.0; 3], alpha_const: 1.0, rgb_wave: None, alpha_wave: None, rgb_one_minus_vertex: false, alpha_one_minus_vertex: false, tc_mods: Vec::new(), shader_time_offset: 0.0, shader_clamp_time: None, authored_glow: false, alpha_test: 0.0 }
     }
 
     #[test]
@@ -1687,6 +1746,25 @@ mod tests {
         assert!((high[3] - 1.0).abs() < 1e-5);
         let clamped = FxMaterial { shader_clamp_time: Some(0.25), ..material };
         assert_eq!(clamped.vertex_color([255; 4], 0.5), clamped.vertex_color([255; 4], 9.0));
+    }
+
+    #[test]
+    fn world_fx_overbright_preserves_alpha_and_exact_vertex() {
+        let mut camera = view();
+        let material = FxMaterial { rgb_identity_light: true, ..white(FxBlend::Alpha) };
+        let exact = white(FxBlend::Alpha);
+        let rgba = [255, 128, 64, 192];
+        assert_eq!(material.world_vertex_color(rgba, 0.0, &camera), exact.vertex_color(rgba, 0.0));
+        camera.set_overbright(1, true, false);
+        let color = material.world_vertex_color(rgba, 0.0, &camera);
+        assert!((color[0] - 0.214_041_14).abs() < 1e-6);
+        assert_eq!(color[3], 192.0 / 255.0);
+        assert_eq!(exact.world_vertex_color(rgba, 0.0, &camera), exact.vertex_color(rgba, 0.0));
+        assert_eq!(material.resident_slot(7, &camera), 7 | (1 << 31));
+        assert_eq!(exact.resident_slot(7, &camera), 7);
+        camera.set_overbright(1, false, false);
+        assert_eq!(material.world_vertex_color(rgba, 0.0, &camera)[0], 0.5);
+        assert_eq!(material.resident_slot(7, &camera), 7 | (1 << 30));
     }
 
     #[test]
@@ -1749,7 +1827,7 @@ mod tests {
 
 
     fn view() -> FxView {
-        FxView { origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], fov_x: 90.0, seconds: 0.0 }
+        FxView { origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], fov_x: 90.0, seconds: 0.0, identity_light: 1.0, }
     }
 
     #[test]
@@ -2238,7 +2316,7 @@ mod resident_fx_tests {
     fn stage() -> FxMaterial {
         FxMaterial {
             texture: None, animation: None, blend: FxBlend::AddAlpha,
-            rgb_vertex: true, alpha_vertex: true,
+            rgb_vertex: true, rgb_identity_light: false, alpha_vertex: true,
             rgb_const: [1.0; 3], alpha_const: 1.0,
             rgb_wave: None, alpha_wave: None,
             rgb_one_minus_vertex: false, alpha_one_minus_vertex: false,
@@ -2255,7 +2333,7 @@ mod resident_fx_tests {
         };
         let view = FxView {
             origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            fov_x: 90.0, seconds: 0.1,
+            fov_x: 90.0, seconds: 0.1, identity_light: 1.0,
         };
         let frame = Arc::new(crate::renderer::FxGpuResidentFrame::default());
         let (surfaces, accepted, _) = tessellate_resident_sprites(
@@ -2283,6 +2361,7 @@ mod resident_fx_tests {
             axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             fov_x: 90.0,
             seconds: 0.0,
+            identity_light: 1.0,
         };
         let draw = FxDraw::Sprite { shader_time: 0.0,
             origin: [1.0, 2.0, 3.0], radius: 8.0,
@@ -2319,7 +2398,7 @@ mod resident_fx_tests {
         });
         let view = FxView {
             origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            fov_x: 90.0, seconds: 0.0,
+            fov_x: 90.0, seconds: 0.0, identity_light: 1.0,
         };
         let (surfaces, accepted, _) = tessellate_resident_sprites(&[], frame, &view, &mut |_| vec![]);
         assert!(accepted.is_empty());

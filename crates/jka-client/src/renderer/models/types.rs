@@ -11,6 +11,7 @@ pub(in crate::renderer) struct Ghoul2GpuDrawUniform {
     // xyz: model axis, w: stable foliage variation tag (also for rigid MD3 instances).
     pub(in crate::renderer) axis0: [f32; 4],
     pub(in crate::renderer) axis1: [f32; 4],
+    // w: SkinGore's reflection-probe binding holds a captured map probe.
     pub(in crate::renderer) axis2: [f32; 4],
     pub(in crate::renderer) origin: [f32; 4],
     pub(in crate::renderer) color: [f32; 4],
@@ -109,6 +110,7 @@ pub(in crate::renderer) struct EntityDlight {
     /// Light Brightness setting.
     pub(in crate::renderer) color: Vec3,
     pub(in crate::renderer) radius: f32,
+    pub(in crate::renderer) radial_exponent: Option<f32>,
 }
 
 /// MAX_DLIGHTS (tr_types.h); the Legacy BSP dlight masks share the cap.
@@ -140,8 +142,13 @@ pub(in crate::renderer) fn add_entity_dlights(
         } else {
             Vec3::ZERO
         };
-        let distance = distance.max(DLIGHT_MINIMUM_RADIUS);
-        let weight = DLIGHT_AT_RADIUS * dlight.radius * dlight.radius / (distance * distance);
+        let weight = if let Some(exponent) = dlight.radial_exponent {
+            let ratio = distance / dlight.radius.max(1.0);
+            (1.0 - ratio * ratio).max(0.0).powf(exponent) * 255.0
+        } else {
+            let distance = distance.max(DLIGHT_MINIMUM_RADIUS);
+            DLIGHT_AT_RADIUS * dlight.radius * dlight.radius / (distance * distance)
+        };
         directed += dlight.color * weight;
         direction += toward * weight;
     }
@@ -270,6 +277,7 @@ pub(in crate::renderer) struct Ghoul2RtSkinningResources {
 }
 
 pub(in crate::renderer) struct Ghoul2PreparedDraw {
+    pub(in crate::renderer) skin_gore: Option<Arc<str>>,
     pub(in crate::renderer) entity_num: u16,
     pub(in crate::renderer) portal_only: bool,
     pub(in crate::renderer) mesh_key: Arc<str>,
@@ -285,6 +293,7 @@ pub(in crate::renderer) struct Ghoul2PreparedDraw {
 }
 
 pub(in crate::renderer) struct Ghoul2PendingDraw {
+    pub(in crate::renderer) skin_gore: Option<Arc<str>>,
     pub(in crate::renderer) entity_num: u16,
     pub(in crate::renderer) portal_only: bool,
     pub(in crate::renderer) mesh_key: Arc<str>,
@@ -417,6 +426,23 @@ pub(in crate::renderer) struct FxGpuSpritePreparedDraw {
     pub(in crate::renderer) authored_glow: bool,
     pub(in crate::renderer) lightning: bool,
     pub(in crate::renderer) rope: bool,
+    /// Render-space AABB of this draw's billboards; `None` for lightning and
+    /// ropes, whose instances are not billboards.
+    pub(in crate::renderer) bounds: Option<([f32; 3], [f32; 3])>,
+    /// Set per frame by `classify_submerged_fx`: wholly under an opaque
+    /// water's surface, so it is drawn before the water, not after.
+    pub(in crate::renderer) submerged: bool,
+}
+
+/// Which translucent FX sprites a phase draws, relative to an opaque,
+/// depth-writing water surface. Such water fails the depth test of anything
+/// drawn after it that lies beneath, so submerged FX (a saber blade under a
+/// lake) are drawn before the water, where it refracts and fogs them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::renderer) enum FxWaterSplit {
+    Off,
+    SubmergedOnly,
+    DryOnly,
 }
 
 pub(in crate::renderer) struct DynamicPreparedDraw {
@@ -535,7 +561,7 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) model_glow_pipelines:
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     /// Bit per `DynamicModelAlphaMode::index` with a prepared MD3 draw this frame.
-    pub(in crate::renderer) model_alpha_mask: u16,
+    pub(in crate::renderer) model_alpha_mask: u32,
     pub(in crate::renderer) fx_sprite_shader: Option<wgpu::ShaderModule>,
     pub(in crate::renderer) fx_rope_shader: Option<wgpu::ShaderModule>,
     pub(in crate::renderer) fx_rope_pipeline: Option<wgpu::RenderPipeline>,
@@ -561,6 +587,7 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) skin_layout: wgpu::BindGroupLayout,
     pub(in crate::renderer) skin_pipeline_layout: wgpu::PipelineLayout,
     pub(in crate::renderer) skin_shader: wgpu::ShaderModule,
+    pub(in crate::renderer) skin_gore_gpu: Option<super::skin_gore::SkinGoreGpu>,
     pub(in crate::renderer) skin_wireframe_pipeline: Option<wgpu::RenderPipeline>,
     pub(in crate::renderer) skin_pipelines:
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
@@ -573,10 +600,10 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) skin_source_pipelines:
         [Option<wgpu::RenderPipeline>; DynamicModelAlphaMode::COUNT],
     /// Bit per `DynamicModelAlphaMode::index` with a prepared Ghoul2 draw this frame.
-    pub(in crate::renderer) skin_alpha_mask: u16,
+    pub(in crate::renderer) skin_alpha_mask: u32,
     /// Subset of `skin_alpha_mask` whose draws carry a Source 1 VMT material.
     /// Zero in a stock session, which keeps the draw loop byte-identical.
-    pub(in crate::renderer) skin_source_mask: u16,
+    pub(in crate::renderer) skin_source_mask: u32,
     // Depth-writing entities in the single-sample scene depth prepass. These
     // target the fixed prepass formats, so they never depend on MSAA/HDR.
     pub(in crate::renderer) prepass_pipeline: wgpu::RenderPipeline,
@@ -608,6 +635,7 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) fx_sprite_instance_buffer: wgpu::Buffer,
     pub(in crate::renderer) fx_sprite_instance_capacity: u64,
     pub(in crate::renderer) fx_sprite_draws: Vec<FxGpuSpritePreparedDraw>,
+    pub(in crate::renderer) fx_water_split: std::cell::Cell<FxWaterSplit>,
     /// Frame-local fast gate: ordinary FX uses its original single-pipeline loop.
     pub(in crate::renderer) fx_rope_present: bool,
     pub(in crate::renderer) lightning_gpu: Option<super::lightning_gpu::LightningGpu>,
@@ -685,6 +713,8 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     /// Lazily created only while RT Shadows is active. RT-off keeps the original
     /// Ghoul2 vertex-shader skinning path and never allocates/dispatches this.
     pub(in crate::renderer) rt_skinning: Option<Ghoul2RtSkinningResources>,
+    /// GPU cloth (r_clothSolver 1) simulation state and per-frame dispatches.
+    pub(in crate::renderer) cloth_gpu: super::cloth_gpu::ClothGpuRenderer,
     pub(in crate::renderer) rt_prepared: bool,
     // Per-frame (colour map, normal map) pointer pair -> stable key cache.
     // TextureData is Arc-backed and immutable during prepare, so identical

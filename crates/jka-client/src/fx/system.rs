@@ -39,7 +39,7 @@ const MASK_SOLID: i32 = 0x0000_0001 | 0x0000_1000;
 /// SURF_NOIMPACT (surfaceflags.h): no impact effect on this surface.
 const SURF_NOIMPACT: i32 = 0x0008_0000;
 
-type Axis = [[f32; 3]; 3];
+pub(crate) type Axis = [[f32; 3]; 3];
 
 /// Presentation ownership for a spawned FX tree. Child/death/emitter effects
 /// inherit the root class so runtime A/B switches suppress the authored tree
@@ -220,6 +220,12 @@ pub enum FxDraw {
         normals: Vec<[f32; 3]>,
         rgba: Vec<[u8; 4]>,
         indices: Vec<u32>,
+        lighting_origin: [f32; 3],
+    },
+    /// An opaque baked mesh in render axes relative to `lighting_origin`.
+    BakedLitMesh {
+        vertices: Arc<Vec<crate::renderer::DynamicModelVertex>>,
+        indices: Arc<Vec<u32>>,
         lighting_origin: [f32; 3],
     },
     /// RT_CYLINDER: `start_radius` ring at start, `end_radius` ring at end.
@@ -794,6 +800,17 @@ impl FxSystem {
             return 0;
         };
         let mut template = parse_effect_without_auto_light(&key, &gp2::parse(&bytes));
+        if crate::ninja_fire_debug::promotion_candidate(&key) {
+            // The FX worker owns the parsed source and publishes immutable
+            // geometry once, rather than reparsing EFX on the render thread.
+            crate::ninja_fire_debug::register_effect_geometry(
+                &key, super::fire_geometry::FlameGeometry::from_template(&template));
+        }
+        if jka_ninja::INCLUDED {
+            if let Some(geometry) = super::fire_geometry::FlameGeometry::from_smoke_template(&template) {
+                crate::ninja_fire_debug::register_smoke_geometry(&key, geometry);
+            }
+        }
         template.auto_light = self.light_promotion.effect_profile(&key);
         // Reserve the id before resolving links so self-references terminate.
         let id = (self.effects.len() + 1) as EffectId;
@@ -1024,6 +1041,9 @@ impl FxSystem {
             // GPU evaluates its transform/colour/lifetime and the worker skips
             // update_primitive entirely (including the CPU sprite allocation).
             let gpu_owned = prim.gpu_id.is_some_and(|id| owned.contains(&id))
+                && !(crate::ninja_fire_debug::promote()
+                    && matches!(prim.class, FxClass::MapRunner(_))
+                    && crate::ninja_fire_debug::original_flame_shader(&prim.shader))
                 && prim.gpu_spawn.as_ref().is_some_and(|spawn| {
                     super::gpu_sparks::primitive_eligibility(
                         prim.kind, prim.flags, physics_mode,
@@ -1356,7 +1376,8 @@ impl FxSystem {
             _ => {}
         }
 
-        let life = fx.life.get(rng) as i32; // killTime is an int in FX_Add*
+        // Sample the authored duration exactly once (preserving stock RNG order).
+        let life = fx.life.get(rng) as i32;
         let time = self.time;
         let parm = |value: f32, shift: u32| -> f32 {
             match (flags >> shift) & FX_PARM_MASK {
@@ -1431,7 +1452,10 @@ impl FxSystem {
             return;
         }
         self.next_visual_id = self.next_visual_id.wrapping_add(1);
-        if self.gpu_staging {
+        if self.gpu_staging && !(crate::ninja_fire_debug::promote()
+            && matches!(class, FxClass::MapRunner(_))
+            && crate::ninja_fire_debug::original_flame_shader(&primitive.shader))
+        {
             // No silent promotion yet. This is intentionally a staging stream
             // while the stock FX simulation and drawing remain unchanged.
             let spawn = super::gpu_sparks::GpuSparkSpawn {
@@ -1969,7 +1993,7 @@ fn vectoangles(value: [f32; 3]) -> [f32; 3] {
     [-pitch, yaw, 0.0]
 }
 
-fn angles_to_axis(angles: [f32; 3]) -> Axis {
+pub(crate) fn angles_to_axis(angles: [f32; 3]) -> Axis {
     let (sp, cp) = angles[0].to_radians().sin_cos();
     let (sy, cy) = angles[1].to_radians().sin_cos();
     let (sr, cr) = angles[2].to_radians().sin_cos();

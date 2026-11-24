@@ -112,7 +112,6 @@ pub(super) fn check(
                 false,
                 4.0,
                 1.0 / 60.0,
-                false,
             );
             water.prepare(device, queue, [SIZE, SIZE], samples, &view);
             let mut bytes = [0u8; 512];
@@ -223,7 +222,7 @@ pub(super) fn check(
                     }),
                     ..Default::default()
                 });
-                water.draw_submerged(&mut pass, &camera_group, &shadow_group, None, river);
+                water.draw_submerged(&mut pass, river);
             }
             queue.submit(Some(encoder.finish()));
             let pixels = super::material_tests::read_texture(
@@ -262,7 +261,6 @@ pub(super) fn check(
                     false,
                     4.0,
                     0.0,
-                    false,
                 );
                 water.prepare(device, queue, [SIZE, SIZE], samples, &view);
                 bytes[..64].copy_from_slice(bytemuck::cast_slice(

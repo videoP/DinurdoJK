@@ -8,6 +8,8 @@
 const MAX_SURFACE_DEFORMATION_STAMPS: u32 = 32u;
 const FOOTPRINT_MODE_2D: u32 = 1u;
 const FOOTPRINT_MODE_3D: u32 = 2u;
+const FOOTPRINT_MODE_NINJA: u32 = 3u;
+const FOOTPRINT_MODE_NINJA_COMPOSITE: u32 = 4u;
 const MATERIAL_SNOW_WORD: u32 = 14u;
 const JKA_MARK_RADIUS: f32 = 6.0;
 
@@ -36,6 +38,52 @@ struct SurfaceDeformationUniform {
 
 fn surface_material_id(material_word: u32) -> u32 { return (material_word & MATERIAL_SURFACE_KIND_MASK) >> MATERIAL_SURFACE_KIND_SHIFT; }
 fn is_authored_snow(material_word: u32) -> bool { return surface_material_id(material_word) == MATERIAL_SNOW_WORD; }
+
+fn ninja_snow_composite_mode() -> bool {
+    return surface_deformation.header.y == FOOTPRINT_MODE_NINJA_COMPOSITE;
+}
+
+fn ninja_snow_mode() -> bool {
+    return surface_deformation.header.y == FOOTPRINT_MODE_NINJA || ninja_snow_composite_mode();
+}
+
+fn ninja_snow_weight(position: vec3<f32>) -> f32 {
+    let radius = surface_deformation.snowflow_params2.z;
+    let distance_to_focus = distance(position.xz, surface_deformation.legacy_bounds.xy);
+    return 1.0 - smoothstep(radius * 0.8, radius, distance_to_focus);
+}
+
+struct NinjaSnowShading {
+    color_scale: vec3<f32>,
+    normal: vec3<f32>,
+    roughness: f32,
+};
+
+// Replaced by the private Humpy1 functions when they are included in the build.
+fn ninja_snow_vertex_offset(position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(0.0);
+}
+
+fn ninja_snow_material(position: vec3<f32>, normal: vec3<f32>, eye: vec3<f32>, direction: vec3<f32>) -> NinjaSnowShading {
+    return NinjaSnowShading(vec3<f32>(1.0), normal, 1.0);
+}
+
+// The same bind-group slots carry either mode's resources, never both.
+// Full snow shades the original receiver (instance 0), not the shell. Only
+// the opaque base or source-classified reverse-lightmap diffuse stage owns
+// material replacement: never tint $lightmap or additive siblings a second time.
+fn ninja_snow_receiver_active(shell_kind: u32, material_word: u32, tc_gen: u32, flags: u32) -> bool {
+    if (!is_authored_snow(material_word) || tc_gen == 1u) { return false; }
+    if (ninja_snow_composite_mode()) {
+        return shell_kind == 0u && surface_deformation.snowflow_header.z != 0u && ((flags & MATERIAL_FLAG_OPAQUE_STAGE) != 0u || (material_word & MATERIAL_FLAG_REVERSE_LIGHTMAP_DIFFUSE) != 0u) && (flags & MATERIAL_FLAG_EXPLICIT_LIGHTMAP) == 0u;
+    }
+    return shell_kind == 1u && surface_deformation.header.y == FOOTPRINT_MODE_NINJA
+        && surface_deformation.snowflow_header.y != 0u;
+}
+fn ninja_snow_apply_albedo(base: vec4<f32>, snow: NinjaSnowShading) -> vec4<f32> {
+    // Keep the authored BSP texture and its stage colors in Composite mode.
+    return vec4<f32>(base.rgb * snow.color_scale, base.a);
+}
 fn xz_inside_bounds(position: vec2<f32>, bounds: vec4<f32>) -> bool {
     return position.x >= bounds.x && position.y >= bounds.y && position.x <= bounds.z && position.y <= bounds.w;
 }
@@ -170,10 +218,22 @@ fn deform_surface_deformation_vertex(
     position: vec3<f32>, normal: vec3<f32>, material_word: u32,
     instance_index: u32, allow_shell: bool,
 ) -> vec4<f32> {
-    if (!allow_shell || instance_index == 0u || surface_deformation.header.y != FOOTPRINT_MODE_3D ||
+    // BSP is authoritative for map height and collision. In Ninja Composite
+    // mode the material's tiled WPO remains an input to snow shading/relief,
+    // NEVER an unconditional displacement of authored map vertices. The UE
+    // reference uses a dense Landscape, not JKA's coarse brush triangles.
+    if (ninja_snow_composite_mode()) {
+        return vec4<f32>(position, 0.0);
+    }
+    if (!allow_shell || instance_index == 0u ||
         !is_authored_snow(material_word) || normalize(normal).y <= 0.35) {
         return vec4<f32>(position, 0.0);
     }
+    if (surface_deformation.header.y == FOOTPRINT_MODE_NINJA && surface_deformation.snowflow_header.y != 0u) {
+        let n = normalize(normal);
+        return vec4<f32>(position + ninja_snow_vertex_offset(position, n) * ninja_snow_weight(position) + n * 0.025, 1.0);
+    }
+    if (surface_deformation.header.y != FOOTPRINT_MODE_3D) { return vec4<f32>(position, 0.0); }
     let height = max(snowflow_filtered_height(position.xz), 0.0);
     return vec4<f32>(position + normalize(normal) * (height + 0.025), 1.0);
 }
@@ -194,6 +254,12 @@ fn surface_deformation_should_discard(
     shell_kind: u32, shell_coverage: f32, pixel_position: vec2<f32>, allow_shell: bool,
 ) -> bool {
     if (shell_kind == 0u) { return false; }
+    if (ninja_snow_composite_mode()) { return true; }
+    if (surface_deformation.header.y == FOOTPRINT_MODE_NINJA) {
+        return !allow_shell || surface_deformation.snowflow_header.y == 0u ||
+            !is_authored_snow(material_word) || normalize(world_normal).y <= 0.25 ||
+            ninja_snow_weight(world_position) <= 0.0;
+    }
     if (!allow_shell || surface_deformation.header.y != FOOTPRINT_MODE_3D ||
         !is_authored_snow(material_word) || normalize(world_normal).y <= 0.25 ||
         snowflow_falloff(world_position.xz) <= 0.0) { return true; }

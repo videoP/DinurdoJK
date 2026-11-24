@@ -1171,7 +1171,7 @@ mod strafehelper_review {
         for (a,b) in original.iter().zip(&moved) {
             if a.textured == 1.0 {
                 assert!((b.position[0]-a.position[0]-73.0*2.0/1280.0).abs()<1e-5);
-                assert!((b.position[1]-a.position[1]-41.0*2.0/800.0).abs()<1e-5);
+                assert!((b.position[1]-a.position[1]-41.0*2.0/720.0).abs()<1e-5);
                 changed += 1;
             } else { assert_eq!(a.position,b.position); }
         }

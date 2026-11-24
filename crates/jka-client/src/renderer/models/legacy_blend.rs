@@ -10,7 +10,7 @@ use crate::renderer::{
 pub(in crate::renderer) fn eligible(mode: Mode) -> bool {
     matches!(
         mode,
-        Mode::AdditiveOne | Mode::DstColorAdd | Mode::SightShellNoDepth
+        Mode::AdditiveOne | Mode::DstColorAdd | Mode::SightShellNoDepth | Mode::StageMaskBlend
     )
 }
 
@@ -581,8 +581,8 @@ impl DynamicModelRenderer {
         &mut self,
         jobs: &mut PipelineJobManager,
         device: &wgpu::Device,
-        model_mask: u16,
-        skin_mask: u16,
+        model_mask: u32,
+        skin_mask: u32,
     ) {
         if self.legacy_blend_mode > 1 && self.legacy_blend_mode != 4 { return; }
         // Mode 4 draws encoded model colors into a UNORM alias of the SDR

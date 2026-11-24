@@ -6,6 +6,7 @@ fn dlight(position: [f32; 3], color: [f32; 3], radius: f32) -> EntityDlight {
         position: Vec3::from_array(position),
         color: Vec3::from_array(color),
         radius,
+        radial_exponent: None,
     }
 }
 

@@ -438,6 +438,7 @@ fn rt_segment_light_preserves_power_and_point_mode() {
         radius: 14.0,
         source_radius: 3.5,
         intensity: 1.0,
+        radial_exponent: None,
         spot: None,
         segment: Some([[0.0, 2.0, 3.0], [10.0, 2.0, 3.0]]),
         blade_segments: None,
@@ -473,6 +474,7 @@ fn promoted_spot_light_packs_direction_and_cone_without_stealing_shadow_metadata
         radius: 256.0,
         source_radius: 12.0,
         intensity: 1.0,
+        radial_exponent: None,
         spot: Some(crate::fx::system::FxSpotLight {
             direction: [2.0, 0.0, 0.0],
             inner_cone_cos: 0.94,
@@ -507,6 +509,7 @@ fn rt_multiblade_expansion_conserves_aggregate_power() {
         source_radius: 0.0,
         color: [0.25, 0.0, 0.75],
         intensity: 2.0,
+        radial_exponent: None,
         spot: None,
         segment: None,
         blade_segments: Some(
@@ -1579,7 +1582,7 @@ fn entity_shadow_pass_writes_caster_depth() {
             rt_rigid: None,
             rt_skinned_key: None,
             ghoul2_gpu: None,
-            fx_gpu_sprites: None,
+            cloth_gpu: None, fx_gpu_sprites: None,
             texture: None,
             alpha_mode: DynamicModelAlphaMode::Opaque,
 
@@ -1591,6 +1594,7 @@ fn entity_shadow_pass_writes_caster_depth() {
             &device,
             &queue,
             &[surface],
+            None,
             None,
             false,
             false,

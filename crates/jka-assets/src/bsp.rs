@@ -277,7 +277,40 @@ pub struct Bsp {
     pub light_grid: Option<LightGrid>,
 }
 
+/// Immutable subset required by static acoustic brush traversal. No visual data.
+#[derive(Debug, Clone)]
+pub struct AcousticCollision {
+    pub collision: CollisionTree,
+    pub world_brushes: Range<usize>,
+    /// Indexed by the network inline-model number. The world is index zero.
+    pub models: Vec<AcousticModel>,
+    pub planes: Vec<Plane>,
+    pub brushes: Vec<Brush>,
+    pub brush_sides: Vec<BrushSide>,
+    pub shaders: Vec<Shader>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcousticModel {
+    pub mins: [f32; 3],
+    pub maxs: [f32; 3],
+    pub brushes: Range<usize>,
+}
+
 impl Bsp {
+    pub fn acoustic_collision(&self) -> Result<AcousticCollision> {
+        Ok(AcousticCollision {
+            collision: self.collision.as_ref().ok_or_else(|| invalid("no acoustic collision tree"))?.clone(),
+            world_brushes: self.models.first().ok_or_else(|| invalid("no acoustic world model"))?.brushes.clone(),
+            models: self.models.iter().map(|model| AcousticModel {
+                mins: model.mins,
+                maxs: model.maxs,
+                brushes: model.brushes.clone(),
+            }).collect(),
+            planes: self.planes.clone(), brushes: self.brushes.clone(),
+            brush_sides: self.brush_sides.clone(), shaders: self.shaders.clone(),
+        })
+    }
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < HEADER_BYTES || data.len() > MAX_FILE_BYTES {
             return Err(invalid(format!(
@@ -772,6 +805,10 @@ impl Bsp {
     /// carry the JKA material id from each individual brush side. Curved patch
     /// and triangle-soup collision surfaces are appended separately.
     pub fn world_acoustic_mesh(&self, patch_subdivisions: usize) -> Result<AcousticMesh> {
+        self.world_acoustic_mesh_cancellable(patch_subdivisions, || false)
+    }
+
+    pub fn world_acoustic_mesh_cancellable(&self, patch_subdivisions: usize, cancelled: impl Fn() -> bool) -> Result<AcousticMesh> {
         if !(1..=16).contains(&patch_subdivisions) {
             return Err(invalid("patch subdivisions must be 1..16"));
         }
@@ -799,6 +836,7 @@ impl Bsp {
         let mut faces = Vec::<AcousticBrushFace>::new();
         let mut bounds = vec![None; self.brushes.len()];
         for brush_index in world.brushes.clone() {
+            if cancelled() { return Err(invalid("acoustic mesh build cancelled")); }
             let brush = &self.brushes[brush_index];
             let brush_shader = self
                 .shaders
@@ -816,16 +854,17 @@ impl Bsp {
                 let polygon = brush_side_polygon(self, brush, side_index, extent)?;
                 if polygon.len() < 3 { continue; }
                 for &point in &polygon { brush_bounds.extend(point); }
-                let material = self
+                let flags = self
                     .shaders
                     .get(side.shader)
                     .ok_or_else(|| invalid("brush-side shader index out of range"))?
-                    .surface_flags & MATERIAL_MASK;
+                    .surface_flags;
                 faces.push(AcousticBrushFace {
                     brush_index,
                     normal: self.planes[side.plane].normal,
                     polygon,
-                    material: material as u8,
+                    material: (flags & MATERIAL_MASK) as u8,
+                    flags: if flags & SURF_SKY != 0 { ACOUSTIC_SKY } else { 0 },
                 });
             }
             if brush_bounds.is_valid() {
@@ -842,6 +881,7 @@ impl Bsp {
         let mut occupied = HashMap::<(i32, i32, i32), Vec<usize>>::new();
         let mut large = Vec::<usize>::new();
         for brush_index in world.brushes.clone() {
+            if cancelled() { return Err(invalid("acoustic mesh build cancelled")); }
             let Some(bb) = bounds[brush_index] else { continue; };
             let lo = bb.min.map(coord);
             let hi = bb.max.map(coord);
@@ -866,6 +906,7 @@ impl Bsp {
         let mut kept = Vec::<Option<AcousticBrushFace>>::new();
         let mut identical = HashMap::<Vec<[i64; 3]>, usize>::new();
         for face in faces {
+            if cancelled() { return Err(invalid("acoustic mesh build cancelled")); }
             let center = face.polygon.iter().fold([0.0_f32; 3], |mut sum, point| {
                 for axis in 0..3 { sum[axis] += point[axis]; }
                 sum
@@ -917,7 +958,7 @@ impl Bsp {
                         duplicates += 2;
                         continue;
                     }
-                    if dot > 0.99 && previous.material == face.material {
+                    if dot > 0.99 && previous.material == face.material && previous.flags == face.flags {
                         duplicates += 1;
                         continue;
                     }
@@ -927,6 +968,7 @@ impl Bsp {
             kept.push(Some(face));
         }
         for face in kept.into_iter().flatten() {
+            if cancelled() { return Err(invalid("acoustic mesh build cancelled")); }
             let polygon = face.polygon;
             mesh.reserve(polygon.len(), polygon.len().saturating_sub(2))?;
             let base = u32::try_from(mesh.vertices.len())
@@ -935,6 +977,7 @@ impl Bsp {
             for index in 1..polygon.len() - 1 {
                 mesh.triangles.push([base, base + index as u32, base + index as u32 + 1]);
                 mesh.materials.push(face.material);
+                mesh.acoustic_flags.push(face.flags);
             }
         }
         if hidden > 0 || duplicates > 0 {
@@ -945,6 +988,7 @@ impl Bsp {
         // brushes. Include solid/terrain authored surfaces so curved architecture
         // and terrain participate in reflection/occlusion baking as well.
         for surface_index in world.surfaces.clone() {
+            if cancelled() { return Err(invalid("acoustic mesh build cancelled")); }
             let surface = &self.surfaces[surface_index];
             if !matches!(surface.kind, SurfaceKind::Patch | SurfaceKind::Triangles) {
                 continue;
@@ -957,6 +1001,7 @@ impl Bsp {
                 continue;
             }
             let material = (shader.surface_flags & MATERIAL_MASK) as u8;
+            let flags = ACOUSTIC_THIN | if shader.surface_flags & SURF_SKY != 0 { ACOUSTIC_SKY } else { 0 };
             match surface.kind {
                 SurfaceKind::Patch => {
                     let [width, height] = surface.patch_size;
@@ -989,6 +1034,7 @@ impl Bsp {
                                     let c = a + (n + 1) as u32;
                                     mesh.triangles.extend_from_slice(&[[a, c, b], [b, c, c + 1]]);
                                     mesh.materials.extend_from_slice(&[material, material]);
+                                    mesh.acoustic_flags.extend_from_slice(&[flags, flags]);
                                 }
                             }
                         }
@@ -1011,6 +1057,7 @@ impl Bsp {
                             base + triangle[2],
                         ]);
                         mesh.materials.push(material);
+                        mesh.acoustic_flags.push(flags);
                     }
                 }
                 _ => unreachable!(),
@@ -1018,6 +1065,7 @@ impl Bsp {
         }
 
         debug_assert_eq!(mesh.triangles.len(), mesh.materials.len());
+        debug_assert_eq!(mesh.triangles.len(), mesh.acoustic_flags.len());
         Ok(mesh)
     }
 
@@ -1408,6 +1456,7 @@ struct AcousticBrushFace {
     normal: [f32; 3],
     polygon: Vec<[f32; 3]>,
     material: u8,
+    flags: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -1442,11 +1491,16 @@ pub struct CompetitiveMesh {
 /// Static acoustic triangle soup in native JKA coordinates. `materials` is
 /// parallel to `triangles` and stores the low-five-bit `MATERIAL_*` id from
 /// OpenJK/JKA `surfaceflags.h` for later conversion to Steam Audio materials.
+pub const ACOUSTIC_SKY: u8 = 1;
+pub const ACOUSTIC_THIN: u8 = 2;
+
 #[derive(Debug, Clone, Default)]
 pub struct AcousticMesh {
     pub vertices: Vec<[f32; 3]>,
     pub triangles: Vec<[u32; 3]>,
     pub materials: Vec<u8>,
+    /// Parallel triangle flags for EchoField; Steam Audio ignores these.
+    pub acoustic_flags: Vec<u8>,
 }
 
 impl AcousticMesh {
@@ -1459,6 +1513,7 @@ impl AcousticMesh {
         self.vertices.reserve(vertices);
         self.triangles.reserve(triangles);
         self.materials.reserve(triangles);
+        self.acoustic_flags.reserve(triangles);
         Ok(())
     }
 }

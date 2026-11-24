@@ -487,22 +487,29 @@ impl FogSystem {
         // The additive material is fogged directly in its fragment program:
         // blending a fog-color pass over it would also fog the background.
         if additive_only { return false; }
+        // Depth-writing global-fog surfaces are fogged by the fullscreen
+        // legacy global fog pass (see `legacy_global_fog_params`) in both
+        // Legacy modes. Local brush fog and transparent-only global surfaces
+        // cannot be represented by that frontmost depth, so keep their
+        // post-material geometry pass.
+        let geometry = !fog_is_global || !global_post_eligible;
         match self.legacy_drawfog_value() {
-            // Opaque/depth-writing global Legacy 1 fog is composited in the final
-            // display-space pass to match OpenJK's gamma/LDR framebuffer blend.
-            // Transparent-only global surfaces cannot be represented by that
-            // frontmost depth mask, so keep their geometry fog pass.
-            1 => !fog_is_global || !global_post_eligible,
-            // Legacy 2 remains GL_EXP2, but all authored BSP fog now uses the
-            // same post-material geometry pass. Keeping a second in-stage path
-            // caused material-dependent fog strength differences.
-            2 => self.map_fog.is_some(),
+            1 => geometry,
+            // Legacy 2 without authored fog is the manual in-stage fog.
+            2 => self.map_fog.is_some() && geometry,
             _ => false,
         }
     }
 
-    pub(crate) fn legacy1_global_post_params(&self) -> Option<([f32; 3], f32, f32)> {
-        if self.mode != FogMode::LegacyDrawFog1 || !self.legacy_effective() {
+    /// BSP global fog (brushNum -1) for the fullscreen legacy fog pass drawn
+    /// inside the scene pass after every world stage and depth-writing entity,
+    /// before non-depth-writing entity FX. OpenJK fogs only shaders with a fog
+    /// pass (sort <= SS_SEE_THROUGH), so saber blades and other blended entity
+    /// effects must stay unfogged; a final-post composite fogged them by the
+    /// depth of the wall behind them. Returns (display-space color,
+    /// depthForOpaque, strength scale, GL_EXP2 curve for r_drawfog 2).
+    pub(crate) fn legacy_global_fog_params(&self) -> Option<([f32; 3], f32, f32, bool)> {
+        if !self.mode.is_legacy() || !self.legacy_effective() {
             return None;
         }
         let fog = self.global_fog?;
@@ -510,36 +517,32 @@ impl FogSystem {
             fog.color,
             fog.depth_for_opaque,
             authored_fog_strength_scale(self.strength),
+            self.mode == FogMode::LegacyDrawFog2,
         ))
     }
 
-    /// Global/manual Legacy fog for geometry that is not a BSP material stage.
+    /// The map has compiled BSP global fog. OpenJK then always clears the
+    /// colour buffer to the fog colour (RB_DrawBuffer), so pixels beyond the
+    /// distanceCull far plane show fog instead of stale contents.
+    pub(crate) fn has_global_fog(&self) -> bool {
+        self.global_fog.is_some()
+    }
+
+    /// Manual Legacy fog for geometry that is not a BSP material stage.
     /// Procedural grass supplements this with its source surface's local fog slot.
-    /// Returned as
-    /// (linear RGB + depthForOpaque, [mode, scale, 0, 0]) with mode 1 = authored
-    /// global EXP2, 2 = manual. Mirrors bsp.wgsl legacy_fog_color_amount so this
+    /// Returned as (linear RGB + depthForOpaque, [mode, scale, 0, 0]) with
+    /// mode 2 = manual. Mirrors bsp.wgsl legacy_fog_color_amount so this
     /// geometry and BSP at the same depth match.
     ///
-    /// Legacy 1 with authored fog returns None: its global fog is composited in
-    /// post from the depth prepass (entities are in it; grass takes its ground's).
+    /// Authored fog returns None in both Legacy modes: global fog is applied by
+    /// the fullscreen pass from the depth prepass (entities are in it; grass
+    /// takes its ground's), and OpenJK leaves entities in local brushes unfogged.
     pub(crate) fn legacy_self_fog(&self) -> Option<([f32; 4], [f32; 4])> {
-        let drawfog = self.legacy_drawfog_value();
-        if drawfog == 0 {
+        if self.legacy_drawfog_value() == 0
+            || self.map_fog.is_some()
+            || self.local_fog_count > 0
+        {
             return None;
-        }
-        if self.map_fog.is_some() || self.local_fog_count > 0 {
-            if drawfog != 2 {
-                return None;
-            }
-            // OpenJK r_drawfog 2 only uses GL fog for the world's global fog.
-            // Entities on maps with only local fog brushes remain unfogged here;
-            // procedural grass handles local brush fog from its source BSP surface.
-            let fog = self.global_fog?;
-            let color = legacy_authored_fog_color(fog.color);
-            return Some((
-                [color[0], color[1], color[2], fog.depth_for_opaque],
-                [1.0, authored_fog_strength_scale(self.strength), 0.0, 0.0],
-            ));
         }
         // No authored fog: the strength slider is the manual Legacy fog, the
         // same neutral colour and 1024-unit curve BSP uses in both Legacy modes.
@@ -552,8 +555,8 @@ impl FogSystem {
         authored_fog_strength_scale(self.strength)
     }
 
-    pub(crate) fn legacy1_global_post_active(&self) -> bool {
-        self.legacy1_global_post_params().is_some()
+    pub(crate) fn legacy_global_fog_active(&self) -> bool {
+        self.legacy_global_fog_params().is_some()
     }
 
     pub(crate) fn volumetric_effective(&self) -> bool {

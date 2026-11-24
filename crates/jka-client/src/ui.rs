@@ -143,14 +143,15 @@ pub(crate) use hud::extensions::{EXT_IMAGE_TEXTURE_SOURCE, EXT_IMAGE_SHADER_SOUR
 pub use hud::layout::{
     hud_element_rect, HudElementId, HudElementLayout, HudLayout, HudRect, HudRectContext,
 };
-pub(crate) use hud::layout::{apply_hud_layout, enemy_info_icon_rect, hud_stock_rect, snap_hud_neighbor_size, snap_hud_rect_position, snap_hud_scale_to_grid, snap_hud_dimensions_scale};
+pub(crate) use hud::layout::{apply_hud_layout, enemy_info_icon_rect, hud_stock_rect, hud_offset_to_pixels, hud_pixel_delta_to_offset, snap_hud_neighbor_size, snap_hud_rect_position, snap_hud_scale_to_grid, snap_hud_dimensions_scale};
 pub(crate) use hud::movement::visible_jka_chars;
 use hud::movement::{
     build_lagometer, build_movement_keys, build_race_timer, build_speedometer, build_strafe_helper,
     center_print_lines, icon_cell_uv, movement_keys_origin, ICON_CROSSHAIR_BASE, ICON_FORCE_BASE,
-    ICON_TEXTURE_SOURCE, TEAM_ICON_TEXTURE_SOURCE,
+    TEAM_ICON_TEXTURE_SOURCE,
 };
 pub use hud::movement::{icon_name, ICON_NAMES, TEAM_ICON_CELL, TEAM_ICON_COLUMNS};
+pub(in crate::ui) use hud::movement::{ICON_TEXTURE_SOURCE, ICON_WEAPON_BASE};
 pub(crate) const ICON_SHADER_SOURCE_BASE: f32 = hud::movement::ICON_SHADER_SOURCE_BASE;
 pub(crate) use hud::movement::{ICON_WEAPON_NO_AMMO_BASE, ICON_WEAPON_STAFF, ICON_INVENTORY_BASE};
 use hud::notices::{build_center_print, build_follow_indicator, build_vote};
@@ -228,6 +229,7 @@ pub use settings::rendering::{
     VIDEO_ROW_VOXEL_PROBE_GI, VIDEO_ROW_VSYNC, VIDEO_ROW_WIREFRAME, VIDEO_ROW_WORLD_LIGHTING,
 };
 pub use settings::video::{PlayerBlobShadowSettings, VideoSettings};
+pub(crate) use settings::video::OPENJK_R_MODES;
 pub use text::{
     build_world_player_label_vertices, fallback_font_rgba, parse_fontdat, ProportionalFont,
     UiVertex,
@@ -353,7 +355,7 @@ impl Default for ChatSettings {
 pub struct UiChatAnim {
     /// 0 closed .. 1 fully open (eased).
     pub open: f32,
-    /// Milliseconds since the last edit to the typed text.
+    /// Milliseconds since the last text edit or caret movement.
     pub idle_ms: u32,
     /// Caret blink phase.
     pub caret: bool,
@@ -1851,6 +1853,7 @@ pub struct UiSnapshot {
     pub console_help_hover: bool,
     pub chat_mode: ChatMode,
     pub chat_input: String,
+    pub chat_cursor: usize,
     pub chat_input_selected: bool,
     /// The chat composer has a usable emoji picker button.
     pub chat_emoji_picker_available: bool,
@@ -2015,6 +2018,7 @@ impl Default for UiSnapshot {
             console_help_hover: false,
             chat_mode: ChatMode::Global,
             chat_input: String::new(),
+            chat_cursor: 0,
             chat_input_selected: false,
             chat_emoji_picker_available: false,
             chat_lines: Vec::new(),

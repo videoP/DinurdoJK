@@ -471,7 +471,12 @@ pub(in crate::renderer) fn instantiate_portal_draw_plans(
         batch.is_inline_entity = false;
         batch.ocean_clipmap = None;
         batch.ocean_clipmap_id = u8::MAX;
-        batch.ocean_replaced = false;
+        batch.ocean_owners = 0;
+        // A recipe may claim a river only if all of its exact FULL pieces do.
+        let members = &plan.geometries[variant.geometry].members;
+        let owner = members.first().and_then(|&i| full_batches.get(i)).and_then(|b| b.river_owner);
+        batch.river_owner = owner.filter(|&id| members.iter().all(|&i| full_batches.get(i).is_some_and(|b| b.river_owner == Some(id))));
+        batch.river_replaced = false;
         batch.compact_group = None;
         batch.bounds_min = variant.bounds_min;
         batch.bounds_max = variant.bounds_max;

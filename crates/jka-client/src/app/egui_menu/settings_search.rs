@@ -211,7 +211,7 @@ mod tests {
             && item.subsection == Some(SetupSection::InterfaceChat)));
         assert!(items.iter().any(|item| item.label == "Effects / game"
             && item.subsection == Some(SetupSection::AudioGeneral)));
-        assert!(items.iter().any(|item| item.label == "EAL map audio"
+        assert!(items.iter().any(|item| item.label == "Echofield Audio"
             && item.subsection == Some(SetupSection::AudioPositional)));
         assert!(items.iter().any(|item| item.label == "Steam binaural HRTF"
             && item.subsection == Some(SetupSection::AudioPositional)));

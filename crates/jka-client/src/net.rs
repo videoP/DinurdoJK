@@ -866,6 +866,9 @@ pub struct LiveInput {
     move_priority: [i8; 3],
     /// JK2 connections: native CGame selection, the usercmd's source of truth.
     jk2: Option<jk2_input::Jk2Selection>,
+    /// EternalJK CL_NoUseableForce / CL_CmdButtons: snapshot-derived fallback
+    /// for +useforce, shared by the transmitted and provisional usercmds.
+    no_useable_force: bool,
 }
 
 pub struct CommandButtons<'a> {
@@ -938,9 +941,12 @@ impl LiveInput {
 
     /// Seed cg.weaponSelect / forceSelect from the authoritative state
     /// (CG_SetInitialSnapshot and CG_Respawn).
-    pub fn sync_selection(&mut self, ps: &PlayerState) {
+    pub fn sync_selection(&mut self, ps: &PlayerState, japro_server: bool) {
         self.delta_angles = ["delta_angles[0]", "delta_angles[1]", "delta_angles[2]"]
             .map(|field| ps.field_i32(field).unwrap_or(0));
+        // EternalJK CG_NoUseableForce reads the predicted local player state.
+        // Unlike input bindings, this is dynamic and updates on each snapshot.
+        self.no_useable_force = self.jk2.is_none() && Self::no_useable_force(ps, japro_server);
         if self.jk2.is_some() {
             return; // sync_jk2 owns JK2 CGame selection
         }
@@ -1008,8 +1014,11 @@ impl LiveInput {
             }
         }
         cmd.buttons |= was_pressed;
-        // jk2mv CL_CmdButtons has no FORCEPOWER+USE holdable remap.
-        if self.jk2.is_none() && cmd.buttons & BUTTON_FORCEPOWER != 0 && cmd.buttons & BUTTON_USE != 0 {
+        // EternalJK CL_CmdButtons: +useforce becomes USE_HOLDABLE when
+        // +use is held OR CG_NoUseableForce is true. JK2MV has no such remap.
+        if self.jk2.is_none() && cmd.buttons & BUTTON_FORCEPOWER != 0
+            && (cmd.buttons & BUTTON_USE != 0 || self.no_useable_force)
+        {
             cmd.buttons &= !BUTTON_FORCEPOWER;
             cmd.buttons |= BUTTON_USE_HOLDABLE;
         }
@@ -1315,8 +1324,24 @@ impl LiveInput {
         }
     }
 
-    /// TaystJK CG_NoUseableForce, excluding jaPRO race-mode special handling
-    /// (which remains in the caller's server-specific command path).
+    /// EternalJK CG_NextForcePower_f / CG_PrevForcePower_f: jaPRO race
+    /// movement styles prior to MV_COOP_JKA use force cycling for teleports.
+    /// This is a *server identity* check, never a heuristic from stats alone.
+    pub fn japro_race_force_teleport(ps: &PlayerState, japro_server: bool) -> bool {
+        japro_server && ps.stats[crate::japro_cg::STAT_RACEMODE] != 0
+            && ps.stats[crate::japro_cg::STAT_MOVEMENTSTYLE] < crate::japro_cg::MV_COOP_JKA
+    }
+
+    /// EternalJK CG_NoUseableForce: race styles other than MV_SPEED suppress
+    /// selected Force powers. MV_SPEED is the jaPRO enumerator value 11.
+    pub fn no_useable_force(ps: &PlayerState, japro_server: bool) -> bool {
+        const MV_SPEED: i32 = 11;
+        (Self::japro_race_force_teleport(ps, japro_server)
+            && ps.stats[crate::japro_cg::STAT_MOVEMENTSTYLE] != MV_SPEED)
+            || !Self::has_selectable_force(ps)
+    }
+
+    /// EternalJK CG_NoUseableForce: only powers a player can cycle count.
     pub fn has_selectable_force(ps: &PlayerState) -> bool {
         const INVALID_FORCE_MASK: i32 = (1 << 1) | (1 << 15) | (1 << 16) | (1 << 17);
         let known = ps.field_i32("fd.forcePowersKnown").unwrap_or(0);
@@ -1520,9 +1545,8 @@ pub fn predict_settings(configstrings: &std::collections::BTreeMap<u16, Vec<u8>>
         no_spec_move: int(server, b"g_noSpecMove", 0),
         tracemask,
         no_footsteps: i32::from(int(server, b"dmflags", 0) & 32 != 0),
-        // One authoritative Pmove implementation for all servers. The server's
-        // advertised mod/capabilities still configure TaystJK's internal rules.
-        backend: 1,
+        // One native Pmove implementation (TaystJK) serves every server; the
+        // advertised mod/capabilities configure its internal rules.
         // Compact Rust-side identity consumed by native japro_configure:
         // 0 Base/other, 1 jaPRO, 2 JA+.
         server_mod: if japro { 1 } else if japlus { 2 } else { 0 },
@@ -1740,7 +1764,7 @@ fn skip_portable_shield_movement(
 /// CG_ClipMoveToEntities resolves shape and placement from currentState, not
 /// from the next snapshot's `solid` that admitted the entity to the list.
 /// Keeping these steps separate matters when projectiles spawn/despawn.
-fn solid_entity_from_state(
+pub(crate) fn solid_entity_from_state(
     state: &jka_protocol::gamestate::EntityState,
     origin: [f32; 3],
     angles: [f32; 3],
@@ -2293,8 +2317,8 @@ impl Predictor {
         };
         vec![
             format!(
-                "predsettings: duel-event-v3 backend={} server_mod={} race={} style={style_name}({style}) pmove_fixed={} pmove_float={} pmove_msec={} cl_commandRate={command_rate}",
-                settings.backend, settings.server_mod, u8::from(race), settings.pmove_fixed, settings.pmove_float, settings.pmove_msec
+                "predsettings: duel-event-v3 server_mod={} race={} style={style_name}({style}) pmove_fixed={} pmove_float={} pmove_msec={} cl_commandRate={command_rate}",
+                settings.server_mod, u8::from(race), settings.pmove_fixed, settings.pmove_float, settings.pmove_msec
             ),
             format!("  velocity snap: {snap}"),
             format!("  step chopping: {chop}"),
@@ -2521,8 +2545,7 @@ impl Predictor {
             // This is diagnostic context, not normal gameplay output. Keep it visible when the
             // dedicated prediction diagnostics are enabled, or under the global verbose gate.
             let line = format!(
-                "PRED-SETTINGS backend={} pmove_fixed={} pmove_float={} pmove_msec={} step_slide_fix={} gravity={} speed={:.3} race={} style={} jcinfo={:#x} duel_type={} base_snapshot={} cmdtime={}",
-                if prediction_settings.backend == 1 { "TaystJK" } else { "stock" },
+                "PRED-SETTINGS pmove_fixed={} pmove_float={} pmove_msec={} step_slide_fix={} gravity={} speed={:.3} race={} style={} jcinfo={:#x} duel_type={} base_snapshot={} cmdtime={}",
                 prediction_settings.pmove_fixed,
                 prediction_settings.pmove_float,
                 prediction_settings.pmove_msec,
@@ -3571,7 +3594,7 @@ mod tests {
             let time = net.session_mut().set_cgame_time(now, 0);
             if net.state() >= ConnectionState::Primed {
                 if let Some(snapshot) = &latest {
-                    input.sync_selection(&snapshot.player_state);
+                    input.sync_selection(&snapshot.player_state, false);
                 }
                 // Fly/run in a slow circle and hop every second.
                 let t = started.elapsed().as_secs_f32();
@@ -3914,18 +3937,18 @@ mod tests {
             br"\gamename\JA+ Mod\jp_cinfo\4660\taystJKinfo\33\restricts\7".to_vec(),
         )]);
         let settings = predict_settings(&config, &ps);
-        assert_eq!((settings.backend, settings.server_mod, settings.cinfo), (1, 2, 4660));
+        assert_eq!((settings.server_mod, settings.cinfo), (2, 4660));
         assert_eq!(settings.hook_pull, 800);
         assert_eq!((settings.taystjk_info, settings.restricts), (33, 7));
 
         config.insert(0, br"\gamename\basejka\taystJKinfo\9".to_vec());
         let settings = predict_settings(&config, &ps);
-        assert_eq!((settings.backend, settings.server_mod, settings.taystjk_info, settings.base_game), (1, 0, 9, 1));
+        assert_eq!((settings.server_mod, settings.taystjk_info, settings.base_game), (0, 9, 1));
 
         config.remove(&36);
         config.insert(0, br"\gamename\basejka\taystJKinfo\1".to_vec());
         let settings = predict_settings(&config, &ps);
-        assert_eq!(settings.backend, 1, "Presentation-only capability flags must not change the fixed TaystJK backend");
+        assert_eq!(settings.server_mod, 0, "Presentation-only capability flags must not change server identity");
 
         // A TaystJK server explicitly advertises whether its game module uses
         // the Raven SDK API. This overrides gamename, including a false value.
@@ -4101,6 +4124,62 @@ mod tests {
     }
 
     #[test]
+    fn eternal_force_use_remaps_to_holdable_only_with_no_useable_force_or_use_button() {
+        let mut input = LiveInput::default();
+        let mut ps = PlayerState::default();
+        ps.stats[0] = 100;
+        let force = ["+useforce"].map(String::from).into_iter().collect::<HashSet<_>>();
+        let pressed = ["+useforce", "+use"].map(String::from).into_iter().collect::<HashSet<_>>();
+        fn buttons(active: &HashSet<String>) -> CommandButtons<'_> {
+            CommandButtons { active, forced_moveup: false, idrive: true, any_key: true, talking: false }
+        }
+
+        // Empty force mask: EternalJK redirects +useforce even without +use.
+        input.sync_selection(&ps, false);
+        let cmd = input.preview_cmd(&buttons(&force));
+        assert_eq!(cmd.buttons & BUTTON_FORCEPOWER, 0);
+        assert_ne!(cmd.buttons & BUTTON_USE_HOLDABLE, 0);
+        assert_eq!(input.create_cmd(&buttons(&force)).buttons & BUTTON_FORCEPOWER, 0);
+
+        // One selectable power restores native Force use.
+        ps.set_field_bits("fd.forcePowersKnown", 1 << 0);
+        input.sync_selection(&ps, false);
+        let cmd = input.preview_cmd(&buttons(&force));
+        assert_ne!(cmd.buttons & BUTTON_FORCEPOWER, 0);
+        assert_eq!(cmd.buttons & BUTTON_USE_HOLDABLE, 0);
+        // Holding +use still redirects (and leaves BUTTON_USE present).
+        let cmd = input.create_cmd(&buttons(&pressed));
+        assert_eq!(cmd.buttons & BUTTON_FORCEPOWER, 0);
+        assert_ne!(cmd.buttons & (BUTTON_USE_HOLDABLE | BUTTON_USE), 0);
+
+        // JK2MV does not implement EternalJK's remapping.
+        input.set_jk2(true);
+        input.sync_selection(&ps, false);
+        let cmd = input.preview_cmd(&buttons(&pressed));
+        assert_ne!(cmd.buttons & BUTTON_FORCEPOWER, 0);
+        assert_eq!(cmd.buttons & BUTTON_USE_HOLDABLE, 0);
+    }
+
+    #[test]
+    fn eternal_race_force_remap_has_exact_japro_and_style_guards() {
+        let mut ps = PlayerState::default();
+        ps.stats[0] = 100;
+        ps.set_field_bits("fd.forcePowersKnown", 1 << 0);
+        ps.stats[crate::japro_cg::STAT_RACEMODE] = 1;
+        ps.stats[crate::japro_cg::STAT_MOVEMENTSTYLE] = 10;
+        assert!(!LiveInput::japro_race_force_teleport(&ps, false));
+        assert!(!LiveInput::no_useable_force(&ps, false));
+        assert!(LiveInput::japro_race_force_teleport(&ps, true));
+        assert!(LiveInput::no_useable_force(&ps, true));
+        ps.stats[crate::japro_cg::STAT_MOVEMENTSTYLE] = 11; // MV_SPEED
+        assert!(LiveInput::japro_race_force_teleport(&ps, true));
+        assert!(!LiveInput::no_useable_force(&ps, true));
+        ps.stats[crate::japro_cg::STAT_MOVEMENTSTYLE] = crate::japro_cg::MV_COOP_JKA;
+        assert!(!LiveInput::japro_race_force_teleport(&ps, true));
+        assert!(!LiveInput::no_useable_force(&ps, true));
+    }
+
+    #[test]
     fn create_cmd_maps_kbuttons_and_movement() {
         let mut input = LiveInput::default();
         input.view_angles = [10.0, -90.0, 0.0];
@@ -4180,7 +4259,7 @@ mod tests {
         for ammo in &mut ps.ammo { *ammo = 999; }
         ps.set_field_bits("weapon", 3);
         let mut input = LiveInput::default();
-        input.sync_selection(&ps);
+        input.sync_selection(&ps, false);
         assert!(!input.select_weapon_clean(&ps, "7"));
         assert_eq!(input.weapon_select, 7);
         assert!(input.single_fire_alt);
@@ -4207,7 +4286,7 @@ mod tests {
         let mut ps = PlayerState::default();
         ps.set_field_bits("delta_angles[0]", 124);
         ps.set_field_bits("delta_angles[1]", 28000);
-        input.sync_selection(&ps);
+        input.sync_selection(&ps, false);
         let none = HashSet::new();
         let buttons = CommandButtons { active: &none, forced_moveup: false, idrive: true, any_key: false, talking: false };
         assert!(input.queue_emote_taunt(1799));

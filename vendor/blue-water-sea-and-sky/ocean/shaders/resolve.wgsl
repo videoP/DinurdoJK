@@ -24,6 +24,8 @@ struct FieldParams {
     time: vec4<f32>,
     wind: vec4<f32>,
     cascades: array<CascadeParams, 3>,
+    // DinurdoJK: xyz = 1 when cascade 0/1/2 carries visible waves (see fft.wgsl).
+    cascade_on: vec4<f32>,
 }
 
 struct PassParams {
@@ -107,6 +109,14 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     let pixel = vec2<i32>(id.xy);
     let layer = i32(id.z);
     if pixel.x >= n || pixel.y >= n || layer >= i32(field.wind.w) {
+        return;
+    }
+    // DinurdoJK: an inactive cascade (its FFT skipped) is flat: zeros keep both output halves and every reader
+    // consistent, and a reactivated cascade starts without stale foam.
+    if field.cascade_on[layer] < 0.5 {
+        textureStore(displacement, pixel, layer, vec4<f32>(0.0));
+        textureStore(derivatives, pixel, layer, vec4<f32>(0.0));
+        textureStore(extras, pixel, layer, vec4<f32>(0.0));
         return;
     }
     let radix = i32(pass_params.radix);

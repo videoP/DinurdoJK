@@ -7,9 +7,11 @@ pub(in crate::renderer) mod md3_cache;
 pub(in crate::renderer) mod motion;
 pub(in crate::renderer) mod bundles;
 pub(in crate::renderer) mod skinning;
+pub(in crate::renderer) mod cloth_gpu;
 pub(in crate::renderer) mod state;
 pub(in crate::renderer) mod submission;
 pub(in crate::renderer) mod types;
+pub(in crate::renderer) mod skin_gore;
 pub(in crate::renderer) mod resident_fx;
 pub(in crate::renderer) mod lightning_gpu;
 

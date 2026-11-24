@@ -13,6 +13,8 @@ pub struct VoiceBlock {
     pub active: u32,
     pub name: [u8; 96],
     pub pcm: [f32; FRAMES],
+    pub max_distance: f32,
+    pub ambience_gain_hf: f32,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -27,8 +29,8 @@ pub struct SceneFrame {
     pub voices: [VoiceBlock; MAX_SOURCES],
 }
 // Enforce Rust/C++ ABI layout at compile time (native/eal_scene.cpp also asserts).
-const _: [(); 1144] = [(); std::mem::size_of::<VoiceBlock>()];
-const _: [(); 109872] = [(); std::mem::size_of::<SceneFrame>()];
+const _: [(); 1152] = [(); std::mem::size_of::<VoiceBlock>()];
+const _: [(); 110640] = [(); std::mem::size_of::<SceneFrame>()];
 
 impl SceneFrame {
     pub fn silent() -> Self {
@@ -63,6 +65,28 @@ pub struct SceneStats {
 
 const _: [(); 72] = [(); std::mem::size_of::<SceneStats>()];
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EchoVoice {
+    pub id: u64,
+    pub position: [f32; 3],
+    pub direct_gain: f32,
+    pub direct_cutoff: f32,
+    pub send_gain: [f32; 4],
+    pub send_cutoff: [f32; 4],
+    pub redirected: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EchoFrame {
+    pub slots: [jka_echofield::reverb::ReverbSlot; 4],
+    pub voices: [EchoVoice; MAX_SOURCES],
+    pub disable_authored_diffraction: u32,
+    pub reserved: u32,
+}
+const _: [(); 104] = [(); std::mem::size_of::<jka_echofield::reverb::ReverbSlot>()];
+const _: [(); 64] = [(); std::mem::size_of::<EchoVoice>()];
+const _: [(); 6568] = [(); std::mem::size_of::<EchoFrame>()];
 pub struct NativeScene {
     #[cfg(windows)]
     scene: *mut std::ffi::c_void,
@@ -85,11 +109,32 @@ unsafe extern "C" {
         error: *mut u8,
         capacity: u32,
     ) -> i32;
+    fn djk_echo_render(
+        scene: *mut std::ffi::c_void,
+        frame: *const SceneFrame,
+        echo: *const EchoFrame,
+        stereo: *mut f32,
+        stats: *mut SceneStats,
+        error: *mut u8,
+        capacity: u32,
+    ) -> i32;
     fn djk_eal_destroy(scene: *mut std::ffi::c_void);
 }
 impl NativeScene {
     #[cfg(windows)]
     pub fn new(rate: u32, map: &crate::eal::EalMap) -> Result<Self, String> {
+        Self::new_inner(rate, Some(map))
+    }
+    #[cfg(windows)]
+    pub fn new_echo(rate: u32) -> Result<Self, String> {
+        Self::new_inner(rate, None)
+    }
+    #[cfg(not(windows))]
+    pub fn new_echo(_: u32) -> Result<Self, String> {
+        Err("Native EchoField scene currently requires Windows".into())
+    }
+    #[cfg(windows)]
+    fn new_inner(rate: u32, map: Option<&crate::eal::EalMap>) -> Result<Self, String> {
         use std::os::windows::ffi::OsStrExt;
         let path = std::env::current_exe()
             .map_err(|e| e.to_string())?
@@ -107,8 +152,8 @@ impl NativeScene {
         let scene = unsafe {
             djk_eal_create(
                 dll.as_ptr(),
-                map.raw_data().as_ptr(),
-                map.raw_data().len() as u32,
+                map.map_or(std::ptr::null(), |m| m.raw_data().as_ptr()),
+                map.map_or(0, |m| m.raw_data().len() as u32),
                 rate,
                 error.as_mut_ptr(),
                 error.len() as u32,
@@ -124,6 +169,38 @@ impl NativeScene {
         Err("Native EAL scene currently requires Windows".into())
     }
 
+    pub fn render_echo(
+        &mut self,
+        frame: &SceneFrame,
+        echo: &EchoFrame,
+        output: &mut [f32; FRAMES * 2],
+    ) -> Result<SceneStats, String> {
+        #[cfg(windows)]
+        {
+            let mut stats = SceneStats::default();
+            let mut error = [0; 512];
+            if unsafe {
+                djk_echo_render(
+                    self.scene,
+                    frame,
+                    echo,
+                    output.as_mut_ptr(),
+                    &mut stats,
+                    error.as_mut_ptr(),
+                    error.len() as u32,
+                )
+            } == 0
+            {
+                return Err(message(&error));
+            }
+            Ok(stats)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (frame, echo, output);
+            Err("Native EchoField scene currently requires Windows".into())
+        }
+    }
     pub fn render(
         &mut self,
         frame: &SceneFrame,

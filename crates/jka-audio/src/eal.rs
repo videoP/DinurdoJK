@@ -615,6 +615,30 @@ impl EalMap {
     }
 }
 
+// EchoField can borrow the existing authored baseline without parsing .eal twice.
+// This is a read-only adapter, not a replacement for EalMan's diffraction or
+// an active hybrid routing path. The native EAL scene remains unchanged.
+impl jka_echofield::AuthoredAcoustics for EalMap {
+    fn baseline(&self, listener: [f32; 3], source: [f32; 3]) -> Option<jka_echofield::AuthoredBaseline<'_>> {
+        let a = self.environment_at_jka(listener)?;
+        let b = self.environment_at_jka(source)?;
+        let obstacle = self.source_acoustics_jka(listener, source).map(|s| jka_echofield::AuthoredObstacle {
+            index: s.index,
+            level_mb: s.obstruction.level_mb,
+            lf_ratio: s.obstruction.lf_ratio,
+            room_ratio: s.obstruction.room_ratio,
+            obstructs: s.obstruction.obstructs,
+        });
+        Some(jka_echofield::AuthoredBaseline {
+            listener_environment_id: a.id,
+            source_environment_id: b.id,
+            listener_preset_words: &a.preset.eax_words,
+            source_preset_words: &b.preset.eax_words,
+            obstacle,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

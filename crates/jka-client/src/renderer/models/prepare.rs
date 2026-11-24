@@ -103,6 +103,13 @@ pub(in crate::renderer) struct CpuPackJob {
     pub indices: Range<usize>,
     pub light: Option<scene::ClassicEntityLight>,
     pub water: Option<crate::water_wetness::WaterProfile>,
+    pub translation: Option<Vec3>,
+}
+
+pub(super) fn translate_vertices(vertices: &mut [DynamicModelVertex], offset: Vec3) {
+    for vertex in vertices {
+        vertex.position = (Vec3::from_array(vertex.position) + offset).to_array();
+    }
 }
 
 /// Split only at surface boundaries, retaining exact primitive order. Gaps may
@@ -149,6 +156,9 @@ pub(in crate::renderer) fn pack_jobs(
         return;
     }
     for job in jobs {
+        if let Some(offset) = job.translation {
+            translate_vertices(&mut vertices[job.vertices.start - vertex_base..job.vertices.end - vertex_base], offset);
+        }
         if let Some(water) = job.water {
             for vertex in &mut vertices[job.vertices.start - vertex_base..job.vertices.end - vertex_base] {
                 vertex.water_wetness = water.wetness_at_z(vertex.position[1]);
@@ -360,12 +370,14 @@ mod tests {
                 indices: 3..4000,
                 light: Some(light),
                 water: None,
+                translation: None,
             },
             CpuPackJob {
                 vertices: 4004..9000,
                 indices: 4003..9000,
                 light: None,
                 water: None,
+                translation: Some(Vec3::new(1.0, 2.0, 3.0)),
             },
         ];
         let mut serial_vertices = input.clone();
@@ -394,5 +406,6 @@ mod tests {
         assert_eq!(serial_indices, parallel_indices);
         assert_eq!(parallel_indices[4000..4003], [2; 3]);
         assert_eq!(parallel_vertices[4000].color, [0.2, 0.4, 0.8, 0.5]);
+        assert_eq!(parallel_vertices[4004].position, [4005.0, 3.0, 5.0]);
     }
 }

@@ -7,7 +7,7 @@ use std::ops::Range;
 pub(in crate::renderer) fn compositing_requires_order(mode: DynamicModelAlphaMode) -> bool {
     matches!(mode, DynamicModelAlphaMode::Modulate | DynamicModelAlphaMode::Modulate2x
         | DynamicModelAlphaMode::DstColorAdd | DynamicModelAlphaMode::Darken
-        | DynamicModelAlphaMode::Screen)
+        | DynamicModelAlphaMode::Screen | DynamicModelAlphaMode::StageMaskBlend)
 }
 
 /// Framebuffer filters do not commute with additive/alpha passes. Preserve
@@ -227,6 +227,8 @@ mod tests {
             authored_glow: false,
             lightning: false,
             rope: false,
+            bounds: None,
+            submerged: false,
         }
     }
 

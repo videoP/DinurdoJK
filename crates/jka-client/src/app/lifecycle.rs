@@ -146,6 +146,7 @@ impl ApplicationHandler<UserEvent> for App {
         self.applied_gpu_adapter = self.video.gpu_adapter;
         self.applied_resolution = self.video.resolution;
         self.applied_resolution_desktop = self.video.resolution_desktop;
+        self.applied_resolution_mode = self.video.resolution_mode;
         self.applied_grass = self.video.grass;
         self.applied_ocean = self.video.ocean;
         self.reset_egui_for_window(&window);
@@ -1043,7 +1044,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let has_grass = !map.grass_patches.is_empty();
                 let has_ocean = self.latest_prepare_options.ocean
                     && prepared_map_has_ocean_surface(map.as_ref());
-                let has_acoustics = map.steam_audio_acoustic_mesh.is_some();
+                let has_acoustics = map.steam_audio_acoustic_mesh.is_some() || map.echo_geometry.is_some();
                 if let Some(loading) = &mut self.loading {
                     if loading.request_id == request_id {
                         loading.set_optional_task_presence(
@@ -1122,13 +1123,25 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 prepared_laps.lap("restart cache clone");
 
-                if shader_remap_map_matches_session && !self.shader_remaps.is_empty() {
+                // q3map_dinurdoPromoted overrides belong to this map, whichever
+                // session owns it; fold them into the same initial upload.
+                let ocean_prepared = self.latest_prepare_options.ocean
+                    && super::map_loading::prepared_map_has_ocean_surface(map.as_ref());
+                let rivers_survive = !(shader_remap_map_matches_session
+                    && self.shader_remaps.has_authored_remaps());
+                self.install_shader_promotion(map.as_ref(), ocean_prepared, rivers_survive);
+                let remap_state = if shader_remap_map_matches_session {
+                    self.shader_remaps.clone()
+                } else {
+                    self.shader_remaps.promotion_only()
+                };
+                if !remap_state.is_empty() {
                     if let Err(error) = scene::apply_shader_remaps_in_place(
                         map.as_mut(),
                         &self.base,
                         self.game.as_deref(),
                         self.latest_prepare_options,
-                        &self.shader_remaps,
+                        &remap_state,
                     ) {
                         self.push_console_line(format!("^1shader remap: {error}"));
                     }
@@ -1350,7 +1363,7 @@ impl ApplicationHandler<UserEvent> for App {
                     session.weapon_fx.set_saber_marks(self.video.saber_marks);
                     if let Some(sound) = session.sound_presenter.as_mut() {
                         sound.set_steam_audio_map(acoustic_mesh, bake);
-                        sound.set_eal_map(&name);
+                        sound.set_prepared_eal_map(&name, map.echo_geometry.clone());
                     }
                 }
                 prepared_laps.lap("session collision/physics/audio");
@@ -2571,6 +2584,8 @@ impl ApplicationHandler<UserEvent> for App {
                         self.applied_resolution = [size.width, size.height];
                         self.video.resolution_desktop = false;
                         self.applied_resolution_desktop = false;
+                        self.video.resolution_mode = -1;
+                        self.applied_resolution_mode = -1;
                     }
                     self.mark_config_dirty();
                 }

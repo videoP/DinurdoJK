@@ -302,7 +302,7 @@ fn fx_survives_raster_rt_and_back_preparation() {
             rt_rigid: None,
             rt_skinned_key: None,
             ghoul2_gpu: None,
-            fx_gpu_sprites: Some(FxGpuSprites {
+            cloth_gpu: None, fx_gpu_sprites: Some(FxGpuSprites {
                 resident: None,
                 instances: Arc::new(vec![FxGpuSpriteInstance::zeroed(); 2]),
                 blob_shadow: false, lightning: false, rope: false,
@@ -320,6 +320,7 @@ fn fx_survives_raster_rt_and_back_preparation() {
                     &device,
                     &queue,
                     std::slice::from_ref(&surface),
+                    None,
                     None,
                     false,
                     rt,

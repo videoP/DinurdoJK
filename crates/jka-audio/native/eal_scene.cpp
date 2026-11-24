@@ -21,9 +21,12 @@
 #include <string>
 #include <vector>
 
-static_assert(sizeof(DjkEalVoice)==1144);
-static_assert(sizeof(DjkEalFrame)==109872);
+static_assert(sizeof(DjkEalVoice)==1152);
+static_assert(sizeof(DjkEalFrame)==110640);
 static_assert(sizeof(DjkEalStats)==72);
+static_assert(sizeof(DjkEchoSlot)==104);
+static_assert(sizeof(DjkEchoVoice)==64);
+static_assert(sizeof(DjkEchoFrame)==6568);
 
 namespace {
 const GUID slots[4] = {
@@ -58,6 +61,9 @@ struct CallbackTelemetry {
 };
 struct Source {
     ALuint source=0;
+    std::array<ALuint,5> echo_filters{};
+    DjkEchoVoice echo_last{};
+    bool echo_valid=false;
     std::array<ALuint,3> buffers{};
     uint64_t id=0;
     uint32_t next=0;
@@ -147,6 +153,93 @@ struct Scene {
     ALCint hrtf_status=ALC_HRTF_DISABLED_SOFT;
     CallbackTelemetry telemetry;
     EalMan manager;
+    bool echo_mode=false;
+    std::array<float,3> echo_listener{};
+    const DjkEchoFrame* echo_frame=nullptr;
+    std::array<ALuint,4> echo_effects{},echo_slots{};
+    std::array<DjkEchoSlot,4> echo_last_slots{};
+    bool echo_slots_valid=false;
+    // Core EFX extension entry points resolved from the existing OpenAL context.
+    using Gen = void (AL_APIENTRY *)(ALsizei,ALuint*);
+    using Delete = void (AL_APIENTRY *)(ALsizei,const ALuint*);
+    using Int = void (AL_APIENTRY *)(ALuint,ALenum,ALint);
+    using Float = void (AL_APIENTRY *)(ALuint,ALenum,ALfloat);
+    using Floats = void (AL_APIENTRY *)(ALuint,ALenum,const ALfloat*);
+    using Source3i = void (AL_APIENTRY *)(ALuint,ALenum,ALint,ALint,ALint);
+    Gen gen_effects=nullptr,gen_slots=nullptr,gen_filters=nullptr;
+    Delete delete_effects=nullptr,delete_slots=nullptr,delete_filters=nullptr;
+    Int effect_i=nullptr,slot_i=nullptr,filter_i=nullptr;
+    Float effect_f=nullptr,filter_f=nullptr;
+    Floats effect_fv=nullptr;
+    Source3i source_3i=nullptr;
+    template<class T> T al_extension(const char* name) {
+        auto p=p_alGetProcAddress(name);if(!p) throw std::runtime_error(std::string("OpenAL EFX missing ")+name);return reinterpret_cast<T>(p);
+    }
+    void echo_init() {
+        gen_effects=al_extension<Gen>("alGenEffects");delete_effects=al_extension<Delete>("alDeleteEffects");
+        gen_slots=al_extension<Gen>("alGenAuxiliaryEffectSlots");delete_slots=al_extension<Delete>("alDeleteAuxiliaryEffectSlots");
+        gen_filters=al_extension<Gen>("alGenFilters");delete_filters=al_extension<Delete>("alDeleteFilters");
+        effect_i=al_extension<Int>("alEffecti");effect_f=al_extension<Float>("alEffectf");effect_fv=al_extension<Floats>("alEffectfv");
+        slot_i=al_extension<Int>("alAuxiliaryEffectSloti");filter_i=al_extension<Int>("alFilteri");filter_f=al_extension<Float>("alFilterf");
+        source_3i=symbol<Source3i>("alSource3i");
+        gen_effects(4,echo_effects.data());gen_slots(4,echo_slots.data());
+        for(auto id:echo_effects) effect_i(id,0x8001,0x8000); // AL_EFFECT_TYPE / AL_EFFECT_EAXREVERB
+        p_alDistanceModel(AL_NONE);p_alDopplerFactor(0.0f);
+        symbol<decltype(&alListenerf)>("alListenerf")(0x20004,1.0f/32.0f); // AL_METERS_PER_UNIT
+        check("EchoField EFX initialization");
+    }
+    static float bounded(float value,float low,float high) {return std::isfinite(value)?std::clamp(value,low,high):low;}
+    static int32_t gain_millibels(float gain) {
+        return int32_t(std::lround(2000.0f * std::log10(bounded(gain, 1e-5f, 1.0f))));
+    }
+    void echo_rooms(DjkEalStats& stats) {
+        if(!echo_frame) throw std::runtime_error("Missing EchoField snapshot");
+        for(size_t i=0;i<4;++i) {
+            const auto& r=echo_frame->slots[i]; const auto id=echo_effects[i];
+            if(!echo_slots_valid || std::memcmp(&r,&echo_last_slots[i],sizeof(r))) {
+                // EFX EAXREVERB tokens and legal ranges (EFX specification).
+                auto f=[&](ALenum p,float v,float lo,float hi){effect_f(id,p,bounded(v,lo,hi));};
+                f(1,r.density,0,1);f(2,r.diffusion,0,1);f(3,r.gain,0,1);f(4,r.gain_hf,0,1);f(5,r.gain_lf,0,1);
+                f(6,r.decay_time,0.1f,20);f(7,r.decay_hf_ratio,0.1f,2);f(8,r.decay_lf_ratio,0.1f,2);
+                f(9,r.reflections_gain,0,3.16f);f(10,r.reflections_delay,0,0.3f);effect_fv(id,11,r.reflections_pan);
+                f(12,r.late_gain,0,10);f(13,r.late_delay,0,0.1f);effect_fv(id,14,r.late_pan);
+                f(15,r.echo_time,0.075f,0.25f);f(16,r.echo_depth,0,1);f(17,r.modulation_time,0.04f,4);f(18,r.modulation_depth,0,1);
+                f(19,r.air_absorption_gain_hf,0.892f,1);f(20,r.hf_reference,1000,20000);f(21,r.lf_reference,20,1000);f(22,r.room_rolloff,0,10);
+                slot_i(echo_slots[i],1,ALint(id));echo_last_slots[i]=r;
+            }
+            ++stats.rooms;
+        }
+        echo_slots_valid=true;
+    }
+    void echo_source(Source& s,const DjkEalVoice& voice,DjkEalStats& stats) {
+        DjkEchoVoice value{};value.id=voice.id;value.direct_gain=value.direct_cutoff=1;
+        std::fill_n(value.send_cutoff,4,1.0f);
+        const auto index=size_t(&s-sources.data());
+        if(!dry_reference() && echo_frame && echo_frame->voices[index].id==voice.id) value=echo_frame->voices[index];
+        if(!dry_reference() && voice.ambience_gain_hf > 0.0f) {
+            value.direct_cutoff *= bounded(voice.ambience_gain_hf,0.0f,1.0f);
+        }
+        if(!s.echo_filters[0]) {p_alSourcei(s.source,0x2000A,AL_FALSE);p_alSourcei(s.source,0x2000B,AL_FALSE);p_alSourcei(s.source,0x2000C,AL_FALSE);gen_filters(5,s.echo_filters.data());for(auto f:s.echo_filters) filter_i(f,0x8001,1);s.echo_valid=false;}
+        if(!s.echo_valid || value.id!=s.echo_last.id || std::memcmp(&value.direct_gain,&s.echo_last.direct_gain,10*sizeof(float))) {
+            auto filter=[&](ALuint id,float gain,float cutoff){filter_f(id,1,bounded(gain,0,1));filter_f(id,2,bounded(cutoff,0,1));};
+            filter(s.echo_filters[0],value.direct_gain,value.direct_cutoff);p_alSourcei(s.source,0x20005,ALint(s.echo_filters[0]));
+            for(int i=0;i<4;++i) {filter(s.echo_filters[i+1],value.send_gain[i],value.send_cutoff[i]);source_3i(s.source,0x20006,ALint(echo_slots[i]),3-i,ALint(s.echo_filters[i+1]));}
+            // Echofield provides the atmospheric gain and cutoff in the
+            // snapshot. Additional OpenAL air absorption would overlap it.
+            p_alSourcef(s.source,0x20007,0.0f);
+            s.echo_last=value;s.echo_valid=true;
+        }
+        if(value.direct_gain<0.999f || value.direct_cutoff<0.999f) ++stats.filtered_sources;
+        bool relative=current_debug_mode==4 || current_debug_mode==8;
+        if(relative!=s.relative_mode){p_alSourcei(s.source,AL_SOURCE_RELATIVE,relative?AL_TRUE:AL_FALSE);s.relative_mode=relative;}
+        std::array<float,3> live_pos{voice.position[0],voice.position[1],voice.position[2]};
+        if(value.redirected) {
+            float distance=0; for(int i=0;i<3;++i){const auto d=voice.position[i]-echo_listener[i]; distance+=d*d;}
+            distance=std::sqrt(distance);
+            for(int i=0;i<3;++i) live_pos[i]=echo_listener[i]+value.position[i]*distance;
+        }
+        const auto pos=openal(live_pos.data());p_alSource3f(s.source,AL_POSITION,relative?0.0f:pos[0],relative?0.0f:pos[1],relative?0.0f:pos[2]);
+    }
     std::array<Source,DJK_EAL_VOICES> sources{};
     std::array<int,4> environments{{-999,-998,-999,-999}};
     std::map<int,std::vector<Aperture>> apertures;
@@ -211,7 +304,10 @@ struct Scene {
             for(auto& s:sources) if(s.source) {
                 p_alSourceStop(s.source); p_alDeleteSources(1,&s.source);
                 p_alDeleteBuffers(3,s.buffers.data());
+                if(echo_mode && delete_filters && s.echo_filters[0]) delete_filters(5,s.echo_filters.data());
             }
+            if(echo_mode && delete_slots && echo_slots[0]) delete_slots(4,echo_slots.data());
+            if(echo_mode && delete_effects && echo_effects[0]) delete_effects(4,echo_effects.data());
             make(nullptr); p_alcDestroyContext(context);
         }
         if(device && p_alcCloseDevice) p_alcCloseDevice(device);
@@ -239,11 +335,13 @@ struct Scene {
             ALC_FREQUENCY,static_cast<ALCint>(rate),ALC_MAX_AUXILIARY_SENDS,4,ALC_HRTF_SOFT,ALC_FALSE,0};
         context=p_alcCreateContext(device,attributes);
         if(!context || !make(context)) throw std::runtime_error("OpenAL EAL context unavailable");
+        if(p_alIsExtensionPresent("AL_SOFT_callback_buffer"))
+            callback_buffer=reinterpret_cast<LPALBUFFERCALLBACKSOFT>(p_alGetProcAddress("alBufferCallbackSOFT"));
+        echo_mode=size==0 && bytes==nullptr;
+        if(echo_mode){echo_init();return;}
         if(!p_alIsExtensionPresent("EAX4.0")) throw std::runtime_error("OpenAL runtime lacks EAX 4.0");
         get=reinterpret_cast<EAXGet>(p_alGetProcAddress("EAXGet"));
         set=reinterpret_cast<EAXSet>(p_alGetProcAddress("EAXSet"));
-        if(p_alIsExtensionPresent("AL_SOFT_callback_buffer"))
-            callback_buffer=reinterpret_cast<LPALBUFFERCALLBACKSOFT>(p_alGetProcAddress("alBufferCallbackSOFT"));
         if(!set || !get) throw std::runtime_error("OpenAL missing EAXSet");
         std::istringstream data(std::string(reinterpret_cast<const char*>(bytes),size),std::ios::binary);
         if(manager.LoadDataSetFromMemory(data)!=0) throw std::runtime_error("EalMan rejected the EAL dataset (JKA EAL 3.0 required)");
@@ -459,6 +557,8 @@ struct Scene {
                 s.next=preroll;
             }
             s.properties_valid=false; s.send_valid=false; s.active_sends_valid=false; s.model={}; s.model.ulInsideConeAngle=360; s.model.ulOutsideConeAngle=360; s.model.fConeZdir=-1; s.base=default_properties;
+            s.echo_valid=false;
+            if(!echo_mode) {
             int32_t id=0;
             const auto name=canonical(std::string(voice.name,strnlen(voice.name,sizeof(voice.name))));
             const auto model=file_models.find(name);
@@ -466,7 +566,10 @@ struct Scene {
             if(model!=file_models.end() || manager.GetSourceID(name,id)==0) {
                 if(manager.GetSourceAttributes(id,s.model)==0) std::memcpy(&s.base,&s.model.eaxAttributes,sizeof(s.base));
             }
+            }
         }
+        if(echo_mode) echo_source(s,voice,stats);
+        else {
         auto props=s.base;
         static_assert(sizeof(props)==sizeof(s.model.eaxAttributes));
         // PCM already carries JKA distance/volume and presentation pitch.
@@ -483,8 +586,10 @@ struct Scene {
         EMPoint virtual_position{};
         const auto position=eagle(voice.position);
         auto authored=props;
+        const uint32_t diffraction_flags = echo_frame && echo_frame->disable_authored_diffraction
+            ? EMFLAG_NODIFFRACTION : 0;
         if(!dry_reference() && manager.GetSourceDynamicAttributes(0,position,props.lObstruction,props.flObstructionLFRatio,
-            props.lOcclusion,props.flOcclusionLFRatio,props.flOcclusionRoomRatio,virtual_position,0)!=0)
+            props.lOcclusion,props.flOcclusionLFRatio,props.flOcclusionRoomRatio,virtual_position,diffraction_flags)!=0)
             throw std::runtime_error("EalMan source query failed");
         props.lObstruction=std::min(props.lObstruction,authored.lObstruction);
         props.lOcclusion=std::min(props.lOcclusion,authored.lOcclusion);
@@ -497,7 +602,22 @@ struct Scene {
         int32_t ob=0,oc=0;float ob_lf=0,oc_lf=0,room=0;EMPoint ignored{};
         if(!dry_reference())
             manager.GetSourceDynamicAttributes(0,position,ob,ob_lf,oc,oc_lf,room,ignored,EMFLAG_NODIFFRACTION);
-        if(std::min(oc,authored.lOcclusion)!=props.lOcclusion || std::min(ob,authored.lObstruction)!=props.lObstruction) ++stats.diffracted_sources;
+        const bool authored_diffraction = std::min(oc,authored.lOcclusion)!=props.lOcclusion
+            || std::min(ob,authored.lObstruction)!=props.lObstruction;
+        if(authored_diffraction) ++stats.diffracted_sources;
+        // EalMan owns the direct path whenever it resolves authored blocking
+        // or diffraction. Supplement otherwise with live mover/liquid results.
+        // The authored room sends are still taken from EalMan below.
+        if(!dry_reference() && echo_frame && !authored_diffraction && !props.lObstruction && !props.lOcclusion) {
+            const auto& dynamic = echo_frame->voices[size_t(&s-sources.data())];
+            if(dynamic.id==voice.id) {
+                props.lDirect = std::clamp(props.lDirect + gain_millibels(dynamic.direct_gain), -10000, 1000);
+                props.lDirectHF = std::clamp(props.lDirectHF + gain_millibels(dynamic.direct_cutoff), -10000, 0);
+            }
+        }
+        if(!dry_reference() && voice.ambience_gain_hf > 0.0f) {
+            props.lDirectHF = std::clamp(props.lDirectHF + gain_millibels(voice.ambience_gain_hf), -10000, 0);
+        }
         int32_t env=-1;
         if(!dry_reference()) manager.GetListenerDynamicAttributes(0,position,env,0);
         int routed=-1;
@@ -539,6 +659,7 @@ struct Scene {
         p_alSourcef(s.source,AL_CONE_OUTER_ANGLE,dry_reference()?360.0f:std::clamp(float(s.model.ulOutsideConeAngle),0.0f,360.0f));
         p_alSourcef(s.source,AL_CONE_OUTER_GAIN,dry_reference()?1.0f:std::clamp(std::pow(10.0f,s.model.lConeOutsideVolume/2000.0f),0.0f,1.0f));
         p_alSource3f(s.source,AL_DIRECTION,s.model.fConeXdir,s.model.fConeYdir,-s.model.fConeZdir);
+        }
         if(s.callback_mode) {
             const float* pcm=voice.pcm;
             std::array<float,DJK_EAL_FRAMES> tone{};
@@ -606,6 +727,8 @@ struct Scene {
                 ALC_FREQUENCY,static_cast<ALCint>(rate),ALC_MAX_AUXILIARY_SENDS,4,ALC_HRTF_SOFT,frame.hrtf?ALC_TRUE:ALC_FALSE,0};
             if(!reset(device,attributes)) throw std::runtime_error("OpenAL could not apply EAL headphone positioning");
             requested_hrtf=frame.hrtf?1:0;
+            echo_slots_valid=false;
+            for(auto& s:sources) s.echo_valid=false;
             ALCint active=ALC_FALSE;
             p_alcGetIntegerv(device,ALC_HRTF_SOFT,1,&active);
             p_alcGetIntegerv(device,ALC_HRTF_STATUS_SOFT,1,&hrtf_status);
@@ -634,6 +757,7 @@ struct Scene {
             last_volume.fill(INT32_MIN);
             last_pan_valid.fill(false);
             for(auto& src:sources) {
+                src.echo_valid=false;
                 src.active_sends_valid=false;
                 src.send_valid=false;
                 src.properties_valid=false;
@@ -641,10 +765,11 @@ struct Scene {
         }
         stats={}; stats.hrtf=hrtf; stats.hrtf_status=uint32_t(hrtf_status);
         stats.transport=callback_reference()?1u:2u;
+        std::copy_n(frame.listener,3,echo_listener.begin());
         const auto pos=openal(frame.listener);p_alListenerfv(AL_POSITION,pos.data());
         const auto ahead=openal(frame.ahead),up=openal(frame.up);
         const float orientation[]={ahead[0],ahead[1],ahead[2],up[0],up[1],up[2]};p_alListenerfv(AL_ORIENTATION,orientation);
-        if(!dry_reference()) rooms(frame,stats);
+        if(!dry_reference()) {if(echo_mode) echo_rooms(stats);else rooms(frame,stats);}
         for(size_t i=0;i<sources.size();++i) {
             if(frame.voices[i].active) stream(sources[i],frame.voices[i],stats);
             else if(sources[i].id) {
@@ -707,5 +832,9 @@ extern "C" int djk_eal_render(void* scene,const DjkEalFrame* frame,float* stereo
     try { static_cast<Scene*>(scene)->process(*frame,stereo,*stats);return 1; }
     catch(const std::exception& e) { std::fill(stereo,stereo+DJK_EAL_FRAMES*2,0.0f);error_text(error,capacity,e.what());return 0; }
     catch(...) { std::fill(stereo,stereo+DJK_EAL_FRAMES*2,0.0f);error_text(error,capacity,"Unknown EAL render failure");return 0; }
+}
+extern "C" int djk_echo_render(void* scene,const DjkEalFrame* frame,const DjkEchoFrame* echo,float* stereo,DjkEalStats* stats,char* error,uint32_t capacity) {
+    auto* s=static_cast<Scene*>(scene);s->echo_frame=echo;
+    int ok=djk_eal_render(scene,frame,stereo,stats,error,capacity);s->echo_frame=nullptr;return ok;
 }
 extern "C" void djk_eal_destroy(void* scene) { delete static_cast<Scene*>(scene); }

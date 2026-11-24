@@ -511,7 +511,12 @@ fn implicit_lightmap_rgb(diffuse: vec3<f32>, lightmap: vec3<f32>) -> vec3<f32> {
 
 fn classic_three_stage_rgb(input: VertexOut) -> vec4<f32> {
     // 0: base diffuse; 2: baked lightmap; 5: stage-three overlay (non-sky).
-    let diffuse = textureSample(base_texture, base_sampler, input.uv).rgb;
+    var diffuse = textureSample(base_texture, base_sampler, input.uv).rgb;
+    if (ninja_snow_composite_mode() && ((input.shell_kind >> 1u) & CLASSIC_LIGHTMAP_ONLY) == 0u &&
+        ninja_snow_receiver_active(input.shell_kind & 1u, material.header.w, material.header.x, material.header.z)) {
+        let snow = ninja_snow_material(input.world_position, input.world_normal, camera.camera_pos_time.xyz, camera.camera_forward.xyz);
+        diffuse *= snow.color_scale;
+    }
     let lightmap = textureSample(lightmap_texture, lightmap_sampler, input.lightmap_uv).rgb;
     let overlay_sample = textureSample(sky_rt, sky_sampler, input.uv);
     // alphaGen vertex multiplies the authored image alpha, not replaces it.
@@ -793,6 +798,10 @@ fn competitive_one_stage_lit(input: VertexOut, classic: u32) -> vec4<f32> {
     }
 
     var base = source_sample * stage_color;
+    if (!classic_lightmap_only && ninja_snow_receiver_active(shell_kind, material.header.w, material.header.x, material.header.z)) {
+        let snow = ninja_snow_material(input.world_position, input.world_normal, camera.camera_pos_time.xyz, camera.camera_forward.xyz);
+        base = ninja_snow_apply_albedo(base, snow);
+    }
     // An authored masked base with BSP vertex alpha 127/255 and GE128 cannot
     // seed depth. For the narrowly identified multi-stage depth-equal case,
     // test the source texture's alpha while retaining the vertex alpha for

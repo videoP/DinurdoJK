@@ -49,7 +49,7 @@ fn torso_only_taunts_do_not_use_the_full_body_cancel_rule() {
 
 #[test]
 fn pmove_crouch_keeps_torso_taunts_but_cancels_full_body_taunts() {
-    for backend in [0, 1] {
+    for server_mod in [0, 1] {
         let movement = support::animations();
         for (name, full_body) in [
             ("BOTH_ENGAGETAUNT", false),
@@ -60,7 +60,7 @@ fn pmove_crouch_keeps_torso_taunts_but_cancels_full_body_taunts() {
             let mut player = support::player(24.125);
             player
                 .configure(&jka_movement::PredictSettings {
-                    backend,
+                    server_mod,
                     ..Default::default()
                 })
                 .unwrap();
@@ -92,7 +92,7 @@ fn pmove_crouch_keeps_torso_taunts_but_cancels_full_body_taunts() {
             assert_eq!(
                 player.entity_view().force_hand_extend == 10,
                 !full_body,
-                "{name}, backend={backend}: {view:?}"
+                "{name}, server_mod={server_mod}: {view:?}"
             );
             if !full_body {
                 assert_eq!(view.torso_anim, anim as i32);

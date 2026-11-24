@@ -94,7 +94,7 @@ fn studio_alpha_gpu_preserves_light_coverage_and_normal_rendering() {
             // Exercise the actual model uniform and fragment lighting path.
             let mut light=crate::renderer::TransientLight{kind:crate::fx::system::FxLightKind::AuthoredEffect,
                 position:[0.0,0.0,8.0],color:[1.0,0.0,0.0],intensity:2.0,radius:64.0,source_radius:0.0,
-                spot:None,segment:None,blade_segments:None};
+                radial_exponent:None,spot:None,segment:None,blade_segments:None};
             let point=render(&[body],true,&[light.clone()]);
             assert!(point[0]>opaque[0]+20 && point[1]==opaque[1] && point[3]==255,"point light must add red while preserving alpha: {point:?}");
             light.spot=Some(crate::fx::system::FxSpotLight{direction:[0.0,0.0,1.0],inner_cone_cos:0.95,outer_cone_cos:0.9});

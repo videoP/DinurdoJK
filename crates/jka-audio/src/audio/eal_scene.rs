@@ -28,6 +28,9 @@ pub(super) struct EalVoiceHandle {
     detached: bool,
 }
 impl EalVoiceHandle {
+    pub fn is_playing(&self) -> bool {
+        !self.control.stopped.load(Ordering::Acquire)
+    }
     pub fn stop(&self) {
         self.control.stopped.store(true, Ordering::Release);
     }
@@ -70,6 +73,7 @@ struct Stream {
     sound: Arc<RegisteredSound>,
     gains: Arc<Gains>,
     control: Arc<Control>,
+    ambience: bool,
     cursor: f64,
     synced: bool,
     looping: bool,
@@ -142,6 +146,7 @@ impl Stream {
 }
 impl Drop for Stream {
     fn drop(&mut self) {
+        self.control.stopped.store(true, Ordering::Release);
         if self.gains.eal_owner.load(Ordering::Acquire) == self.id {
             self.gains
                 .eal_native_mix
@@ -228,6 +233,30 @@ impl EalBus {
         loop_start: usize,
         phase: Option<usize>,
     ) -> Option<EalVoiceHandle> {
+        self.add_stream(name, sound, gains, looping, loop_start, phase, false)
+    }
+
+    pub fn add_ambience(
+        &self,
+        name: &str,
+        sound: Arc<RegisteredSound>,
+        gains: Arc<Gains>,
+        looping: bool,
+        phase: usize,
+    ) -> Option<EalVoiceHandle> {
+        self.add_stream(name, sound, gains, looping, 0, Some(phase), true)
+    }
+
+    fn add_stream(
+        &self,
+        name: &str,
+        sound: Arc<RegisteredSound>,
+        gains: Arc<Gains>,
+        looping: bool,
+        loop_start: usize,
+        phase: Option<usize>,
+        ambience: bool,
+    ) -> Option<EalVoiceHandle> {
         if sound.samples.is_empty() || loop_start >= sound.samples.len() {
             return None;
         }
@@ -257,6 +286,7 @@ impl EalBus {
             sound,
             gains,
             control: control.clone(),
+            ambience,
             cursor: cursor as f64,
             synced: phase.is_some(),
             looping,
@@ -296,18 +326,25 @@ pub(super) struct EalSceneSource {
 impl EalSceneSource {
     fn fill(&mut self) {
         for _ in 0..MAX_SOURCES * 2 {
-            let Some(slot) = self.streams.iter_mut().find(|s| s.is_none()) else {
+            let empty = self.streams.iter().position(Option::is_none);
+            let replaceable = empty.is_none().then(|| {
+                self.streams.iter().position(|s| s.as_ref().is_some_and(|s| s.ambience))
+            }).flatten();
+            if empty.is_none() && replaceable.is_none() {
                 break;
-            };
+            }
             let Ok(mut stream) = self.receiver.try_recv() else {
                 break;
+            };
+            let Some(index) = empty.or(replaceable.filter(|_| !stream.ambience)) else {
+                continue;
             };
             let actual = f64::from_bits(stream.gains.eal_position.load(Ordering::Acquire));
             if actual.is_finite() {
                 stream.cursor = actual;
                 stream.synced = true;
             }
-            *slot = Some(stream);
+            self.streams[index] = Some(stream);
         }
         let sequence = self.sequence;
         self.sequence += 1;
@@ -327,6 +364,8 @@ impl EalSceneSource {
             };
             voice.id = stream.id;
             voice.name = stream.name;
+            voice.max_distance=f32::from_bits(stream.gains.echo_max_distance.load(Ordering::Relaxed));
+            voice.ambience_gain_hf = f32::from_bits(stream.gains.ambience_gain_hf.load(Ordering::Relaxed));
             voice.position = std::array::from_fn(|i| {
                 f32::from_bits(stream.gains.environment_source[i].load(Ordering::Relaxed))
             });

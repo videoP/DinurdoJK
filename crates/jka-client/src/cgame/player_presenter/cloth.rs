@@ -1,11 +1,60 @@
 //! Cloth.
 use crate::cgame::player_presenter::{
-    scene, transform_model_normal, transform_model_point, ClothCapsule, ClothMotion, ClothOutput,
-    ClothSurfaceFrame, ClothSystem, DynamicModelVertex, Ghoul2SkinnedSurface, GlaAnimation,
+    scene, submission::mesh::append_surface_indices, transform_model_normal,
+    transform_model_point, Arc, ClothCapsule, ClothMotion, ClothOutput, ClothSurfaceFrame,
+    ClothSystem, DynamicModelVertex, Ghoul2GpuMeshSource, Ghoul2SkinnedSurface, GlaAnimation,
     GlmModel, GlmSurface, HashMap, Matrix3x4, PlayerPresenter, PlayerSurfaceAsset,
 };
 
+/// A GPU cloth garment build (r_clothSolver 1), keyed by model/LOD/surfaces.
+pub(in crate::cgame::player_presenter) enum ClothGpuGarmentSlot {
+    Pending(std::sync::mpsc::Receiver<Result<crate::renderer::ClothGpuGarment, String>>),
+    Ready(Arc<crate::renderer::ClothGpuGarment>),
+    Failed,
+}
+
+/// One GPU cloth render surface: garment surface ordinal, draw indices and
+/// the stable RT-caster key of its (remeshed) topology.
+pub(in crate::cgame::player_presenter) struct ClothGpuDraw {
+    pub(in crate::cgame::player_presenter) ordinal: u32,
+    pub(in crate::cgame::player_presenter) indices: Arc<Vec<u32>>,
+    pub(in crate::cgame::player_presenter) key: Arc<str>,
+}
+
+/// Densified bind-pose cloth surface plus its draw topology. Only used while
+/// cloth physics is on; the stock GLM surface draws otherwise.
+pub(in crate::cgame::player_presenter) struct ClothRemesh {
+    pub(in crate::cgame::player_presenter) surface: GlmSurface,
+    /// Same winding/two-sided convention as `Ghoul2GpuMeshSource::cpu_indices`.
+    pub(in crate::cgame::player_presenter) indices: Arc<Vec<u32>>,
+    /// Distinct RT skinned-caster key: the vertex count differs from the base.
+    pub(in crate::cgame::player_presenter) key: Arc<str>,
+}
+
 impl PlayerPresenter {
+    /// Cached remesh for one auto-cloth surface, built on first use.
+    pub(in crate::cgame::player_presenter) fn cloth_remesh(
+        &mut self,
+        surface: &GlmSurface,
+        gpu_mesh: &Ghoul2GpuMeshSource,
+    ) -> Option<Arc<ClothRemesh>> {
+        if let Some(cached) = self.cloth_remeshes.get(&gpu_mesh.base_key) {
+            return cached.clone();
+        }
+        let two_sided = gpu_mesh.cpu_indices.len() > surface.triangles.len() * 3;
+        let built = crate::cgame::cloth_remesh::remesh_cloth_surface(surface).and_then(|surface| {
+            let indices = append_surface_indices(&surface, two_sided).ok()?;
+            Some(Arc::new(ClothRemesh {
+                key: Arc::from(format!("{}#cloth_remesh_v1", gpu_mesh.base_key)),
+                indices: Arc::new(indices),
+                surface,
+            }))
+        });
+        self.cloth_remeshes
+            .insert(Arc::clone(&gpu_mesh.base_key), built.clone());
+        built
+    }
+
     pub(in crate::cgame::player_presenter) fn cloth_surface_name<'a>(
         glm: &'a GlmModel,
         surface: &GlmSurface,
@@ -128,6 +177,168 @@ impl PlayerPresenter {
                 self.stage_time_ms,
             )
             .unwrap_or_default()
+    }
+
+    /// This frame's GPU cloth inputs for one player, or `None` while the
+    /// static garment is still building (the stock surfaces draw meanwhile).
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::cgame::player_presenter) fn gpu_cloth_frame(
+        &mut self,
+        entity_num: u16,
+        model_label: &str,
+        lod_index: usize,
+        jobs: &[(&PlayerSurfaceAsset, &GlmSurface, &Arc<Ghoul2GpuMeshSource>)],
+        glm: &GlmModel,
+        surface_assets: &[PlayerSurfaceAsset],
+        gla: &GlaAnimation,
+        pose: &[Matrix3x4],
+        bones: &Arc<Vec<crate::renderer::Ghoul2GpuBone>>,
+        axis: [[f32; 3]; 3],
+        origin: [f32; 3],
+        tuning: crate::renderer::ClothGpuTuning,
+    ) -> Option<(Arc<crate::renderer::ClothGpuFrame>, HashMap<usize, ClothGpuDraw>)> {
+        let mut surfaces = Vec::new();
+        for &(_, surface, gpu_mesh) in jobs {
+            if !Self::cloth_surface_name(glm, surface).is_some_and(ClothSystem::is_cloth_surface_name) {
+                continue;
+            }
+            let remesh = self.cloth_remesh(surface, gpu_mesh);
+            surfaces.push((surface, gpu_mesh, remesh));
+        }
+        if surfaces.is_empty() {
+            return None;
+        }
+        let key: Arc<str> = Arc::from(format!(
+            "{model_label}#lod{lod_index}#{}#cloth_gpu_v1",
+            surfaces
+                .iter()
+                .map(|(surface, _, _)| surface.surface_index.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+        let garment = match self.cloth_gpu_garments.get(&key) {
+            Some(ClothGpuGarmentSlot::Ready(garment)) => Arc::clone(garment),
+            Some(ClothGpuGarmentSlot::Failed) => return None,
+            Some(ClothGpuGarmentSlot::Pending(rx)) => match rx.try_recv() {
+                Ok(Ok(garment)) => {
+                    let garment = Arc::new(garment);
+                    self.cloth_gpu_garments
+                        .insert(Arc::clone(&key), ClothGpuGarmentSlot::Ready(Arc::clone(&garment)));
+                    garment
+                }
+                Ok(Err(error)) => {
+                    devprintln!(1, "CLOTH GPU: {model_label} garment rejected: {error}");
+                    self.cloth_gpu_garments.insert(key, ClothGpuGarmentSlot::Failed);
+                    return None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.cloth_gpu_garments.insert(key, ClothGpuGarmentSlot::Failed);
+                    return None;
+                }
+            },
+            None => {
+                // One CPU skin at the current pose seeds the stitched garment,
+                // exactly as the CPU solver's first frame does.
+                let mut frames = Vec::with_capacity(surfaces.len());
+                let mut vertices = Vec::with_capacity(surfaces.len());
+                for (surface, _, remesh) in &surfaces {
+                    let source: &GlmSurface = remesh.as_deref().map_or(*surface, |r| &r.surface);
+                    let frame = crate::cgame::player_presenter::skin_surface_timed(
+                        &mut self.perf,
+                        source,
+                        pose,
+                    )
+                    .ok()
+                    .and_then(|skinned| Self::cloth_surface_frame(glm, source, &skinned, pose));
+                    let gpu_vertices = (0..source.vertices.len())
+                        .map(|index| {
+                            crate::cgame::player_presenter::submission::mesh::gpu_vertex_from_glm(
+                                source, index, None, lod_index,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .ok();
+                    let (Some(frame), Some(gpu_vertices)) = (frame, gpu_vertices) else {
+                        self.cloth_gpu_garments.insert(key, ClothGpuGarmentSlot::Failed);
+                        return None;
+                    };
+                    frames.push(frame);
+                    vertices.push(gpu_vertices);
+                }
+                let capsules =
+                    self.cloth_body_capsules(model_label, glm, surface_assets, lod_index, gla, pose);
+                let config = self.cloth.config();
+                let (tx, rx) = std::sync::mpsc::channel();
+                let build_key = Arc::clone(&key);
+                let label = model_label.to_owned();
+                let spawned = std::thread::Builder::new()
+                    .name("jka-cloth-gpu-build".into())
+                    .spawn(move || {
+                        let _ = tx.send(crate::cgame::cloth_gpu::build_garment(
+                            build_key, &label, lod_index, &frames, vertices, &capsules, config,
+                        ));
+                    });
+                self.cloth_gpu_garments.insert(
+                    key,
+                    if spawned.is_ok() {
+                        ClothGpuGarmentSlot::Pending(rx)
+                    } else {
+                        ClothGpuGarmentSlot::Failed
+                    },
+                );
+                return None;
+            }
+        };
+        if garment.surface_ranges.len() != surfaces.len() {
+            return None;
+        }
+
+        let config = self.cloth.config();
+        let colliders = if config.body_collision {
+            let capsules =
+                self.cloth_body_capsules(model_label, glm, surface_assets, lod_index, gla, pose);
+            crate::cgame::cloth_gpu::pack_colliders(&capsules, config.body_clearance.clamp(0.0, 4.0))
+        } else {
+            Vec::new()
+        };
+        // Reference `wind` export: shared weather wind, scaled by r_clothAirResistance.
+        let wind = self
+            .cloth_weather_wind
+            .map(|wind| {
+                let velocity = wind.at(self.stage_time_ms as f32 * 0.001);
+                scene::jka_position([velocity[0], 0.0, velocity[1]])
+            })
+            .unwrap_or([0.0; 3])
+            .map(|component| component * 0.0254 * config.air_resistance);
+        let frame = Arc::new(crate::renderer::ClothGpuFrame {
+            entity_num,
+            garment,
+            bones: Arc::clone(bones),
+            colliders,
+            axis,
+            origin,
+            time_ms: self.stage_time_ms,
+            wind,
+            tuning,
+        });
+        let draws = surfaces
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (surface, gpu_mesh, remesh))| {
+                (
+                    surface.surface_index,
+                    ClothGpuDraw {
+                        ordinal: ordinal as u32,
+                        indices: Arc::clone(
+                            remesh.as_ref().map_or(&gpu_mesh.cpu_indices, |r| &r.indices),
+                        ),
+                        key: Arc::clone(remesh.as_ref().map_or(&gpu_mesh.base_key, |r| &r.key)),
+                    },
+                )
+            })
+            .collect();
+        Some((frame, draws))
     }
 
     pub(in crate::cgame::player_presenter) fn cpu_surface_vertices_with_cloth(

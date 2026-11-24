@@ -125,6 +125,8 @@ material_word! { HEADER_W, WGSL_W;
     MATERIAL_FLAG_INLINE_BAKED_RECEIVER_EXCLUSION = 0x00800000;
     /// Extra authored additive stage selects the clamp sampler.
     MATERIAL_FLAG_ADDITIVE_CLAMP = 0x01000000;
+    /// Diffuse stage of a source-classified reverse lightmap modulation pair.
+    MATERIAL_FLAG_REVERSE_LIGHTMAP_DIFFUSE = 0x02000000;
 }
 
 pub(crate) const MATERIAL_SURFACE_KIND_SHIFT: u32 = 8;

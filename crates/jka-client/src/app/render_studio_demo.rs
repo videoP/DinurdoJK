@@ -754,11 +754,14 @@ impl StudioDemoSource {
             screen_fx: session.screen_fx.clone(),
             cloud_foreground: if crate::fx::render_enabled() { session.fx_blades.clone() } else { Arc::new(Vec::new()) },
             ocean_actors: session.ocean_actors.clone(),
+            ninja_entities: session.ninja_entities.clone(),
             hud: None,
         };
         apply_scene_observer(&mut frame, observer, false);
         let mut view = crate::fx::draw::FxView::from_camera(&frame.camera);
         view.seconds = sample.presentation_time_ms as f32 / 1000.0;
+        let jk2 = self.demo_protocol != 26;
+        view.set_overbright(video.effective_overbright_bits(jk2), jk2, video.hdr);
         let presenter = &mut session.entity_presenter;
         let fx = if !crate::fx::render_enabled() {
             Vec::new()
@@ -2137,6 +2140,8 @@ fn studio_hud_for_source(
     // Never pick up editor diagnostics or a gameplay FPS counter.
     video.draw_fps=0;
     ui.video=video;
+    // Studio and gameplay HUD layouts share the same 1280x720 reference space.
+    // Output size changes only the screen projection, not saved offsets.
     ui.hud_layout=layout;
     ui.studio_hud_virtual_layout=true;
     if !flags.enabled("crosshair") {crosshair.style=0;}
@@ -2417,7 +2422,7 @@ mod scene_observer_tests {
         let shot=crate::camera::Camera::new_with_fov([10.0,20.0,30.0],0.0,80.0);
         let original=StudioSourceFrame{shot_camera:shot,camera:shot,lens:crate::renderer::StudioLens{aperture:Some(2.8),focus_distance:64.0},environment:None,
             id:1,revision:0,time:0.0,player_position:None,area_mask:None,dynamic_models:Arc::new(vec![]),inline_models:Arc::new(vec![]),
-            lights:Arc::new(vec![]),screen_fx:Arc::new(vec![]),cloud_foreground:Arc::new(vec![]),ocean_actors:Arc::new(vec![]),hud:None};
+            lights:Arc::new(vec![]),screen_fx:Arc::new(vec![]),cloud_foreground:Arc::new(vec![]),ocean_actors:Arc::new(vec![]),ninja_entities:None,hud:None};
         let observer=StudioCameraKey{position:[200.0,80.0,100.0],..Default::default()};
         let mut preview=original.clone();apply_scene_observer(&mut preview,Some(observer),false);
         assert_eq!(preview.camera.position.to_array(),scene::render_position(observer.position));assert!(preview.lens.aperture.is_none());

@@ -19,6 +19,8 @@ pub struct Cloth {
     pub(crate) inverse_masses: Vec<Real>,
     pub(crate) forces: Vec<Vec3>,
     pub(crate) pins: BTreeMap<u32, Vec3>,
+    /// Optional per-hinge bending stiffness multiplier; empty means uniform.
+    pub(crate) hinge_stiffness: Vec<Real>,
 }
 
 impl Cloth {
@@ -49,6 +51,7 @@ impl Cloth {
             masses,
             forces: vec![Vec3::ZERO; n],
             pins: BTreeMap::new(),
+            hinge_stiffness: Vec::new(),
         })
     }
     pub fn mesh(&self) -> &ClothMesh {
@@ -105,6 +108,19 @@ impl Cloth {
             return Err(ClothError::InvalidParameter("velocity"));
         }
         self.velocities[i] = v;
+        Ok(())
+    }
+    /// Scale bending stiffness per hinge (same order as `mesh().hinges()`).
+    /// Effective compliance is `bend_compliance / scale`. Empty restores the
+    /// uniform material.
+    pub fn set_hinge_stiffness(&mut self, scale: Vec<Real>) -> Result<(), ClothError> {
+        if !scale.is_empty()
+            && (scale.len() != self.mesh.hinges().len()
+                || scale.iter().any(|s| !s.is_finite() || *s <= 0.0))
+        {
+            return Err(ClothError::InvalidParameter("hinge stiffness"));
+        }
+        self.hinge_stiffness = scale;
         Ok(())
     }
     /// Persistent external force, in newtons; set to zero to clear it.

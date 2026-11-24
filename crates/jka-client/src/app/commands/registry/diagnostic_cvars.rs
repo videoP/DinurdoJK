@@ -6,6 +6,79 @@ use crate::{
     },
 };
 pub(super) const CVARS: &[CvarDef<App>] = &[
+CvarDef::new("r_ninjaFog", "0", "0|1", "Fluid Ninja ground fog. Enable, then use ninjafog in a loaded map. 0 clears the volume. Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::ninja_fog_debug::enabled()), |app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    if enabled && !jka_ninja::INCLUDED {
+        app.push_console_line("^3[NINJA FOG]^7 Fluid Ninja is not included in this build".to_owned());
+    } else {
+        crate::ninja_fog_debug::set_enabled(enabled);
+    }
+    Ok(())
+}),
+CvarDef::new("r_shaderPromotion", "1", "0|1", "Apply authored q3map_dinurdoPromoted overrides (hide or swap map shaders such as seabed caustics) while their promotion system (ocean, river, water, fire, smoke) is active. 0 restores the authored shaders. Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::app::shader_promotion::enabled()), |_app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    crate::app::shader_promotion::set_enabled(enabled);
+    Ok(())
+}),
+CvarDef::new("r_ninjaFirePromote","0", "0|1", "Replace supported stationary ET_FX flame layers with Ninja fire and Burning Man sparks. Smoke is controlled separately by r_ninjaSmokePromote. Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::ninja_fire_debug::promote()), |app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    if enabled && !jka_ninja::INCLUDED {
+        app.push_console_line("^3[NINJA FIRE]^7 Fluid Ninja is not included in this build".to_owned());
+        return Ok(());
+    }
+    crate::ninja_fire_debug::set_promote(enabled);
+    if let Some(session) = app.game_session.as_mut() {
+        session.weapon_fx.set_runner_culling(app.video.fx_occlusion == 1 || crate::ninja_fire_debug::promotion_enabled());
+    }
+    if enabled && crate::ninja_fire_debug::brushes_wanted() {
+        if let Some(map) = app.game_session.as_ref().and_then(|session| session.map_name.clone()) {
+            app.ensure_ninja_fire_brushes(&map);
+        }
+    }
+    Ok(())
+}),
+CvarDef::new("r_ninjaSmokePromote", "0", "0|1", "Promote supported upright particle smoke and steam from continuous stationary ET_FX emitters to Ninja smoke. The two nearest eligible sources use volumes once the GPU is ready. Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::ninja_fire_debug::promote_smoke()), |app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    if enabled && !jka_ninja::INCLUDED {
+        app.push_console_line("^3[NINJA SMOKE]^7 Fluid Ninja is not included in this build".to_owned());
+        return Ok(());
+    }
+    crate::ninja_fire_debug::set_promote_smoke(enabled);
+    if let Some(session) = app.game_session.as_mut() {
+        session.weapon_fx.set_runner_culling(app.video.fx_occlusion == 1 || crate::ninja_fire_debug::promotion_enabled());
+    }
+    Ok(())
+}),
+CvarDef::new("r_ninjaFireEmbers", "0", "0|1", "Fire_Smoke_Explosive flamethrower-turret embers (bright streaks and soft settling dots, colliding with solid map brushes) from every Ninja fire source: placed, promoted and Burning Man. Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::ninja_fire_debug::embers()), |app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    crate::ninja_fire_debug::set_embers(enabled);
+    if enabled && jka_ninja::INCLUDED {
+        if let Some(map) = app.game_session.as_ref().and_then(|session| session.map_name.clone()) {
+            app.ensure_ninja_fire_brushes(&map);
+        }
+    }
+    Ok(())
+}),
+CvarDef::new("r_ninjaFireFlicker", "1", "0|1", "Animate the ninjafireon point light with the existing two-octave smooth flicker curve. 0 restores the authored steady intensity. Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::ninja_fire_debug::flicker()), |_app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    crate::ninja_fire_debug::set_flicker(enabled);
+    Ok(())
+}),
+CvarDef::new("r_ninjaFireAirflow", "0", "0|1", "Thin the outer Ninja flame and brighten its ember-red core in fast air, with a brief flare as the airflow subsides. Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::ninja_fire_debug::airflow_response()), |_app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    crate::ninja_fire_debug::set_airflow_response(enabled);
+    Ok(())
+}),
+CvarDef::new("r_ninjaFireCollision", "1", "0|1", "Fluid Ninja MeshField collision against solid BSP world brushes. Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::ninja_fire_debug::collision()), |app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    crate::ninja_fire_debug::set_collision(enabled);
+    if enabled && jka_ninja::INCLUDED {
+        if let Some(map) = app.game_session.as_ref().and_then(|session| session.map_name.clone()) {
+            app.ensure_ninja_fire_brushes(&map);
+        }
+    }
+    Ok(())
+}),
 CvarDef::new("r_lampShadowDebug", "0", "0|1|2", "Session-only: 0 off, 1 single diagnostic snapshot after next local-shadow selection, 2 repeat on player move/PVS reselection. Reports flare candidates, grouping, slots, plus post-encode moving-caster face masks and shader gate states in console/latest.log. No GPU readback or render changes.", CvarType::Int { min: 0, max: 2 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(crate::renderer::lamp_shadow_debug_mode() as i32), |app, value| {
     let CvarValue::Int(mode) = value else { unreachable!() };
     crate::renderer::set_lamp_shadow_debug_mode(mode as u8);
@@ -76,6 +149,12 @@ CvarDef::new("r_riverDebug", "0", "0|1|2", "Live spawnriver diagnostics: 0 off, 
     }));
     Ok(())
 }),
+CvarDef::new("r_riverPromotion", "0", "0|1|2|3", "Experimental authored river promotion on map reload. 0 off, 1 log candidates and hydraulic plans, 2 preview with authored water visible, 3 replace eligible water after convergence.", CvarType::Int { min: 0, max: 3 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(i32::from(crate::scene::river_promotion::mode())), |app, value| {
+    let CvarValue::Int(mode) = value else { unreachable!() };
+    crate::scene::river_promotion::set_mode(mode as u8);
+    app.push_console_line(format!("r_riverPromotion {mode}: reload map to apply"));
+    Ok(())
+}),
 CvarDef::new("r_riverPause", "0", "0|1", "Live river A/B: 1 stops the solver (no simulated time passes) while the water keeps drawing, with FFT detail and foam, from the last solved state. Compare GPU cost with r_gpuTimings 1 ([JKA RIVER PERF] sim/solve/draw) or plain FPS. Session-only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::river_runtime::paused()), |app, value| {
     let CvarValue::Bool(paused) = value else { unreachable!() };
     crate::river_runtime::set_paused(paused);
@@ -104,6 +183,31 @@ CvarDef::new("r_riverWhitewater", "1", "0|1", "River whitewater spray (Unreal SW
     let CvarValue::Bool(enabled) = value else { unreachable!() };
     crate::river_runtime::set_whitewater(enabled);
     app.push_console_line(format!("^3r_riverWhitewater:^7 {}", if enabled { "ON" } else { "OFF" }));
+    Ok(())
+}),
+CvarDef::new("r_ninjaWakePush", "1", "0..4", "Fluid Ninja actor wake push strength (Ninja ocean, Coast and Source-lake wake; not the river): scales the composite VeloFromBrushMotion of the shared wake. 1 = the Fluid Ninja Creek demo (water pushed up to ~8 m/s, can run ahead of a slower body); .25 = the Fluid Ninja Lake demo's own value. Session only, for A/B.", CvarType::Float { min: 0.0, max: 4.0 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Float(jka_ninja::wake_push()), |app, value| {
+    let CvarValue::Float(scale) = value else { unreachable!() };
+    jka_ninja::set_wake_push(scale);
+    app.push_console_line(format!("^3r_ninjaWakePush:^7 {scale}"));
+    Ok(())
+}),
+CvarDef::new("r_riverNinjaDebug", "0", "0|1", "Fluid Ninja river wake diagnostics. Logs actor capture, GPU contact, hash and painter samples once per second while the Fluid Ninja river is built in.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(jka_river::river_ninja::wake_debug_enabled()), |app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    jka_river::river_ninja::set_wake_debug(enabled);
+    app.push_console_line(format!("^3r_riverNinjaDebug:^7 {}", if enabled { "ON" } else { "OFF" }));
+    Ok(())
+}),
+CvarDef::new("r_riverNinjaMaterialDebug", "0", "0..5", "Above-water Fluid Ninja material A/B: 0 full material, 1 omit wetmap foam color, 2 bypass the geometry-distance coverage mask, 3 omit scene refraction, 4 omit in-scattered light while retaining extinction, 5 display raw wetmap. Live and session only.", CvarType::Int { min: 0, max: 5 }, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Int(jka_river::river_ninja::material_debug() as i32), |app, value| {
+    let CvarValue::Int(mode) = value else { unreachable!() };
+    jka_river::river_ninja::set_material_debug(mode as u32);
+    app.push_console_line(format!("^3r_riverNinjaMaterialDebug:^7 {}", match mode {
+        1 => "Wetmap foam color omitted",
+        2 => "Geometry-distance coverage mask bypassed",
+        3 => "Scene refraction omitted",
+        4 => "Volume in-scattering omitted",
+        5 => "Raw wetmap",
+        _ => "Full material",
+    }));
     Ok(())
 }),
 CvarDef::new("r_riverWaterMesh", "1", "0|1", "Sparse rivers beyond the camera window: 1 draws the Unreal Water plugin's water mesh quadtree (LOD tiles over the wet simulation tiles, read straight from the simulation), 0 draws only the window (r_riverWindow).", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(jka_river::river_far::enabled()), |app, value| {

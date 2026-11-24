@@ -674,12 +674,9 @@ pub struct PredictSettings {
     pub no_spec_move: i32,
     pub tracemask: i32,
     pub no_footsteps: i32,
-    /// Native implementation: 0 = stock OpenJK, 1 = TaystJK shared BG/Pmove.
-    /// The TaystJK backend is used for JA+ and jaPRO, and can also be selected
-    /// for Base when advertised TaystJK feature flags require it.
-    pub backend: i32,
     /// Server identity consumed by the TaystJK cgs.serverMod branches:
-    /// 0 = Base/other, 1 = jaPRO, 2 = JA+. Keep this separate from backend.
+    /// 0 = Base/other, 1 = jaPRO, 2 = JA+. Every server uses the one native
+    /// TaystJK BG/Pmove implementation; this selects its compatibility rules.
     pub server_mod: i32,
     /// JA+ `jp_cinfo` (`cgs.cinfo`). jaPRO continues to use `jcinfo`.
     pub cinfo: i32,
@@ -706,7 +703,7 @@ impl Default for PredictSettings {
         Self {
             pmove_fixed: 0, pmove_msec: 8, pmove_float: 0, gametype: 0,
             debug_melee: 0, step_slide_fix: 1, no_spec_move: 0,
-            tracemask: 0x1111, no_footsteps: 0, backend: 0, server_mod: 0,
+            tracemask: 0x1111, no_footsteps: 0, server_mod: 0,
             cinfo: 0, jcinfo: 0, jcinfo2: 0, taystjk_info: 0, dmflags: 0,
             hook_pull: 0, restricts: 0, base_game: 0, plugin_disable: 1536, legacy_fixes: 0,
             duel_client: 0, duel_type: 0, roll_debug: 0,

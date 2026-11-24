@@ -1057,7 +1057,7 @@ fn wide_runs(value: &str) -> Vec<(bool, &str)> {
 }
 
 /// The colour in force after `run`, given the one before it.
-fn colour_after(run: &str, mut active: [f32; 4], alpha: f32) -> [f32; 4] {
+pub(super) fn colour_after(run: &str, mut active: [f32; 4], alpha: f32) -> [f32; 4] {
     let mut chars = run.char_indices().peekable();
     while let Some((index, _)) = chars.next() {
         if let Some((skip, code)) = color_escape(run.as_bytes(), index, alpha) {

@@ -39,6 +39,10 @@ fn ease_out(t: f32) -> f32 {
 }
 
 impl App {
+    pub(super) fn note_chat_cursor_move(&mut self) {
+        self.chat_anim.last_key = Instant::now();
+    }
+
     pub(in crate::app) fn chat_anim_ui(&self, now: Instant) -> UiChatAnim {
         let state = &self.chat_anim;
         let since = now.saturating_duration_since(state.changed_at).as_secs_f32() * 1000.0;

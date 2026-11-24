@@ -25,6 +25,7 @@ impl Renderer {
         // Individual immutable uploads now use the device's asset pool. Never
         // borrow a renderer's mutable/baked texture just because its map matches.
         let _ = shared;
+        self.clear_promoted_rivers();
         self.load_map_internal(map, None, None, None)
     }
 
@@ -32,6 +33,7 @@ impl Renderer {
         &mut self, map: PreparedMap,
         key: Option<(u64, crate::scene::ShaderRemapState)>,
     ) -> WorldUploadTimings {
+        self.clear_promoted_rivers();
         // Remove the incoming entry before enforcing the bound on the outgoing
         // one. Both CPU/session and GPU caches use three inactive entries.
         let resident = key.as_ref().and_then(|key| {
@@ -67,6 +69,9 @@ impl Renderer {
     ) -> WorldUploadTimings {
         // Park this world under its new material state, never its old key.
         self.studio_active_world = studio_world;
+        // Remaps can change stage eligibility and ownership. Restore authored
+        // water instead of carrying a stale hydraulic claim across the remap.
+        self.clear_promoted_rivers();
         match self.remap_resident_world(&plan, base_texture_count) {
             Ok(timings) => timings,
             Err(reason) => {
@@ -80,6 +85,8 @@ impl Renderer {
 
     fn load_map_internal(&mut self, mut map: PreparedMap, reuse: Option<usize>, resident: Option<StudioCachedWorld>, shared: Option<&crate::renderer::WorldGpu>) -> WorldUploadTimings {
         let load_map_started = Instant::now();
+        let river_plans = std::sync::Arc::clone(&map.river_plans);
+        let river_mode = if map.sub_bsp_boundary.is_some() { 0 } else { map.river_promotion_mode };
         // A setting change can enqueue a costly PBR variant immediately before
         // the application requests a map rebuild. Cancel the obsolete variant
         // BEFORE beginning the new world's synchronous upload. Native driver
@@ -178,8 +185,7 @@ impl Renderer {
         // Before the world bind groups are built, so build_world binds the
         // current field views; a restored world is rebound right after build.
         // Only a map with snow AND r_footprints on samples the 2048^2 field.
-        let snow_field = self.surface_deformation_shader_needed();
-        self.surface_deformation.set_field_enabled(&self.device, snow_field);
+        self.sync_surface_deformation_resources();
         self.map_has_water = map
             .batches
             .iter()
@@ -289,9 +295,7 @@ impl Renderer {
             &self.cull_debug_layout,
             &self.lighting_settings_buffer,
             &self.pbr_settings_buffer,
-            self.surface_deformation.buffer(),
-            self.surface_deformation.field_views(),
-            self.surface_deformation.field_sampler(),
+            &self.surface_deformation,
             &self.grass_renderer,
             &self.surface_sprite_effect_renderer,
             self.ocean_enabled,
@@ -356,6 +360,7 @@ impl Renderer {
         self.shadow_resources.rendered_generations = [0; crate::renderer::SHADOW_CASCADES];
         self.shadow_resources.last_csm_mode = None;
         self.world = Some(world);
+        self.install_promoted_rivers(&river_plans, river_mode);
         self.write_material_enhancement_settings();
         // Both BSP and model shaders sample the same immutable map irradiance
         // volume. Rebind model materials only at map install (not each frame).

@@ -313,6 +313,11 @@ impl DynamicModelRenderer {
         let mut light_memo = EntityLightMemo::default();
 
         for surface in surfaces {
+            // The RT compute-skinning path has no SkinGore material inputs.
+            // Do not accidentally paint its entire albedo over the player.
+            if surface.ghoul2_gpu.as_ref().is_some_and(|skin| skin.skin_gore.is_some()) {
+                continue;
+            }
             // Camera-culled RT-only surfaces should never leak into ordinary
             // entity rendering. Non-Ghoul2/non-RT transient surfaces have no
             // reason to survive the presentation cull.
@@ -372,6 +377,58 @@ impl DynamicModelRenderer {
             } else {
                 None
             };
+
+            if let Some(cloth) = surface.cloth_gpu.as_ref() {
+                // GPU cloth writes this reserved range from compute, before
+                // raster and BLAS builds read the shared skinned buffer.
+                let count = cloth.vertex_count();
+                if count == 0 || surface.indices.is_empty() {
+                    continue;
+                }
+                let base_vertex = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+                let first_index = u32::try_from(indices.len()).unwrap_or(u32::MAX);
+                vertices.resize(vertices.len() + count, DynamicModelVertex::zeroed());
+                if rt_receivers {
+                    raw_colors.resize(vertices.len(), cloth.color);
+                }
+                indices.extend_from_slice(surface.indices.as_slice());
+                let water = (surface.wireframe_class == crate::renderer::DynamicWireframeClass::Player)
+                    .then(|| self.entity_water.get(&surface.entity_num).copied())
+                    .flatten();
+                self.cloth_gpu.record(cloth, base_vertex, classic_light, water);
+                if surface.raster_visible {
+                    self.draws.push(DynamicPreparedDraw {
+                        entity_num: surface.entity_num, portal_only: surface.portal_only,
+                        first_index,
+                        index_count: u32::try_from(surface.indices.len()).unwrap_or(u32::MAX),
+                        base_vertex: i32::try_from(base_vertex).unwrap_or(i32::MAX),
+                        texture_key,
+                        alpha_mode: surface.alpha_mode,
+                        wireframe_class: surface.wireframe_class,
+                        authored_glow: surface.authored_glow,
+                    });
+                }
+                if matches!(
+                    surface.alpha_mode,
+                    DynamicModelAlphaMode::Opaque | DynamicModelAlphaMode::Mask
+                ) {
+                    if let Some(mesh_key) = surface.rt_skinned_key.as_ref() {
+                        rt_casters.push(RayTracedSkinnedPrepared {
+                            key: RayTracedSkinnedMeshKey {
+                                entity_num: surface.entity_num,
+                                mesh_key: Arc::clone(mesh_key),
+                                non_opaque: surface.alpha_mode == DynamicModelAlphaMode::Mask,
+                            },
+                            first_vertex: base_vertex,
+                            vertex_count: u32::try_from(count).unwrap_or(u32::MAX),
+                            first_index,
+                            index_count: u32::try_from(surface.indices.len()).unwrap_or(u32::MAX),
+                            alpha_texture: surface.texture.clone(),
+                        });
+                    }
+                }
+                continue;
+            }
 
             if let Some(skin) = surface.ghoul2_gpu.as_ref() {
                 if skin.vertices.is_empty() || skin.indices.is_empty() || skin.bones.is_empty() {
@@ -581,6 +638,9 @@ impl DynamicModelRenderer {
             } else {
                 vertices.extend_from_slice(surface.vertices.as_slice());
             }
+            if let Some(offset) = surface.vertex_translation() {
+                super::prepare::translate_vertices(&mut vertices[base_vertex as usize..], offset);
+            }
             if surface.wireframe_class == crate::renderer::DynamicWireframeClass::Player {
                 if let Some(water) = self.entity_water.get(&surface.entity_num) {
                     for vertex in &mut vertices[base_vertex as usize..] {
@@ -664,6 +724,7 @@ impl DynamicModelRenderer {
             queue.write_buffer(self.rt_raw_color_buffer.as_ref().unwrap(), 0, bytes);
         }
         self.scratch_raw_colors = raw_colors;
+        self.cloth_gpu.prepare(jobs, device, queue, &mut vertices);
         let vertex_bytes = bytemuck::cast_slice(vertices.as_slice());
         let index_bytes = bytemuck::cast_slice(indices.as_slice());
         let bone_bytes = bytemuck::cast_slice(bones.as_slice());
@@ -734,6 +795,11 @@ impl DynamicModelRenderer {
         }
         rt.casters = rt_casters;
         self.rt_prepared = true;
+        if self.cloth_gpu.has_dispatches() {
+            if let Some(rt) = self.rt_skinning.as_ref() {
+                self.cloth_gpu.bind_output(device, &rt.vertex_buffer);
+            }
+        }
         self.ensure_model_pipelines(jobs, device, prepare_authored_glow);
         self.upload_prepared_fx_sprites(jobs, device, queue, &fx_sprite_instances, prepare_authored_glow);
         self.scratch_fx_sprite_instances = fx_sprite_instances;

@@ -9,10 +9,30 @@ fn upstream_coast_real_map_sky_corners_are_open_sea() {
     let bsp = Bsp::parse(&bytes.bytes).unwrap();
     let geometry = Geometry::from_bsp(&bsp).unwrap();
     for origin in [[-14592.,-14592.],[-14592.,14080.],[14080.,-14592.],[14080.,14080.]] {
-        let heights = geometry.upstream_shore_heights(origin,[5,5],128.,3.,&[]).unwrap();
+        let heights = geometry.upstream_shore_heights(origin,[5,5],128.,3.,&[],false).unwrap();
         println!("Sky corner {origin:?}: {heights:?}");
         assert!(heights.iter().all(|h| h.is_nan() || *h < -100.),"sky shell is not land/shallow surf: {origin:?}");
     }
+}
+
+#[test]
+fn upstream_shore_reads_a_beach_over_the_water_volume_floor() {
+    let mut geometry = Geometry {
+        solids: vec![
+            box_solid([-10., -10., -120.], [10., 10., -96.]),
+            box_solid([-10., -10., -8.], [10., 10., -2.]),
+        ],
+        triangles: vec![],
+        liquids: vec![box_solid([-10., -10., -100.], [10., 10., 0.])],
+    };
+    let profile = |geometry: &Geometry| {
+        geometry.upstream_shore_heights([0., 0.], [2, 2], 1., 0., &[],false).unwrap()
+    };
+    assert_eq!(profile(&geometry), vec![-2.; 4]);
+    assert!(geometry.column([0., 0.], 0., &[0, 1], &[]).overhang);
+
+    geometry.solids.push(box_solid([-10., -10., -1.5], [10., 10., -1.]));
+    assert!(profile(&geometry).iter().all(|z| z.is_nan()));
 }
 
 #[test]
@@ -23,14 +43,14 @@ fn upstream_coast_keeps_sky_shell_open_and_real_banks_solid() {
         solids: vec![sky_wall, box_solid([-100.,-100.,-100.],[-10.,100.,15.])],
         triangles:vec![], liquids:vec![],
     };
-    let samples = geometry.upstream_shore_heights([-20.,0.],[31,2],1.,10.,&[]).unwrap();
+    let samples = geometry.upstream_shore_heights([-20.,0.],[31,2],1.,10.,&[],false).unwrap();
     assert_eq!(samples[0],5.,"actual bank stays land");
     assert!(samples[25].is_nan(),"sky collision shell must not become a surf bank or wind blocker");
     assert!(geometry.column([5.,0.],10.,&[0],&[]).bed.unwrap()>10.,"existing solver geometry is preserved");
     let mut floor = box_solid([-100.,-100.,-100.],[100.,100.,5.]);
     floor.sky[0]=true; // A distant sky side does not erase the actual floor below water.
     let geometry = Geometry {solids:vec![floor],triangles:vec![],liquids:vec![]};
-    assert_eq!(geometry.upstream_shore_heights([0.,0.],[2,2],1.,10.,&[]).unwrap()[0],-5.);
+    assert_eq!(geometry.upstream_shore_heights([0.,0.],[2,2],1.,10.,&[],false).unwrap()[0],-5.);
 }
 
 #[test]
@@ -42,45 +62,18 @@ fn upstream_coast_raster_respects_water_level_roofs_and_unknown_columns() {
         triangles:vec![],liquids:vec![],
     };
     let footprint=rectangle([-100.,-100.],[100.,100.]);
-    let heights=geometry.upstream_shore_heights([-1.,0.],[3,2],1.,10.,&footprint).unwrap();
+    let heights=geometry.upstream_shore_heights([-1.,0.],[3,2],1.,10.,&footprint,false).unwrap();
     assert_eq!(heights[0],-5.,"an overhead roof must not become the seabed");
     assert_eq!(heights[2],5.,"solid land crossing the water plane must shelter waves");
-    let upper=geometry.upstream_shore_heights([1.,0.],[2,2],1.,20.,&footprint).unwrap();
+    let upper=geometry.upstream_shore_heights([1.,0.],[2,2],1.,20.,&footprint,false).unwrap();
     assert_eq!(upper[0],-5.,"each pool must use its own still-water level");
-    let unknown=geometry.upstream_shore_heights([200.,200.],[2,2],1.,10.,&footprint).unwrap();
+    let unknown=geometry.upstream_shore_heights([200.,200.],[2,2],1.,10.,&footprint,false).unwrap();
     assert!(unknown.iter().all(|h|h.is_nan()),"missing geometry is unknown, never a guessed bank");
     let terrain=Geometry {solids:vec![],liquids:vec![],triangles:vec![Triangle {
         points:[[0.,0.,15.],[10.,0.,15.],[0.,10.,15.]],normal:[0.,0.,1.],bounds:[[0.,0.],[10.,10.]],
     }]};
-    let bank=terrain.upstream_shore_heights([1.,1.],[2,2],1.,10.,&[]).unwrap();
+    let bank=terrain.upstream_shore_heights([1.,1.],[2,2],1.,10.,&[],false).unwrap();
     assert_eq!(bank[0],5.,"brush-free triangle terrain above water must provide land shelter");
-}
-
-/// The Gerstner ocean's contact field: what upstream's two depth cameras see within 10 units of the water at z = 0.
-#[test]
-fn contact_band_keeps_solids_crossing_the_water_and_ignores_decks_and_seabeds() {
-    let geometry = Geometry {
-        solids: vec![
-            // A wall through the water, a pier deck clear above it, a seabed well below it.
-            box_solid([0., -100., -50.], [4., 100., 50.]),
-            box_solid([10., -100., 4.], [14., 100., 6.]),
-            box_solid([20., -100., -100.], [24., 100., -30.]),
-        ],
-        triangles: vec![Triangle {
-            points: [[30., -100., 2.], [40., -100., 2.], [30., 100., 2.]],
-            normal: [0., 0., 1.],
-            bounds: [[30., -100.], [40., 100.]],
-        }],
-        liquids: vec![],
-    };
-    let spans = geometry.contact_band([-1., 0.], [42, 1], 1., 0., 10.).unwrap();
-    let at = |x: f32| spans[(x + 1.) as usize];
-    assert_eq!(at(-1.), [-10., 10.], "open water has no contact");
-    assert_eq!(at(2.), [10., -10.], "a wall through the water is clipped to the band");
-    assert_eq!(at(12.), [6., 4.], "a deck above the water keeps its own underside");
-    assert_eq!(at(22.), [-10., 10.], "a seabed below the band is not contact");
-    assert_eq!(at(31.), [2., 2.], "triangle terrain inside the band is a surface");
-    assert!(geometry.contact_band([0., 0.], [0, 1], 1., 0., 10.).is_err());
 }
 
 fn large_pool_tiles() -> Vec<Region> {

@@ -158,6 +158,7 @@ impl App {
         self.poll_race_ghost_web();
         self.sync_coastal_debug();
         self.sync_coastal_live();
+        self.sync_shader_promotion();
         let trail_lines = self.strafe_trails.poll();
         let trail_changed = !trail_lines.is_empty();
         for line in trail_lines {
@@ -217,6 +218,7 @@ impl App {
             }
         }
 
+        self.sync_echofield_weather();
         // Multiplayer advances flipkick only when an actual usercmd is authored
         // in tick_network. Render frames can greatly outnumber those commands.
         self.tick_network(dt);
@@ -242,7 +244,9 @@ impl App {
         let mut local_movement_error = None;
         if local_is_playing
             && matches!(self.overlay, OverlayMode::None | OverlayMode::DevRadial | OverlayMode::EmoteRadial)
-            && self.captured
+            // Scripted headless captures have no cursor to grab. Their local
+            // game clock still needs to advance for time-dependent effects.
+            && (self.captured || super::lifecycle::headless())
         {
             // Local play originates the same CL_CreateCmd action payload as
             // remote play. The old offline path only forwarded attack/alt
@@ -254,7 +258,7 @@ impl App {
                 .and_then(|session| session.current_snapshot.as_ref())
                 .map(|snapshot| snapshot.player_state.clone())
             {
-                self.live_input.sync_selection(&ps);
+                self.live_input.sync_selection(&ps, false);
             }
             self.apply_out_of_ammo_changes();
             // Solo currently authors one input sample per application frame;
@@ -529,6 +533,7 @@ impl App {
         self.update_player_name_visibility(now);
         self.ensure_inline_instance_capacity();
         let snapshot_started = Instant::now();
+        self.refresh_ninja_fog_surface();
         self.publish_snapshot();
         if let Some(export) = self.render_studio.export.as_mut() {
             export.app_cost(super::render_studio_profile::StudioAppCost::Snapshot,

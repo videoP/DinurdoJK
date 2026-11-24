@@ -192,7 +192,7 @@ fn river_far_shade(input: RiverFarOut, front: bool, fused: bool) -> vec4<f32> {
     if !pixel.outside_window || pixel.material_mask < 0.3333 || input.eye_under > 0.5 {
         discard;
     }
-    let base = river_base_pass(input.clip, input.world, front, pixel.graph_normal, foam, pixel_depth, slope, input.ambient, input.directed);
+    let base = river_base_pass(input.clip, input.world, front, pixel.graph_normal, foam, pixel_depth, slope, input.ambient, input.directed, vec3<f32>(0.0));
     if fused {
         let reflection = river_composite_pass(input.clip, input.world, front, pixel.graph_normal, foam, pixel_depth, slope);
         return vec4<f32>(base.rgb + reflection.rgb, base.a);

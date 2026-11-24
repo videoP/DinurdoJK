@@ -42,6 +42,7 @@ static AUDIO_RESULT_FOOT: [std::sync::atomic::AtomicU32; 3] = [
     std::sync::atomic::AtomicU32::new(0),
 ];
 static AUDIO_RESULT_FOOT_WET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static AUDIO_RESULT_CAMERA_WET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static AUDIO_RESULT_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static AUDIO_RESULT_WET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -52,13 +53,15 @@ fn audio_clock_ms() -> u64 {
 
 /// Render-thread river lifecycle. Invalidates all results on map unload.
 pub fn set_audio_rivers_present(present: bool) {
-    AUDIO_RIVERS.store(present, Ordering::Release);
+    let previous = AUDIO_RIVERS.swap(present, Ordering::AcqRel);
+    if previous && !present { crate::river_ambience::invalidate(); }
     if !present {
         AUDIO_EYE_TIME.store(0, Ordering::Release);
         AUDIO_RESULT_SEQ.fetch_add(1, Ordering::AcqRel);
         AUDIO_RESULT_TIME.store(0, Ordering::Relaxed);
         AUDIO_RESULT_WET.store(false, Ordering::Relaxed);
         AUDIO_RESULT_FOOT_WET.store(false, Ordering::Relaxed);
+        AUDIO_RESULT_CAMERA_WET.store(false, Ordering::Relaxed);
         AUDIO_RESULT_SEQ.fetch_add(1, Ordering::Release);
     }
 }
@@ -75,6 +78,7 @@ pub struct AudioListenerProbe {
 pub struct RiverAudioContact {
     pub eye: bool,
     pub foot: bool,
+    pub camera: bool,
 }
 
 pub fn audio_rivers_present() -> bool { AUDIO_RIVERS.load(Ordering::Acquire) }
@@ -97,6 +101,7 @@ pub fn listener_water_contact(eye: [f32; 3], foot: [f32; 3]) -> Option<RiverAudi
     let time = AUDIO_RESULT_TIME.load(Ordering::Relaxed);
     let eye_wet = AUDIO_RESULT_WET.load(Ordering::Relaxed);
     let foot_wet = AUDIO_RESULT_FOOT_WET.load(Ordering::Relaxed);
+    let camera_wet = AUDIO_RESULT_CAMERA_WET.load(Ordering::Relaxed);
     let sampled_eye = AUDIO_RESULT_EYE.each_ref().map(|v| f32::from_bits(v.load(Ordering::Relaxed)));
     let sampled_foot = AUDIO_RESULT_FOOT.each_ref().map(|v| f32::from_bits(v.load(Ordering::Relaxed)));
     if start != AUDIO_RESULT_SEQ.load(Ordering::Acquire) || time == 0 || now.saturating_sub(time) > 500 {
@@ -110,6 +115,7 @@ pub fn listener_water_contact(eye: [f32; 3], foot: [f32; 3]) -> Option<RiverAudi
     (nearby(sampled_eye, eye) && nearby(sampled_foot, foot)).then_some(RiverAudioContact {
         eye: eye_wet,
         foot: foot_wet,
+        camera: camera_wet,
     })
 }
 
@@ -138,6 +144,7 @@ pub fn publish_audio_result(sample: AudioListenerProbe, water: RiverAudioContact
     for (slot, value) in AUDIO_RESULT_FOOT.iter().zip(sample.foot) { slot.store(value.to_bits(), Ordering::Relaxed); }
     AUDIO_RESULT_WET.store(water.eye, Ordering::Relaxed);
     AUDIO_RESULT_FOOT_WET.store(water.foot, Ordering::Relaxed);
+    AUDIO_RESULT_CAMERA_WET.store(water.camera, Ordering::Relaxed);
     AUDIO_RESULT_TIME.store(audio_clock_ms(), Ordering::Relaxed);
     AUDIO_RESULT_SEQ.fetch_add(1, Ordering::Release);
 }
@@ -489,6 +496,9 @@ fn source_rise_per_step_cm(cfs: f32, step_seconds: f64, cells: u32, cell_area_cm
 
 pub struct LiveRiver {
     pub id: crate::river_authoring::Id,
+    /// Replacement candidates stay hidden until the renderer admits their draw.
+    promotion_replaces: bool,
+    pub promotion_active: bool,
     /// r_riverDebug: (menu deformation toggle, presented actors) last frame.
     pub body_source: (bool, usize),
     /// r_riverDebug: bodies used last frame and the first one (lattice cm).
@@ -499,6 +509,7 @@ pub struct LiveRiver {
     render_controls: [f32; 8],
     pub authored: wgpu::Buffer,
     foam_minimum_depth: std::cell::Cell<f32>,
+    underwater_optics: std::cell::Cell<u8>,
     pub source: LocalSource,
     /// Native actor origin (XY centre, minimum Z), centimetres.
     pub origin_cm: [f64; 3],
@@ -518,6 +529,13 @@ pub struct LiveRiver {
     ambient: crate::river_slw::ClassicAmbient,
     /// Native FoamGrid (stages 4/16), created with the material fields.
     foam: Option<crate::river_foam::Field>,
+    // Optional Phase 2 native input bridge, not the Phase 1 solver itself.
+    ninja_inputs: Option<crate::river_ninja::Prepared>,
+    ninja_failed: bool,
+    ninja_epoch: u64,
+    /// The Fluid Ninja velocity/density view the body groups were built with
+    /// (None = native foam presentation). Identity change rebuilds them.
+    body_ninja: Option<wgpu::TextureView>,
     /// Live window blocks (river_blocks), rebuilt when SimGridRT is.
     blocks: Option<crate::river_blocks::Cull>,
     /// The water body's group for each FoamRT parity.
@@ -538,9 +556,25 @@ pub struct LiveRiver {
 }
 
 impl LiveRiver {
+    pub fn promoted_ready(&self) -> bool {
+        self.settled
+            && self.body_group().is_some()
+            && self.block_cull().is_some()
+            && self.eye_state.is_some()
+    }
+
+    pub fn draw_enabled(&self) -> bool {
+        !self.promotion_replaces || self.promotion_active
+    }
+
+    pub fn audio_enabled(&self) -> bool {
+        !crate::river_promotion::is_promoted(self.id) || self.promotion_active
+    }
+
     /// Replace this river's developer drains (at most river_tiles::MAX_DRAINS).
     /// Live: the bed, water and foam are kept.
     pub fn set_drains(&mut self, queue: &wgpu::Queue, drains: &[LocalDrain]) {
+        if crate::river_promotion::is_promoted(self.id) { return; }
         let cm = f64::from(CENTIMETRES_PER_MAP_UNIT);
         let (origin, grid_min, dx) = match &self.solver {
             Solver::Dense(_) => (
@@ -990,12 +1024,15 @@ impl LiveRiver {
         });
         Ok(Self {
             id: 0,
+            promotion_replaces: false,
+            promotion_active: false,
             body_source: (false, 0),
             body_debug: (0, None),
             far: None,
             render_controls: [f32::NAN; 8],
             authored,
             foam_minimum_depth: std::cell::Cell::new(60.0),
+            underwater_optics: std::cell::Cell::new(crate::river_settings::Settings::default().underwater_optics),
             source,
             origin_cm: domain.origin,
             grid,
@@ -1009,6 +1046,10 @@ impl LiveRiver {
             slice: None,
             ambient,
             foam: None,
+            ninja_inputs: None,
+            ninja_failed: false,
+            ninja_epoch: 0,
+            body_ninja: None,
             blocks: None,
             body_groups: None,
             eye_state: None,
@@ -1017,6 +1058,236 @@ impl LiveRiver {
             spray_group: None,
             debug: DebugStats::new(),
             settled: false,
+            convergence,
+            wet_spot_probe: None,
+        })
+    }
+
+    /// Prefilled authored domain. No developer source box, no global drain,
+    /// no sparse growth beyond the reconstructed footprint.
+    pub fn spawn_promoted(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        plan: &crate::river_promotion::Plan,
+        replace: bool,
+        light: impl FnMut([f32; 3]) -> Option<jka_render_core::light::ClassicEntityLight>,
+        map_toward_sun: Option<[f32; 3]>,
+    ) -> Result<Self, String> {
+        use jka_water::river::{Geometry, Water};
+        let cm = CENTIMETRES_PER_MAP_UNIT;
+        let [w, h] = plan.dims;
+        let count = w as usize * h as usize;
+        if count != plan.cells.len()
+            || count == 0
+            || count > crate::river_promotion::MAX_CELLS
+            || !plan.dx.is_finite()
+            || plan.dx <= 0.0
+        {
+            return Err("invalid promoted river lattice".into());
+        }
+        let low = plan
+            .cells
+            .iter()
+            .filter(|c| c.wet)
+            .map(|c| c.bed)
+            .fold(f32::INFINITY, f32::min);
+        let high = plan
+            .cells
+            .iter()
+            .filter(|c| c.wet)
+            .map(|c| c.level)
+            .fold(f32::NEG_INFINITY, f32::max);
+        if !low.is_finite() || !high.is_finite() {
+            return Err("empty promoted river".into());
+        }
+        let size = [w as f32 * plan.dx, h as f32 * plan.dx];
+        let center = [
+            plan.corner[0] + size[0] * 0.5,
+            plan.corner[1] + size[1] * 0.5,
+            low,
+        ];
+        let grid = Grid {
+            dimensions: plan.dims,
+            world_size: size.map(|v| v * cm),
+            cell_size: [plan.dx * cm; 2],
+        };
+        let controls = Controls {
+            speed: 1.0,
+            ..Controls::default()
+        };
+        let frame = Frame::new(grid, controls, 1.0 / 60.0)?;
+        let p = frame.parameters();
+        let wall = (high - low + 512.0) * cm;
+        let mut geo = Vec::with_capacity(count);
+        let mut seed = Vec::with_capacity(count);
+        let mut info = Vec::with_capacity(count);
+        for c in &plan.cells {
+            if c.wet {
+                let depth = (c.level - c.bed) * cm;
+                if !depth.is_finite() || depth <= 0.0 || depth > p.max_depth {
+                    return Err("promoted depth outside solver bounds".into());
+                }
+                let bottom = (c.bed - low) * cm;
+                // Painted phase speed is not physical speed; only seed a modest
+                // flow with the painted heading, bounded by the gravity wave speed.
+                let v = c.velocity.map(|v| v * cm);
+                let speed = v[0].hypot(v[1]);
+                let scale = if speed > 1e-5 {
+                    (0.5 * (p.gravity * depth).sqrt())
+                        .min(128.0 * cm)
+                        .min(p.max_velocity)
+                        / speed.max(1.0)
+                } else {
+                    0.0
+                };
+                geo.push(Geometry {
+                    bottom,
+                    collider: 0.0,
+                    collision_velocity: [0.0; 2],
+                });
+                seed.push(Water {
+                    height: bottom + depth,
+                    depth,
+                    velocity: v.map(|v| v * scale.min(1.0)),
+                });
+                info.push(WaterInfo {
+                    height: if c.exchange != 0.0 {
+                        (c.target - low) * cm
+                    } else {
+                        bottom + depth
+                    },
+                    depth,
+                    flow_velocity: [c.exchange * cm, 0.0],
+                });
+            } else {
+                geo.push(Geometry {
+                    bottom: wall,
+                    collider: 1.0,
+                    collision_velocity: [0.0; 2],
+                });
+                seed.push(Water {
+                    height: wall,
+                    ..Water::default()
+                });
+                info.push(WaterInfo::default());
+            }
+        }
+        let previous: Vec<_> = geo.iter().map(|g| g.bottom).collect();
+        let mut boundary = BoundaryControls::cached_river_variant(
+            1.0 / 60.0,
+            [-grid.world_size[0] * 0.5, -grid.world_size[1] * 0.5, 0.0],
+        );
+        boundary.match_spline = false;
+        let mut simulation = Simulation::new(
+            device,
+            grid.dimensions,
+            &seed,
+            &geo,
+            &previous,
+            p,
+            Transport {
+                advect_depth: false,
+                ..crate::river_tiles::spawn_transport()
+            },
+            Presentation::default(),
+            BoundaryInput {
+                water_info: &info,
+                boxes: &[],
+                controls: boundary,
+            },
+        )?;
+        simulation.enable_promoted_boundaries();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("promoted river initial solve"),
+        });
+        simulation.encode_reference_frame(device, &mut encoder, frame)?;
+        let mesh = crate::river_grid_mesh::encode(
+            device,
+            &mut encoder,
+            GridMesh::new(grid.dimensions, grid.world_size)?,
+        )?;
+        queue.submit(Some(encoder.finish()));
+        let texels = crate::river_slw::classic_ambient_texels(
+            grid.dimensions,
+            |x, y| {
+                let c = &plan.cells[(y * w + x) as usize];
+                [
+                    plan.corner[0] + (x as f32 + 0.5) * plan.dx,
+                    plan.corner[1] + (y as f32 + 0.5) * plan.dx,
+                    if c.wet { c.level } else { low },
+                ]
+            },
+            light,
+            map_toward_sun,
+        );
+        let ambient = crate::river_slw::ClassicAmbient::upload(device, queue, &texels)?;
+        use wgpu::util::DeviceExt;
+        let authored = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("promoted river material"),
+            contents: bytemuck::cast_slice(&crate::river_settings::Settings::default().uniform()),
+            usage: wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+        });
+        let source = LocalSource {
+            center,
+            radius: size[0].max(size[1]) * 0.5,
+            water_level: high,
+            source_width: plan.dx,
+            resolution: w.max(h),
+            rate: 1.0,
+            mode: SourceMode::WaterLevel,
+            discharge_cfs: None,
+        };
+        let convergence = replace.then(|| {
+            let mut probe = SolveConvergence::new(device, &simulation);
+            probe.expect_authored(
+                seed.iter().filter(|w| w.depth > 0.1).count() as f64,
+                seed.iter().map(|w| f64::from(w.depth)).sum(),
+            );
+            probe
+        });
+        Ok(Self {
+            id: plan.id,
+            promotion_replaces: replace,
+            promotion_active: false,
+            body_source: (false, 0),
+            body_debug: (0, None),
+            far: None,
+            render_controls: [f32::NAN; 8],
+            authored,
+            foam_minimum_depth: std::cell::Cell::new(4.0),
+            underwater_optics: std::cell::Cell::new(crate::river_settings::Settings::default().underwater_optics),
+            source,
+            origin_cm: center.map(|v| f64::from(v) * f64::from(cm)),
+            grid,
+            inlet: SourceBox {
+                position: [0.0; 3],
+                size: [1.0; 3],
+                angle: 0.0,
+                sink: false,
+            },
+            controls,
+            solver: Solver::Dense(simulation),
+            material: None,
+            mesh,
+            simulated_seconds: frame.hydraulic_duration(),
+            pending_seconds: 0.0,
+            slice: None,
+            ambient,
+            foam: None,
+            ninja_inputs: None,
+            ninja_failed: false,
+            ninja_epoch: 0,
+            body_ninja: None,
+            blocks: None,
+            body_groups: None,
+            eye_state: None,
+            spray: None,
+            spray_view: None,
+            spray_group: None,
+            debug: DebugStats::new(),
+            settled: !replace,
             convergence,
             wet_spot_probe: None,
         })
@@ -1164,12 +1435,15 @@ impl LiveRiver {
         });
         Ok(Self {
             id: 0,
+            promotion_replaces: false,
+            promotion_active: false,
             body_source: (false, 0),
             body_debug: (0, None),
             far: None,
             render_controls: [f32::NAN; 8],
             authored,
             foam_minimum_depth: std::cell::Cell::new(60.0),
+            underwater_optics: std::cell::Cell::new(crate::river_settings::Settings::default().underwater_optics),
             source,
             origin_cm,
             grid,
@@ -1183,6 +1457,10 @@ impl LiveRiver {
             slice: None,
             ambient,
             foam: None,
+            ninja_inputs: None,
+            ninja_failed: false,
+            ninja_epoch: 0,
+            body_ninja: None,
             blocks: None,
             body_groups: None,
             eye_state: None,
@@ -1301,6 +1579,7 @@ impl LiveRiver {
         self.origin_cm = sparse.window_origin_cm();
         sparse.shifted = true;
         self.foam = None;
+        self.ninja_inputs = None; // window-relative mask and FNL history must reset
         self.body_groups = None;
         match window_ambient(device, queue, self.origin_cm, self.grid, self.source.water_level, light, map_toward_sun) {
             Ok(ambient) => self.ambient = ambient,
@@ -1325,6 +1604,39 @@ impl LiveRiver {
         water: Option<&crate::river_surface::RiverSurface>,
         solve_timestamp: &mut dyn FnMut(&mut wgpu::CommandEncoder, bool),
     ) -> Result<(), String> {
+        self.encode_frame_with_ninja(device, encoder, engine_delta, world_time, water, solve_timestamp, None)
+    }
+
+    /// Same native frame, with the authoritative presentation clock and the
+    /// existing render snapshot's actor samples when FNL is active.
+    pub fn encode_frame_with_ninja(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        engine_delta: f32,
+        world_time: f64,
+        water: Option<&crate::river_surface::RiverSurface>,
+        solve_timestamp: &mut dyn FnMut(&mut wgpu::CommandEncoder, bool),
+        ninja_source: Option<crate::river_ninja::FrameSource<'_>>,
+    ) -> Result<(), String> {
+        // Before the zero-delta return, release disabled/invalidated FNL inputs.
+        // Never clear the hydraulic solver or its Unreal presentation here.
+        let ninja_requested = crate::river_ninja::actor_capture_requested();
+        if !ninja_requested {
+            if self.ninja_inputs.is_some() || self.ninja_failed {
+                self.ninja_inputs = None;
+                self.ninja_failed = false;
+            }
+        } else {
+            let epoch = crate::river_ninja::timeline_epoch();
+            let time_discontinuous = self.ninja_inputs.as_ref().zip(ninja_source).is_some_and(|(p, source)| {
+                p.scene_revision != source.scene_revision || p.game_seconds.zip(source.game_seconds).is_some_and(|(old, new)| new < old)
+            });
+            if self.ninja_epoch != epoch || time_discontinuous {
+                self.ninja_inputs = None;
+                self.ninja_epoch = epoch;
+            }
+        }
         // Live render-height controls (River menu A/B).
         let presentation = Presentation {
             smoothing_method: u32::from(smoothing_method()),
@@ -1523,7 +1835,77 @@ impl LiveRiver {
             Solver::Dense(simulation) => simulation.state_index(),
             Solver::Sparse(_) => 0,
         };
-        foam.encode_frame(device, encoder, state_index, frame)?;
+        // While Fluid Ninja presents this river (mode 1) the native foam is not
+        // drawn, so it is not simulated either.
+        if self.body_ninja.is_none() {
+            foam.encode_frame(device, encoder, state_index, frame)?;
+        }
+        // Phase 2: prepare the native solid/dry mask in command order. FNL
+        // solver dispatch attaches here after the Phase 1 API is available.
+        // Sparse window state and pool geometry only agree after gather or
+        // while no partial solver frame has changed the pool since gather.
+        if ninja_requested && !self.ninja_failed {
+            let resolution = [crate::river_ninja::resolution(); 2];
+            let bridge = &mut self.ninja_inputs;
+            let solver = &self.solver;
+            let coherent = matches!(solver, Solver::Dense(_)) || moved || shifted || self.slice.is_none();
+            if bridge.as_ref().is_some_and(|p| p.domain.resolution != resolution) {
+                *bridge = None;
+            }
+            if coherent {
+                let result = (|| -> Result<(), String> {
+                    use crate::river_ninja::{Blocks, Domain, Geometry, Inputs, Prepared};
+                    let (state, geometry) = match solver {
+                        Solver::Dense(simulation) => (simulation.state(), Geometry::Dense(simulation.bed_geometry())),
+                        Solver::Sparse(sparse) => {
+                            if !sparse.presented || sparse.shifted { return Ok(()); }
+                            let Some(origin) = sparse.window.origin_cell() else { return Ok(()) };
+                            (&sparse.window.state_textures()[0], sparse.simulation.ninja_geometry(origin))
+                        }
+                    };
+                    let inputs = Inputs { domain: Domain::new(self.origin_cm, self.grid, resolution)?, state, geometry,
+                        blocks: self.blocks.as_ref().map(|b| Blocks {
+                            flags: b.flags(), grid: b.grid(), cells: self.mesh.geometry.cells(),
+                        }) };
+                    Prepared::refresh(bridge, device, encoder, &inputs,
+                        surface_written || (matches!(solver, Solver::Dense(_)) && self.slice.is_some() && !paused))
+                })();
+                if let Err(error) = result {
+                    self.ninja_inputs = None;
+                    self.ninja_failed = true;
+                    eprintln!("[RIVER NINJA] input adapter disabled (toggle off/on to retry): {error}");
+                }
+            }
+        }
+        // Contact records use exactly the same coherent native surface as the
+        // prepared mask, including the previous gathered sparse window during
+        // an unfinished hydraulic slice. This does not modify that surface.
+        if ninja_source.is_none() {
+            if let Some(bridge) = &mut self.ninja_inputs { bridge.clear_contacts(); }
+        }
+        let mut ninja_debug_frame = None;
+        if let (Some(bridge), Some(source)) = (&mut self.ninja_inputs, ninja_source) {
+            let state = match &self.solver {
+                Solver::Dense(simulation) => Some(simulation.state()),
+                Solver::Sparse(sparse) if sparse.presented && !sparse.shifted => Some(&sparse.window.state_textures()[0]),
+                _ => None,
+            };
+            if let Some(state) = state {
+                let result = bridge.prepare_contacts(device, encoder, state, source)
+                    .map_err(|e| format!("contact adapter: {e}"))
+                    // Fluid Ninja field: after mask and contacts, before spray.
+                    .and_then(|()| bridge.encode_field(device, encoder, state, source).map_err(|e| format!("field: {e}")));
+                match result {
+                    Ok(step) if source.debug.is_some() => ninja_debug_frame = Some((state, source, step)),
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.ninja_inputs = None;
+                        self.ninja_failed = true;
+                        eprintln!("[RIVER NINJA] disabled until the next map load: {error}");
+                    }
+                }
+            }
+        }
         // Whitewater (SW_River_Secondary_Emitter) over the foam stage's reader
         // fields, on the real frame clock (particles are presentation).
         if !whitewater() {
@@ -1557,6 +1939,19 @@ impl LiveRiver {
                 }
             }
         }
+        // Fluid Ninja views for the water body: the field's exports plus the
+        // material flow/roughness maps. Rebuild the groups when they change.
+        let ninja_views = ninja_source.and_then(|s| s.images).zip(self.ninja_inputs.as_ref().and_then(|p| p.field_outputs()))
+            .and_then(|(images, out)| Some(crate::river_surface::NinjaViews {
+                velocity_density: out.velocity_density?, pressure: out.pressure?, distance: out.distance?,
+                flow_map: images[5], roughness_map: images[6],
+                caustics: ninja_source.and_then(|source| source.caustics),
+            }));
+        let bound = ninja_views.map(|v| v.velocity_density);
+        if self.body_ninja.as_ref() != bound {
+            self.body_groups = None;
+            self.body_ninja = bound.cloned();
+        }
         if self.body_groups.is_none() {
             if let (Some(water), Some(textures), Some(blocks)) = (water, material.textures(), self.blocks.as_ref()) {
                 let (pair, _) = foam.foam_pair();
@@ -1571,8 +1966,18 @@ impl LiveRiver {
                         &pair[i],
                         &self.authored,
                         &blocks.blocks,
+                        ninja_views,
                     )
                 }));
+                if ninja_views.is_some() {
+                    eprintln!("[RIVER NINJA] surface bindings ready");
+                }
+            }
+        }
+        if let Some((state, source, step)) = ninja_debug_frame {
+            let material_bound = ninja_views.is_some() && self.body_groups.is_some();
+            if let Some(bridge) = &mut self.ninja_inputs {
+                bridge.debug_wake(device, encoder, state, source, self.id, step, material_bound);
             }
         }
         if diag > 0 { self.debug.record(steps, dropped, start.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0)); }
@@ -1614,7 +2019,12 @@ impl LiveRiver {
 
     pub fn set_settings(&self, queue: &wgpu::Queue, settings: crate::river_settings::Settings) {
         self.foam_minimum_depth.set(settings.foam_minimum_depth);
+        self.underwater_optics.set(settings.underwater_optics);
         queue.write_buffer(&self.authored, 0, bytemuck::cast_slice(&settings.uniform()));
+    }
+
+    pub fn uses_ninja_underwater(&self) -> bool {
+        self.underwater_optics.get() >= crate::river_settings::FLUID_NINJA_UNDERWATER
     }
 
     /// This frame's camera for the whitewater ViewRecycler (None: not run).
@@ -1661,6 +2071,7 @@ impl LiveRiver {
     }
 
     pub fn set_live_controls(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, controls: crate::river_authoring::LiveControls) -> Result<(), String> {
+        if crate::river_promotion::is_promoted(self.id) { return Err("authored river boundaries are map-owned".into()); }
         let source = controls.apply(self.source)?;
         if source == self.source { return Ok(()); }
         let cm = f64::from(CENTIMETRES_PER_MAP_UNIT);
@@ -1728,6 +2139,31 @@ impl LiveRiver {
             Solver::Dense(simulation) => simulation.state(),
             Solver::Sparse(sparse) => &sparse.window.state_textures()[0],
         }
+    }
+
+    /// The bridge's encoded input textures. Call after encode_frame, or borrow
+    /// disjoint fields at the Phase 1 dispatch site inside encode_frame.
+    pub fn ninja_snapshot(&self) -> Option<crate::river_ninja::Snapshot<'_>> {
+        use crate::river_ninja::{Blocks, Snapshot};
+        let p = self.ninja_inputs.as_ref()?;
+        if !crate::river_ninja::actor_capture_requested() || self.ninja_epoch != crate::river_ninja::timeline_epoch() {
+            return None;
+        }
+        let state = match &self.solver {
+            Solver::Dense(simulation) => simulation.state(),
+            Solver::Sparse(sparse) => {
+                if !sparse.presented || sparse.shifted { return None; }
+                &sparse.window.state_textures()[0]
+            }
+        };
+        // A dense solver slice may already have wetted a previously dry
+        // block, while SimGridRT/flags still describe the preceding full frame.
+        // Disable the optional cull in that case rather than dropping input.
+        let blocks = if matches!(&self.solver, Solver::Dense(_)) && self.slice.is_some() { None }
+            else { self.blocks.as_ref().map(|b| Blocks { flags: b.flags(), grid: b.grid(), cells: self.mesh.geometry.cells() }) };
+        Some(Snapshot { domain: p.domain, state, solid_or_dry: p.mask.texture(), blocks,
+            timeline_epoch: self.ninja_epoch, game_seconds: p.game_seconds, scene_revision: p.scene_revision,
+            contacts: p.contacts() })
     }
 
     /// SimGridRT (height/depth/velocity, cm) and NormalsRT once available.

@@ -423,6 +423,7 @@ mod draw2d_tests {
         assert!(!build_vertices(&ui, 1920, 1080, None, None).is_empty());
         ui.mode = OverlayMode::Chat;
         ui.chat_input = "screenshot".to_string();
+        ui.chat_cursor = ui.chat_input.len();
         let mut transient = Vec::new();
         build_transient_vertices(&mut transient, &ui, None, 1920, 1080);
         assert!(!transient.is_empty());

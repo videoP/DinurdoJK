@@ -145,11 +145,14 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             }
         } else {
             let point_mode = settings.feature_flags.z & 0xffu;
-            if (point_mode == 0u) {
+            // The HVOL-only bit permits a transient list in Legacy/Vertex
+            // without enabling clustered lighting for BSP surfaces.
+            let hvol_runtime = (settings.feature_flags.z & 0x1000u) != 0u;
+            if (point_mode == 0u && !hvol_runtime) {
                 continue;
             }
-            // Fast/clustered-lite keeps only runtime-authored transient lights.
-            if (point_mode == 2u && light.shadow.w < 0.5) {
+            // Lite, and HVOL's Legacy/Vertex fallback, exclude static points.
+            if ((point_mode == 2u || point_mode == 0u) && light.shadow.w < 0.5) {
                 continue;
             }
         }

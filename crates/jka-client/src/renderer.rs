@@ -199,6 +199,12 @@ mod context;
 mod collision_world;
 mod diagnostics;
 mod environment;
+mod ninja_blood;
+mod ninja_fire;
+mod ninja_fog;
+mod ninja_hvol;
+mod ninja_snow_drift;
+mod ninja_snow_berm;
 mod frame;
 mod frametime_graph;
 mod glass;
@@ -250,9 +256,10 @@ use api::{
     DYNAMIC_MODEL_ALPHA_ORDER, DYNAMIC_MODEL_VERTEX_WORDS, MAX_CLOUD_FOREGROUND_BLADES,
 };
 pub use api::{
-    ClientFramePerf, CloudForegroundBlade, CompanionId, CompanionSceneView, DynamicModelAlphaMode,
+    ClientFramePerf, ClothGpuCollider, ClothGpuFrame, ClothGpuGarment, ClothGpuSurface, ClothGpuTuning,
+    CloudForegroundBlade, CompanionId, CompanionSceneView, DynamicModelAlphaMode,
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, EguiRenderData, ModelGeometrySource,
-    FxGpuSpriteInstance, FxGpuSprites, FxGpuResidentSprites, FxGpuResidentFrame, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex,
+    FxGpuSpriteInstance, FxGpuSprites, FxGpuResidentSprites, FxGpuResidentFrame, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex, Ghoul2SkinGore,
     InlineModelInstance, InspectorEntityHint, PostEffects, RayTracedRigidInstance, RenderCommand, SunBakeStage,
     BakedSunAutoStatus, BakedSunDirectionStatus,
     RenderSnapshot, FrontendSceneToken, TileCostCommand, ScreenshotFormat, SourceMaterialParams, SpectatorHighlight,
@@ -376,7 +383,7 @@ use post::pipelines::{
     create_bloom_pipeline, create_cloud_pass_pipeline, create_cloud_resolve_bind_group,
     create_cull_debug_pipeline, create_dof_pipeline, create_gamma_post_pipeline,
     create_planar_debug_pipeline, create_post_pipeline, create_post_pipeline_for, create_rain_post_pipeline,
-    create_cloud_shadow_opaque_pipeline,
+    create_cloud_shadow_opaque_pipeline, create_legacy_global_fog_pipeline,
     create_ssao_temporal_pipeline,
     create_ssr_temporal_pipeline, create_ssr_visibility_resources, create_taa_post_pipeline,
     create_wireframe_pipeline, wireframe_cull_slot,
@@ -639,6 +646,22 @@ const LOCAL_SHADOW_CACHE_SLOTS: usize = 8;
 const LOCAL_SHADOW_MAP_SIZE: u32 = 512;
 /// `camera_water_surface` / `PostUniform::underwater` value for a camera that is not submerged.
 pub(crate) const NO_WATER_SURFACE: f32 = -1.0e30;
+
+/// The camera against the water, classified once per frame (`classify_camera_water`) for every consumer.
+/// Whole-screen effects (underwater blur, tint, fog, DOF) switch on `Submerged`, i.e. `camera_water_surface`;
+/// work that changes only submerged pixels (the underwater pass) may skip `Air` alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum CameraWater {
+    /// No fresh eye solve: consumers keep their own conservative bounds.
+    #[default]
+    Unknown,
+    /// The near plane stands clearly above pool `slot`'s surface, allowing for the sample's age.
+    Air { slot: usize },
+    /// Above the surface but within that allowance: the near plane may reach the water.
+    Near,
+    /// The eye is inside a water volume (`camera_water_surface` is its top).
+    Submerged,
+}
 const LOCAL_SHADOW_NEAR: f32 = 4.0;
 const LOCAL_SHADOW_RESELECT_DISTANCE: f32 = 192.0;
 const LOCAL_SHADOW_HYSTERESIS: f32 = 1.35;
@@ -859,6 +882,7 @@ struct Renderer {
     scene_time: Option<f32>,
     /// CGame's multiplayer/demo serverTime for deterministic native lightning.
     weather_server_time_ms: Option<i32>,
+    river_wake_debug_subject: Option<jka_river::river_ninja::WakeDebugSubject>,
     studio_settings_signature: String,
     scene_depth_capture: bool,
     device: wgpu::Device,
@@ -928,6 +952,9 @@ struct Renderer {
     ocean_inert_bind_group: wgpu::BindGroup,
     ocean_spray_albedo: GpuImage,
     lake_normal: wgpu::TextureView,
+    /// HL2 `materials/dev/water_normal.vtf` frames for lake water:
+    /// `None` until first selected, then the load result (kept on failure).
+    source_water_normal: Option<Option<wgpu::TextureView>>,
     detail_texture: GpuImage,
     detail_texture_auto: bool,
     detail_texture_game: Option<PathBuf>,
@@ -941,11 +968,29 @@ struct Renderer {
     ocean_spray_pipeline: Option<wgpu::RenderPipeline>,
     /// Developer "spawnriver" patches: native Unreal river solver, debug view.
     live_rivers: Vec<crate::river_runtime::LiveRiver>,
+    /// Map-owned replacement candidates and the mask of ready candidates.
+    river_promotion_claims: Vec<live_river::PromotionClaim>,
+    river_promotion_active: u8,
+    ninja_blood: ninja_blood::NinjaBloodState,
+    ninja_fire: ninja_fire::NinjaFireState,
+    ninja_fog: ninja_fog::NinjaFogState,
+    ninja_snow_drift: ninja_snow_drift::NinjaSnowDustState,
+    ninja_snow_berms: ninja_snow_berm::NinjaSnowBermState,
     /// Developer drains, applied to every live river and to new ones.
     river_drains: Vec<crate::river_runtime::LocalDrain>,
     /// Presented players for river PreSim collisions (same records the
     /// ocean interaction reads), refreshed every render frame.
     river_actors: Arc<Vec<crate::ocean::interaction::ActorSample>>,
+    // Lazy: no vector capacity or GPU work until the Ninja path is requested.
+    river_ninja_history: Option<jka_river::river_ninja::ActorHistory>,
+    river_ninja_entities: Option<Arc<Vec<jka_river::river_ninja::ActorSample>>>,
+    /// Fluid Ninja input images: None = not loaded, Some(None) = load failed (no retry until toggled).
+    river_ninja_textures: Option<Option<live_river::NinjaInputTextures>>,
+    /// Shared by the Ninja surface and underwater material. A failed load stays
+    /// cached while either consumer is enabled.
+    river_ninja_caustics: Option<Option<wgpu::TextureView>>,
+    /// Ocean underwater mode 5 textures (`ensure_ocean_ninja_underwater`).
+    ocean_ninja_underwater: Option<Option<crate::ocean::NinjaUnderwaterTextures>>,
     /// The Water menu's player deformation toggle and strength as set, before
     /// `resolved_for_gpu` (which clears `interaction` for the Lakes backend
     /// even while the ocean is off). Rivers are not an ocean backend.
@@ -957,6 +1002,8 @@ struct Renderer {
     water_boxes: Vec<crate::ocean::WaterVolume>,
     /// Top of the water volume the camera is inside, or NO_WATER_SURFACE.
     camera_water_surface: f32,
+    /// This frame's camera/water classification (`classify_camera_water`).
+    camera_water: CameraWater,
     /// Hybrid only: promoted pool under the eye, and how far its rasterized surface
     /// there sits above the flat plane (render units, from the GPU probe; 0 = flat).
     eye_wave_slot: Option<usize>,
@@ -1098,6 +1145,9 @@ struct Renderer {
     /// 1x1 placeholder nothing samples.
     _ui_icons: GpuImage,
     ui_icons_loaded: bool,
+    /// Native weapon/Force icon atlas owns JK2/JKA-specific image bytes and
+    /// shader resolution; unlike extension art it is not keyed by qpaths.
+    ui_icon_scope: Option<(Option<PathBuf>, Option<u8>)>,
     /// Team overlay model/weapon/powerup art packed on demand (UI texture source 6).
     _ui_team_icons: GpuImage,
     ui_team_icon_key: Vec<String>,
@@ -1627,6 +1677,9 @@ struct Renderer {
     post_specialized: HashMap<(wgpu::TextureFormat, u32), wgpu::RenderPipeline>,
     /// Deferred cloud-shadow multiplier for opaque light only. No work when disabled.
     cloud_shadow_opaque_pipeline: Option<wgpu::RenderPipeline>,
+    /// In-scene OpenJK global fog before entity FX, keyed by (attachment
+    /// format, samples). Only compiled while a Legacy mode has BSP global fog.
+    legacy_global_fog_pipeline: Option<((wgpu::TextureFormat, u32), wgpu::RenderPipeline)>,
     /// Like the post bindings, but never samples the scene attachment being written.
     cloud_shadow_opaque_bind_group: wgpu::BindGroup,
     /// Specialized rain-only full-screen post, compiled lazily for A/B testing.

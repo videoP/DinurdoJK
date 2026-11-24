@@ -1,0 +1,9 @@
+[package]
+name = "jka-echofield"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-only"
+
+[dependencies]
+jka-assets = { path = "../jka-assets" }

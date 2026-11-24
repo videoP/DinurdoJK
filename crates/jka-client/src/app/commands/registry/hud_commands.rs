@@ -250,7 +250,6 @@ commands! {
                     self.hud_edit_drag_delta = [0.0, 0.0];
                     self.hud_edit_chat_resize_origin = None;
                     self.hud_edit_chat_resize_corner = None;
-                    self.align_hud_defaults_for_editor();
                     self.set_overlay(OverlayMode::HudEdit);
                 }
                 CommandResult::Handled

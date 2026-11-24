@@ -350,6 +350,13 @@ impl MarkSurfaces {
         self.project_filtered(points, projection, out, true);
     }
 
+    /// Ninja surface blood is not a stock mark, so `r_marksOnTriangleMeshes`
+    /// parity does not apply: compiled-in `misc_model` triangles receive it
+    /// like world faces. Material exclusions (nomarks/noimpact/fog) still hold.
+    pub fn project_blood(&self, points: &[[f32; 3]; 4], projection: [f32; 3], out: &mut MarkBuffer) {
+        self.project_filtered(points, projection, out, true);
+    }
+
     fn project_filtered(&self, points: &[[f32; 3]; 4], projection: [f32; 3], out: &mut MarkBuffer, include_blob_only: bool) {
         out.clear();
         if self.triangles.is_empty() {
@@ -433,6 +440,38 @@ impl MarkSurfaces {
                 break;
             }
         }
+    }
+
+    /// Actual static render triangles for the opt-in surface blood walker,
+    /// including compiled-in model triangles (see `project_blood`). Shares
+    /// R_MarkFragments' broad phase and material exclusions; IDs are valid
+    /// only for this MarkSurfaces instance.
+    pub fn blood_triangle(&self, id: usize) -> Option<([[f32; 3]; 3], [f32; 3])> {
+        let t = self.triangles.get(id)?;
+        Some((t.points, t.normal))
+    }
+
+    pub fn blood_triangles_near(&self, point: [f32; 3]) -> Vec<usize> {
+        if !point.iter().all(|x| x.is_finite()) { return Vec::new(); }
+        let lo = point.map(|x| cell_coord(x - 2.0));
+        let hi = point.map(|x| cell_coord(x + 2.0));
+        let mut ids = Vec::new();
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    let key = cell_key(x, y, z);
+                    let start = self.cells.partition_point(|entry| entry.0 < key);
+                    ids.extend(self.cells[start..].iter().take_while(|entry| entry.0 == key).map(|entry| entry.1));
+                }
+            }
+        }
+        ids.extend_from_slice(&self.large);
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter().filter_map(|id| {
+            let t = &self.triangles[id as usize];
+            (0..3).all(|i| point[i] >= t.mins[i] - 2.0 && point[i] <= t.maxs[i] + 2.0).then_some(id as usize)
+        }).collect()
     }
 
     /// True when a small mark centred on `point` (surface normal `normal`) would

@@ -50,6 +50,7 @@ impl App {
         settings.gpu_adapter = stable.gpu_adapter;
         settings.resolution = stable.resolution;
         settings.resolution_desktop = stable.resolution_desktop;
+        settings.resolution_mode = stable.resolution_mode;
         // Grass can be disabled live. Preserve a pending enable as latched
         // until the renderer has actually been restarted with the required map
         // resources, but persist live disables immediately.

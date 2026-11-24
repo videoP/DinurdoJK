@@ -118,7 +118,8 @@ pub(in crate::renderer) fn effective_stage_variant(
     m: MaterialFragmentKey,
 ) -> WorldShaderVariantKey {
     v = v.base_pass_key();
-    if m.flags & (MATERIAL_FLAG_NORMAL_MAP | MATERIAL_FLAG_ROUGHNESS_MAP | MATERIAL_FLAG_HEIGHT_MAP | MATERIAL_FLAG_METALLIC_MAP | MATERIAL_FLAG_SPECULAR_MAP | MATERIAL_FLAG_EMISSIVE_MAP | MATERIAL_FLAG_PACKED_RMO | MATERIAL_FLAG_HEIGHT_FROM_ALPHA | MATERIAL_FLAG_REFLECTION_PROBE | MATERIAL_FLAG_RMO_SPECULAR_ALPHA) == 0 {
+    let ninja_capable_snow = v.surface_deformation && m.vertex_recipe.surface_material == 14;
+    if !ninja_capable_snow && m.flags & (MATERIAL_FLAG_NORMAL_MAP | MATERIAL_FLAG_ROUGHNESS_MAP | MATERIAL_FLAG_HEIGHT_MAP | MATERIAL_FLAG_METALLIC_MAP | MATERIAL_FLAG_SPECULAR_MAP | MATERIAL_FLAG_EMISSIVE_MAP | MATERIAL_FLAG_PACKED_RMO | MATERIAL_FLAG_HEIGHT_FROM_ALPHA | MATERIAL_FLAG_REFLECTION_PROBE | MATERIAL_FLAG_RMO_SPECULAR_ALPHA) == 0 {
         v.pbr = false;
         v.pom = false;
         v.deluxe = false;

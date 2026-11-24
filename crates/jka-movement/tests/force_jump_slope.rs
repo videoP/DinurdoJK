@@ -133,13 +133,12 @@ fn ground_ramps_and_slope_sliding_are_bit_identical() {
 }
 
 #[test]
-fn remote_prediction_ignores_local_fix_for_both_backends_and_fixed_steps() {
-    for backend in [0, 1] {
+fn remote_prediction_ignores_local_fix_for_base_and_japro_and_fixed_steps() {
+    for server_mod in [0, 1] {
         for fixed in [0, 1] {
             for float in [0, 1, 2] {
                 let settings = PredictSettings {
-                    backend,
-                    server_mod: backend,
+                    server_mod,
                     pmove_fixed: fixed,
                     pmove_float: float,
                     ..Default::default()
@@ -199,7 +198,6 @@ fn qw_and_pjk_keep_their_existing_ramp_jump_branch() {
     for style in [2, 5] {
         let mut old = player(24.125);
         old.configure(&PredictSettings {
-            backend: 1,
             server_mod: 1,
             ..Default::default()
         })
@@ -234,7 +232,6 @@ fn remote_scope_does_not_depend_on_the_local_testing_toggle() {
     let movement = animations();
     for style in (0..19).filter(|style| *style != 9) {
         let settings = PredictSettings {
-            backend: 1,
             server_mod: 1,
             ..Default::default()
         };
@@ -268,16 +265,14 @@ fn remote_scope_does_not_depend_on_the_local_testing_toggle() {
 #[test]
 fn prediction_correction_is_scoped_to_japro_race_mode() {
     let movement = animations();
-    for (backend, server_mod, race, corrected) in [
-        (0, 0, 0, false),
-        (0, 0, 1, false),
-        (1, 0, 1, false),
-        (1, 2, 1, false),
-        (1, 1, 0, false),
-        (1, 1, 1, true),
+    for (server_mod, race, corrected) in [
+        (0, 0, false),
+        (0, 1, false),
+        (2, 1, false),
+        (1, 0, false),
+        (1, 1, true),
     ] {
         let settings = PredictSettings {
-            backend,
             server_mod,
             ..Default::default()
         };
@@ -312,14 +307,14 @@ fn prediction_correction_is_scoped_to_japro_race_mode() {
                 .unwrap();
             assert_eq!(
                 a.origin, p.origin,
-                "scope backend={backend} mod={server_mod} race={race} at {n}"
+                "scope mod={server_mod} race={race} at {n}"
             );
             assert_eq!(a.velocity, p.velocity);
             observed_change |= p.velocity != old.velocity;
         }
         assert_eq!(
             observed_change, corrected,
-            "scope backend={backend} mod={server_mod} race={race}"
+            "scope mod={server_mod} race={race}"
         );
     }
 }

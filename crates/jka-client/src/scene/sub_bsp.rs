@@ -84,6 +84,10 @@ pub(crate) fn prepare_source_with_sub_bsps_and_shader_hook(
     // An aggregate preparation must never lend appended textures/geometry or
     // collision to the main-map-only pipeline on a later join/restart.
     let seed = seed.filter(|map| map.sub_bsp_names.is_empty());
+    let mut options = options;
+    if !names.is_empty() {
+        options.river_promotion = 0;
+    }
     let mut map = match source {
         MapSource::Bsp(name) => super::prepare::prepare_internal(
             root, game, name, Some(jobs), options, seed, shader_ready,
@@ -121,6 +125,7 @@ pub(crate) fn prepare_source_with_sub_bsps_and_shader_hook(
     imported_options.ocean = false;
     imported_options.client_physics = false;
     imported_options.steam_audio = false;
+    imported_options.echo_acoustics = false;
     imported_options.planar_reflections = false;
     imported_options.planar_environment = false;
     for name in names {

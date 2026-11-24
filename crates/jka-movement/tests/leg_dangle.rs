@@ -35,7 +35,7 @@ fn right_up(name: &str) -> bool {
 }
 
 fn japro() -> PredictSettings {
-    PredictSettings { backend: 1, server_mod: 1, ..PredictSettings::default() }
+    PredictSettings { server_mod: 1, ..PredictSettings::default() }
 }
 
 #[test]

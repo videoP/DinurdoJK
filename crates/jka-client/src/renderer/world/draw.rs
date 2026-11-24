@@ -1,12 +1,9 @@
 //! World draw.
 use crate::renderer::WorldBatch;
 
-/// Whether promoted water owns this authored water batch, so ordinary and wireframe passes
-/// must not draw it. Suppress sibling passes only when their face actually
-/// received a replacement. Rejected faces and faces past the cap keep every
-/// authored stage, so enabling the feature cannot remove unpromoted water.
-pub(in crate::renderer) fn ocean_suppresses_batch(ocean_enabled: bool, batch: &WorldBatch) -> bool {
-    ocean_enabled && batch.ocean_replaced
+/// Keep authored stages until a pool that covers them owns the water draw.
+pub(in crate::renderer) fn ocean_suppresses_batch(owned_pools: u8, batch: &WorldBatch) -> bool {
+    owned_pools & batch.ocean_owners != 0
 }
 
 /// Render-only cvar filter for static BSP surfaces whose *original* shader qpath

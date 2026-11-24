@@ -419,8 +419,10 @@ impl Renderer {
                         source.legacy_additive_only);
                     fog_arena.push(&self.device, &self.queue, bytemuck::bytes_of(&glow))
                 });
-                let marks = std::array::from_fn(|slot| world.footprint_mark_textures[slot]
-                    .and_then(|i| textures.get(i)).unwrap_or(&self.white));
+                let marks = self.surface_deformation.mark_views(std::array::from_fn(|slot| {
+                    &world.footprint_mark_textures[slot]
+                        .and_then(|i| textures.get(i)).unwrap_or(&self.white).view
+                }));
                 let detail_texture = crate::renderer::detail_texture_for_source(
                     source, &self.detail_texture, self.detail_texture_auto,
                     &self.detail_auto_textures, &world.detail_texture_by_base,
@@ -488,7 +490,7 @@ impl Renderer {
                 if !source.water {
                     batch.ocean_clipmap = None;
                     batch.ocean_clipmap_id = u8::MAX;
-                    batch.ocean_replaced = false;
+                    batch.ocean_owners = 0;
                     batch.ocean_surface_bind_group = None;
                     batch._ocean_material_buffer = None;
                 }
@@ -888,8 +890,7 @@ impl Renderer {
         self.map_has_water = self.world.as_ref().is_some_and(|w| w.coarse_batches.iter().any(|b| b.source.water));
         self.map_has_snow_surfaces = self.world.as_ref().is_some_and(|w| w.coarse_batches.iter().any(|b|
             u32::from(b.source.surface_material) == crate::renderer::MATERIAL_SNOW && b.source.pipeline.class != DrawClass::Sky));
-        let snow_field = self.surface_deformation_shader_needed();
-        if self.surface_deformation.set_field_enabled(&self.device, snow_field) {
+        if self.sync_surface_deformation_resources() {
             if let Some(mut world) = self.world.take() {
                 self.rebuild_world_surface_bind_groups(&mut world);
                 self.world = Some(world);

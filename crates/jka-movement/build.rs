@@ -3,47 +3,14 @@ use std::env;
 fn main() {
     cc::Build::new()
         .include("native")
-        .file("native/mod_dispatch.c")
-        .compile("jka_mod_dispatch");
-    let root = "vendor/openjk";
-    let mut movement = cc::Build::new();
-    movement
-        .include(format!("{root}/codemp"))
-        .include(format!("{root}/shared"))
-        .include("native")
-        .define("_CGAME", None)
-        .define("FINAL_BUILD", None)
-        .define("_CRT_SECURE_NO_WARNINGS", None)
-        .warnings(false)
-        .flag_if_supported("/fp:precise")
-        .flag_if_supported("/we4013")
-        .flag_if_supported("-fno-strict-aliasing")
-        .flag_if_supported("-ffp-contract=off");
-    define_linux_arch_string(&mut movement);
-    for file in [
-        "codemp/game/bg_pmove.c",
-        "codemp/game/bg_slidemove.c",
-        "codemp/game/bg_panimate.c",
-        "codemp/game/bg_saber.c",
-        "codemp/game/bg_misc.c",
-        "codemp/game/bg_weapons.c",
-        "shared/qcommon/q_math.c",
-        "codemp/qcommon/q_shared.c",
-        "shared/qcommon/q_string.c",
-    ] {
-        movement.file(format!("{root}/{file}"));
-    }
-    if movement.get_compiler().is_like_msvc() {
-        movement.flag("/FIstock_namespace.h");
-    } else {
-        movement.flag("-include").flag("native/stock_namespace.h");
-    }
-    movement.file("native/movement.c").compile("jka_pmove");
-    let japro_root = "vendor/japro";
+        .file("native/jump_trace.c")
+        .compile("jka_jump_trace");
+    // Pinned TaystJK (an OpenJK fork) is the only JKA/Base movement backend.
+    let root = "vendor/japro";
     let mut japro = cc::Build::new();
     japro
-        .include(format!("{japro_root}/codemp"))
-        .include(format!("{japro_root}/shared"))
+        .include(format!("{root}/codemp"))
+        .include(format!("{root}/shared"))
         .include("native/japro")
         .include("native")
         .define("_CGAME", None)
@@ -71,19 +38,21 @@ fn main() {
         "codemp/qcommon/q_shared.c",
         "shared/qcommon/q_string.c",
     ] {
-        japro.file(format!("{japro_root}/{file}"));
+        japro.file(format!("{root}/{file}"));
     }
+    // The vendored BG sources use the jump-trace declarations without including
+    // them, so every translation unit in this library gets them first.
     if japro.get_compiler().is_like_msvc() {
-        japro.flag("/FIjapro_namespace.h");
+        japro.flag("/FIhost_prelude.h");
     } else {
-        japro.flag("-include").flag("native/japro_namespace.h");
+        japro.flag("-include").flag("native/host_prelude.h");
     }
     japro
-        .file("native/japro_movement.c")
+        .file("native/movement.c")
         .file("native/japro_sailing.c")
         .compile("jka_japro_pmove");
-    // Separate JK2 native layouts and symbols. Never add this to JKA's backend
-    // switch or feed normalized presentation state to its snapshot importer.
+    // Separate JK2 native layouts and symbols. Never feed normalized
+    // presentation state to its snapshot importer.
     let mut jk2 = cc::Build::new();
     jk2.include("vendor/mvsdk/code").include("vendor/mvsdk/code/game")
         .include("vendor/mvsdk/code/cgame").include("vendor/mvsdk/code/renderer").include("native")

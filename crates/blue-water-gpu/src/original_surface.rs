@@ -82,7 +82,7 @@ pub(crate) fn sampler(
 }
 
 /// `r_oceanPixelDetail` 5's tile classifier: one 8x8 workgroup per 16x16-pixel tile over the reduced shading.
-fn adaptive_classifier(device: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+pub fn adaptive_classifier(device: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
     let compute = wgpu::ShaderStages::COMPUTE;
     let texture = |binding, sample_type| wgpu::BindGroupLayoutEntry {
         binding, visibility: compute,
@@ -122,6 +122,47 @@ fn adaptive_classifier(device: &wgpu::Device) -> (wgpu::ComputePipeline, wgpu::B
         cache: None,
     });
     (pipeline, layout)
+}
+
+fn create_surface_pipeline(
+    device: &wgpu::Device, layout: &wgpu::PipelineLayout, shader: &wgpu::ShaderModule,
+    samples: u32, targets: &[Option<wgpu::ColorTargetState>],
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Blue Water original surface"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vertex"),
+            compilation_options: Default::default(),
+            buffers: &[Some(geometry::OceanVertex::LAYOUT)],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fragment"),
+            compilation_options: Default::default(),
+            targets,
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: samples,
+            ..Default::default()
+        },
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 pub struct OriginalSurfacePipeline {
@@ -917,18 +958,17 @@ pub(crate) fn placeholder(
 }
 
 pub(crate) fn size_of_binding(module: &wgpu::naga::Module, group: u32, binding: u32) -> u64 {
-    let (_, global) = module
-        .global_variables
-        .iter()
-        .find(|(_, global)| {
-            global
-                .binding
-                .as_ref()
-                .is_some_and(|at| at.group == group && at.binding == binding)
-        })
-        .unwrap_or_else(|| panic!("Blue Water original surface binding {group}:{binding}"));
+    try_size_of_binding(module, group, binding)
+        .unwrap_or_else(|| panic!("Blue Water original surface binding {group}:{binding}"))
+}
+
+/// `size_of_binding` for a binding the module may have dropped as unused.
+pub(crate) fn try_size_of_binding(module: &wgpu::naga::Module, group: u32, binding: u32) -> Option<u64> {
+    let (_, global) = module.global_variables.iter().find(|(_, global)| {
+        global.binding.as_ref().is_some_and(|at| at.group == group && at.binding == binding)
+    })?;
     match &module.types[global.ty].inner {
-        wgpu::naga::TypeInner::Struct { span, .. } => u64::from(*span),
+        wgpu::naga::TypeInner::Struct { span, .. } => Some(u64::from(*span)),
         _ => panic!("Blue Water original surface uniform type"),
     }
 }
@@ -954,19 +994,8 @@ pub(crate) fn entry_sampler(binding: u32, value: &wgpu::Sampler) -> wgpu::BindGr
     }
 }
 
-/// `r_oceanType 5`'s textures (group 1, bindings 18-21, `hybrid_gerstner.wgsl`): the packed pattern texture with its
-/// repeating sampler and the two persistent foam maps (`crate::godot_water`). Cheap to clone (handles).
-#[derive(Clone)]
-pub struct GodotWaterViews {
-    pub patterns: wgpu::TextureView,
-    pub repeat: wgpu::Sampler,
-    pub foam_near: wgpu::TextureView,
-    pub foam_far: wgpu::TextureView,
-}
-
-/// Size of the `JkaHybridSwell` uniform (group 1, binding 17): swell, motion, breaker, Godot water, its foam centres
-/// and its water and crest colours.
-pub const HYBRID_SWELL_BYTES: u64 = 112;
+/// Size of the `JkaHybridSwell` uniform (group 1, binding 17): swell, motion and breaker.
+pub const HYBRID_SWELL_BYTES: u64 = 48;
 
 /// The wake sampler's inputs (`naval_ocean::wake`): the `Wake` uniform, the field's two display textures, the trail atlas
 /// and the torpedo field. Cheap to clone (handles).
@@ -993,9 +1022,6 @@ pub struct OriginalSurfaceBindings {
     neutral_cloud: (wgpu::TextureView, wgpu::Sampler, wgpu::Buffer),
     surface: wgpu::Buffer,
     hybrid_swell: wgpu::Buffer,
-    /// `r_oceanType 5`'s textures; 1x1 placeholders until `set_godot_water`.
-    godot: GodotWaterViews,
-    neutral_godot: GodotWaterViews,
     environment: wgpu::Buffer,
     ambient_atlas: wgpu::Texture,
     ambient: [f32; 3],
@@ -1208,19 +1234,6 @@ impl OriginalSurfaceBindings {
             wgpu::TextureViewDimension::D2,
             1,
         );
-        let blank_godot = placeholder(device, "Godot water blank texture", wgpu::TextureFormat::Rgba8Unorm,
-            wgpu::TextureViewDimension::D2, 1);
-        let neutral_godot = GodotWaterViews {
-            patterns: blank_godot.clone(),
-            repeat: device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("Godot water blank repeat"),
-                address_mode_u: wgpu::AddressMode::Repeat,
-                address_mode_v: wgpu::AddressMode::Repeat,
-                ..Default::default()
-            }),
-            foam_near: blank_godot.clone(),
-            foam_far: blank_godot,
-        };
         let sky_roof = placeholder(device, "no BSP roof", wgpu::TextureFormat::Rgba32Float,
             wgpu::TextureViewDimension::D2, 1);
         let neutral_player_interaction = (
@@ -1247,7 +1260,6 @@ impl OriginalSurfaceBindings {
             &reflection_table,
             &boundary,
             &hybrid_swell,
-            &neutral_godot,
             &sky_roof,
             &neutral_player_interaction.0, &neutral_player_interaction.1,
             &color,
@@ -1339,8 +1351,6 @@ impl OriginalSurfaceBindings {
             ),
             surface,
             hybrid_swell,
-            godot: neutral_godot.clone(),
-            neutral_godot,
             environment,
             ambient_atlas: atlas,
             ambient: [117.0 / 255.0, 154.0 / 255.0, 186.0 / 255.0],
@@ -1383,7 +1393,6 @@ impl OriginalSurfaceBindings {
         reflection_table: &wgpu::Buffer,
         boundary: &wgpu::Buffer,
         hybrid_swell: &wgpu::Buffer,
-        godot: &GodotWaterViews,
         sky_roof: &wgpu::TextureView,
         player_interaction_view: &wgpu::TextureView,
         player_interaction_domains: &wgpu::Buffer,
@@ -1412,10 +1421,6 @@ impl OriginalSurfaceBindings {
                 entry_buffer(15, reflection_table),
                 entry_buffer(16, boundary),
                 entry_buffer(17, hybrid_swell),
-                entry_texture(18, &godot.patterns),
-                entry_sampler(19, &godot.repeat),
-                entry_texture(20, &godot.foam_near),
-                entry_texture(21, &godot.foam_far),
                 entry_texture(22, sky_roof),
                 entry_texture(23, player_interaction_view),
                 entry_buffer(24, player_interaction_domains),
@@ -1464,7 +1469,6 @@ impl OriginalSurfaceBindings {
             &self.reflection_table,
             &self.boundary,
             &self.hybrid_swell,
-            &self.godot,
             &self.sky_roof,
             &self.player_interaction.0, &self.player_interaction.1,
             color,
@@ -1483,21 +1487,6 @@ impl OriginalSurfaceBindings {
             |(view, domains)| (view.clone(), domains.clone()));
         if self.player_interaction == next { return; }
         self.player_interaction = next;
-        if let Some((color, depth)) = self.current_scene.take() {
-            self.set_scene(device, pipeline, &color, &depth);
-        }
-    }
-
-    /// Bind `r_oceanType 5`'s textures (or the neutral ones again for `None`). Rebuilds the material group against the
-    /// scene copies already bound.
-    pub fn set_godot_water(&mut self, device: &wgpu::Device, pipeline: &OriginalSurfacePipeline,
-        views: Option<&GodotWaterViews>) {
-        let next = views.unwrap_or(&self.neutral_godot);
-        if self.godot.patterns == next.patterns && self.godot.foam_near == next.foam_near
-            && self.godot.foam_far == next.foam_far {
-            return;
-        }
-        self.godot = next.clone();
         if let Some((color, depth)) = self.current_scene.take() {
             self.set_scene(device, pipeline, &color, &depth);
         }
@@ -1585,6 +1574,9 @@ impl OriginalSurfaceBindings {
             self.current_cloud = next_cloud;
         }
     }
+    /// Boundary uniform for optional external height-probe implementations.
+    pub fn boundary_buffer(&self) -> &wgpu::Buffer { &self.boundary }
+
     pub fn underwater_probe(&self) -> &wgpu::TextureView {
         &self.probe_view
     }
@@ -1686,18 +1678,16 @@ impl OriginalSurfaceBindings {
         queue.write_buffer(&self.hybrid_swell, 0, bytemuck::bytes_of(two_vec4));
     }
 
-    /// Sky reflection gain is packed into breaker.w (existing 112-byte uniform).
+    pub fn hybrid_swell_buffer(&self) -> &wgpu::Buffer {
+        &self.hybrid_swell
+    }
+
+    /// Sky reflection gain is packed into breaker.w.
     /// It affects atlas reflection only, not moon/sun highlights or SSR.
     pub fn write_breaker_mode(&self, queue: &wgpu::Queue, mode: u8, fast_foam: f32,
         fast_foam_detail: bool, sky_reflection_gain: f32) {
         queue.write_buffer(&self.hybrid_swell, 32, bytemuck::bytes_of(&[f32::from(mode), fast_foam,
             if fast_foam_detail { 1.0 } else { 0.0 }, sky_reflection_gain]));
-    }
-
-    /// `r_oceanType 5`: [1 on, wave scale, seconds, foam bits], the foam maps' centres [near x, z, far x, z] (m) and the
-    /// linear water and crest colours. Zero turns the Godot waves off.
-    pub fn write_godot_water(&self, queue: &wgpu::Queue, godot: &[[f32; 4]; 4]) {
-        queue.write_buffer(&self.hybrid_swell, 48, bytemuck::bytes_of(godot));
     }
 
     pub fn write_surface_prefix(&self, queue: &wgpu::Queue, first_25_vec4: &[[f32; 4]; 25]) {
@@ -1753,6 +1743,26 @@ impl OriginalSurfacePipeline {
 
     /// Pipeline construction needs only the immutable wave layout. Hosts can
     /// clone that handle into their build queue without sharing wave state.
+    pub fn full_resolution_layout(&self) -> &wgpu::PipelineLayout {
+        &self.pipeline_layout
+    }
+
+    /// Compile a full-resolution material for existing surface bind groups.
+    pub fn full_resolution_variant(
+        device: &wgpu::Device, layout: &wgpu::PipelineLayout, color: wgpu::TextureFormat,
+        samples: u32, reflection_steps: u32, cost_probe: u32,
+    ) -> Result<wgpu::RenderPipeline, String> {
+        let mut composer = shader_composer::composer_with_surface_probes(cost_probe, 1)
+            .map_err(|error| format!("Blue Water surface imports: {error:?}"))?;
+        let module = shader_composer::jka_surface_module_with_probe(&mut composer, reflection_steps, 0, cost_probe)
+            .map_err(|error| error.emit_to_string(&composer))?;
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Blue Water full-resolution material variant"),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
+        });
+        Ok(create_surface_pipeline(device, layout, &shader, samples, &[Some(color.into())]))
+    }
+
     pub fn new_with_wave_layout(
         device: &wgpu::Device,
         wave_layout: &wgpu::BindGroupLayout,
@@ -1805,10 +1815,6 @@ impl OriginalSurfacePipeline {
                 storage(15, fragment),
                 uniform(16, both),
                 uniform(17, both),
-                sampled(18, both, t2, false),
-                sampler(19, both, false),
-                sampled(20, fragment, t2, false),
-                sampled(21, fragment, t2, false),
                 roof_sampled(fragment),
                 sampled(23, both, wgpu::TextureViewDimension::D2Array, false),
                 uniform(24, both),
@@ -1846,43 +1852,10 @@ impl OriginalSurfacePipeline {
             label: Some("Blue Water original surface shader"),
             source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(source)),
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Blue Water original surface"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vertex"),
-                compilation_options: Default::default(),
-                buffers: &[Some(geometry::OceanVertex::LAYOUT)],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fragment"),
-                compilation_options: Default::default(),
-                // Reduced modes compose the material with the glint outputs (`jka_reduced_glints`); this pipeline is
-                // then unused but must match them.
-                targets: if pixel_detail_mode == 0 { &main_targets[..] } else { &reduced_targets[..] },
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState {
-                count: samples,
-                ..Default::default()
-            },
-            multiview_mask: None,
-            cache: None,
-        });
+        // In a reduced mode the shader writes three targets, even though
+        // subsequent draws use its single-sample reduced pipeline.
+        let targets = if pixel_detail_mode == 0 { &main_targets[..] } else { &reduced_targets[..] };
+        let pipeline = create_surface_pipeline(device, &layout, &shader, samples, targets);
         let (reduced_pipeline, near_pipeline, reconstruct_pipeline, reconstruct_layout) = if pixel_detail_mode == 0 {
             (None, None, None, None)
         } else {
@@ -2004,7 +1977,7 @@ impl OriginalSurfacePipeline {
             });
             let near = if matches!(pixel_detail_mode, 3 | 4) {
                 let mut composer = shader_composer::composer().expect("Blue Water composer");
-                let near_module = shader_composer::jka_near_surface_module(&mut composer, reflection_steps, cost_probe)
+                let near_module = shader_composer::jka_near_surface_module(&mut composer, reflection_steps)
                     .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
                 let near_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("Blue Water distance-aware near detail"),
@@ -2044,7 +2017,7 @@ impl OriginalSurfacePipeline {
                 // Mode 5: the full material on the blocks the reconstruction discards, opaque and depth-writing like
                 // it, so each pixel is drawn by exactly one of the two.
                 let mut composer = shader_composer::composer().expect("Blue Water composer");
-                let full_module = shader_composer::jka_adaptive_surface_module(&mut composer, reflection_steps, cost_probe)
+                let full_module = shader_composer::jka_adaptive_surface_module(&mut composer, reflection_steps)
                     .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&composer)));
                 let full_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("Blue Water adaptive full-resolution detail"),
@@ -3095,17 +3068,89 @@ impl OriginalClipmap {
             }
         }
         if horizon {
-            // Keep the untouched vendor horizon/skirt vertex geometry.
-            let mut remap = std::collections::BTreeMap::<u32, u32>::new();
-            for &old in &self.source_indices[self.horizon_start as usize..self.index_count as usize] {
-                let new = *remap.entry(old).or_insert_with(|| {
-                    let id = vertices.len() as u32;
-                    vertices.push(self.source_vertices[old as usize]);
-                    id
-                });
-                indices.push(new);
-            }
+            self.append_horizon(&mut vertices, &mut indices);
         }
         (vertices, indices, counts)
+    }
+
+    /// Keep the untouched vendor horizon/skirt vertex geometry, remapped into a local vertex buffer.
+    fn append_horizon(&self, vertices: &mut Vec<geometry::OceanVertex>, indices: &mut Vec<u32>) {
+        let mut remap = std::collections::BTreeMap::<u32, u32>::new();
+        for &old in &self.source_indices[self.horizon_start as usize..self.index_count as usize] {
+            let new = *remap.entry(old).or_insert_with(|| {
+                let id = vertices.len() as u32;
+                vertices.push(self.source_vertices[old as usize]);
+                id
+            });
+            indices.push(new);
+        }
+    }
+
+    /// A surface nothing displaces, as the fewest triangles the vertex stage
+    /// places exactly (local vertices, drawn like `local_adaptive_mesh`).
+    ///
+    /// * `bounds` (world XZ metres, finite pools): one quad over them plus
+    ///   `pad`, on level 0's lattice (no inner-ring offset there) at even
+    ///   indices (the geomorph never moves them), clamped to the clipmap's reach.
+    ///   `pad` covers the live level-0 frame drifting from the quantized
+    ///   `frames` between rebuilds; the fragment stage still clips the shore.
+    /// * `None` (sky-connected): the whole outermost level. With `horizon`, a
+    ///   fan whose rim is every outer lattice vertex, so the vendor horizon ring
+    ///   joins it exactly as it joins the outer ring; otherwise two triangles.
+    pub fn local_flat_mesh(
+        &self, frames: &[[f32; 4]; 10], bounds: Option<[f32; 4]>, horizon: bool, pad: f32,
+    ) -> (Vec<geometry::OceanVertex>, Vec<u32>) {
+        let clip = self.clipmap;
+        let last = clip.levels - 1;
+        let half = (clip.segments / 2) as i32;
+        let outer = frames[last];
+        let reach = half as f32 * outer[2];
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let vertex = |x: i32, y: i32, cell: f32, level: usize| geometry::OceanVertex {
+            position: [x as f32 * cell, y as f32 * cell],
+            level: [level as f32, 0.0],
+        };
+        match bounds {
+            Some(b) => {
+                let base = frames[0];
+                let cell = base[2];
+                let lo = [(b[0] - pad).max(outer[0] - reach), (b[1] - pad).max(outer[1] - reach)];
+                let hi = [(b[2] + pad).min(outer[0] + reach), (b[3] + pad).min(outer[1] + reach)];
+                if !(lo[0] < hi[0] && lo[1] < hi[1]) {
+                    return (vertices, indices);
+                }
+                let even = |v: f32, origin: f32, up: bool| {
+                    let i = (v - origin) / (cell * 2.0);
+                    (if up { i.ceil() } else { i.floor() }) as i32 * 2
+                };
+                let (x0, x1) = (even(lo[0], base[0], false), even(hi[0], base[0], true));
+                let (y0, y1) = (even(lo[1], base[1], false), even(hi[1], base[1], true));
+                vertices.extend([vertex(x0, y0, cell, 0), vertex(x1, y0, cell, 0),
+                    vertex(x1, y1, cell, 0), vertex(x0, y1, cell, 0)]);
+                // The original upstream clockwise winding.
+                indices.extend_from_slice(&[0, 2, 1, 0, 3, 2]);
+            }
+            None if horizon => {
+                let cell = outer[2];
+                vertices.push(vertex(0, 0, cell, last));
+                for i in -half..half { vertices.push(vertex(i, -half, cell, last)); }
+                for i in -half..half { vertices.push(vertex(half, i, cell, last)); }
+                for i in -half..half { vertices.push(vertex(-i, half, cell, last)); }
+                for i in -half..half { vertices.push(vertex(-half, -i, cell, last)); }
+                let rim = vertices.len() as u32 - 1;
+                for k in 0..rim {
+                    indices.extend_from_slice(&[0, 1 + (k + 1) % rim, 1 + k]);
+                }
+                self.append_horizon(&mut vertices, &mut indices);
+            }
+            None => {
+                let cell = outer[2];
+                vertices.extend([vertex(-half, -half, cell, last), vertex(half, -half, cell, last),
+                    vertex(half, half, cell, last), vertex(-half, half, cell, last)]);
+                indices.extend_from_slice(&[0, 2, 1, 0, 3, 2]);
+            }
+        }
+        (vertices, indices)
     }
 }

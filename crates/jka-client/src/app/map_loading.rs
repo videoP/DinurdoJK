@@ -211,7 +211,7 @@ impl MapLoadingState {
             (options.grass, Task::MapGrass),
             (options.voxel_probe_gi, Task::MapGi),
             (options.ocean, Task::MapOcean),
-            (options.steam_audio, Task::MapAcoustics),
+            (options.steam_audio || options.echo_acoustics, Task::MapAcoustics),
         ] {
             if !enabled {
                 self.skip_task(task);
@@ -679,6 +679,7 @@ impl App {
             grass: self.video.grass,
             voxel_probe_gi: self.video.voxel_probe_gi,
             ocean: self.video.ocean,
+            river_promotion: scene::river_promotion::mode(),
             client_physics: self.video.client_physics || self.video.breakables_enhanced,
             gen_normal_maps: self.video.gen_normal_maps,
             float_lightmap: self.video.float_lightmap && (self.video.hdr || self.video.hdr_output != 0),
@@ -692,6 +693,7 @@ impl App {
             glass_promotion: crate::materials::glass_promotion_enabled(),
             allow_asset_overrides: self.video.allow_asset_overrides,
             steam_audio: self.audio.steam_audio,
+            echo_acoustics: self.audio.echofield,
             // `menudevmap`: the stage look (water, retextures, fx) without props.
             menu_look: self.menu_look_play,
             menu_props: false,
@@ -818,6 +820,7 @@ impl App {
         // but the expensive optional Rapier and Steam Audio products are not.
         prepare_options.client_physics = false;
         prepare_options.steam_audio = false;
+        prepare_options.echo_acoustics = false;
         self.latest_prepare_options = prepare_options;
         println!("Map editor preview: background rebuild {}", source.label());
         if self
@@ -959,6 +962,7 @@ impl App {
         options.visual_only = true;
         options.client_physics = false;
         options.steam_audio = false;
+        options.echo_acoustics = false;
         options.menu_look = true;
         options.menu_props = true;
         options
@@ -1030,6 +1034,9 @@ impl App {
     ) {
         if purpose != MapLoadPurpose::FrontendBackground {
             self.stop_menu_ambience();
+            // Flow test emitters belong to one map session; a (re)load starts clean.
+            crate::ninja_fire_debug::clear();
+            crate::ninja_fog_debug::clear();
         }
         // A real world/cgame registration must not inherit runtime redirects
         // from the previous map. Remap-only presentation uploads bypass this
@@ -1037,6 +1044,7 @@ impl App {
         // A superseded early frontend result must not hold a stale BSP alive.
         self.deferred_frontend_map = None;
         self.shader_remaps.clear();
+        self.reset_shader_promotion();
         self.reset_shader_remap_ui();
         self.shader_remap_upload = false;
         self.shader_remap_dirty = false;
@@ -1226,6 +1234,10 @@ impl App {
         // honest and show only its fresh GPU upload/first-frame cost.
         // A vid_restart reuses the pristine CPU cache; reconstruct the
         // configured presentation variant before handing it to the renderer.
+        // A full upload reinstalls promoted rivers from the pristine cache.
+        let ocean_prepared = prepare_options.ocean && prepared_map_has_ocean_surface(map.as_ref());
+        let rivers_survive = !self.shader_remaps.has_authored_remaps();
+        self.install_shader_promotion(map.as_ref(), ocean_prepared, rivers_survive);
         if !self.shader_remaps.is_empty() {
             if let Err(error) = scene::apply_shader_remaps_in_place(
                 &mut map, &self.base, self.game.as_deref(), prepare_options, &self.shader_remaps,
@@ -1254,7 +1266,7 @@ impl App {
         let mut loading = MapLoadingState::new(request_id, label.clone(), self.game.as_deref());
         loading.sub_bsp_names = map.sub_bsp_names.clone();
         loading.apply_prepare_options(&prepare_options);
-        let has_ocean = prepare_options.ocean && prepared_map_has_ocean_surface(map.as_ref());
+        let has_ocean = ocean_prepared;
         loading.set_optional_task_presence(
             crate::thread_activity::Task::MapOcean,
             has_ocean,
@@ -1278,7 +1290,7 @@ impl App {
             if prepare_options.voxel_probe_gi {
                 cached.push(Task::MapGi);
             }
-            if prepare_options.steam_audio {
+            if prepare_options.steam_audio || prepare_options.echo_acoustics {
                 cached.push(Task::MapAcoustics);
             }
             if !map.portal_draw_plan.plan_by_cluster.is_empty() {
@@ -1347,6 +1359,10 @@ impl App {
             // initial upload; do not accidentally drop the dirty state.
             return true;
         };
+        // Promotion overrides are only ever built from this map's BSP shaders.
+        if before.promotion() != self.shader_remaps.promotion() {
+            return true;
+        }
         let map = cache.map.as_ref();
         map.batches.iter().chain(&map.pvs_batches).chain(&map.inline_batches).any(|batch| {
             let Some(entry) = map.material_debug.entries.get(batch.material_debug_index as usize) else {
@@ -1486,6 +1502,9 @@ impl App {
             self.shader_remap_dirty = true;
             return Ok(false);
         };
+        // The renderer's remap upload clears promoted rivers, restoring the
+        // authored water; `river` overrides must stop applying with them.
+        self.shader_promotion.forget_rivers();
         let label = cache.label.clone();
         let options = cache.prepare_options;
         let base_texture_count = cache.map.textures.len();

@@ -1,4 +1,4 @@
-use super::cloth::{ClothCapsule, ClothSystem};
+use super::cloth::{ClothCapsule, ClothRestCapsule, ClothSystem};
 use jka_assets::ghoul2::{multiply_3x4, GlaAnimation, GlmModel, Matrix3x4};
 use std::collections::HashMap;
 
@@ -32,6 +32,7 @@ fn fit_body_ellipsoid(points: &[[f32; 3]]) -> Option<ClothCapsule> {
         b: center.to_array(),
         radius: radii.max_element(),
         basis: Some(glam::Mat3::from_diagonal(radii).to_cols_array_2d()),
+        rest: None,
     })
 }
 
@@ -42,7 +43,9 @@ pub(crate) fn build_body_templates(
     visible: &[usize],
     lod_index: usize,
 ) -> Vec<(usize, ClothCapsule)> {
-    let mut clouds = HashMap::<usize, Vec<[f32; 3]>>::new();
+    // Points keep their dominant weight: blended vertices (skirt flaps, pads
+    // or capes skinned partly to a limb) must not inflate that limb's proxy.
+    let mut clouds = HashMap::<usize, Vec<([f32; 3], f32)>>::new();
     if let Some(lod) = glm.lods.get(lod_index) {
         for surface in &lod.surfaces {
             if !visible.contains(&surface.surface_index) {
@@ -76,7 +79,10 @@ pub(crate) fn build_body_templates(
                     continue;
                 };
                 if bone < gla.skeleton.len() {
-                    clouds.entry(bone).or_default().push(vertex.position);
+                    clouds
+                        .entry(bone)
+                        .or_default()
+                        .push((vertex.position, weight.weight));
                 }
             }
         }
@@ -89,11 +95,108 @@ pub(crate) fn build_body_templates(
         if points.len() < 4 {
             continue;
         }
-        if let Some(capsule) = fit_body_ellipsoid(points) {
+        // Limb/spine bones with a known child joint get a capsule along the
+        // bone segment. A bind-space bounding ellipsoid of every dominant
+        // vertex is badly inflated by attached clothing (a skirt flap skinned
+        // to the shin made a 14-unit "shin" that kicked capes while running).
+        if let Some(capsule) = fit_bone_segment_capsule(gla, bone, points) {
+            templates.push((bone, capsule));
+            continue;
+        }
+        let points = points.iter().map(|(p, _)| *p).collect::<Vec<_>>();
+        if let Some(capsule) = fit_body_ellipsoid(&points) {
             templates.push((bone, capsule));
         }
     }
     templates
+}
+
+/// Humanoid bone segments (start, end, fallback radius in JKA units).
+/// Entries with a fallback are also used when a bone has no visible
+/// geometry (limbs hidden under a robe). Twist bones are measured only.
+const BODY_SEGMENTS: &[(&str, &str, Option<f32>)] = &[
+    ("pelvis", "lower_lumbar", Some(7.0)),
+    ("lower_lumbar", "upper_lumbar", Some(7.0)),
+    ("upper_lumbar", "thoracic", Some(6.5)),
+    ("thoracic", "cervical", Some(5.5)),
+    ("cranium", "cranium", Some(5.5)),
+    ("rhumerus", "rradius", Some(3.2)),
+    ("rhumerusX", "rradius", None),
+    ("rradius", "rhand", Some(2.8)),
+    ("rradiusX", "rhand", None),
+    ("lhumerus", "lradius", Some(3.2)),
+    ("lhumerusX", "lradius", None),
+    ("lradius", "lhand", Some(2.8)),
+    ("lradiusX", "lhand", None),
+    ("rfemurYZ", "rtibia", Some(4.2)),
+    ("rfemurX", "rtibia", None),
+    ("lfemurYZ", "ltibia", Some(4.2)),
+    ("lfemurX", "ltibia", None),
+    ("rtibia", "rtalus", Some(3.4)),
+    ("ltibia", "ltalus", Some(3.4)),
+];
+
+fn bone_index(gla: &GlaAnimation, name: &str) -> Option<usize> {
+    gla.skeleton
+        .iter()
+        .position(|bone| bone.name.eq_ignore_ascii_case(name))
+}
+
+fn bind_origin(gla: &GlaAnimation, index: usize) -> Option<[f32; 3]> {
+    let matrix = gla.skeleton.get(index)?.base_pose;
+    Some([matrix[0][3], matrix[1][3], matrix[2][3]])
+}
+
+/// Capsule along a bone's bind segment. Radius is a high percentile of the
+/// distances of mostly-rigid vertices, so a minority of blended or outlying
+/// clothing vertices cannot inflate it. Bones without a distinct child joint
+/// (head, hands, feet, clavicles) keep the ellipsoid fit.
+fn fit_bone_segment_capsule(
+    gla: &GlaAnimation,
+    bone: usize,
+    points: &[([f32; 3], f32)],
+) -> Option<ClothCapsule> {
+    const RIGID_WEIGHT: f32 = 0.6;
+    const PERCENTILE: f32 = 0.9;
+    let name = &gla.skeleton.get(bone)?.name;
+    let &(_, end, fallback) = BODY_SEGMENTS
+        .iter()
+        .find(|(start, end, _)| start.eq_ignore_ascii_case(name) && !start.eq_ignore_ascii_case(end))?;
+    let a = glam::Vec3::from_array(bind_origin(gla, bone)?);
+    let b = glam::Vec3::from_array(bind_origin(gla, bone_index(gla, end)?)?);
+    if a.distance_squared(b) < 1.0e-4 {
+        return None;
+    }
+    let rigid = points
+        .iter()
+        .filter(|(_, weight)| *weight >= RIGID_WEIGHT)
+        .count();
+    let mut distances = points
+        .iter()
+        .filter(|(_, weight)| rigid < 6 || *weight >= RIGID_WEIGHT)
+        .map(|(p, _)| {
+            let p = glam::Vec3::from_array(*p);
+            let ab = b - a;
+            let t = ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
+            p.distance(a + ab * t)
+        })
+        .filter(|d| d.is_finite())
+        .collect::<Vec<_>>();
+    if distances.len() < 4 {
+        return None;
+    }
+    distances.sort_by(f32::total_cmp);
+    let index = ((distances.len() - 1) as f32 * PERCENTILE).round() as usize;
+    // Never thinner than half the stock rig nor thicker than twice it.
+    let reference = fallback.unwrap_or(3.0);
+    let radius = distances[index].clamp(reference * 0.5, reference * 2.0);
+    Some(ClothCapsule {
+        a: a.to_array(),
+        b: b.to_array(),
+        radius,
+        basis: None,
+        rest: None,
+    })
 }
 pub(crate) fn pose_body_capsules(
     templates: &[(usize, ClothCapsule)],
@@ -131,6 +234,13 @@ pub(crate) fn pose_body_capsules(
                     })
                 })
             }),
+            // Templates are fitted in bind space.
+            rest: Some(ClothRestCapsule {
+                a: capsule.a,
+                b: capsule.b,
+                radius: capsule.radius,
+                basis: capsule.basis,
+            }),
         })
     };
     let mut capsules = templates
@@ -144,33 +254,14 @@ pub(crate) fn pose_body_capsules(
         let matrix = multiply_3x4(pose.get(index)?, &gla.skeleton.get(index)?.base_pose);
         Some([matrix[0][3], matrix[1][3], matrix[2][3]])
     };
-    for (start, end, radius) in [
-        ("pelvis", "lower_lumbar", 7.0),
-        ("lower_lumbar", "upper_lumbar", 7.0),
-        ("upper_lumbar", "thoracic", 6.5),
-        ("thoracic", "cervical", 5.5),
-        ("cranium", "cranium", 5.5),
-        ("rhumerus", "rradius", 3.2),
-        ("rradius", "rhand", 2.8),
-        ("lhumerus", "lradius", 3.2),
-        ("lradius", "lhand", 2.8),
-        ("rfemurYZ", "rtibia", 4.2),
-        ("lfemurYZ", "ltibia", 4.2),
-        ("rtibia", "rtalus", 3.4),
-        ("ltibia", "ltalus", 3.4),
-    ] {
-        let Some(start) = gla
-            .skeleton
-            .iter()
-            .position(|bone| bone.name.eq_ignore_ascii_case(start))
-        else {
+    for &(start, end, radius) in BODY_SEGMENTS {
+        let Some(radius) = radius else {
             continue;
         };
-        let Some(end) = gla
-            .skeleton
-            .iter()
-            .position(|bone| bone.name.eq_ignore_ascii_case(end))
-        else {
+        let Some(start) = bone_index(gla, start) else {
+            continue;
+        };
+        let Some(end) = bone_index(gla, end) else {
             continue;
         };
         // A measured proxy attached to this bone takes precedence.
@@ -183,6 +274,15 @@ pub(crate) fn pose_body_capsules(
                 b,
                 radius,
                 basis: None,
+                rest: match (bind_origin(gla, start), bind_origin(gla, end)) {
+                    (Some(a), Some(b)) => Some(ClothRestCapsule {
+                        a,
+                        b,
+                        radius,
+                        basis: None,
+                    }),
+                    _ => None,
+                },
             });
         }
     }

@@ -22,7 +22,7 @@ impl StudioLightRender for StudioLight {
         });
         Some(TransientLight { kind: crate::fx::system::FxLightKind::AuthoredEffect, position,
             color: key.color, intensity, radius: key.radius, source_radius: key.source_radius,
-            spot, segment: None, blade_segments: None })
+            radial_exponent: None, spot, segment: None, blade_segments: None })
     }
 }
 

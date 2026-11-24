@@ -147,7 +147,7 @@ pub fn start(
         key[1]
     ));
     let job = Arc::new(Job {
-        upstream_shore: super::upstream_coast::Source::new(Arc::clone(&bsp),debug_footprints.clone()),
+        upstream_shore: super::upstream_coast::Source::new(Arc::clone(&bsp),debug_footprints.clone(),Some(directory.clone())),
         status: Mutex::new(Status::Pending),
         selection_ms: selection_started.elapsed().as_secs_f64() * 1000.0,
         footprints: debug_footprints,

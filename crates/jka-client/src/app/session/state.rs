@@ -25,10 +25,11 @@ impl GameSession {
     ) {
         self.screen_shake_level = screen_shake;
         self.weapon_fx.set_footprint_mode(footprints);
-        self.weapon_fx.set_gib_level(game.blood);
+        self.weapon_fx.set_blood_mode(game.blood);
         self.weapon_fx.set_score_plums(game.score_plums);
         self.player_presenter
             .set_gore_limit(usize::from(game.g2_marks));
+        self.player_presenter.set_skin_gore_enabled(game.blood != 0);
         self.player_presenter
             .set_footstep_level(game.footsteps, footprints != FootprintMode::Off);
         self.player_presenter.set_footstep_trace(game.footstep_trace);
@@ -162,8 +163,11 @@ impl GameSession {
             extension_events: Vec::new(),
             extension_last_damage: None,
             player_position: None,
+            ninja_fire_river_wet: None,
             ocean_actors: Arc::new(Vec::new()),
+            ninja_entities: None,
             ocean_interaction_enabled: false,
+            ocean_ninja_enabled: false,
             lake_wakes_enabled: false,
             water_wake_mode: 1,
             water_wake: super::water_wake::WaterWakeTracker::default(),

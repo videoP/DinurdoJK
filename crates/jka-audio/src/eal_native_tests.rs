@@ -221,8 +221,8 @@ fn tone(material: i32, lf: f32, hz: f32) -> f64 {
 }
 #[test]
 fn ffi_layout_matches_native_scene() {
-    assert_eq!(std::mem::size_of::<VoiceBlock>(), 1144);
-    assert_eq!(std::mem::size_of::<SceneFrame>(), 48 + 96 * 1144);
+    assert_eq!(std::mem::size_of::<VoiceBlock>(), 1152);
+    assert_eq!(std::mem::size_of::<SceneFrame>(), 48 + 96 * 1152);
     assert_eq!(std::mem::size_of::<SceneStats>(), 72);
 }
 #[test]

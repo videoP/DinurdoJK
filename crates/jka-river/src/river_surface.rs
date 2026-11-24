@@ -3,11 +3,8 @@
 //! river. It replaces the old grid debug tint.
 //!
 //! Surface detail (stage 2): the shared native FFT detail texture drives the
-//! live-grid WPO and the detail-normal graph; the native foam field (per river)
-//! and the T_ShallowWater_Foam detail drive primary foam, its normal, its
-//! attribute lerps and scattering. The foam detail (`FOAM_DETAIL_TEXTURE`, an
-//! 8-bit linear PNG) loads like any JKA texture, mips and r_picmip included;
-//! without it foam is absent, never substituted.
+//! live-grid WPO and the detail-normal graph. Foam and the material come from
+//! Fluid Ninja; the native foam presentation (T_ShallowWater_Foam) is gone.
 //!
 //! Reflections: native SLW composite, active sky and quality-2 SSR (same-frame
 //! color; no temporal history or local reflection captures).
@@ -23,8 +20,16 @@ use jka_water::river::{foam, material, surface, wave_advection, CENTIMETRES_PER_
 
 pub const SHADER: &str = include_str!("river_surface.wgsl");
 
-/// T_ShallowWater_Foam (linear: RGB foam normal, A mask) in an asset pk3.
-pub const FOAM_DETAIL_TEXTURE: &str = "textures/japro/river_foam_detail";
+/// The Fluid Ninja views a water body samples while the Fluid Ninja river is built in.
+#[derive(Clone, Copy)]
+pub struct NinjaViews<'a> {
+    pub velocity_density: &'a wgpu::TextureView,
+    pub pressure: &'a wgpu::TextureView,
+    pub distance: &'a wgpu::TextureView,
+    pub flow_map: &'a wgpu::TextureView,
+    pub roughness_map: &'a wgpu::TextureView,
+    pub caustics: Option<&'a wgpu::TextureView>,
+}
 
 /// The live-instance material settings as WGSL constructors.
 pub fn settings_shader() -> String {
@@ -77,6 +82,7 @@ pub fn shader_source() -> String {
         crate::river_slw::ADAPTER_SHADER,
         &settings_shader(),
         SHADER,
+        jka_ninja::river_material_wgsl(),
         crate::river_composite::TRACE_SHADER,
         crate::river_composite::SHADER,
         blue_water_gpu::underwater_optics::SHADER,
@@ -105,22 +111,25 @@ pub fn compose() -> Result<wgpu::naga::Module, String> {
 pub struct ViewUniform {
     pub eye: [f32; 4],
     pub forward: [f32; 4],
+    /// Screen right in xyz, Fluid Ninja material time in w.
     pub right: [f32; 4],
+    /// Screen up in xyz. In w, 0 = native, 1 = Ninja underwater, 2 = with caustics.
     pub up: [f32; 4],
     pub distortion: [f32; 4],
     pub sun_direction: [f32; 4],
     pub sun_illuminance: [f32; 4],
-    /// Material Time, foam detail present (1/0), Engine.DeltaTime, bed clamp.
+    /// Material Time, unused, Engine.DeltaTime, bed clamp.
     pub time: [f32; 4],
     /// Runtime fragment material LOD (x = 0 original, 1 wave, 2 wave + foam; y = mip cutoff;
     /// z = r_riverAdaptiveSSR; w = r_underwaterReflections).
     pub material_lod: [f32; 4],
+    /// x = live Fluid Ninja material diagnostic selection.
+    pub ninja_debug: [u32; 4],
 }
 
 impl ViewUniform {
     /// `size` is the scene target (UnscaledViewRect). `blue_water_ambient`
-    /// must match the environment group the draw binds; `foam` whether the
-    /// foam detail resource is bound.
+    /// must match the environment group the draw binds.
     pub fn new(
         camera: &jka_render_core::camera::Camera,
         size: [u32; 2],
@@ -128,7 +137,6 @@ impl ViewUniform {
         blue_water_ambient: bool,
         time: f32,
         delta: f32,
-        foam: bool,
     ) -> Self {
         let forward = camera.forward();
         let roll = glam::Quat::from_axis_angle(forward, camera.roll);
@@ -163,8 +171,9 @@ impl ViewUniform {
                 illuminance[2],
                 if blue_water_ambient { 1.0 } else { 0.0 },
             ],
-            time: [time, if foam { 1.0 } else { 0.0 }, delta, 0.0],
+            time: [time, 0.0, delta, 0.0],
             material_lod: [0.0; 4],
+            ninja_debug: [0; 4],
         }
     }
 }
@@ -196,11 +205,15 @@ pub struct RiverSurface {
     composite: Option<wgpu::RenderPipeline>,
     fused: bool,
     submerged: Option<wgpu::RenderPipeline>,
+    submerged_inputs_layout: wgpu::BindGroupLayout,
+    submerged_inputs: Option<wgpu::BindGroup>,
+    inert_submerged_inputs: wgpu::BindGroup,
     eye_pipeline: wgpu::ComputePipeline,
     eye_write_layout: wgpu::BindGroupLayout,
     eye_read_layout: wgpu::BindGroupLayout,
     submerged_args: wgpu::Buffer,
     audio_probe: Option<crate::river_audio_probe::AudioProbe>,
+    ambience_probe: Option<crate::river_ambience::Probe>,
     /// r_riverWire 0: the live window blocks, masked as the water draws.
     wire: Option<wgpu::RenderPipeline>,
     /// r_riverWire 1: the whole window grid mesh, unmasked.
@@ -217,12 +230,11 @@ pub struct RiverSurface {
     gf: PreintegratedGf,
     /// Shared native Grid2D_OceanPatch FFT detail (one per renderer).
     ocean: crate::river_ocean::Ocean,
-    /// T_ShallowWater_Foam from the JKA texture loader; None if missing.
-    foam_detail: Option<wgpu::TextureView>,
-    /// Repeating trilinear, as world textures sample.
-    foam_detail_sampler: wgpu::Sampler,
-    /// Bound in its place while absent (never read: foam is off then).
+    /// Repeating trilinear, as world textures sample (the Ninja TA_WRAP sampler).
+    wrap_sampler: wgpu::Sampler,
+    /// Bound in place of absent optional material textures.
     inert_detail: (wgpu::TextureView, wgpu::Sampler),
+    inert_volume: wgpu::TextureView,
     /// Bilinear clamp for FoamRT's cubic reconstruction edge fallback.
     foam_rt_sampler: wgpu::Sampler,
     view: wgpu::Buffer,
@@ -267,6 +279,13 @@ fn texture(filterable: bool) -> wgpu::BindingType {
         multisampled: false,
     }
 }
+fn volume_texture() -> wgpu::BindingType {
+    wgpu::BindingType::Texture {
+        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+        view_dimension: wgpu::TextureViewDimension::D3,
+        multisampled: false,
+    }
+}
 fn sampler(kind: wgpu::SamplerBindingType) -> wgpu::BindingType {
     wgpu::BindingType::Sampler(kind)
 }
@@ -303,6 +322,15 @@ impl RiverSurface {
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 }),
+                // Fluid Ninja presentation (inert 1x1 views while off).
+                entry(16, texture(true)),
+                entry(17, texture(true)),
+                entry(18, texture(true)),
+                entry(19, texture(true)),
+                entry(20, texture(true)),
+                entry(21, sampler(Filtering)),
+                entry(22, sampler(Filtering)),
+                entry(23, volume_texture()),
             ],
         });
         let storage = || wgpu::BindingType::Buffer {
@@ -339,10 +367,12 @@ impl RiverSurface {
                 entry(5, sampler(Filtering)),
                 compute_entry(6, texture(true)),
                 compute_entry(7, sampler(Filtering)),
-                entry(8, texture(true)),
-                entry(9, sampler(Filtering)),
                 entry(11, texture(false)),
             ],
+        });
+        let submerged_inputs_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("river submerged material textures"),
+            entries: &[entry(0, texture(true)), entry(1, texture(true)), entry(2, volume_texture())],
         });
         let eye_write_entry = |binding| wgpu::BindGroupLayoutEntry {
             binding, visibility: wgpu::ShaderStages::COMPUTE,
@@ -404,7 +434,7 @@ impl RiverSurface {
         ocean.encode_reset(&mut encoder);
         queue.submit(Some(encoder.finish()));
         let inert = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("river absent foam detail"),
+            label: Some("river absent material texture"),
             size: wgpu::Extent3d {
                 width: 1,
                 height: 1,
@@ -421,10 +451,24 @@ impl RiverSurface {
             inert.create_view(&Default::default()),
             device.create_sampler(&Default::default()),
         );
-        let foam_detail_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("river foam detail"),
+        let inert_volume = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("river absent caustics volume"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }).create_view(&Default::default());
+        let inert_submerged_inputs = submerged_inputs_group(
+            device, &submerged_inputs_layout, &inert_detail.0, &inert_detail.0, &inert_volume,
+        );
+        let wrap_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("river material wrap"),
             address_mode_u: wgpu::AddressMode::Repeat,
             address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
@@ -497,11 +541,15 @@ impl RiverSurface {
             composite: None,
             fused: false,
             submerged: None,
+            submerged_inputs_layout,
+            submerged_inputs: None,
+            inert_submerged_inputs,
             eye_pipeline,
             eye_write_layout,
             eye_read_layout,
             submerged_args,
             audio_probe: None,
+            ambience_probe: None,
             wire: None,
             wire_full: None,
             blocks: crate::river_blocks::Pipelines::new(device),
@@ -512,9 +560,9 @@ impl RiverSurface {
             scene_sampler,
             gf: PreintegratedGf::new(device, queue),
             ocean,
-            foam_detail: None,
-            foam_detail_sampler,
+            wrap_sampler,
             inert_detail,
+            inert_volume,
             foam_rt_sampler,
             view,
             cpu_view: ViewUniform::default(),
@@ -654,9 +702,22 @@ impl RiverSurface {
             cache: None,
         });
         self.composite = Some(composite);
+        let submerged_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("river submerged optics"),
+            bind_group_layouts: &[
+                None,
+                Some(&self.body_layout),
+                None,
+                Some(&self.frame_layout),
+                Some(&self.submerged_inputs_layout),
+                None,
+                Some(&self.eye_read_layout),
+            ],
+            immediate_size: 0,
+        });
         self.submerged = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("river Hybrid underwater optics"),
-            layout: Some(&layout),
+            label: Some("river submerged optics"),
+            layout: Some(&submerged_layout),
             vertex: wgpu::VertexState { module: &self.module, entry_point: Some("vs_submerged"), compilation_options: Default::default(), buffers: &[] },
             fragment: Some(wgpu::FragmentState { module: &self.module, entry_point: Some("fs_submerged"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: Default::default(),
@@ -886,14 +947,28 @@ impl RiverSurface {
                 .is_some_and(|(key, _)| *key == (format, samples))
     }
 
-    pub fn has_foam_detail(&self) -> bool {
-        self.foam_detail.is_some()
+    pub fn has_ninja_underwater_inputs(&self) -> bool {
+        self.submerged_inputs.is_some()
     }
 
-    /// Bind the foam detail texture (loaded once per renderer).
-    pub fn set_foam_detail(&mut self, detail: wgpu::TextureView) {
-        self.foam_detail = Some(detail);
-        self.frame = None;
+    pub fn set_ninja_underwater_inputs(
+        &mut self,
+        device: &wgpu::Device,
+        noise: Option<&wgpu::TextureView>,
+        gradient: Option<&wgpu::TextureView>,
+        caustics: Option<&wgpu::TextureView>,
+    ) {
+        self.submerged_inputs = Some(submerged_inputs_group(
+            device,
+            &self.submerged_inputs_layout,
+            noise.unwrap_or(&self.inert_detail.0),
+            gradient.unwrap_or(&self.inert_detail.0),
+            caustics.unwrap_or(&self.inert_volume),
+        ));
+    }
+
+    pub fn clear_ninja_underwater_inputs(&mut self) {
+        self.submerged_inputs = None;
     }
 
     pub fn set_map_sky(&mut self, device: &wgpu::Device, faces: Option<[&wgpu::TextureView; 6]>) {
@@ -940,10 +1015,6 @@ impl RiverSurface {
             let copy = self.copy.as_ref().expect("created above");
             let gf = self.gf.texture.create_view(&Default::default());
             let ocean = self.ocean.texture.create_view(&Default::default());
-            let (detail, detail_sampler) = match &self.foam_detail {
-                Some(view) => (view, &self.foam_detail_sampler),
-                None => (&self.inert_detail.0, &self.inert_detail.1),
-            };
             self.frame = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("river water frame"),
                 layout: &self.frame_layout,
@@ -979,14 +1050,6 @@ impl RiverSurface {
                     wgpu::BindGroupEntry {
                         binding: 7,
                         resource: wgpu::BindingResource::Sampler(&self.ocean.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 8,
-                        resource: wgpu::BindingResource::TextureView(detail),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 9,
-                        resource: wgpu::BindingResource::Sampler(detail_sampler),
                     },
                     wgpu::BindGroupEntry {
                         binding: 11,
@@ -1032,7 +1095,7 @@ impl RiverSurface {
         });
         pass.set_pipeline(&self.eye_pipeline);
         pass.set_bind_group(3, frame, &[]);
-        for river in rivers {
+        for river in rivers.iter().filter(|r| r.draw_enabled()) {
             let (Some(body), Some(eye)) = (river.body_group(), river.eye_state()) else { continue; };
             pass.set_bind_group(0, &eye.classify, &[]);
             pass.set_bind_group(1, body, &[]);
@@ -1060,6 +1123,10 @@ impl RiverSurface {
         if let Some(copy) = &self.copy { copy.capture_indirect(device, encoder, color, depth, &self.submerged_args); }
     }
 
+    pub fn draw_if_eye_submerged<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        pass.draw_indirect(&self.submerged_args, 0);
+    }
+
     /// The per-river group: SimGridRT, NormalsRT, the classic indirect field
     /// and one FoamRT parity.
     pub fn body_group(
@@ -1072,12 +1139,20 @@ impl RiverSurface {
         foam_rt: &wgpu::Texture,
         authored: &wgpu::Buffer,
         blocks: &wgpu::Buffer,
+        ninja: Option<NinjaViews<'_>>,
     ) -> wgpu::BindGroup {
         use wgpu::util::DeviceExt;
         let origin = origin_cm.map(|v| v as f32);
+        // origin.w: 0 native, 1 fluid, 2 fluid with the optional caustics atlas.
+        let ninja_flag = ninja.map_or(0.0, |views| if views.caustics.is_some() { 2.0 } else { 1.0 });
+        let inert = &self.inert_detail.0;
+        let [vd, pd, distance, flow_map, roughness_map] = match &ninja {
+            Some(n) => [n.velocity_density, n.pressure, n.distance, n.flow_map, n.roughness_map],
+            None => [inert; 5],
+        };
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("river water body origin"),
-            contents: bytemuck::cast_slice(&[origin[0], origin[1], origin[2], 0.0, mesh.size()[0], mesh.size()[1], mesh.cells()[0] as f32, mesh.cells()[1] as f32]),
+            contents: bytemuck::cast_slice(&[origin[0], origin[1], origin[2], ninja_flag, mesh.size()[0], mesh.size()[1], mesh.cells()[0] as f32, mesh.cells()[1] as f32]),
             usage: wgpu::BufferUsages::UNIFORM,
         });
         let surface = textures.surface.create_view(&wgpu::TextureViewDescriptor {
@@ -1139,6 +1214,15 @@ impl RiverSurface {
                     binding: 15,
                     resource: blocks.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry { binding: 16, resource: wgpu::BindingResource::TextureView(vd) },
+                wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::TextureView(pd) },
+                wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::TextureView(distance) },
+                wgpu::BindGroupEntry { binding: 19, resource: wgpu::BindingResource::TextureView(flow_map) },
+                wgpu::BindGroupEntry { binding: 20, resource: wgpu::BindingResource::TextureView(roughness_map) },
+                // Simulation buffers clamp (bilinear); material textures wrap (TA_WRAP).
+                wgpu::BindGroupEntry { binding: 21, resource: wgpu::BindingResource::Sampler(&self.foam_rt_sampler) },
+                wgpu::BindGroupEntry { binding: 22, resource: wgpu::BindingResource::Sampler(&self.wrap_sampler) },
+                wgpu::BindGroupEntry { binding: 23, resource: wgpu::BindingResource::TextureView(ninja.and_then(|views| views.caustics).unwrap_or(&self.inert_volume)) },
             ],
         })
     }
@@ -1193,16 +1277,22 @@ impl RiverSurface {
         self.draw_blocks(pass, river);
     }
 
-    pub fn draw_submerged<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, camera: &'a wgpu::BindGroup, shadow_receiver: &'a wgpu::BindGroup, environment: Option<&'a wgpu::BindGroup>, river: &'a crate::river_runtime::LiveRiver) {
+    pub fn draw_submerged<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, river: &'a crate::river_runtime::LiveRiver) {
         let (Some(pipeline), Some(frame), Some(body), Some(eye)) = (&self.submerged, &self.frame, river.body_group(), river.eye_state()) else { return; };
         pass.set_pipeline(pipeline);
-        self.bind_patch(pass, camera, shadow_receiver, environment, frame, body);
+        pass.set_bind_group(1, body, &[]);
+        pass.set_bind_group(3, frame, &[]);
+        pass.set_bind_group(4, self.submerged_inputs.as_ref().unwrap_or(&self.inert_submerged_inputs), &[]);
         pass.set_bind_group(6, &eye.read, &[]);
         pass.draw(0..3, 0..1);
     }
 
     /// Invalidate a pending listener probe on river/map replacement.
-    pub fn reset_audio_probe(&mut self) { self.audio_probe = None; }
+    pub fn reset_audio_probe(&mut self) {
+        self.audio_probe = None;
+        self.ambience_probe = None;
+        crate::river_ambience::invalidate();
+    }
 
     /// Audio samples share the exact visible water-height classifier, with a
     /// separate listener location and no synchronous GPU readback.
@@ -1213,6 +1303,9 @@ impl RiverSurface {
         shadow: &wgpu::BindGroup, environment: Option<&wgpu::BindGroup>,
         rivers: &[crate::river_runtime::LiveRiver],
     ) {
+        let mut ambience = self.ambience_probe.take();
+        crate::river_ambience::Probe::update(&mut ambience, device, queue, encoder, self, rivers);
+        self.ambience_probe = ambience;
         if let Some(probe) = &mut self.audio_probe { probe.poll(device); }
         let Some(sample) = crate::river_runtime::audio_listener_probe() else { return; };
         if self.audio_probe.is_none() && self.frame.is_some() {
@@ -1268,6 +1361,24 @@ impl RiverSurface {
         pass.set_bind_group(4, environment.unwrap_or(&self.inert_env), &[]);
         pass.set_bind_group(5, &self.sky_group, &[]);
     }
+}
+
+fn submerged_inputs_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    noise: &wgpu::TextureView,
+    gradient: &wgpu::TextureView,
+    caustics: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("river submerged material textures"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(noise) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(gradient) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(caustics) },
+        ],
+    })
 }
 
 /// A valid, never-read environment group (1x1 atlas, zero uniforms).

@@ -702,6 +702,32 @@ pub fn validate_conversion(source: &[u8], converted: &ConvertedDemo) -> Result<u
 mod tests {
     use super::*;
     #[test]
+    fn body_queue_copy_preserves_source_weapon_and_event_bits() {
+        use crate::entity_event::{EntityEvent, EV_EVENT_BIT1};
+        for version in [Version::V102, Version::V104] {
+            let mut raw = EntityState {
+                number: 40,
+                fields: super::super::Fields::zero(version.entity_fields()),
+            };
+            let wire_event = ids::EVENTS.len() as i32 - 1;
+            raw.fields.set_field_bits("eType", 15); // JK2 ET_BODY
+            raw.fields.set_field_bits("event", (wire_event | EV_EVENT_BIT1) as u32);
+            raw.fields.set_field_bits("eventParm", 7);
+            raw.fields.set_field_bits("clientNum", 7);
+            raw.fields.set_field_bits("weapon", 2); // JK2 WP_SABER
+            let mut adapter = Adapter::default();
+            let body = adapter.entity(version, &raw).unwrap();
+            assert_eq!(body.number, 40);
+            assert_eq!(body.field_i32("eType"), Some(15));
+            assert_eq!(body.field_i32("event"), Some(EntityEvent::EV_JK2_BODY_QUEUE_COPY.as_i32() | EV_EVENT_BIT1));
+            assert_eq!(body.field_i32("eventParm"), Some(7));
+            assert_eq!(body.field_i32("clientNum"), Some(7));
+            assert_eq!(body.field_i32("weapon"), Some(3)); // presentation WP_SABER
+            assert_eq!(adapter.omitted_events, 0);
+        }
+    }
+
+    #[test]
     fn real_demos_keep_timing_pose_and_map_while_ids_are_mapped() {
         for bytes in [
             include_bytes!("../../tests/fixtures/jk2-102-prefix.dm_15").as_slice(),

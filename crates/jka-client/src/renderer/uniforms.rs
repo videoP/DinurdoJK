@@ -416,9 +416,9 @@ pub(in crate::renderer) struct SsrTemporalUniform {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(in crate::renderer) struct GammaPostUniform {
     pub(in crate::renderer) values: [f32; 4],
-    // x: HDR scene. HDR already removes the fog quantization that motivated the
-    // legacy output dither, so the compact presentation shader skips it.
-    // y: native HDR LUT headroom, z: overbright bits, w: JK2 SDR LUT mode.
+    // x: HDR scene. y: native HDR output (the only case that skips the output
+    // dither; a float scene still quantizes at an 8-bit swapchain) and LUT
+    // headroom, z: overbright bits, w: JK2 SDR LUT mode.
     pub(in crate::renderer) flags: [f32; 4],
 }
 
@@ -481,7 +481,7 @@ pub(in crate::renderer) struct GpuPointLight {
     // z: static shader-promotion evidence mask (0 for authored/runtime lights).
     // w: positive=baked local irradiance layer+1, negative=shadow-only metadata.
     pub(in crate::renderer) shape: [f32; 4],
-    // x: cubemap slot + 1; y: q3map falloff metadata;
+    // x: cubemap slot + 1; y: q3map falloff metadata or negated radial exponent;
     // z: q3map extra_distance for static map lights OR source radius for
     // runtime transients (shadow.w=1); w: runtime-transient marker.
     pub(in crate::renderer) shadow: [f32; 4],
@@ -497,6 +497,7 @@ pub(in crate::renderer) fn transient_light_gpu(
     intensity_scale: f32,
     segment_enabled: bool,
 ) -> GpuPointLight {
+    let intensity = light.intensity.max(0.0) * intensity_scale;
     let mut result = GpuPointLight {
         position_radius: [
             light.position[0],
@@ -508,11 +509,11 @@ pub(in crate::renderer) fn transient_light_gpu(
             light.color[0],
             light.color[1],
             light.color[2],
-            light.intensity.max(0.0) * intensity_scale,
+            intensity,
         ],
         emitter: [0.0; 4],
         shape: [0.0; 4],
-        shadow: [0.0, 0.0, light.source_radius.max(0.0), 1.0],
+        shadow: [0.0, -light.radial_exponent.unwrap_or_default(), light.source_radius.max(0.0), 1.0],
     };
     if let Some(spot) = light.spot {
         let spot_is_finite = spot.direction.iter().all(|value| value.is_finite())
@@ -548,7 +549,7 @@ pub(in crate::renderer) fn transient_light_gpu(
 pub(in crate::renderer) fn transient_light_samples(
     light: &TransientLight,
     rt: bool,
-) -> impl Iterator<Item = TransientLight> + '_ {
+) -> impl ExactSizeIterator<Item = TransientLight> + '_ {
     let blades = light
         .blade_segments
         .as_deref()

@@ -424,7 +424,7 @@ fn blended_alpha_mode(stage: &jka_assets::shader::Stage) -> DynamicModelAlphaMod
 /// path cannot draw it.  Preserve TaystJK's framebuffer-dependent blend stages
 /// (filter/modulate/darken) in their authored order; silently dropping these
 /// changes the appearance of the remaining passes.  `tcGen environment` is
-/// drawn; other generated coordinates and alpha tests still are not.
+/// drawn. Masked blending uses the GE128 threshold with source alpha.
 pub(in crate::cgame::player_presenter) fn blended_stage_mode(
     stage: &jka_assets::shader::Stage,
     allow_opaque: bool,
@@ -433,12 +433,16 @@ pub(in crate::cgame::player_presenter) fn blended_stage_mode(
     if stage.image.is_empty()
         || (stage.image.starts_with('$') && !stage.image.eq_ignore_ascii_case("$whiteimage"))
         || stage.entity_rgb
-        || !stage.alpha_test.trim().is_empty()
         || !matches!(stage.tc_gen, TcGen::Base | TcGen::Environment)
     {
         return None;
     }
-    match FxBlend::from_blend_func(&stage.blend) {
+    let alpha_test = stage.alpha_test.trim();
+    let blend = FxBlend::from_blend_func(&stage.blend);
+    if !alpha_test.is_empty() && blend != FxBlend::Alpha {
+        return None;
+    }
+    match blend {
         FxBlend::Opaque => allow_opaque.then_some(DynamicModelAlphaMode::Opaque),
         FxBlend::Add => Some(DynamicModelAlphaMode::AdditiveOne),
         FxBlend::AddAlpha => Some(DynamicModelAlphaMode::Additive),
@@ -456,8 +460,17 @@ pub(in crate::cgame::player_presenter) fn blended_stage_mode(
                 .collect::<Vec<_>>()
                 .join(" ")
                 .to_ascii_lowercase();
-            (blend == "gl_src_alpha gl_one_minus_src_alpha" || blend == "blend")
-                .then_some(blended_alpha_mode(stage))
+            if blend != "gl_src_alpha gl_one_minus_src_alpha" && blend != "blend" {
+                return None;
+            }
+            if alpha_test.is_empty() {
+                return Some(blended_alpha_mode(stage));
+            }
+            (alpha_test.eq_ignore_ascii_case("ge128")
+                && !stage.depth_write
+                && !stage.depth_equal
+                && blended_alpha_mode(stage) == DynamicModelAlphaMode::Blend)
+                .then_some(DynamicModelAlphaMode::StageMaskBlend)
         }
     }
 }
@@ -476,14 +489,23 @@ pub(in crate::cgame::player_presenter) fn blended_stages<'a>(
         return Vec::new();
     }
     let opaque_primary = FxBlend::from_blend_func(&primary.blend) == FxBlend::Opaque;
-    let stages = shader
-        .stages
-        .iter()
-        .filter_map(|stage| {
-            blended_stage_mode(stage, opaque_primary && std::ptr::eq(stage, primary))
-                .map(|mode| (stage, mode))
-        })
-        .collect::<Vec<_>>();
+    let mut stages = Vec::new();
+    // Keep GE128 overlays in the same compositing pass as the additive stages
+    // underneath. The depth-writing primary is submitted before that pass.
+    let mut masked_blend_supported = opaque_primary;
+    for stage in &shader.stages {
+        let is_primary = std::ptr::eq(stage, primary);
+        let mode = blended_stage_mode(stage, opaque_primary && is_primary);
+        if let Some(mode) = mode {
+            if mode != DynamicModelAlphaMode::StageMaskBlend || masked_blend_supported {
+                stages.push((stage, mode));
+            }
+        }
+        masked_blend_supported &= matches!(mode,
+            Some(DynamicModelAlphaMode::AdditiveOne | DynamicModelAlphaMode::DstColorAdd
+                | DynamicModelAlphaMode::StageMaskBlend))
+            || (is_primary && mode == Some(DynamicModelAlphaMode::Opaque));
+    }
     if opaque_primary {
         // The opaque base must itself be drawable, else the overlays would
         // replace it. A lone base without tcMods keeps the compact path.

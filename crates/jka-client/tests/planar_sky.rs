@@ -14,8 +14,8 @@ fn lake_planar_sky_survives_sdr_and_hdr_targets() {
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         // Both full lake materials must retain compatible SDR/HDR pipelines;
         // the capture's floating-point format is independent of these targets.
-        let _sdr_lake = blue_water_gpu::lakes::LakePipeline::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb, 1);
-        let _hdr_lake = blue_water_gpu::lakes::LakePipeline::new(&device, wgpu::TextureFormat::Rgba16Float, 1);
+        let _sdr_lake = blue_water_gpu::lakes::LakePipeline::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb, 1, None);
+        let _hdr_lake = blue_water_gpu::lakes::LakePipeline::new(&device, wgpu::TextureFormat::Rgba16Float, 1, None);
         let capture = planar_target::color_texture(&device, 4, 1, 4);
         let capture_view = capture.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2), array_layer_count: Some(1), ..Default::default()

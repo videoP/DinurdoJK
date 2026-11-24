@@ -171,8 +171,8 @@ pub(crate) fn prepare_event_visual(
         EntityEvent::EV_FORCE_DRAINED | EntityEvent::EV_TEAM_POWER => {
             (EventDispatchResult::Handled("TEAM_POWER_SHELL"), None)
         }
-        // The gib models (models/gibs/*) are not shipped with JKA, so only the
-        // gib sound exists to present.
+        // WeaponFx handles the visual gib burst and Ninja blood. Keep this
+        // dispatch label stable for existing event diagnostics.
         EntityEvent::EV_GIB_PLAYER => (EventDispatchResult::Handled("GIB_SOUND_ONLY"), None),
         EntityEvent::EV_DISRUPTOR_MAIN_SHOT
         | EntityEvent::EV_DISRUPTOR_SNIPER_SHOT
@@ -475,7 +475,7 @@ fn flash_surface(flash: &EventFlash, current_time: i32) -> Option<DynamicModelSu
         rt_rigid: None,
         rt_skinned_key: None,
         ghoul2_gpu: None,
-        fx_gpu_sprites: None,
+        cloth_gpu: None, fx_gpu_sprites: None,
         texture: None,
         alpha_mode: DynamicModelAlphaMode::Additive,
 

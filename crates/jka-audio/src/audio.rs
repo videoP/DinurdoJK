@@ -3,6 +3,7 @@ pub mod variometer;
 mod underwater;
 use underwater::{DryMusicSource, UnderwaterControl, UnderwaterSource};
 mod eal_scene;
+mod echofield;
 use eal_scene::{EalBus, EalVoiceHandle};
 use std::{
     collections::{HashMap, HashSet},
@@ -65,6 +66,27 @@ const STOP_FADE_SECONDS: f32 = 0.004;
 // and TaystJK take those channels from the one-shot pool; merged loops
 // get their own ceiling here so a hum never steals an event sound mid-play.
 const MAX_LOOP_VOICES: usize = 32;
+// Dedicated dry river budget: never displace a legacy loop or one-shot.
+pub const MAX_RIVER_LOOP_VOICES: usize = 16;
+/// River recordings live beside the other japro sounds: `sound/japro/<name>.wav`
+/// and `<name>_2.wav`, `<name>_3.wav` variants. Six required layers, then three
+/// optional specialist textures.
+pub const RIVER_LOOP_ROOT: &str = "sound/japro/";
+pub const RIVER_LOOP_NAMES: [&str; 9] = [
+    "still", "calm", "slow", "fast", "rapids", "waterfall", "riffles", "eddies", "hydraulics",
+];
+/// The shared folder also holds rain, thunder and other loops, so a river loop
+/// is identified by its file name, not its folder.
+fn is_river_loop_qpath(qpath: &str) -> bool {
+    let Some(file) = qpath.strip_prefix(RIVER_LOOP_ROOT) else { return false };
+    let Some(stem) = file.strip_suffix(".wav") else { return false };
+    let base = match stem.rsplit_once('_') {
+        Some((base, variant)) if variant.parse::<u8>().is_ok() => base,
+        _ => stem,
+    };
+    RIVER_LOOP_NAMES.contains(&base)
+}
+const RIVER_LOOP_PREFIX: &str = "\u{1e}river:";
 const CHAN_AUTO: i32 = 0;
 // 256 samples is ~5.3 ms at 48 kHz: short enough for responsive head rotation,
 // while still giving Steam Audio a fixed block size as required by its HRTF DSP.
@@ -111,6 +133,11 @@ pub struct LoopRequest {
     /// 0..=1 level of this emitter (an ambient set's `masterVolume / 255`).
     pub volume: f32,
 }
+impl LoopRequest {
+    fn is_river(&self) -> bool {
+        self.emitter & (1u64 << 63) != 0 && is_river_loop_qpath(&self.qpath)
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct Listener {
@@ -126,6 +153,20 @@ pub struct Listener {
 pub struct RegisteredSound {
     samples: Arc<[f32]>, // mono SFX, as in the legacy software sound path
     sample_rate: rodio::SampleRate,
+}
+
+impl RegisteredSound {
+    pub(crate) fn from_mono(samples: Vec<f32>, rate: u32) -> Option<Self> {
+        if samples.is_empty() { return None; }
+        Some(Self { samples: samples.into(), sample_rate: rodio::SampleRate::new(rate)? })
+    }
+    /// Scale to the given absolute peak; silent input is returned unchanged.
+    pub(crate) fn normalized(self, peak: f32) -> Self {
+        let max = self.samples.iter().fold(0.0f32, |max, sample| max.max(sample.abs()));
+        if max <= 0.0 { return self; }
+        let scale = peak / max;
+        Self { samples: self.samples.iter().map(|sample| sample * scale).collect(), sample_rate: self.sample_rate }
+    }
 }
 
 /// Raw compressed SFX bytes staged by the game thread for CPU-only decoding on
@@ -304,6 +345,34 @@ impl SoundAssets {
         Ok(None)
     }
 
+    /// Reader for Echofield ambience recordings on the acoustic worker.
+    pub fn echo_ambience_reader(&self) -> AssetSearchPath { self.assets.fork() }
+
+    /// Defer VFS read, parsing and BVH construction to the acoustic worker.
+    pub fn echo_geometry_input(&self, map: &str) -> Option<crate::EchoGeometryInput> {
+        let map = map.replace('\\', "/").to_ascii_lowercase();
+        let map = map.strip_prefix("maps/").unwrap_or(&map);
+        let map = map.strip_suffix(".bsp").unwrap_or(map);
+        if map.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+            || map.contains(':')
+        {
+            return None;
+        }
+        let path = format!("maps/{map}.bsp");
+        Some(crate::EchoGeometryInput::asset(self.assets.fork(), path))
+    }
+
+    pub fn matches_echo_vfs(
+        &self,
+        token: &jka_assets::pk3::VfsIndexToken,
+        variant: Option<u8>,
+        overrides: bool,
+    ) -> bool {
+        *token == self.assets.index_token()
+            && variant == self.assets.jk2_version()
+            && overrides == self.assets.asset_overrides_allowed()
+    }
+
     /// Re-scan the underlying VFS and forget only failed registrations.
     /// Successfully decoded sounds remain cached so an explicit filesystem
     /// refresh does not glitch currently playing/looping audio.
@@ -460,7 +529,7 @@ impl SoundAssets {
     }
 }
 
-fn decode_sound(bytes: Vec<u8>) -> Result<RegisteredSound, String> {
+pub(crate) fn decode_sound(bytes: Vec<u8>) -> Result<RegisteredSound, String> {
     decode_sound_with_gapless(bytes, false)
 }
 
@@ -518,6 +587,8 @@ struct Gains {
     target: [AtomicU32; 2],
     mono_target: AtomicU32,
     eal_track_position: AtomicBool,
+    echo_max_distance: AtomicU32,
+    ambience_gain_hf: AtomicU32,
     eal_position: AtomicU64,
     direction: [AtomicU32; 3],
     hrtf_spatializable: AtomicBool,
@@ -542,6 +613,8 @@ impl Gains {
             target: value.map(|v| AtomicU32::new(v.to_bits())),
             mono_target: AtomicU32::new(value[0].max(value[1]).to_bits()),
             eal_track_position: AtomicBool::new(false),
+            echo_max_distance: AtomicU32::new(1506.0_f32.to_bits()),
+            ambience_gain_hf: AtomicU32::new(0),
             eal_position: AtomicU64::new(f64::NAN.to_bits()),
             // Steam Audio listener-local convention: +X right, +Y up, +Z behind.
             // A centered/non-spatial source defaults to directly ahead (-Z).
@@ -1519,8 +1592,8 @@ struct MusicVoice {
     pending_loop: Option<Arc<[u8]>>,
 }
 
-struct Voice { loop_start: Option<usize>, player: Player, wet_player: Option<EalVoiceHandle>, sound: Arc<RegisteredSound>, gains: Arc<Gains>, request: SoundRequest, steam_audio_capable: bool, volume: f32 }
-struct LoopVoice { qpath: String, player: Player, wet_player: Option<EalVoiceHandle>, sound: Arc<RegisteredSound>, gains: Arc<Gains>, steam_audio_capable: bool }
+struct Voice { loop_start: Option<usize>, player: Player, wet_player: Option<EalVoiceHandle>, sound: Arc<RegisteredSound>, gains: Arc<Gains>, request: SoundRequest, steam_audio_capable: bool, volume: f32, doppler: f32 }
+struct LoopVoice { qpath: String, player: Player, wet_player: Option<EalVoiceHandle>, sound: Arc<RegisteredSound>, gains: Arc<Gains>, steam_audio_capable: bool, doppler: f32 }
 
 /// Queue `source` on a new Player *before* handing the Player's output to the
 /// mixer. `Mixer::add` builds its channel/rate converter from the metadata the
@@ -1584,6 +1657,9 @@ pub struct AudioInfo {
     pub steam_audio_environmental_error: Option<String>,
     /// EAGLE zones and the optional per-source OpenAL Soft EAX scene.
     pub eal_file: Option<String>,
+    pub echo_field_selected: bool,
+    pub echofield_ambience_sources: usize,
+    pub echofield_diagnostics: Option<crate::EchoDiagnostics>,
     pub eal_environment: Option<String>,
     pub eal_preset_count: usize,
     pub eal_effects_active: bool,
@@ -1662,6 +1738,7 @@ pub struct AudioBackend {
     capacity_kicks: u64,
     last_capacity_kick: Option<String>,
     loops: Vec<LoopRequest>,
+    river_loops: Vec<(LoopRequest, Arc<RegisteredSound>)>,
     loop_voices: HashMap<String, LoopVoice>,
     // OpenJK paints loops at `s_paintedtime % length`: every loop of one sfx
     // shares a cycle, and a loop that restarts resumes at that clock's phase.
@@ -1702,6 +1779,12 @@ pub struct AudioBackend {
     steam_audio_acoustic_mesh: Option<Arc<AcousticMesh>>,
     steam_audio_bake: Option<Arc<SteamAudioBakeData>>,
     eal_map: Option<Arc<EalMap>>,
+    echo_bsp: Option<crate::EchoGeometryInput>,
+    echo_ambience_assets: Option<AssetSearchPath>,
+    echo_active: bool,
+    echo_settings: crate::EchoSettings,
+    last_echo_movers: Option<Instant>,
+    ambience: echofield::Ambience,
     eal_file: Option<String>,
     eal_environment: Option<String>,
     eal_environment_id: Option<i32>,
@@ -1783,6 +1866,7 @@ impl AudioBackend {
             capacity_kicks: 0,
             last_capacity_kick: None,
             loops: Vec::new(),
+            river_loops: Vec::new(),
             loop_voices: HashMap::new(),
             loop_epoch: Instant::now(),
             mixer,
@@ -1820,6 +1904,12 @@ impl AudioBackend {
             steam_audio_acoustic_mesh: None,
             steam_audio_bake: None,
             eal_map: None,
+            echo_bsp: None,
+            echo_ambience_assets: None,
+            echo_active: false,
+            echo_settings: crate::EchoSettings::default(),
+            last_echo_movers: None,
+            ambience: echofield::Ambience::default(),
             eal_file: None,
             eal_environment: None,
             eal_environment_id: None,
@@ -1851,6 +1941,7 @@ impl AudioBackend {
             capacity_kicks: 0,
             last_capacity_kick: None,
             loops: Vec::new(),
+            river_loops: Vec::new(),
             loop_voices: HashMap::new(),
             loop_epoch: Instant::now(),
             mixer,
@@ -1888,6 +1979,12 @@ impl AudioBackend {
             steam_audio_acoustic_mesh: None,
             steam_audio_bake: None,
             eal_map: None,
+            echo_bsp: None,
+            echo_ambience_assets: None,
+            echo_active: false,
+            echo_settings: crate::EchoSettings::default(),
+            last_echo_movers: None,
+            ambience: echofield::Ambience::default(),
             eal_file: None,
             eal_environment: None,
             eal_environment_id: None,
@@ -1926,9 +2023,13 @@ impl AudioBackend {
         backend.music_level = self.music_level;
         backend.rate = 1.0;
         backend.set_underwater(self.underwater_mode, false);
-        backend.set_eal_map(self.eal_file.clone(), self.eal_map.clone());
+        backend.echo_settings = self.echo_settings;
+        backend.ambience.weather = self.ambience.weather;
         backend.set_eal_hrtf_enabled(self.eal_hrtf_enabled);
-        backend.set_eal_enabled(self.eal_enabled.load(Ordering::Relaxed));
+        backend.set_acoustic_map_enabled(
+            self.eal_file.clone(), self.eal_map.clone(), self.echo_bsp.clone(),
+            self.eal_enabled.load(Ordering::Relaxed),
+        );
         (backend, output)
     }
 
@@ -1987,6 +2088,11 @@ impl AudioBackend {
             steam_audio_environment_last_ms: self.steam_audio_environmental_runtime.as_ref().map_or(0.0, SteamAudioEnvironmentalRuntime::last_ms),
             steam_audio_environmental_error: environmental_runtime_error,
             eal_file: self.eal_file.clone(),
+            echo_field_selected: self.echo_active,
+            echofield_ambience_sources: self.ambience.active(),
+            echofield_diagnostics: self.eal_worker_status.as_ref().and_then(|worker| {
+                worker.ambience.try_lock().ok()?.diagnostics
+            }),
             eal_environment: self.eal_environment.clone(),
             eal_preset_count: self.eal_map.as_ref().map_or(0, |map| map.environments.len()),
             eal_effects_active: self.eal_enabled.load(Ordering::Relaxed) && self.eal_worker_status.as_ref().is_some_and(|status| status.running.load(Ordering::Acquire)),
@@ -2011,7 +2117,7 @@ impl AudioBackend {
             eal_filtered_sources: self.eal_worker_status.as_ref().map_or(0, |status| status.filtered_sources.load(Ordering::Relaxed)),
             eal_diffracted_sources: self.eal_worker_status.as_ref().map_or(0, |status| status.diffracted_sources.load(Ordering::Relaxed)),
             eal_directional_rooms: self.eal_worker_status.as_ref().map_or(0, |status| status.directional_rooms.load(Ordering::Relaxed)),
-            eal_fallback_loops: if self.eal_map.is_some() && self.eal_bus.is_some() { self.loop_voices.iter().filter(|(key,v)| **key == v.qpath).count() } else { 0 },
+            eal_fallback_loops: if (self.eal_map.is_some() || self.echo_bsp.is_some()) && self.eal_bus.is_some() { self.loop_voices.iter().filter(|(key,v)| **key == v.qpath).count() } else { 0 },
             eal_hrtf: self.eal_worker_status.as_ref().is_some_and(|status| status.hrtf.load(Ordering::Relaxed)),
             eal_latency_ms: (LATENCY_BLOCKS + crate::eal_native::PREROLL_BLOCKS) as f32 * BLOCK_FRAMES as f32 * 1000.0 / self.output_sample_rate as f32,
         }
@@ -2187,6 +2293,22 @@ impl AudioBackend {
     /// Reconfigure the authored reverb bus when a map changes. OpenAL is
     /// optional and loaded dynamically. A failure leaves Steam Audio intact.
     pub fn set_eal_map(&mut self, file: Option<String>, map: Option<Arc<EalMap>>) {
+        self.set_acoustic_map(file,map,None);
+    }
+    /// Echofield recordings are read through this reader on the acoustic worker.
+    pub fn set_echo_ambience_assets(&mut self, reader: AssetSearchPath) {
+        if let Some(status) = &self.eal_worker_status {
+            *status.ambience_assets.lock().unwrap_or_else(|error| error.into_inner()) = Some(reader.fork());
+        }
+        self.echo_ambience_assets = Some(reader);
+    }
+    pub fn set_acoustic_map_enabled(&mut self,file:Option<String>,map:Option<Arc<EalMap>>,echo_bsp:Option<crate::EchoGeometryInput>,enabled:bool){
+        self.eal_enabled.store(enabled,Ordering::Release);
+        self.set_acoustic_map(file,map,echo_bsp);
+    }
+    pub fn set_acoustic_map(&mut self,file:Option<String>,map:Option<Arc<EalMap>>,echo_bsp:Option<crate::EchoGeometryInput>){
+        self.clear_echofield_ambience();
+        self.apply_echofield_pitch(None);
         // The old wet processor must be removed before replacing its input bus.
         for voice in &mut self.voices {
             if let Some(player) = voice.wet_player.take() { player.stop(); }
@@ -2202,6 +2324,9 @@ impl AudioBackend {
         if let Some(player) = self.eal_wet_player.take() { player.stop(); }
         self.eal_bus = None;
         self.eal_map = map;
+        self.echo_bsp = echo_bsp;
+        self.echo_active = false;
+        self.last_echo_movers = None;
         self.eal_file = file;
         self.eal_environment = None;
         self.eal_environment_id = None;
@@ -2229,8 +2354,12 @@ impl AudioBackend {
     /// attaches continuing sounds at their actual PCM position, including loops.
     pub fn set_eal_enabled(&mut self, enabled: bool) {
         self.eal_enabled.store(enabled, Ordering::Release);
+        if !enabled {
+            self.clear_echofield_ambience();
+            self.apply_echofield_pitch(None);
+        }
         if enabled && self.eal_worker_status.as_ref().is_some_and(|status| !status.running.load(Ordering::Acquire)) {
-            self.set_eal_map(self.eal_file.clone(), self.eal_map.clone());
+            self.set_acoustic_map(self.eal_file.clone(),self.eal_map.clone(),self.echo_bsp.clone());
             return;
         }
         if enabled && self.eal_bus.is_none() { self.start_eal_bus(); }
@@ -2239,9 +2368,30 @@ impl AudioBackend {
 
     fn start_eal_bus(&mut self) {
         if self.eal_bus.is_some() { return; }
-        let Some(map) = self.eal_map.clone() else { return; };
-        match EalWorker::new(self.output_sample_rate, map) {
+        let bsp = self.echo_bsp.clone();
+        let offline = self._device.is_none();
+        let authored = self.eal_map.clone().map(|map| {
+            if bsp.is_some() {
+                EalWorker::new_authored(self.output_sample_rate, map, bsp.clone(), offline)
+            } else {
+                EalWorker::new(self.output_sample_rate, map)
+            }
+        });
+        let (using_echo,worker) = match authored {
+            Some(Ok(worker)) => (false,Ok(worker)),
+            authored => if let Some(bsp)=bsp {
+                if let Some(Err(error))=authored {eprintln!("EAL native initialization failed: {error}; trying EchoField");}
+                (true,EalWorker::new_echo(self.output_sample_rate,bsp,offline))
+            }else if let Some(worker)=authored{(false,worker)}else{return;}
+        };
+        match worker {
             Ok(worker) => {
+                self.echo_active=using_echo;
+                *worker.status.weather.lock().unwrap_or_else(|error| error.into_inner()) = self.ambience.weather;
+                *worker.status.echo_settings.lock().unwrap_or_else(|error| error.into_inner()) = self.echo_settings;
+                *worker.status.ambience_assets.lock().unwrap_or_else(|error| error.into_inner()) = self.echo_ambience_assets.as_ref().map(AssetSearchPath::fork);
+                worker.status.ambience_paused.store(self.rate == 0.0, Ordering::Relaxed);
+                worker.status.software_underwater.store(self.underwater_mode != 0, Ordering::Relaxed);
                 self.eal_worker_status = Some(Arc::clone(&worker.status));
                 let (bus, wet) = EalBus::new(worker, self.listener, Arc::clone(&self.eal_enabled), Arc::clone(&self.eal_debug_mode), self.output_sample_rate, self._device.is_none());
                 bus.update_listener(self.listener, self.eal_hrtf_enabled);
@@ -2250,9 +2400,9 @@ impl AudioBackend {
                 self.eal_effects_error = None;
                 let requests: Vec<_> = self.loops.iter().filter_map(|r| self.loop_voices.values()
                     .find(|v| v.qpath == r.qpath).map(|v| (r.clone(),Arc::clone(&v.sound)))).collect();
-                self.set_loops(requests);
+                self.set_all_loops(requests);
                 self.reconnect_eal_sends();
-                println!("EAL: OpenAL Soft effects worker enabled; {:.1} ms scene latency", self.info().eal_latency_ms);
+                println!("{}: OpenAL Soft effects worker enabled; {:.1} ms scene latency", if using_echo{"EchoField"}else{"EAL"},self.info().eal_latency_ms);
             },
             Err(err) => {
                 self.eal_effects_error = Some(err.clone());
@@ -2272,14 +2422,18 @@ impl AudioBackend {
             if voice.wet_player.is_some() || !matches!(voice.request.origin, SoundOrigin::Entity(_) | SoundOrigin::Fixed(_)) { continue; }
             if !self.eal_oneshot_budget_left() { break; }
             let send = self.eal_send(&voice.request.qpath, Arc::clone(&voice.sound), Arc::clone(&voice.gains), voice.loop_start.is_some(), voice.loop_start.unwrap_or(0), None);
-            if let Some(send) = &send { send.set_speed(self.rate.max(0.0)); }
+            if let Some(send) = &send { send.set_speed(self.rate.max(0.0) * voice.doppler); }
             self.voices[i].wet_player = send;
         }
-        let names: Vec<_> = self.loop_voices.keys().cloned().collect();
+        let mut names: Vec<_> = self.loop_voices.keys().cloned().collect();
+        names.sort_by_key(|name| name.starts_with(RIVER_LOOP_PREFIX));
+        let mut wet_count = self.loop_voices.values().filter(|v| v.wet_player.is_some()).count();
         for name in names {
             let voice = &self.loop_voices[&name];
-            if voice.wet_player.is_some() || (self.eal_map.is_some() && name == voice.qpath) { continue; }
+            if voice.wet_player.is_some() || ((self.eal_map.is_some() || self.echo_bsp.is_some()) && name == voice.qpath) { continue; }
+            if name.starts_with(RIVER_LOOP_PREFIX) && wet_count >= crate::eal_native::MAX_SOURCES - EAL_ONESHOT_SOURCES { continue; }
             let send = self.eal_send(&voice.qpath, Arc::clone(&voice.sound), Arc::clone(&voice.gains), true, 0, None);
+            wet_count += send.is_some() as usize;
             self.loop_voices.get_mut(&name).unwrap().wet_player = send;
         }
     }
@@ -2300,7 +2454,7 @@ impl AudioBackend {
             }
         }
         if self.eal_enabled.load(Ordering::Relaxed) && self.eal_bus.is_none()
-            && self.eal_map.is_some() && self.eal_effects_error.is_none() {
+            && (self.eal_map.is_some() || self.echo_bsp.is_some()) && self.eal_effects_error.is_none() {
             self.start_eal_bus();
         }
         self.origins.clear();
@@ -2315,6 +2469,10 @@ impl AudioBackend {
         // live switch the first frame after the worker reports ready.
         self.refresh_steam_audio_environmental_runtime();
         self.refresh_voice_gains();
+        self.update_echofield_pitch();
+        let mut ambience = std::mem::take(&mut self.ambience);
+        ambience.frame(self);
+        self.ambience = ambience;
         self.submit_environment_frame();
         self.update_music();
     }
@@ -2411,11 +2569,128 @@ impl AudioBackend {
     /// Only the game-sound bus is filtered; the separate music mixer is dry.
     /// A single atomic write updates the audio-thread DSP without reallocating voices.
     pub fn set_underwater(&mut self, mode: u8, listener_submerged: bool) {
+        if self.ambience.weather.submerged != listener_submerged {
+            self.ambience.weather.submerged = listener_submerged;
+            self.publish_echofield_weather();
+        }
         let next = if listener_submerged { mode.min(3) } else { 0 };
         if self.underwater_mode != next {
             self.underwater_mode = next;
             self.underwater_control.store(next, Ordering::Relaxed);
+            if let Some(status) = &self.eal_worker_status {
+                status.software_underwater.store(next != 0, Ordering::Relaxed);
+            }
         }
+    }
+
+    pub fn set_echofield_weather(&mut self, hour: f32, rains: bool, storm: bool, wind: f32, temperature: f32) {
+        let weather = jka_echofield::soundscape::Weather {
+            hour, raining: rains, storm, wind_metres_per_second: wind, temperature,
+            submerged: self.ambience.weather.submerged,
+        };
+        if self.ambience.weather != weather {
+            self.ambience.weather = weather;
+            self.publish_echofield_weather();
+        }
+    }
+
+    pub fn set_echofield_settings(&mut self, settings: crate::EchoSettings) {
+        if self.echo_settings == settings { return; }
+        self.echo_settings = settings;
+        if !settings.enhancements {
+            self.clear_echofield_ambience();
+        }
+        if !settings.enhancements || !settings.doppler {
+            self.apply_echofield_pitch(None);
+        }
+        if let Some(status) = &self.eal_worker_status {
+            *status.echo_settings.lock().unwrap_or_else(|error| error.into_inner()) = settings;
+        }
+    }
+
+    fn update_echofield_pitch(&mut self) {
+        if !self.eal_enabled.load(Ordering::Relaxed)
+            || !self.echo_settings.enhancements || !self.echo_settings.doppler
+        {
+            return;
+        }
+        let Some(status) = &self.eal_worker_status else { return; };
+        if !status.running.load(Ordering::Acquire) {
+            self.apply_echofield_pitch(None);
+            return;
+        }
+        let pending = status.doppler.try_lock().ok().and_then(|mut pending| pending.take());
+        if let Some(pitch) = pending {
+            self.apply_echofield_pitch(Some(&pitch));
+        }
+    }
+
+    fn apply_echofield_pitch(&mut self, pitches: Option<&HashMap<u64, f32>>) {
+        let pitch = |gains: &Gains| {
+            pitches.and_then(|map| map.get(&gains.eal_owner.load(Ordering::Acquire)).copied()).unwrap_or(1.0)
+        };
+        for voice in &mut self.voices {
+            let next = pitch(&voice.gains);
+            if voice.doppler != next {
+                voice.doppler = next;
+                if self.rate > 0.0 {
+                    voice.player.set_speed(self.rate * next);
+                    if let Some(wet) = &voice.wet_player { wet.set_speed(self.rate * next); }
+                }
+            }
+        }
+        for voice in self.loop_voices.values_mut() {
+            let next = pitch(&voice.gains);
+            if voice.doppler != next {
+                voice.doppler = next;
+                if self.rate > 0.0 {
+                    voice.player.set_speed(next);
+                    if let Some(wet) = &voice.wet_player { wet.set_speed(next); }
+                }
+            }
+        }
+    }
+
+    fn publish_echofield_weather(&self) {
+        if let Some(status) = &self.eal_worker_status {
+            *status.weather.lock().unwrap_or_else(|error| error.into_inner()) = self.ambience.weather;
+        }
+    }
+
+    pub fn set_echofield_movers(&mut self, movers: impl Iterator<Item = crate::EchoMover>) {
+        if !self.eal_enabled.load(Ordering::Relaxed) || self.echo_bsp.is_none() {
+            return;
+        }
+        let Some(status) = &self.eal_worker_status else { return; };
+        let now = Instant::now();
+        if self._device.is_some() && self.last_echo_movers.is_some_and(|last| {
+            now.saturating_duration_since(last) < Duration::from_millis(50)
+        }) {
+            return;
+        }
+        if let Ok(mut pending) = status.movers.try_lock() {
+            *pending = Some(movers.collect());
+            self.last_echo_movers = Some(now);
+        }
+    }
+
+    pub fn set_echofield_river_contacts(&self, origins: impl Iterator<Item = [f32; 3]>) {
+        if self._device.is_none() || !self.eal_enabled.load(Ordering::Relaxed)
+            || !self.echo_settings.enhancements
+        {
+            return;
+        }
+        let Some(status) = &self.eal_worker_status else { return; };
+        if let Ok(mut contacts) = status.river_contacts.try_lock() {
+            *contacts = Some((Instant::now(), origins.take(32)
+                .map(jka_echofield::world::Contact::river).collect()));
+        }
+    }
+
+    fn clear_echofield_ambience(&mut self) {
+        let mut ambience = std::mem::take(&mut self.ambience);
+        ambience.clear(self);
+        self.ambience = ambience;
     }
 
     /// Select the reference mix semantics explicitly; do not infer game
@@ -2491,7 +2766,7 @@ impl AudioBackend {
             source_origin: Option<[f32; 3]>,
         }
 
-        let split = self.eal_map.is_some() && self.eal_bus.is_some();
+        let split = (self.eal_map.is_some() || self.echo_bsp.is_some()) && self.eal_bus.is_some();
         let mut asset_totals: HashMap<&str,[f32;2]> = HashMap::new();
         let mut totals: HashMap<String, LoopTotal> = HashMap::with_capacity(self.loop_voices.len());
         for request in &self.loops {
@@ -2508,11 +2783,12 @@ impl AudioBackend {
                     spatialize_detail_mode(origin, self.listener, CHAN_AUTO, self.separation, self.jk2_mode)
                 }
             };
-            if split {
+            if split && !request.is_river() {
                 let asset=asset_totals.entry(&request.qpath).or_default();
                 for i in 0..2 { asset[i] += spatial.stereo[i]*request.volume; }
             }
             let key = self.loop_key(request);
+            if request.is_river() && !self.loop_voices.contains_key(&key) { continue; }
             let key = if self.loop_voices.contains_key(&key) { key } else { request.qpath.clone() };
             let total = totals.entry(key).or_default();
             total.source_origin = Some(match request.origin { SoundOrigin::Local => self.listener.origin, SoundOrigin::Entity(p) | SoundOrigin::Fixed(p) => p });
@@ -2541,7 +2817,9 @@ impl AudioBackend {
             // Retain the legacy per-asset cap even when its emitters have
             // independent EAL routes. Splitting 100 identical torches must
             // not turn one clamped loop into 100 full-volume loops.
-            let scale = asset_totals.get(voice.qpath.as_str()).map_or([1.;2],|sum|sum.map(|v|if v>1. {1./v} else {1.}));
+            let scale = if qpath.starts_with(RIVER_LOOP_PREFIX) { [1.;2] } else {
+                asset_totals.get(voice.qpath.as_str()).map_or([1.;2],|sum|sum.map(|v|if v>1. {1./v} else {1.}))
+            };
             let next = std::array::from_fn(|i|(stereo[i]*scale[i]).min(1.) * self.effects_volume);
             for (previous, next) in voice.gains.get().into_iter().zip(next) {
                 self.largest_gain_step = self.largest_gain_step.max((previous - next).abs());
@@ -2586,36 +2864,72 @@ impl AudioBackend {
     /// Replace this frame's loop set (CGame's S_ClearLoopingSounds followed by
     /// its S_AddLoopingSound calls). Each request carries its registered sfx.
     fn loop_key(&self, request: &LoopRequest) -> String {
-        if self.eal_map.is_some() && self.eal_bus.is_some() { format!("{}\u{1f}{:016x}",request.qpath,request.emitter) }
+        if request.is_river() { format!("{RIVER_LOOP_PREFIX}{}\u{1f}{:016x}",request.qpath,request.emitter) }
+        else if (self.eal_map.is_some() || self.echo_bsp.is_some()) && self.eal_bus.is_some() { format!("{}\u{1f}{:016x}",request.qpath,request.emitter) }
         else { request.qpath.clone() }
     }
 
     pub fn set_loops(&mut self, mut requests: Vec<(LoopRequest, Arc<RegisteredSound>)>) {
+        requests.extend(self.river_loops.iter().cloned());
+        self.set_all_loops(requests);
+    }
+
+    /// River controls arrive at 10 Hz independently of CGame's frame loops.
+    pub fn set_river_loops(&mut self, requests: Vec<(LoopRequest, Arc<RegisteredSound>)>) {
+        if requests.is_empty() && self.river_loops.is_empty() { return; }
+        let requests: Vec<_> = requests.into_iter().filter(|(r,_)| r.is_river()).take(MAX_RIVER_LOOP_VOICES).collect();
+        // Per-frame envelope changes need no player-set rebuild. Keep the
+        // persisted requests current so CGame's next loop submission uses them.
+        let same_voices = requests.len() == self.river_loops.len() && requests.iter().all(|(r, sound)| {
+            self.river_loops.iter().any(|(old, old_sound)| {
+                old.emitter == r.emitter && old.qpath == r.qpath && Arc::ptr_eq(sound, old_sound)
+            }) && self.loop_voices.contains_key(&self.loop_key(r))
+        });
+        if same_voices {
+            for (request, _) in &requests {
+                if let Some(current) = self.loops.iter_mut().find(|r| r.is_river() && r.emitter == request.emitter && r.qpath == request.qpath) {
+                    current.origin = request.origin;
+                    current.volume = request.volume;
+                }
+            }
+            self.river_loops = requests;
+            self.refresh_loop_gains();
+            return;
+        }
+        self.river_loops = requests;
+        let legacy = self.loops.iter().filter(|r| !r.is_river()).filter_map(|r| {
+            self.loop_voices.get(&self.loop_key(r)).or_else(|| self.loop_voices.get(&r.qpath))
+                .map(|v| (r.clone(), Arc::clone(&v.sound)))
+        }).collect();
+        self.set_loops(legacy);
+    }
+
+    fn set_all_loops(&mut self, mut requests: Vec<(LoopRequest, Arc<RegisteredSound>)>) {
         self.loops.clear();
-        let phases: HashMap<String, usize> = self.loop_voices.values().filter_map(|v| {
+        let phases: HashMap<String, usize> = self.loop_voices.iter().filter(|(key, _)| !key.starts_with(RIVER_LOOP_PREFIX)).filter_map(|(_, v)| {
             let p = f64::from_bits(v.gains.eal_position.load(Ordering::Acquire));
             p.is_finite().then(|| (v.qpath.clone(),p.max(0.0) as usize))
         }).collect();
-        let split = self.eal_map.is_some() && self.eal_bus.is_some();
+        let split = (self.eal_map.is_some() || self.echo_bsp.is_some()) && self.eal_bus.is_some();
         let native_limit = crate::eal_native::MAX_SOURCES - EAL_ONESHOT_SOURCES;
         if split {
             let distance = |r:&LoopRequest| match r.origin {
                 SoundOrigin::Local => 0.0,
                 SoundOrigin::Entity(p) | SoundOrigin::Fixed(p) => p.iter().zip(self.listener.origin).map(|(a,b)|(a-b).powi(2)).sum::<f32>(),
             };
-            requests.sort_by(|(a,_),(b,_)|distance(a).total_cmp(&distance(b)).then(a.emitter.cmp(&b.emitter)).then(a.qpath.cmp(&b.qpath)));
+            requests.sort_by(|(a,_),(b,_)|a.is_river().cmp(&b.is_river()).then(distance(a).total_cmp(&distance(b))).then(a.emitter.cmp(&b.emitter)).then(a.qpath.cmp(&b.qpath)));
         }
         let mut selected = std::collections::HashSet::new();
-        let mut wanted: HashMap<String, (String, Arc<RegisteredSound>)> = HashMap::new();
+        let mut wanted: HashMap<String, (String, Arc<RegisteredSound>, u64)> = HashMap::new();
         for (request, sound) in requests {
             let mut key = self.loop_key(&request);
             if split && !selected.contains(&key) {
                 if selected.len() < native_limit { selected.insert(key.clone()); }
-                else { key=request.qpath.clone(); }
+                else if !request.is_river() { key=request.qpath.clone(); }
             }
-            // Beyond the native budget, keep the same per-sfx merged audio
-            // the legacy mixer provided rather than dropping extra emitters.
-            wanted.entry(key).or_insert((request.qpath.clone(),sound));
+            // Legacy overflow merges by asset; river overflow stays spatial
+            // and dry instead of collapsing different river regions.
+            wanted.entry(key).or_insert((request.qpath.clone(),sound,request.emitter));
             self.loops.push(request);
         }
         let stale: Vec<String> = self
@@ -2629,14 +2943,40 @@ impl AudioBackend {
                 self.retire(voice.player, voice.wet_player, &voice.gains);
             }
         }
+        // Release river routes before admitting new legacy emitters. The river
+        // players keep their independent dry spatial path and PCM clock.
+        if split {
+            for (key, voice) in &mut self.loop_voices {
+                if key.starts_with(RIVER_LOOP_PREFIX) && !selected.contains(key) {
+                    if let Some(wet) = voice.wet_player.take() { wet.stop(); }
+                    voice.gains.eal_native_mix.store(0.0f32.to_bits(), Ordering::Release);
+                }
+            }
+        }
+        // HashMap iteration must not let river routes enter the native queue
+        // ahead of legacy loops when both are created in the same frame.
+        let mut wanted: Vec<_> = wanted.into_iter().collect();
+        wanted.sort_by(|(a, _), (b, _)| {
+            a.starts_with(RIVER_LOOP_PREFIX).cmp(&b.starts_with(RIVER_LOOP_PREFIX)).then(a.cmp(b))
+        });
         let elapsed = self.loop_epoch.elapsed().as_secs_f64();
-        for (key, (qpath, sound)) in wanted {
+        for (key, (qpath, sound, emitter)) in wanted {
+            let river = key.starts_with(RIVER_LOOP_PREFIX);
+            let native = split && selected.contains(&key);
             if self.loop_voices.contains_key(&key) { continue; }
-            let native = split && key != qpath;
-            let count = self.loop_voices.iter().filter(|(k,v)| (split && **k != v.qpath) == native).count();
-            if count >= if native { native_limit } else { MAX_LOOP_VOICES } { continue; }
-            let phase = phases.get(&qpath).copied().unwrap_or_else(|| (elapsed * f64::from(sound.sample_rate.get())) as usize);
+            let count = self.loop_voices.iter().filter(|(k,v)| {
+                if river { k.starts_with(RIVER_LOOP_PREFIX) }
+                else { !k.starts_with(RIVER_LOOP_PREFIX) && (split && **k != v.qpath) == native }
+            }).count();
+            if count >= if river { MAX_RIVER_LOOP_VOICES } else if native { native_limit } else { MAX_LOOP_VOICES } { continue; }
+            let clock = (elapsed * f64::from(sound.sample_rate.get())) as usize;
+            let phase = if river {
+                // Stable decorrelated phase for a spatial region; all acoustic
+                // backends receive exactly the same PCM start position.
+                clock.wrapping_add((emitter as usize) % sound.samples.len().max(1))
+            } else { phases.get(&qpath).copied().unwrap_or(clock) };
             let gains = Arc::new(Gains::new([0.0; 2]));
+            gains.echo_max_distance.store(echo_max_distance(CHAN_AUTO,self.jk2_mode).to_bits(),Ordering::Relaxed);
             gains.eal_track_position.store(true, Ordering::Release);
             if let Some(request) = self.loops.iter().find(|r| self.loop_key(r) == key) {
                 let origin = match request.origin { SoundOrigin::Local => self.listener.origin, SoundOrigin::Entity(p) | SoundOrigin::Fixed(p) => p };
@@ -2671,7 +3011,15 @@ impl AudioBackend {
                 (connect_player(&self.mixer, StereoSource::looping(sound, Arc::clone(&gains), phase)), false)
             };
             if self.rate == 0.0 { player.pause(); }
-            self.loop_voices.insert(key, LoopVoice { qpath: qpath.clone(), player, wet_player, sound: retained_sound, gains, steam_audio_capable });
+            self.loop_voices.insert(key, LoopVoice { qpath: qpath.clone(), player, wet_player, sound: retained_sound, gains, steam_audio_capable, doppler: 1.0 });
+        }
+        if split && !self.river_loops.is_empty() {
+            for key in selected.iter().filter(|key| key.starts_with(RIVER_LOOP_PREFIX)) {
+                let Some(v) = self.loop_voices.get(key) else { continue; };
+                if v.wet_player.is_some() { continue; }
+                let send = self.eal_send(&v.qpath, Arc::clone(&v.sound), Arc::clone(&v.gains), true, 0, None);
+                self.loop_voices.get_mut(key).unwrap().wet_player = send;
+            }
         }
         self.refresh_loop_gains();
     }
@@ -2690,23 +3038,32 @@ impl AudioBackend {
     }
 
     pub fn set_rate(&mut self, rate: f32) {
+        let was_paused = self.rate == 0.0;
         self.rate = rate;
+        let paused = rate == 0.0;
+        if paused != was_paused {
+            self.ambience.set_paused(paused);
+            if let Some(status) = &self.eal_worker_status {
+                status.ambience_paused.store(paused, Ordering::Relaxed);
+                status.ambience.lock().unwrap_or_else(|error| error.into_inner()).triggered.clear();
+            }
+        }
         if rate == 0.0 {
             if let Some(tone) = self.variometer.take() { tone.stop(); }
         }
         for voice in &self.voices {
             if rate == 0.0 { voice.player.pause(); }
-            else { voice.player.set_speed(rate); voice.player.play(); }
+            else { voice.player.set_speed(rate * voice.doppler); voice.player.play(); }
             if let Some(wet) = &voice.wet_player {
-                if rate == 0.0 { wet.pause(); } else { wet.set_speed(rate); wet.play(); }
+                if rate == 0.0 { wet.pause(); } else { wet.set_speed(rate * voice.doppler); wet.play(); }
             }
         }
-        // OpenJK loops follow the shared paint clock rather than the demo
-        // timescale, so they only pause; they are never pitch-shifted.
+        // OpenJK loops follow the shared paint clock. Their pitch depends on
+        // physical motion when Echofield is active, independent of demo rate.
         for voice in self.loop_voices.values() {
-            if rate == 0.0 { voice.player.pause(); } else { voice.player.play(); }
+            if rate == 0.0 { voice.player.pause(); } else { voice.player.set_speed(voice.doppler); voice.player.play(); }
             if let Some(wet) = &voice.wet_player {
-                if rate == 0.0 { wet.pause(); } else { wet.set_speed(1.0); wet.play(); }
+                if rate == 0.0 { wet.pause(); } else { wet.set_speed(voice.doppler); wet.play(); }
             }
         }
         if let Some(music) = &self.music {
@@ -2772,6 +3129,7 @@ impl AudioBackend {
         spatial.stereo = spatial.stereo.map(|gain| gain * volume);
         spatial.mono *= volume;
         let gains = Arc::new(Gains::new(spatial.stereo));
+        gains.echo_max_distance.store(echo_max_distance(request.channel,self.jk2_mode).to_bits(),Ordering::Relaxed);
         gains.set_hrtf(spatial.mono, spatial.direction, spatial.hrtf_spatializable);
 
         let environment_origin = match request.origin {
@@ -2832,7 +3190,12 @@ impl AudioBackend {
             (connect_player(voice_mixer, emote_stereo_source(sound, Arc::clone(&gains), loop_start)), false)
         };
         if self.rate == 0.0 { player.pause(); } else { player.set_speed(self.rate); }
-        self.voices.push(Voice { loop_start, player, wet_player, sound: retained_sound, gains, request, steam_audio_capable, volume });
+        if world_positional && !is_dry_voice && loop_start.is_none() {
+            let mut ambience = std::mem::take(&mut self.ambience);
+            ambience.reflect(self, &retained_sound, spatial.mono);
+            self.ambience = ambience;
+        }
+        self.voices.push(Voice { loop_start, player, wet_player, sound: retained_sound, gains, request, steam_audio_capable, volume, doppler: 1.0 });
     }
 
     /// `S_StartAmbientSound`: a one-shot at `volume` (0..=1 of full).
@@ -2868,6 +3231,8 @@ impl AudioBackend {
     }
 
     pub fn clear(&mut self) {
+        self.clear_echofield_ambience();
+        self.last_echo_movers = None;
         if let Some(tone) = self.variometer.take() { tone.stop(); }
         for voice in std::mem::take(&mut self.voices) { self.retire(voice.player, voice.wet_player, &voice.gains); }
         self.channel_replacements = 0;
@@ -2875,6 +3240,7 @@ impl AudioBackend {
         self.last_capacity_kick = None;
         for (_, voice) in std::mem::take(&mut self.loop_voices) { self.retire(voice.player, voice.wet_player, &voice.gains); }
         self.loops.clear();
+        self.river_loops.clear();
         self.origins.clear();
         // A seek/unload discards room history. Native teardown stays on its
         // worker; the next frame starts a fresh bus if requested.
@@ -2997,11 +3363,38 @@ fn sound_gains(
     sound_spatialization(request, listener, effects_volume, voice_volume, separation).stereo
 }
 
+fn attenuation_parameters(channel:i32,jk2:bool)->(f32,f32){
+    // JK2MV's software S_SpatializeOrigin uses SOUND_FULLVOLUME=80
+    // and SOUND_ATTENUATE=0.0008 for *all* spatial channels. Its
+    // channel-specific 256/768 distances belong to optional OpenAL.
+    if jk2 {
+        (80.0, 0.0008)
+    } else { match channel {
+        3 => (256.0 * 3.0, 0.0008),       // CHAN_VOICE
+        4 => (256.0 * 1.35, 0.004),       // CHAN_VOICE_ATTEN
+        10 => (256.0 * 8.0, 0.0008),      // CHAN_LESS_ATTEN
+        12 => (f32::MAX, 0.0008),         // CHAN_VOICE_GLOBAL
+        _ => (256.0, 0.0008),
+    } }
+}
+fn echo_max_distance(channel:i32,jk2:bool)->f32{
+    let (full,atten)=attenuation_parameters(channel,jk2);
+    full+1.0/atten
+}
+
 /// S_SpatializeOrigin with master_vol = 1 plus the listener-local direction
 /// needed by Steam Audio. The legacy stereo result remains byte-for-byte the
 /// same formula as before. HRTF consumes the RMS-equivalent legacy level plus
 /// `direction`, avoiding the previous pre-pan gain boost for close sounds.
 fn spatialize_detail_mode(origin: [f32; 3], listener: Listener, channel: i32, separation: f32, jk2: bool) -> Spatialization {
+    let (full, attenuation) = attenuation_parameters(channel, jk2);
+    spatialize_with_attenuation(origin, listener, separation, jk2, full, attenuation)
+}
+
+fn spatialize_with_attenuation(
+    origin: [f32; 3], listener: Listener, separation: f32, jk2: bool,
+    full_volume_distance: f32, attenuation: f32,
+) -> Spatialization {
     let delta = std::array::from_fn::<_, 3, _>(|i| origin[i] - listener.origin[i]);
     let distance = delta.iter().map(|v| v * v).sum::<f32>().sqrt();
     let source_dir = if distance > 0.0001 {
@@ -3010,18 +3403,6 @@ fn spatialize_detail_mode(origin: [f32; 3], listener: Listener, channel: i32, se
         [0.0; 3]
     };
 
-    // JK2MV's software S_SpatializeOrigin uses SOUND_FULLVOLUME=80
-    // and SOUND_ATTENUATE=0.0008 for *all* spatial channels. Its
-    // channel-specific 256/768 distances belong to optional OpenAL.
-    let (full_volume_distance, attenuation) = if jk2 {
-        (80.0, 0.0008)
-    } else { match channel {
-        3 => (256.0 * 3.0, 0.0008),       // CHAN_VOICE
-        4 => (256.0 * 1.35, 0.004),       // CHAN_VOICE_ATTEN
-        10 => (256.0 * 8.0, 0.0008),      // CHAN_LESS_ATTEN
-        12 => (f32::MAX, 0.0008),         // CHAN_VOICE_GLOBAL
-        _ => (256.0, 0.0008),
-    } };
     let distance_loss = ((distance - full_volume_distance).max(0.0) * attenuation).max(0.0);
     let distance_gain = (1.0 - distance_loss).max(0.0);
 

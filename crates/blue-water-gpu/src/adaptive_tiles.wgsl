@@ -9,25 +9,28 @@
 @group(0) @binding(0) var reduced_color: texture_2d<f32>;
 @group(0) @binding(1) var reduced_depth: texture_depth_2d;
 @group(0) @binding(2) var<storage, read_write> tiles: array<u32>;
-// x: luminance curvature share (`r_oceanPixelContrast`).
+// x: luminance curvature share (`r_oceanPixelContrast`). y: use Coast's material flags in alpha.
 @group(0) @binding(3) var<uniform> params: vec4<f32>;
 
 const DENSE_BLOCKS: u32 = 8u;
 
-var<workgroup> reasons: array<atomic<u32>, 4>;
+var<workgroup> reasons: array<atomic<u32>, 5>;
+// The 8x8 tile plus its one-texel border. Luminance, depth and eligibility
+// are read from the reduced targets once per tile, then shared by its lanes.
+var<workgroup> neighbourhood: array<vec3<f32>, 100>;
 
 // Why one block needs the full material: 0 it does not, 1 a texel without water, 2 a depth step the reconstruction
 // would reject a neighbour across, 3 luminance curving past the threshold.
-fn block_reason(centre: vec2<i32>, dim: vec2<i32>) -> u32 {
+fn block_reason(centre: u32) -> u32 {
     var lum: array<f32, 9>;
     var depth: array<f32, 9>;
-    for (var j = 0; j < 3; j++) {
-        for (var i = 0; i < 3; i++) {
-            let at = clamp(centre + vec2<i32>(i - 1, j - 1), vec2<i32>(0), dim - 1);
-            let shaded = textureLoad(reduced_color, at, 0);
-            if shaded.a < 0.5 { return 1u; }
-            lum[j * 3 + i] = dot(shaded.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-            depth[j * 3 + i] = textureLoad(reduced_depth, at, 0);
+    for (var j = 0u; j < 3u; j++) {
+        for (var i = 0u; i < 3u; i++) {
+            let value = neighbourhood[centre - 11u + j * 10u + i];
+            if value.z < 0.5 { return 1u; }
+            if params.y > 0.5 && value.z > 1.5 { return 4u; }
+            lum[j * 3u + i] = value.x;
+            depth[j * 3u + i] = value.y;
         }
     }
     // The reconstruction weighs a neighbour by exp(-600 |depth step|): past 1/600 it starts leaving one out.
@@ -47,15 +50,23 @@ fn block_reason(centre: vec2<i32>, dim: vec2<i32>) -> u32 {
 @compute @workgroup_size(8, 8)
 fn classify(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocation_index) local: u32,
         @builtin(workgroup_id) group: vec3<u32>, @builtin(num_workgroups) groups: vec3<u32>) {
-    if local < 4u {
+    if local < 5u {
         atomicStore(&reasons[local], 0u);
     }
-    workgroupBarrier();
     let dim = vec2<i32>(textureDimensions(reduced_color));
-    let centre = vec2<i32>(id.xy);
+    let tile_origin = vec2<i32>(group.xy * 8u) - 1;
+    for (var i = local; i < 100u; i += 64u) {
+        let offset = vec2<i32>(i32(i % 10u), i32(i / 10u));
+        let at = clamp(tile_origin + offset, vec2<i32>(0), dim - 1);
+        let shaded = textureLoad(reduced_color, at, 0);
+        let depth = textureLoad(reduced_depth, at, 0);
+        neighbourhood[i] = vec3<f32>(dot(shaded.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), depth, shaded.a);
+    }
+    workgroupBarrier();
+    let centre = 11u + (local / 8u) * 10u + local % 8u;
     // Blocks without water at all (the tile's dry part) need nothing.
-    if all(centre < dim) && textureLoad(reduced_color, centre, 0).a >= 0.5 {
-        atomicAdd(&reasons[block_reason(centre, dim)], 1u);
+    if all(vec2<i32>(id.xy) < dim) && neighbourhood[centre].z >= 0.5 {
+        atomicAdd(&reasons[block_reason(centre)], 1u);
     }
     workgroupBarrier();
     if local == 0u {
@@ -63,6 +74,10 @@ fn classify(@builtin(global_invocation_id) id: vec3<u32>, @builtin(local_invocat
         if atomicLoad(&reasons[3]) >= DENSE_BLOCKS { reason = 3u; }
         if atomicLoad(&reasons[2]) > 0u { reason = 2u; }
         if atomicLoad(&reasons[1]) > 0u { reason = 1u; }
+        if params.y > 0.5 && (atomicLoad(&reasons[4]) > 0u
+            || atomicLoad(&reasons[0]) + atomicLoad(&reasons[1]) + atomicLoad(&reasons[2]) + atomicLoad(&reasons[3]) == 0u) {
+            reason = 4u;
+        }
         tiles[group.y * groups.x + group.x] = reason;
     }
 }

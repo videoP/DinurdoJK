@@ -206,6 +206,9 @@ pub struct SaberDefinition {
     pub hit_person_effect2: Option<String>,
     pub hit_other_effect: Option<String>,
     pub hit_other_effect2: Option<String>,
+    /// jaPRO CG_SaberCompWork's optional victim-decal shader per blade style.
+    pub g2_marks_shader: Option<String>,
+    pub g2_marks_shader2: Option<String>,
     /// SFL2_NO_CLASH_FLARE / SFL2_NO_CLASH_FLARE2.  MP CG_EntityEvent
     /// intentionally checks the primary flag for EV_SABER_BLOCK.
     pub no_clash_flare: bool,
@@ -267,6 +270,8 @@ impl SaberDefinition {
             hit_person_effect2: None,
             hit_other_effect: None,
             hit_other_effect2: None,
+            g2_marks_shader: None,
+            g2_marks_shader2: None,
             no_clash_flare: false,
             no_clash_flare2: false,
         }
@@ -746,6 +751,8 @@ fn parse_saber_file(
                 "blockeffect2" => definition.block_effect2 = parse_optional_qpath(&mut parser)?,
                 "hitpersoneffect" => definition.hit_person_effect = parse_optional_qpath(&mut parser)?,
                 "hitpersoneffect2" => definition.hit_person_effect2 = parse_optional_qpath(&mut parser)?,
+                "g2marksshader" => definition.g2_marks_shader = parse_optional_qpath(&mut parser)?,
+                "g2marksshader2" => definition.g2_marks_shader2 = parse_optional_qpath(&mut parser)?,
                 "hitothereffect" => definition.hit_other_effect = parse_optional_qpath(&mut parser)?,
                 "hitothereffect2" => definition.hit_other_effect2 = parse_optional_qpath(&mut parser)?,
                 "noclashflare" | "noclashflare2" => {
@@ -1101,6 +1108,8 @@ mod tests {
                     hitPersonEffect2 saber/custom_person2.efx
                     hitOtherEffect saber/custom_other.efx
                     hitOtherEffect2 saber/custom_other2.efx
+                    g2MarksShader gfx/damage/custom_saber
+                    g2MarksShader2 gfx/damage/custom_saber2
                     noClashFlare 1
                     noClashFlare2 1
                     saberColor2 green
@@ -1155,6 +1164,8 @@ mod tests {
         assert_eq!(def.hit_person_effect2.as_deref(), Some("saber/custom_person2.efx"));
         assert_eq!(def.hit_other_effect.as_deref(), Some("saber/custom_other.efx"));
         assert_eq!(def.hit_other_effect2.as_deref(), Some("saber/custom_other2.efx"));
+        assert_eq!(def.g2_marks_shader.as_deref(), Some("gfx/damage/custom_saber"));
+        assert_eq!(def.g2_marks_shader2.as_deref(), Some("gfx/damage/custom_saber2"));
         assert!(def.no_clash_flare);
         assert!(def.no_clash_flare2);
         // File order: saberColor after saberColor2 resets it, the later one wins.

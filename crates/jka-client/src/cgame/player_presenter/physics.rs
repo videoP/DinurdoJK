@@ -146,13 +146,31 @@ impl PlayerPresenter {
         );
     }
 
+    pub fn set_skin_gore_enabled(&mut self, enabled: bool) {
+        if self.skin_gore_enabled == enabled { return; }
+        self.skin_gore_enabled = enabled;
+        self.gore.clear();
+        self.skin_gore.clear();
+        self.pending_gore.clear();
+        self.skin_gore_pains.clear();
+        self.saber_gore_hits.clear();
+        self.saber_gore_blades.clear();
+        self.last_gpu.clear();
+    }
+
     pub fn set_gore_limit(&mut self, limit: usize) {
         self.gore_limit = limit.min(64);
-        if self.gore_limit == 0 {
+        if !self.gore_marks_enabled() {
             self.pending_gore.clear();
+            self.saber_gore_hits.clear();
+            self.saber_gore_blades.clear();
             self.gore.clear();
             self.last_gpu.clear();
         }
+    }
+
+    pub(in crate::cgame::player_presenter) fn gore_marks_enabled(&self) -> bool {
+        self.skin_gore_enabled || self.gore_limit > 0
     }
 
     pub(crate) fn set_hair_physics_mode(&mut self, mode: u8) {
@@ -222,6 +240,11 @@ impl PlayerPresenter {
         self.cloth.set_config(config);
     }
 
+    /// r_clothSolver 1: the GPU cloth solver (same r_cloth* settings).
+    pub(crate) fn set_cloth_gpu_solver(&mut self, enabled: bool) {
+        self.cloth.set_gpu_solver(enabled);
+    }
+
     pub(crate) fn set_cloth_wind(&mut self, wind: Option<crate::ocean::AtmosphericWind>) {
         self.cloth_weather_wind = wind;
     }
@@ -253,6 +276,22 @@ impl PlayerPresenter {
         &mut self, specs: &[crate::cgame::weapon_fx::ChunkSpec], current_time: i32,
     ) -> bool {
         self.ragdolls.spawn_breakable_debris(specs, current_time)
+    }
+
+    pub(crate) fn gib_blood_samples(&mut self, time: i32) -> Vec<([f32; 3], [f32; 3])> {
+        self.ragdolls.gib_blood_samples(time)
+    }
+
+    pub(crate) fn physics_gib_blood_samples(&mut self, time: i32) -> Vec<([f32; 3], [f32; 3])> {
+        self.ragdolls.gib_blood_samples(time)
+    }
+
+    pub(crate) fn physics_gib_smear_samples(&mut self, time: i32) -> Vec<crate::ninja_blood::BloodDragSample> {
+        self.ragdolls.gib_smear_samples(time)
+    }
+
+    pub(crate) fn physics_corpse_smear_samples(&mut self, time: i32) -> Vec<crate::ninja_blood::BloodDragSample> {
+        self.ragdolls.corpse_smear_samples(time)
     }
 
     pub(crate) fn physics_debris_models(&self, time: i32) -> Vec<crate::cgame::weapon_fx::ChunkModel> {
@@ -767,7 +806,7 @@ impl PlayerPresenter {
             rt_rigid: None,
             rt_skinned_key: None,
             ghoul2_gpu: None,
-            fx_gpu_sprites: Some(FxGpuSprites {
+            cloth_gpu: None, fx_gpu_sprites: Some(FxGpuSprites {
                 resident: None,
                 instances: Arc::new(std::mem::take(&mut self.blob_shadow_instances)),
                 blob_shadow: true, lightning: false, rope: false,

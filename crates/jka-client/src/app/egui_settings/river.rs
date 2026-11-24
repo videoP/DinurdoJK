@@ -1,5 +1,5 @@
 //! Live river material authorship.
-use super::{color_row, ocean_slider_d, theme, App};
+use super::{color_row_default, ocean_slider_d, theme, App};
 impl App {
     pub(in crate::app) fn commit_river_settings(&mut self) {
         self.mark_config_dirty();
@@ -17,14 +17,30 @@ impl App {
             .unwrap_or(self.video.river_settings);
         let d = crate::river_settings::Settings::default();
         let mut changed = false;
-        theme::section(ui, "UNDERWATER", "Hybrid-style submerged presentation for this river. r_showtris 128 shows the displaced grid, including dry cells.");
-        theme::row(ui, "Underwater optics A/B", "Both modes share spectral optics: A keeps the original appearance; B adds a subtle waterline tint (default). This does not change s_underwater audio.", theme::Reset::None, |ui| {
+        theme::section(ui, "UNDERWATER", "Appearance below the solved water surface.");
+        theme::row(ui, "Underwater optics", "Shared adds a waterline tint to the original mode. Fluid Ninja uses the Green Murky material with animated caustics, depth tint, and distortion. Underwater blur uses the existing depth-of-field setting.", theme::Reset::None, |ui| {
             changed |= ui.selectable_value(&mut s.underwater_optics, 0, "A · Original").changed();
             changed |= ui.selectable_value(&mut s.underwater_optics, 1, "B · Shared").changed();
+            if jka_river::river_ninja::FLUID_NINJA_INCLUDED {
+                changed |= ui.selectable_value(&mut s.underwater_optics, crate::river_settings::FLUID_NINJA_UNDERWATER, "Fluid Ninja").changed();
+            }
         });
-        color_row(ui, "Underwater color", "Fog tint below the solved water surface (sRGB).", theme::Reset::None, &mut s.underwater_color, &mut changed);
-        ocean_slider_d(ui, "Underwater visibility", "Distance in map units at which blue transmission falls to five percent. Red and green fade sooner, as in Hybrid ocean.", &mut s.underwater_visibility, d.underwater_visibility, 1.0..=65536.0, &mut changed);
-        ocean_slider_d(ui, "Underwater darkening depth", "Downwelling-light depth distance in map units; larger values darken more slowly.", &mut s.underwater_darkening, d.underwater_darkening, 1.0..=65536.0, &mut changed);
+        if s.underwater_optics == crate::river_settings::FLUID_NINJA_UNDERWATER
+            && jka_river::river_ninja::FLUID_NINJA_INCLUDED
+        {
+            let optics = &mut s.ninja_underwater;
+            let defaults = d.ninja_underwater;
+            color_row_default(ui, "Distance tint", "Fluid Ninja DistanceColor. Color the water fades toward with distance.", &mut optics.distance_color, defaults.distance_color, &mut changed);
+            ocean_slider_d(ui, "Distance haze", "Fluid Ninja DistanceMult. Lower values let you see farther through the water.", &mut optics.distance_mult, defaults.distance_mult, 0.0..=0.6, &mut changed);
+            ocean_slider_d(ui, "Brightness", "Fluid Ninja GlobalBrightness. Multiplier for the submerged view.", &mut optics.brightness, defaults.brightness, 0.0..=2.0, &mut changed);
+            ocean_slider_d(ui, "Distortion", "Fluid Ninja VisualDistortIntensity. Amount of animated screen-space bending.", &mut optics.distortion, defaults.distortion, 0.0..=0.05, &mut changed);
+            color_row_default(ui, "Caustics tint", "Fluid Ninja CausticsColor. Tint of the projected light when the caustics texture is installed.", &mut optics.caustics_color, defaults.caustics_color, &mut changed);
+            ocean_slider_d(ui, "Caustics intensity", "Fluid Ninja CausticsMult. Strength of the projected light.", &mut optics.caustics_mult, defaults.caustics_mult, 0.0..=200.0, &mut changed);
+        } else {
+            color_row_default(ui, "Underwater color", "Fog tint below the solved water surface for Original and Shared (sRGB).", &mut s.underwater_color, d.underwater_color, &mut changed);
+            ocean_slider_d(ui, "Underwater visibility", "Distance in map units at which blue transmission falls to five percent. Red and green fade sooner, as in Hybrid ocean.", &mut s.underwater_visibility, d.underwater_visibility, 1.0..=65536.0, &mut changed);
+            ocean_slider_d(ui, "Underwater darkening depth", "Downwelling-light depth distance in map units. Larger values darken more slowly.", &mut s.underwater_darkening, d.underwater_darkening, 1.0..=65536.0, &mut changed);
+        }
         {
             let mut mirror = crate::ocean::underwater_reflections();
             if ui.checkbox(&mut mirror, "Underwater reflections").on_hover_text("Seen from below, the surface mirrors the submerged scene (screen traced) where it reflects: fully outside Snell's window. Off shows the water's own color there and skips the trace. Shared with the Hybrid/Blue Water ocean; all rivers, live, this session. Console: r_underwaterReflections.").changed() {
@@ -46,14 +62,8 @@ impl App {
                 s.water.scattering[1],
                 s.water.scattering[2],
             ];
-            color_row(
-                ui,
-                "Scattering color",
-                "Color of light scattered through the river.",
-                theme::Reset::None,
-                &mut c,
-                &mut changed,
-            );
+            color_row_default(ui, "Scattering color", "Color of light scattered through the river.",
+                &mut c, [d.water.scattering[0], d.water.scattering[1], d.water.scattering[2]], &mut changed);
             s.water.scattering[..3].copy_from_slice(&c);
         }
         {
@@ -62,7 +72,8 @@ impl App {
                 s.water.water_albedo[1],
                 s.water.water_albedo[2],
             ];
-            color_row(ui,"Surface albedo","Diffuse surface color; clear water is colored mainly by absorption and scattering.",theme::Reset::None,&mut c,&mut changed);
+            color_row_default(ui, "Surface albedo", "Diffuse surface color; clear water is colored mainly by absorption and scattering.",
+                &mut c, [d.water.water_albedo[0], d.water.water_albedo[1], d.water.water_albedo[2]], &mut changed);
             s.water.water_albedo[..3].copy_from_slice(&c);
         }
         {
@@ -71,14 +82,8 @@ impl App {
                 s.foam.base_color[1],
                 s.foam.base_color[2],
             ];
-            color_row(
-                ui,
-                "Foam color",
-                "Base color of foam under scene lighting.",
-                theme::Reset::None,
-                &mut c,
-                &mut changed,
-            );
+            color_row_default(ui, "Foam color", "Base color of foam under scene lighting.",
+                &mut c, [d.foam.base_color[0], d.foam.base_color[1], d.foam.base_color[2]], &mut changed);
             s.foam.base_color[..3].copy_from_slice(&c);
         }
         ocean_slider_d(
@@ -312,7 +317,7 @@ impl App {
         theme::section(
             ui,
             "FOAM MATERIAL",
-            "Appearance of the native simulated foam.",
+            "Color, coverage, highlights, and normals of the river foam.",
         );
         ocean_slider_d(
             ui,
@@ -369,12 +374,25 @@ impl App {
                     entry.definition.appearance = s;
                 }
                 self.render_command(crate::renderer::RenderCommand::RiverMaterial(id, s));
+                // Underwater optics are a viewer preference, not river
+                // authoring: also save them as the archived defaults.
+                let mut defaults = self.video.river_settings;
+                defaults.underwater_optics = s.underwater_optics;
+                defaults.ninja_underwater = s.ninja_underwater;
+                defaults.underwater_color = s.underwater_color;
+                defaults.underwater_visibility = s.underwater_visibility;
+                defaults.underwater_darkening = s.underwater_darkening;
+                self.commit_river_defaults(defaults);
             } else {
                 self.commit_river_defaults(s);
             }
         }
     }
     fn commit_river_defaults(&mut self, s: crate::river_settings::Settings) {
+        if s.ninja_underwater != self.video.river_settings.ninja_underwater {
+            self.video.river_settings.ninja_underwater = s.ninja_underwater;
+            self.commit_river_settings();
+        }
         if s.underwater_optics != self.video.river_settings.underwater_optics {
             let _ = self.set_console_cvar("r_riverUnderwaterOptics", &s.underwater_optics.to_string());
         }

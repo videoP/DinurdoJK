@@ -7,6 +7,10 @@ pub struct ClothMaterial {
     pub surface_density: Real,
     pub stretch_compliance: Real,
     pub bend_compliance: Real,
+    /// Bending stiffens with fold size: stiffness is multiplied by
+    /// `1 + bend_hardening * (fold / 90 degrees)^2`. Zero is linear (constant
+    /// stiffness); gentle drape stays soft while sharp creases resist.
+    pub bend_hardening: Real,
     /// Exponential velocity damping coefficient in inverse seconds.
     pub damping: Real,
     pub friction: Real,
@@ -20,6 +24,7 @@ impl Default for ClothMaterial {
             surface_density: 0.2,
             stretch_compliance: 0.0,
             bend_compliance: 1.0e-4,
+            bend_hardening: 0.0,
             damping: 0.1,
             friction: 0.5,
             contact_radius: 0.005,
@@ -42,6 +47,7 @@ impl ClothMaterial {
         for (value, name) in [
             (self.stretch_compliance, "stretch_compliance"),
             (self.bend_compliance, "bend_compliance"),
+            (self.bend_hardening, "bend_hardening"),
             (self.damping, "damping"),
             (self.friction, "friction"),
         ] {

@@ -54,6 +54,7 @@ impl DynamicModelRenderer {
         self.fx_sprite_surface_format = surface_format;
         self.fx_sprite_samples = samples;
         self.skin_wireframe_pipeline = None;
+        if let Some(gore) = self.skin_gore_gpu.as_mut() { gore.pipeline = None; }
         // MD3 / Ghoul2 alpha-mode pipelines are lazy: recompiled by
         // ensure_model_pipelines for only the modes that have draws.
         self.model_bundles.clear();
@@ -259,20 +260,21 @@ impl DynamicModelRenderer {
         device: &wgpu::Device,
         prepare_authored_glow: bool,
     ) {
-        let mut model_mask = 0u16;
+        let mut model_mask = 0u32;
         for draw in &self.draws {
             model_mask |= 1 << draw.alpha_mode.index();
         }
-        let mut skin_mask = 0u16;
-        let mut skin_source_mask = 0u16;
+        let mut skin_mask = 0u32;
+        let mut skin_source_mask = 0u32;
         for draw in &self.skin_draws {
+            if draw.skin_gore.is_some() { continue; }
             skin_mask |= 1 << draw.alpha_mode.index();
             if draw.source_material {
                 skin_source_mask |= 1 << draw.alpha_mode.index();
             }
         }
-        let mut model_glow_mask = 0u16;
-        let mut skin_glow_mask = 0u16;
+        let mut model_glow_mask = 0u32;
+        let mut skin_glow_mask = 0u32;
         if prepare_authored_glow {
             for draw in self.draws.iter().filter(|draw| draw.authored_glow) {
                 model_glow_mask |= 1 << draw.alpha_mode.index();
@@ -404,7 +406,7 @@ impl DynamicModelRenderer {
                     let model_wet = self.model_wet_compiled;
                     jobs.request(key, "mirror Ghoul2 variant", move || {
                         create_ghoul2_skin_pipeline_winding(&device, &layout, &shader, format,
-                            1, mode, legacy_fog, model_wet, false, source, true)
+                            1, mode, legacy_fog, model_wet, false, source, true, false)
                     });
                 }
             }
@@ -441,7 +443,7 @@ impl DynamicModelRenderer {
                         let wet = self.model_wet_compiled;
                         jobs.request(key, "camera portal Ghoul2 variant", move || {
                             create_ghoul2_skin_pipeline_winding(&device, &layout, &shader,
-                                format, 1, mode, fog, wet, false, source, false)
+                                format, 1, mode, fog, wet, false, source, false, false)
                         });
                     }
                 }
@@ -503,7 +505,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline.is_some(),
             DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline.is_some(),
             DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline.is_some(),
-            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass | DynamicModelAlphaMode::SightShellNoDepth => false,
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass | DynamicModelAlphaMode::SightShellNoDepth | DynamicModelAlphaMode::StageMaskBlend => false,
             DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline.is_some(),
             DynamicModelAlphaMode::AdditiveOne => self.fx_sprite_additive_one_pipeline.is_some(),
             DynamicModelAlphaMode::Additive => self.fx_sprite_additive_pipeline.is_some(),
@@ -524,7 +526,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline.as_ref(),
             DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline.as_ref(),
             DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline.as_ref(),
-            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass | DynamicModelAlphaMode::SightShellNoDepth => None,
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass | DynamicModelAlphaMode::SightShellNoDepth | DynamicModelAlphaMode::StageMaskBlend => None,
             DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline.as_ref(),
             DynamicModelAlphaMode::AdditiveOne => self.fx_sprite_additive_one_pipeline.as_ref(),
             DynamicModelAlphaMode::Additive => self.fx_sprite_additive_pipeline.as_ref(),
@@ -546,7 +548,7 @@ impl DynamicModelRenderer {
             DynamicModelAlphaMode::Opaque => self.fx_sprite_opaque_pipeline = Some(pipeline),
             DynamicModelAlphaMode::Mask => self.fx_sprite_mask_pipeline = Some(pipeline),
             DynamicModelAlphaMode::Blend => self.fx_sprite_blend_pipeline = Some(pipeline),
-            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass | DynamicModelAlphaMode::SightShellNoDepth => {},
+            DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite | DynamicModelAlphaMode::Glass | DynamicModelAlphaMode::SightShellNoDepth | DynamicModelAlphaMode::StageMaskBlend => {},
             DynamicModelAlphaMode::MaskBlend => self.fx_sprite_mask_blend_pipeline = Some(pipeline),
             DynamicModelAlphaMode::AdditiveOne => {
                 self.fx_sprite_additive_one_pipeline = Some(pipeline)
@@ -1039,6 +1041,7 @@ pub(in crate::renderer) fn fx_sprite_blend(
         | DynamicModelAlphaMode::BlendDepthWrite
         | DynamicModelAlphaMode::BlendUnlitDepthWrite
         | DynamicModelAlphaMode::MaskBlend
+        | DynamicModelAlphaMode::StageMaskBlend
         | DynamicModelAlphaMode::BlendUnlit => Some(wgpu::BlendState::ALPHA_BLENDING),
         DynamicModelAlphaMode::Modulate => Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
@@ -1208,6 +1211,7 @@ pub(in crate::renderer) fn create_fx_sprite_pipeline(
             DynamicModelAlphaMode::Mask => "JKA GPU FX sprite alpha-test pipeline",
             DynamicModelAlphaMode::Blend => "JKA GPU FX sprite blend pipeline",
             DynamicModelAlphaMode::BlendDepthWrite | DynamicModelAlphaMode::BlendUnlitDepthWrite => "JKA GPU FX sprite blended depth-writing pipeline",
+            DynamicModelAlphaMode::StageMaskBlend => "JKA authored masked blend stage",
             DynamicModelAlphaMode::MaskBlend => {
                 "JKA GPU FX sprite alpha-test forced-alpha pipeline"
             }
@@ -1483,6 +1487,7 @@ fn create_dynamic_model_pipeline_inner_winding(
         | DynamicModelAlphaMode::BlendDepthWrite
         | DynamicModelAlphaMode::BlendUnlitDepthWrite
         | DynamicModelAlphaMode::MaskBlend
+        | DynamicModelAlphaMode::StageMaskBlend
         | DynamicModelAlphaMode::BlendUnlit => Some(wgpu::BlendState::ALPHA_BLENDING),
         DynamicModelAlphaMode::Modulate => Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
@@ -1551,6 +1556,7 @@ fn create_dynamic_model_pipeline_inner_winding(
             DynamicModelAlphaMode::Blend => "JKA dynamic model blend pipeline",
             DynamicModelAlphaMode::BlendDepthWrite => "JKA dynamic model blended depth-writing pipeline",
             DynamicModelAlphaMode::BlendUnlitDepthWrite => "JKA dynamic model unlit blended depth-writing pipeline",
+            DynamicModelAlphaMode::StageMaskBlend => "JKA authored masked blend stage",
             DynamicModelAlphaMode::MaskBlend => {
                 "JKA dynamic model alpha-test forced-alpha pipeline"
             }
@@ -1605,6 +1611,7 @@ fn create_dynamic_model_pipeline_inner_winding(
             module: shader,
             entry_point: Some(match alpha_mode {
                 DynamicModelAlphaMode::Mask | DynamicModelAlphaMode::MaskBlend => "fs_mask",
+                DynamicModelAlphaMode::StageMaskBlend => "fs_stage_mask_blend",
                 DynamicModelAlphaMode::Glass => "fs_glass",
                 // OpenJK GLFOGOVERRIDE_BLACK for GL_ONE GL_ONE and
                 // GL_DST_COLOR GL_ZERO stages under r_drawfog 2.
@@ -1649,7 +1656,17 @@ pub(in crate::renderer) fn create_ghoul2_skin_pipeline(
     source_material: bool,
 ) -> wgpu::RenderPipeline {
     create_ghoul2_skin_pipeline_winding(device, layout, shader, surface_format, samples,
-        alpha_mode, legacy_fog, model_wet, force_fog_black, source_material, false)
+        alpha_mode, legacy_fog, model_wet, force_fog_black, source_material, false, false)
+}
+
+/// Lazy, source-only overlay pipeline: Mask retains the stock Ghoul2 GPU
+/// vertex skinning, but presents the original SkinGore wound material.
+pub(in crate::renderer) fn create_ghoul2_skin_gore_pipeline(
+    device: &wgpu::Device, layout: &wgpu::PipelineLayout, shader: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat, samples: u32, fog: bool, wet: bool,
+) -> wgpu::RenderPipeline {
+    create_ghoul2_skin_pipeline_winding(device,layout,shader,format,samples,
+        DynamicModelAlphaMode::Mask,fog,wet,false,false,false,true)
 }
 
 fn create_ghoul2_skin_pipeline_winding(
@@ -1664,6 +1681,7 @@ fn create_ghoul2_skin_pipeline_winding(
     force_fog_black: bool,
     source_material: bool,
     mirror_view: bool,
+    skin_gore: bool,
 ) -> wgpu::RenderPipeline {
     let blend = match alpha_mode {
         DynamicModelAlphaMode::AdditiveOne => Some(wgpu::BlendState {
@@ -1694,6 +1712,7 @@ fn create_ghoul2_skin_pipeline_winding(
         | DynamicModelAlphaMode::BlendDepthWrite
         | DynamicModelAlphaMode::BlendUnlitDepthWrite
         | DynamicModelAlphaMode::MaskBlend
+        | DynamicModelAlphaMode::StageMaskBlend
         | DynamicModelAlphaMode::BlendUnlit => Some(wgpu::BlendState::ALPHA_BLENDING),
         DynamicModelAlphaMode::Modulate => Some(wgpu::BlendState {
             color: wgpu::BlendComponent {
@@ -1761,6 +1780,7 @@ fn create_ghoul2_skin_pipeline_winding(
             DynamicModelAlphaMode::Blend => "JKA Ghoul2 GPU skin blend pipeline",
             DynamicModelAlphaMode::BlendDepthWrite => "JKA Ghoul2 GPU skin blended depth-writing pipeline",
             DynamicModelAlphaMode::BlendUnlitDepthWrite => "JKA Ghoul2 GPU skin unlit blended depth-writing pipeline",
+            DynamicModelAlphaMode::StageMaskBlend => "JKA authored masked blend stage",
             DynamicModelAlphaMode::MaskBlend => {
                 "JKA Ghoul2 GPU skin alpha-test forced-alpha pipeline"
             }
@@ -1823,12 +1843,14 @@ fn create_ghoul2_skin_pipeline_winding(
         }),
         multisample: wgpu::MultisampleState {
             count: samples,
+            alpha_to_coverage_enabled: skin_gore && samples > 1,
             ..Default::default()
         },
         fragment: Some(wgpu::FragmentState {
             module: shader,
-            entry_point: Some(match alpha_mode {
+            entry_point: Some(if skin_gore { "fs_skin_gore" } else { match alpha_mode {
                 DynamicModelAlphaMode::Mask | DynamicModelAlphaMode::MaskBlend => "fs_mask",
+                DynamicModelAlphaMode::StageMaskBlend => "fs_stage_mask_blend",
                 DynamicModelAlphaMode::Glass => "fs_glass",
                 // OpenJK GLFOGOVERRIDE_BLACK for GL_ONE GL_ONE and
                 // GL_DST_COLOR GL_ZERO stages under r_drawfog 2.
@@ -1844,7 +1866,7 @@ fn create_ghoul2_skin_pipeline_winding(
                 | DynamicModelAlphaMode::Darken
                 | DynamicModelAlphaMode::Screen => "fs_unlit",
                 _ => "fs_main",
-            }),
+            }}),
             compilation_options: wgpu::PipelineCompilationOptions {
                 constants: &[
                     ("ENABLE_LEGACY_FOG", f64::from(u8::from(legacy_fog))),

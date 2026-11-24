@@ -1,0 +1,112 @@
+clean_upstream_path	sha256	target	status
+common/src/main/java/com/sonicether/soundphysics/Loggers.java	fa476c6c7ed63e81eb37b96ef11369bc4ee48e28688d3af252a050af4b61ab9b		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/ReflectedAudio.java	252a142dc48797df3cf45a8fa295b2249b26ceb82a3c9584213ea31c6175f06c	propagation.rs	DIRECTION ACCUMULATION PARTIAL
+common/src/main/java/com/sonicether/soundphysics/SoundPhysics.java	28a47f1f7558c6d43e32c56ea929424bacad5e59bcfafddd4c74cb008e830674	propagation.rs; eal_scene.cpp	CORE PROPAGATION AND EFX PARTIAL; LIFECYCLE/CONFIG NOT COMPLETE
+common/src/main/java/com/sonicether/soundphysics/SoundPhysicsMod.java	a4e74df042be49d2f7174a2a6bcf5ab2464bc92f59aef06a55156ded4f6b6916		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/config/ConfigUtils.java	fb2cd011ebc82fba52974bfbfb10181ead01b88a94916ebfc0ecbf77ac792956		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/config/OcclusionConfig.java	7326481b7761ba35f36d494f04ddc617e2a9f13693c0f78e0832edc2492b339e	world.rs	MAPPED SUBSET; NOT FULL CONFIG
+common/src/main/java/com/sonicether/soundphysics/config/ReflectivityConfig.java	2a537063756c17197edbef2a4ba26010809642222143016151b9070dadcf6124	world.rs	MAPPED SUBSET; NOT FULL CONFIG
+common/src/main/java/com/sonicether/soundphysics/config/ReverbParams.java	3372eaf829f16dbffbf7e061082ea69e0612135423e412a835342d5488949a7b	reverb.rs	PARAMETER MATH PORT
+common/src/main/java/com/sonicether/soundphysics/config/SoundPhysicsConfig.java	5abc3a150b4ae05aedfb29920143b2523dc488f54384390ae1d395fc2d63fee5	propagation.rs; reverb.rs	SELECTED DEFAULTS ONLY
+common/src/main/java/com/sonicether/soundphysics/config/SoundRateConfig.java	cc8a798be48ce4f04b03254021049127127872a931e8323432f78987590a4086		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/config/SoundTypes.java	df6b4ea998705061aa578d4040021675fbdd37dc1489aaa98ee390bb10dee5ec		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/config/blocksound/BlockDefinition.java	12b6ea891093e8b60fce5015df424949d18dee4eb1b406032ca080a7e843f0b1		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/config/blocksound/BlockIdDefinition.java	0b6b684bd2de08866755aa5588804f48d24924b0e1afdb519ae66fb8de56c2e0		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/config/blocksound/BlockSoundConfigBase.java	679eea2f5813bc2540543219c5f7060840226d70c11300b1b6143fa2b78a932c		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/config/blocksound/BlockSoundTypeDefinition.java	c449b06311b69f3ecbf9de67e733a7f5497766d15ce5187126af3737b5d4b164		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/config/blocksound/BlockTagDefinition.java	d427073fedaa8f98f895c7d090e50001280b66225d4125d91421494e879aa007		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/debug/RaycastRenderer.java	9dafb4243e025aa605f243a147ea44d8ccd3e53661a52f2a60a23160f97b2d3b		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/eap/AirAbsorptionProcessor.java	3e147941d86c8dd27b4dda40d794904a26ada3dcbf35e63ec4557292c8275b28	acoustic.rs; echo_runtime.rs	MATH PORT / PARTIAL HOST
+common/src/main/java/com/sonicether/soundphysics/eap/EapConfig.java	32bf11dccda14c359eadcdccad1c854a2bff89c519b2e091efb655dd86ae7dbf	audio_cvars.rs	MASTER SWITCH ONLY
+common/src/main/java/com/sonicether/soundphysics/eap/EapRaycastUtils.java	bd58ece5c5f20e8a98472a369f3003db51104c1a4e25f021e33bf53b6a3df9a2	geometry.rs; world.rs	HOST ADAPTER, NOT VOXEL PORT
+common/src/main/java/com/sonicether/soundphysics/eap/EapSystem.java	481f8f044b50b8edcf9004fd2eacf5f0f7fb127b90330f814f460845c504be68	reverb.rs; echo_runtime.rs	REVERB PARAMETER OVERRIDE ONLY
+common/src/main/java/com/sonicether/soundphysics/eap/EarlyReflectionProcessor.java	d47d01f72721a565939f57c792e4b7c1d86d7312719672b92ff94d9eee55b948	reverb.rs; audio/echofield.rs	STATIC HRTF PATH PLAYS EIGHT DELAYED SOURCES; VALIDATION PENDING
+common/src/main/java/com/sonicether/soundphysics/eap/EnvironmentProfile.java	f5d3ddbeeec11efc0442c3d3e65bdb9c1a4c8cef34081060e379bbde2971a912	profile.rs	MATH/DATA PORT
+common/src/main/java/com/sonicether/soundphysics/eap/EnvironmentProfiler.java	438839451375f1e08917b824d7746f17be9d97950805e0668e7bb0db66807449	profile.rs; echo_runtime.rs	STATIC ALGORITHM PORT; HOST CADENCE ADAPTED
+common/src/main/java/com/sonicether/soundphysics/eap/ExcitationSource.java	8f5d9e08c54c2facd3808e16d707991c9b5c65548997ec87e34410fa3dec0cd1	soundscape.rs; audio/echofield.rs	SMOOTHED POSITIONS AND GAINS; LIVE FILTER PARITY PENDING
+common/src/main/java/com/sonicether/soundphysics/eap/ExcitationSourceManager.java	276307d78e4f8ec0b6d76ef54a049b43665a6ac74cef7825160232783dd17753	excitation.rs; soundscape.rs; audio/echofield.rs	FIVE EXCITATION SIGNALS AND LIVE PLAYBACK; NATIVE FILTER PARITY PENDING
+common/src/main/java/com/sonicether/soundphysics/eap/ExcitationType.java	8361e90669f0d1d86c05c9bcfaafefb15a2a3fd0c0b85e5a9d2596ab39d237dd	excitation.rs	FIVE TYPES WIRED
+common/src/main/java/com/sonicether/soundphysics/eap/HrtfManager.java	fedd53fc8ddf3068df6a6e44f27018170cc9bdfb798fbe2c4339d4ed26d6d81a	echo_runtime.rs; eal_native.rs	HOST STATUS GATE ONLY
+common/src/main/java/com/sonicether/soundphysics/eap/PerSourceDRProcessor.java	bb9dacf7c41147a697bcde1e8ce13d79ba90f13b4ec94b1562eeadf0a66d02bd	reverb.rs; echo_runtime.rs	STATIC HRTF PATH UPDATES SEND GAIN
+common/src/main/java/com/sonicether/soundphysics/eap/ReflectionTap.java	d44bdb5424c80f68ff7907ccd4235883a217b012beb5671cb162d71c161238ba	acoustic.rs	DATA/MATH PORT
+common/src/main/java/com/sonicether/soundphysics/eap/RoomGeometry.java	5076d4e2d9dc77bda9d9cb9b6efc690268c86ea6562ed551ebce1f9092b86f2e	acoustic.rs	MATH PORT
+common/src/main/java/com/sonicether/soundphysics/eap/SpectralCategory.java	d10480103683bfd11d1dd89cae182d9487a3a7b1bffbcc4aa2f8f5891208898c	profile.rs	COEFFICIENT PORT; HOST MATERIAL MAPPING
+common/src/main/java/com/sonicether/soundphysics/eap/debug/AudioDiagnostics.java	25b3603ded801ebbe98eefa1063bf83eeb92b669d8322740d5dbe79fa7489208		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/eap/debug/AudioEnergyMeter.java	7293a05ea04fdda2f40e5bfbc320d4c40527f988e2950a883504df18675fa47b		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/eap/debug/EapDebugRenderer.java	0800433095bd3695e742bba34c52e817eed635d86c768d6f7a3ea4a6e7c966ff		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/eap/emitter/Emitter.java	15b6fd38c10f44c37a4059028ae8e5f4399918167c98eebeb06e689b882f898d		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/eap/emitter/EmitterCategory.java	98910c6461de175d1b413660b7b2dbd3daa1712359b7d8a3d88701d27957c8a5	procedural.rs	ENUM/METADATA PORT
+common/src/main/java/com/sonicether/soundphysics/eap/emitter/EmitterManager.java	c6d9988ddeb08fb895e4a0e471b11f1629b5883bb6bf58dcdb966083541d754a	soundscape.rs; audio/echofield.rs	POSITIONED LOOPS AND TRIGGERS; BIRDSONG OMITTED BY REQUEST
+common/src/main/java/com/sonicether/soundphysics/eap/emitter/EmitterPool.java	ea1ff575461329def79f9ed4fcba5e78f9226fe6a4b1a7ff2df2ff7a6634e6d8	audio/echofield.rs; audio/eal_scene.rs	BOUNDED GAME MIXER POOL; GAMEPLAY AND RIVER PRIORITIZED
+common/src/main/java/com/sonicether/soundphysics/eap/emitter/EmitterScanner.java	88e81b5519826ca5cce7e57703703baf0ec6db6dc02f2c043e6293cbe50d2c54	world.rs; soundscape.rs	LOCAL BSP SURFACE/LIQUID PROBES; DYNAMIC INPUTS PENDING
+common/src/main/java/com/sonicether/soundphysics/eap/emitter/EnvironmentConditions.java	52827bfe0b637247340dfa4d8f66b8c3b768888dcddb0bf9b20c90cb22c054a0	environment.rs	TIME/INPUT PORT; WORLD MAPPING OUTSTANDING
+common/src/main/java/com/sonicether/soundphysics/eap/emitter/PerlinNoise.java	552d6f8961436b7df14163e0a98a408125d83525143d9020b74f41445cb3c931	noise.rs	ALGORITHM PORT
+common/src/main/java/com/sonicether/soundphysics/eap/emitter/ProceduralBufferFactory.java	28734410d2c93be121922e77e941950dc7b3dce0ed6c4f9e15af27e9c4894f86	procedural.rs	NAMED PCM ALGORITHMS; NOT CONNECTED
+common/src/main/java/com/sonicether/soundphysics/eap/emitter/SampleEmitterScheduler.java	9c5192ab8264d67400eedbdb4b0bc818a22840638bee1ca61e88aa2bf8a8ee03	scheduler.rs; soundscape.rs	COUNTDOWNS AND FROG CHORUS WIRED
+common/src/main/java/com/sonicether/soundphysics/eap/emitter/SamplePoolLoader.java	5ee5125596387059f93d5fd66e927aa717c28aab4c6e28efc7a259e03b222d39	echo_runtime.rs	LOCAL OGG DIRECTORY LOADER AND PROCEDURAL FALLBACK
+common/src/main/java/com/sonicether/soundphysics/eap/emitter/SampleSubcategory.java	f7ee94f42f3a41ffa0691aace21ea49eb96caa60ed052c6cc3b1800f2cbd0512		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/eap/emitter/SyrinxSynth.java	da46b961beb42e809f1a96bc21b4f3f1c5e6e6b45099b91503a5d73c3a961f51	syrinx.rs	ALGORITHM PORT
+common/src/main/java/com/sonicether/soundphysics/eap/hyperreality/HyperrealityDebugRenderer.java	e21351847240a472ed0b939bbe8fa47a5fdb1c9f93e86482b46237cc6afcd6b6		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/eap/hyperreality/HyperrealityPool.java	df360a8f5d5cfc35ca2c2afb04adc637b7fe2b598f762d1c9641ad5feb185a01	soundscape.rs; audio/echofield.rs	POSITIONAL TERRAIN SOURCES SHARE A BOUNDED POOL
+common/src/main/java/com/sonicether/soundphysics/eap/hyperreality/HyperrealitySource.java	14dc9262ff0a19184d00b6eb4cd45b7d66be35ea5b32425204c03b4ee3da25d4		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/eap/hyperreality/HyperrealitySystem.java	a68b6691f6b0f8e9c50458b8b6e34d3ab306e2ea701e0f72b61923599ee0c572	soundscape.rs; audio/echofield.rs	LIVE FEATURE-DRIVEN POSITIONED TERRAIN LAYERS
+common/src/main/java/com/sonicether/soundphysics/eap/hyperreality/TerrainBufferFactory.java	9907ca6984c17f338b4c302d0435ed58b102f59860f63f1c2d3b520d12717018	terrain_audio.rs; soundscape.rs	THREE BUFFER FAMILIES IN LIVE MIX
+common/src/main/java/com/sonicether/soundphysics/eap/hyperreality/TerrainFeature.java	6f9452be84c7428c1b25807eec19b666e25e682e0249539979f589f4405b1d39	terrain.rs	MATH/DATA PORT
+common/src/main/java/com/sonicether/soundphysics/eap/hyperreality/TerrainFeatureType.java	7dc8c742d062d8a2a68b339aed9df59003c20b8efb5fce0bc9a566fcab509f92	terrain.rs	DATA PORT
+common/src/main/java/com/sonicether/soundphysics/eap/hyperreality/TerrainScanner.java	46cd0158514ba6e14395ca277f1bf9a43c8739a55d17e46358b9d79888e51545	world.rs	BSP FEATURE PROBES; PARITY VALIDATION PENDING
+common/src/main/java/com/sonicether/soundphysics/eap/install/BlindFoldRenderer.java	d7e8c5a4e883b3877bdb1e8c5b36dd06aa4f644b50718f9e03db9cfec8cba1f2		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/eap/install/InstallationManager.java	b5210fc86f6722d6b629e674105de54c0b4f24581803f91e1659c12aa3325089		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/eap/install/MetricsLogger.java	501d4a1e6cdd281fd1f3eb3d5aad5d99fba3948e0aef6fa5288c3bf9056f6ed2		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/eap/math/DirectionalAnalysis.java	cacb12aa7fa809890ee413e9a3523cd4d30b2abceb82211e0b66747c1795518f	profile.rs	MATH PORT
+common/src/main/java/com/sonicether/soundphysics/eap/math/RT60Estimator.java	34cff696dddacc6c1956414ce8004d419b92b163887b5f85395f27fbc0481fe4	acoustic.rs	MATH PORT
+common/src/main/java/com/sonicether/soundphysics/eap/math/SpectralFilter.java	815c4366b16584ded7f53e5f70700f65bb4015e4513f6acb23114437066ba0cb	profile.rs; reverb.rs	COEFFICIENT/FILTER MATH PARTIAL
+common/src/main/java/com/sonicether/soundphysics/integration/voicechat/AudioChannel.java	a2b4709f81e830dc80d0697ceaa5b6b739a050edc8331bc917a706da4ab65caf		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/integration/voicechat/SimpleVoiceChatPlugin.java	93a6f05a1e3ffd94dfb81ebb988462b881c5d94b4ffd431f4d79f14521eeeb87		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/mixin/ChannelAccessor.java	73cdf4513bd086401b5cfa2739ee99b96ff29c200c2f9167e5f9203374c46e6f		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/mixin/ClientLevelMixin.java	48cce141074b302eb442278e1aa9f62933e23b89185305bf169d48f131449da4		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/mixin/ClientPacketListenerMixin.java	c4ff88e4f0add649c70eb0beb61944a850854387831b7d3d74dd3f95e9fee9b1		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/mixin/DebugRendererMixin.java	cc132981bd4411c6d268e1b7fd2e0af433c4fed4b83a4c6a90036d8d68d062b3		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/mixin/EntityMixin.java	b80dc1f2622cb26ba2fe17bba7714923357ec91cbf4fc66a12ca7ebb5c895065		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/mixin/LibraryMixin.java	7afd7e482a3c00a86e37bf13e9c0183d660e501a0ddd3c4b8303ff3fe80c4604		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/mixin/LocalPlayerMixin.java	06f5fcc41306c8046c1b3066aba78905d9ea3d9285df6fef47b0fb8c0a0c7216		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/mixin/MinecraftMixin.java	72782c984b982a2b598e0fc7adac19e55a8f5f7de239e9663a6fd8eb0cdd145a		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/mixin/SoundEventMixin.java	273db29727259ac220d3aafb759d95044641b4db2c83691634b5d3a0cf373fc1		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/mixin/SoundSystemMixin.java	438b65cacb5d89a40eff3624f330640bf4d60aedd6a2c3096698e5805a826102		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/mixin/SourceMixin.java	d31ec92bb884b49038f6e1c17ff0bdbf6b1c2895ee55d281fe0fc92308158c29		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/profiling/TaskProfiler.java	9be7264cd5948bc18fa6df54848496311329b576d392d8d99752d7e89da1adda		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/test/LoopbackAudioCapture.java	cf08bcbb9b3fe093ce3f774f858c8cb2b3311f8d2ada8f3a3a40f2449854531c		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/test/TestCommandServer.java	c7348df6b59b49c916613c67b1f20190794ece5a7030f9d5dd62c67262d36ac3		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/test/TestHarness.java	29cc5e3419606410eacd50d8f210eec2e30527f1d0e383bfb52cba1b916c4ba6		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/utils/LevelAccessUtils.java	2da67ee816995d9b6357bf1eba79b53dbd9f4999c21d86263e8afe997d068d47		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/utils/RaycastUtils.java	d4c76e50766db19c07da70bacef3589233608245bbfdd985acbf74b85d4fe453		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/utils/SoundRateManager.java	a5b233f70749bc3635b960b1e95c4e1b9935d02c8f2159d5d0bf43546463717e		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/utils/SoundUtils.java	496c3b2c2c5fb20f050996996a3af024802ed37f83d0c8196746ce2f6babb703		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/world/CachingClientLevel.java	df5fcec9a820bb7cc0d6cdfa8cb9260d121a6c46faf1c65e20f2e3b4c864c8a5		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/world/ClientLevelProxy.java	6a34da270ed2a86fff03adb10e2ad142c5f7c5a0c1024537c172bf954886fa8a		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/world/ClonedClientLevel.java	9b8eb2378b60d1bb6a3ae2326e21dbd77f42d30fe100a0b0887cbc1db410d201		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/world/ClonedLevelChunk.java	2f2687ab5e5c581d551a36527adc30745b74adc540e506a389fd7b5a10cc16ce		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/world/ClonedLevelHeightAccessor.java	c9deebf3873c3dfae901b36b1abda0ab21c51c8469b6e60c7931bc46e0123c5f		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/main/java/com/sonicether/soundphysics/world/UnsafeClientLevel.java	797176819b44fb39e9ba13a1a62459ac50c0b7cd1f8296fbbf274a8ead924873		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+common/src/test/java/com/sonicether/soundphysics/eap/AirAbsorptionTest.java	bbb323e44d90806ce7a43b6bd2e8e2aef12fc28b29f6d05997d48cfa860cfa0a		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/EnvironmentProfileTest.java	2a2ff868a71877309cb718dfde1f78210b941cbd40f8843ada27f89eecd32e2e		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/PerSourceDRTest.java	c91106774102467e60809f4ae4bea04a6a0dd303f77aed218b0e8b437876680b		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/RoomGeometryTest.java	f45a8b0e9bf561869c2ec681582059dd9c98bc8e328422ba4d475e8b8283729d		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/emitter/EnvironmentConditionsTest.java	b15ef3fd574a3f8f5f07425e999e0774719ead4ccdee5d3a3062a01c5bfa2933		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/emitter/PerlinNoiseTest.java	98269de9b1dc7dd6c40a9ff7b3de7dd4075778df452de766ab00cb74b8868795		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/hyperreality/HyperrealityGainModelTest.java	68582cfd6b9f31f5d9a5bd76f18dcfcbd8f408e665f7978e15f68e345a91acb6		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/hyperreality/HyperrealityPoolTest.java	0f63a43033f619ca05956c8c23792977561a41fe11d1d250ada2147290171db5		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/hyperreality/HyperrealitySourceTest.java	9cfbd8b0232f727975382254966504196cd9cde4ddb68e2e33a23b369ec7f2c7		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/hyperreality/HyperrealitySystemTest.java	f641e74e988864f0bd3f7bd88309b72afcd2c8d9969349a64824f4147a6884d3		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/hyperreality/TerrainBufferFactoryTest.java	0152f621d173dc61db4e9e7cd5cbc729eb2e799cbd30d3821e24e16439608376		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/hyperreality/TerrainFeatureTest.java	e488cb50d6a84030782314cf86b5d3b5415b0c4c23a37d7eac9151d8cbc5e15e		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/hyperreality/TerrainFeatureTypeTest.java	ff647286811962f0312706532feae4a8aeb3976b6960f4c1abe04d09b3849c45		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/hyperreality/TerrainScannerTest.java	e2aa22d4cabc0b36fa4ef399a4e4972d7e1d06e1fbdaa5d522803178d1f6a354		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/math/DirectionalAnalysisTest.java	2f271e416dbf7302fc5a367cac4c7b5a99f6f925fe4be64739065814a743615c		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/math/RT60EstimatorTest.java	ddb7d37cfe41ff782cf3ad9989bd2735b8515c03d3c26ab326b456b9c2e823f6		TEST ORACLE NOT PORTED/RUN
+common/src/test/java/com/sonicether/soundphysics/eap/math/SpectralFilterTest.java	f5f1af3142cab53190064279246bff9f3020cfb183a233a44e9c7e8b99f10fac		TEST ORACLE NOT PORTED/RUN
+fabric/src/main/java/com/sonicether/soundphysics/FabricSoundPhysicsMod.java	32355283d27090fae69539f40ad5ee5fdc1bb9a6ca920cd0c98570c7fb085047		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+fabric/src/main/java/com/sonicether/soundphysics/integration/ClothConfigIntegration.java	41fd217c26504f9f940d734d33cb4b127fd5b317c21a96c41279a4fb441e84be		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+fabric/src/main/java/com/sonicether/soundphysics/integration/ModMenuIntegration.java	51f79eafb0c8d1a017868129eecb32333dadcd2ee5f05ee9e0ef95fb6c1396b7		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+forge/src/main/java/com/sonicether/soundphysics/ForgeSoundPhysicsMod.java	0ba46e25bd83a99a5052408e0fee22105328c7df2fe26d1696d4d0971293fff2		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+neoforge/src/main/java/com/sonicether/soundphysics/NeoForgeSoundPhysicsMod.java	d71e59e24133001ec38f1cf4f48ab671440c78219540e9c63c2d01033ba9725b		OUTSTANDING / MINECRAFT HOST-SPECIFIC
+neoforge/src/main/java/com/sonicether/soundphysics/integration/ClothConfigIntegration.java	cd2e1251b76786ea50a5871b5abe0402ec92c50e48ee00485cf46efb085797e1		OUTSTANDING / MINECRAFT HOST-SPECIFIC

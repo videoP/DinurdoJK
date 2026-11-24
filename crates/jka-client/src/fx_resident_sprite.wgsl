@@ -76,7 +76,12 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
         vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0),
         vec2<f32>(0.0, 1.0), vec2<f32>(0.0, 1.0),
         vec2<f32>(1.0, 0.0), vec2<f32>(1.0, 1.0));
-    let p = residents[draw_slot_indices[ii]];
+    // The two high bits encode the per-stage identityLight multiplier.
+    // They are draw metadata, not part of the persistent particle slot ID.
+    let stage_slot = draw_slot_indices[ii];
+    let p = residents[stage_slot & 0x3fffffffu];
+    let identity_light = select(select(1.0, 0.5, (stage_slot & 0x40000000u) != 0u),
+        0.21404114, (stage_slot & 0x80000000u) != 0u);
     let birth = p.origin_birth.w;
     let death = p.velocity_death.w;
     let alive = fx_clock.now_ms >= birth && fx_clock.now_ms <= death &&
@@ -117,7 +122,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     let quant_alpha = floor(alpha * 255.0);
     let use_alpha = (flags & 0x08000000u) != 0u;
     let color_rgb = select(floor(rgba_rgb * quant_alpha / 256.0), rgba_rgb, use_alpha) / 255.0;
-    output.color = vec4<f32>(color_rgb, select(0.0, quant_alpha / 255.0, use_alpha));
+    output.color = vec4<f32>(color_rgb * identity_light, select(0.0, quant_alpha / 255.0, use_alpha));
     output.world_position = world;
     output.alive = select(0u, 1u, alive);
     return output;

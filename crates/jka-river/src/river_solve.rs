@@ -58,6 +58,7 @@ pub(super) struct SolveConvergence {
     last_sim_seconds: f64,
     consecutive: u32,
     samples: u32,
+    authored_reference: Option<(f64, f64)>,
 }
 
 impl SolveConvergence {
@@ -159,8 +160,13 @@ impl SolveConvergence {
             pipeline, groups, snapshot, summaries, readback, groups_xy, bytes,
             readback_state: Readback::Idle, has_snapshot: false, discard_pending: false,
             last_sample: now, last_poll: now, last_sim_seconds: 0.0,
-            consecutive: 0, samples: 0,
+            consecutive: 0, samples: 0, authored_reference: None,
         }
+    }
+
+    /// Reject convergence to a mostly drained or overfilled authored channel.
+    pub(super) fn expect_authored(&mut self, wet: f64, depth_sum_cm: f64) {
+        self.authored_reference = Some((wet, depth_sum_cm));
     }
 
     /// A live source edit invalidates comparisons from the old flow. Reuse the
@@ -230,7 +236,11 @@ impl SolveConvergence {
         drop(view); // Release BufferView before unmapping its buffer.
         self.readback.unmap();
         self.samples += 1;
-        let qualifies = metrics.qualifies();
+        let qualifies = metrics.qualifies() && self.authored_reference.is_none_or(|(wet, depth)| {
+            metrics.wet_cells >= wet * 0.85
+                && metrics.water_depth_sum_cm >= depth * 0.75
+                && metrics.water_depth_sum_cm <= depth * 1.25
+        });
         self.consecutive = if qualifies { self.consecutive + 1 } else { 0 };
         let mean_depth = metrics.depth_change_cm / metrics.wet_cells.max(1.0);
         let mean_velocity = metrics.velocity_change_cm_s / metrics.wet_cells.max(1.0);

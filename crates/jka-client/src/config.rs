@@ -227,8 +227,8 @@ pub struct GameOptions {
     pub duel_music: bool,
     /// `cg_ambientSounds`: level ambience (`sound.txt` general/local sets).
     pub ambient: bool,
-    /// jaPRO `cg_blood`: 0 no gibs (a death voice instead), 1 skull or brain,
-    /// 2 full gibs. Lives here because the sound side reads it too.
+    /// `cg_blood`: 0 off, 1 Ninja blood/SkinGore and one skull/brain gib,
+    /// 2 the same blood plus TaystJK's complete 10-fragment gib burst.
     pub blood: u8,
     /// `cg_autoSwitch`: 0 never, 1 switch to a better *safe* weapon on pickup (and
     /// when one runs dry), 2 any better weapon.
@@ -283,6 +283,7 @@ pub struct AudioSettings {
     pub emote_music_volume: f32,
     /// Listener-based gameplay sound muffling: 0 off, 1 subtle, 2 normal, 3 heavy.
     pub underwater: u8,
+    pub river_volume: f32,
     pub variometer: bool,
     pub variometer_style: u8,
     pub variometer_input: u8,
@@ -296,8 +297,9 @@ pub struct AudioSettings {
     /// Master gate for Valve Steam Audio integration. Off preserves the legacy
     /// OpenJK-compatible mixer and skips all acoustic scene/bake preparation.
     pub steam_audio: bool,
-    /// Opt-in authored EAGLE/EAX reverb on maps with valid .eal.
-    pub eal_enabled: bool,
+    /// Opt-in map acoustics using authored EAGLE data or static BSP geometry.
+    pub echofield: bool,
+    pub echofield_settings: jka_audio::EchoSettings,
     /// Independent OpenAL Soft HRTF preference for EAL-owned sources.
     pub eal_hrtf: bool,
     /// Ephemeral EAL troubleshooting mode (not saved in the user config).
@@ -320,6 +322,7 @@ impl Default for AudioSettings {
             music_volume: 0.25,
             emote_music_volume: 0.5,
             underwater: 2,
+            river_volume: 1.0,
             variometer: false,
             variometer_style: 0,
             variometer_input: 0,
@@ -329,7 +332,8 @@ impl Default for AudioSettings {
             separation: 0.5,
             mute_when_unfocused: true,
             steam_audio: false,
-            eal_enabled: false,
+            echofield: false,
+            echofield_settings: jka_audio::EchoSettings::default(),
             eal_hrtf: false,
             eal_debug_mode: 0,
             steam_audio_binaural: true,
@@ -495,6 +499,10 @@ pub fn load_client_presentation_settings(
 
     let text = strip_cfg_comments(&text);
     for assignment in config_assignments(&text) {
+        // Old configs archived this selector before cg_blood took over.
+        if assignment.name.eq_ignore_ascii_case("cg_ghoul2MarkMode") {
+            continue;
+        }
         if let Some(def) = crate::app::cvar_definition(&assignment.name) {
             def.load_presentation(&mut settings, &assignment.value);
         } else if crate::console::find(&assignment.name).is_none() {
@@ -562,6 +570,14 @@ pub fn load_video_settings(primary: &Path) -> VideoSettings {
         // Pre-desktop-choice configurations only saved explicit pixel dimensions.
         if !context.resolution_mode_seen {
             settings.resolution_desktop = false;
+            settings.resolution_mode = -1;
+        }
+    }
+    // The custom-width/height cvars are archived alongside r_mode. A stock
+    // numeric preset takes precedence over them regardless of cfg line order.
+    if let Ok(index) = usize::try_from(settings.resolution_mode) {
+        if let Some(resolution) = crate::ui::OPENJK_R_MODES.get(index) {
+            settings.resolution = *resolution;
         }
     }
     if let (Some(x), Some(y)) = (context.window_x, context.window_y) {
@@ -1089,6 +1105,38 @@ mod tests {
     }
 
     #[test]
+    fn openjk_numeric_modes_round_trip_and_override_custom_dimensions() {
+        let path = std::env::temp_dir().join(format!(
+            "djk-openjk-r-mode-{}-{:?}.cfg", std::process::id(), std::thread::current().id()
+        ));
+        for (mode, resolution) in crate::ui::OPENJK_R_MODES.iter().enumerate() {
+            // Both the usual archival ordering and a hand-edited cfg where
+            // r_mode appears last must select the same authoritative preset.
+            for r_mode_first in [true, false] {
+                let mode_line = format!("seta r_mode \"{mode}\"\n");
+                let custom_lines = "seta r_customwidth \"1920\"\nseta r_customheight \"1080\"\n";
+                let cfg = if r_mode_first {
+                    format!("{mode_line}{custom_lines}")
+                } else {
+                    format!("{custom_lines}{mode_line}")
+                };
+                std::fs::write(&path, cfg).unwrap();
+                let loaded = load_video_settings(&path);
+                assert_eq!(loaded.resolution_mode, mode as i32);
+                assert_eq!(loaded.resolution, *resolution);
+                assert!(!loaded.resolution_desktop);
+            }
+        }
+        std::fs::write(&path, "seta r_mode \"-1\"\nseta r_customwidth \"1920\"\nseta r_customheight \"1080\"\n").unwrap();
+        let custom = load_video_settings(&path);
+        assert_eq!(custom.resolution_mode, -1);
+        assert_eq!(custom.resolution, [1920, 1080]);
+        std::fs::write(&path, "seta r_mode \"-2\"\nseta r_customwidth \"1920\"\nseta r_customheight \"1080\"\n").unwrap();
+        assert!(load_video_settings(&path).resolution_desktop);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn confined_ui_cursor_setting_round_trips_and_ignores_invalid_values() {
         let path = std::env::temp_dir().join(format!(
             "djk-confine-cursor-{}-{:?}.cfg", std::process::id(), std::thread::current().id()
@@ -1606,7 +1654,7 @@ mod tests {
                 hit: 4,
                 duel_music: false,
                 ambient: false,
-                blood: 2,
+                blood: 1,
                 auto_switch: 2,
                 score_plums: false,
                 g2_marks: 4,
@@ -2222,6 +2270,15 @@ mod tests {
         settings.river_settings.underwater_color=[0.1,0.3,0.5];
         settings.river_settings.underwater_visibility=120.0;
         settings.river_settings.underwater_darkening=640.0;
+        if jka_river::river_ninja::FLUID_NINJA_INCLUDED {
+            let ninja = &mut settings.river_settings.ninja_underwater;
+            ninja.distance_mult = 0.12;
+            ninja.distortion = 0.02;
+            ninja.brightness = 1.1;
+            ninja.caustics_mult = 35.0;
+            ninja.distance_color = [0.1, 0.8, 0.6];
+            ninja.caustics_color = [0.8, 0.6, 0.4];
+        }
         save_video_settings(&path,settings,&crate::keybinds::Bindings::default(),&ClientPresentationSettings::default(),&AudioSettings::default()).unwrap();
         let loaded=load_video_settings(&path);
         std::fs::remove_file(path).unwrap();

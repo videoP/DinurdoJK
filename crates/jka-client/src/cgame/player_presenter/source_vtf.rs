@@ -119,7 +119,24 @@ pub(super) fn decode_normal_vtf(label: &str, bytes: &[u8]) -> Result<TextureData
     decode_vtf(label, bytes, false)
 }
 
+/// Every frame of an animated (`AnimatedTexture` proxy) linear VTF, e.g. HL2's
+/// `dev/water_normal`. Each entry carries its own full mip chain.
+pub(crate) fn decode_linear_vtf_frames(label: &str, bytes: &[u8]) -> Result<Vec<TextureData>, String> {
+    let (first, frames) = decode_vtf_frame(label, bytes, false, 0)?;
+    let mut out = Vec::with_capacity(frames);
+    out.push(first);
+    for frame in 1..frames {
+        out.push(decode_vtf_frame(label, bytes, false, frame)?.0);
+    }
+    Ok(out)
+}
+
 fn decode_vtf(label: &str, bytes: &[u8], srgb: bool) -> Result<TextureData, String> {
+    decode_vtf_frame(label, bytes, srgb, 0).map(|(data, _)| data)
+}
+
+/// One frame and the file's frame count.
+fn decode_vtf_frame(label: &str, bytes: &[u8], srgb: bool, frame: usize) -> Result<(TextureData, usize), String> {
     if bytes.get(..4) != Some(b"VTF\0") {return Err(format!("{label}: invalid VTF signature"));}
     let (major, minor) = (uint(bytes,4)?, uint(bytes,8)?);
     if major != 7 || minor > 5 {return Err(format!("{label}: unsupported VTF version {major}.{minor}"));}
@@ -134,6 +151,9 @@ fn decode_vtf(label: &str, bytes: &[u8], srgb: bool) -> Result<TextureData, Stri
     // Animated textures interleave every frame inside each mip level; frame 0 is
     // first, so striding past the rest shows the first frame rather than garbage.
     let frames = word(bytes,24)?.max(1);
+    if frame >= frames {
+        return Err(format!("{label}: frame {frame} of {frames}"));
+    }
     // `depth` only exists from 7.2 onwards; a volume texture would add a third
     // dimension to every level.
     let depth = if minor >= 2 { word(bytes,63)?.max(1) } else { 1 };
@@ -212,13 +232,14 @@ fn decode_vtf(label: &str, bytes: &[u8], srgb: bool) -> Result<TextureData, Stri
     let mut rgba = Vec::with_capacity(w * h * 4 * 4 / 3);
     for level in 0..mips {
         let (lw, lh) = level_size(level);
-        let end = offsets[level] + stride(lw, lh);
+        let start = offsets[level] + frame * stride(lw, lh);
+        let end = start + stride(lw, lh);
         let data = bytes
-            .get(offsets[level]..end)
+            .get(start..end)
             .ok_or_else(|| format!("{label}: truncated mip {level}"))?;
         rgba.extend_from_slice(&decode_vtf_level(label, data, format, lw, lh)?);
     }
-    Ok(TextureData {
+    Ok((TextureData {
         label: label.to_owned(),
         source: None,
         width: w as u32,
@@ -228,7 +249,7 @@ fn decode_vtf(label: &str, bytes: &[u8], srgb: bool) -> Result<TextureData, Stri
         mip_level_count: mips as u32,
         clamp: false,
         srgb,
-    })
+    }, frames))
 }
 
 /// The VMT parameters the Source player path consumes.

@@ -549,6 +549,9 @@ pub(in crate::renderer) fn material_uniform(
     if matches!(source.pipeline.blend, BlendMode::Opaque) {
         out.header[2] |= MATERIAL_FLAG_OPAQUE_STAGE;
     }
+    if source.reverse_lightmap_fold_role == 2 {
+        out.header[3] |= MATERIAL_FLAG_REVERSE_LIGHTMAP_DIFFUSE;
+    }
     // Fused additive stage source factor: keep GL_ONE GL_ONE distinct from
     // GL_SRC_ALPHA GL_ONE without adding a native PSO permutation. This bit is
     // read only by fs_additive_fused2/3, never by regular material shaders.

@@ -20,6 +20,87 @@ use crate::cgame::player_presenter::{
     MAX_CLIENTS, MAX_SABER_BLADES, TEAM_SPECTATOR, WP_SABER, FP_SEE, PW_CLOAKED,
 };
 
+/// River tracker filter. Exact named source joints where present, otherwise
+/// the corresponding native Ghoul2 joint. Reuse the already evaluated pose;
+/// the source sizes each tracked point by its actual parent-bone distance.
+fn river_ninja_pose(gla: &jka_assets::ghoul2::GlaAnimation, pose: &[Matrix3x4],
+    axis: [[f32; 3]; 3], origin: [f32; 3]) -> [Option<jka_river::river_ninja::RiverBone>; jka_river::river_ninja::RIVER_BONE_COUNT] {
+    use jka_river::river_ninja::{RiverBone, RIVER_BONE_COUNT};
+    const JOINTS: [(&str, &str); RIVER_BONE_COUNT] = [
+        ("foot_l", "ltalus"), ("foot_r", "rtalus"),
+        ("calf_l", "ltibia"), ("calf_r", "rtibia"),
+        ("hand_l", "lhand"), ("hand_r", "rhand"),
+        ("pelvis", "pelvis"), ("head", "cranium"),
+        ("spine_03", "upper_lumbar"), ("spine_05", "thoracic"),
+        ("upperarm_l", "lhumerus"), ("upperarm_r", "rhumerus"),
+        ("index_01_l", "l_d2_j1"), ("index_01_r", "r_d2_j1"),
+    ];
+    let point = |i: usize| {
+        let base = &gla.skeleton.get(i)?.base_pose;
+        let pivot = [base[0][3], base[1][3], base[2][3]];
+        let p = jka_assets::ghoul2::transform_point(pose.get(i)?, pivot);
+        Some(transform_jka_model_point(p, axis, origin))
+    };
+    JOINTS.map(|(name, native)| {
+        let i = Ghoul2Animator::bone_index(gla, name).or_else(|| Ghoul2Animator::bone_index(gla, native))?;
+        let parent = usize::try_from(gla.skeleton.get(i)?.parent).ok()?;
+        let p = point(i)?;
+        let q = point(parent)?;
+        let d = (p[0]-q[0]).hypot(p[1]-q[1]).hypot(p[2]-q[2]);
+        (d.is_finite() && d > 0.0 && p.iter().all(|x| x.is_finite())).then_some(RiverBone { position_map: p, parent_distance_map: d })
+    })
+}
+
+/// Stage 13's named skeletal filter, with native Ghoul2 equivalents for the
+/// shared humanoid joints. Missing joints are skipped with their slot intact.
+fn burning_man_pose(
+    id: u64, time_ms: i32, gla: &jka_assets::ghoul2::GlaAnimation, pose: &[Matrix3x4],
+    axis: [[f32; 3]; 3], origin: [f32; 3], velocity: [f32; 3], scale: f32,
+) -> crate::ninja_fire_debug::PlayerPose {
+    const JOINTS: [(&str, Option<&str>); jka_ninja::FLAME_BODY_JOINTS] = [
+        ("head", Some("cranium")),
+        ("neck_01", Some("cervical")),
+        ("neck_02", None),
+        ("spine_01", Some("lower_lumbar")),
+        ("spine_03", Some("upper_lumbar")),
+        ("spine_04", None),
+        ("spine_05", Some("thoracic")),
+        ("upperarm_twist_01_l", Some("lhumerusX")),
+        ("upperarm_twist_01_r", Some("rhumerusX")),
+        ("lowerarm_twist_01_l", Some("lradiusX")),
+        ("lowerarm_twist_01_r", Some("rradiusX")),
+        // _humanoid.gla has no middle digit: d1, d2 and d4 only. The second
+        // d2 joint is the nearest finger bone (the old lfinger21 never existed).
+        ("middle_02_l", Some("l_d2_j2")),
+        ("middle_02_r", Some("r_d2_j2")),
+        ("calf_l", Some("ltibia")),
+        ("calf_r", Some("rtibia")),
+        // No tarsal bones either: the foot chain ends at the talus.
+        ("ball_l", Some("ltalus")),
+        ("ball_r", Some("rtalus")),
+    ];
+    let joints = JOINTS.map(|(original, fallback)| {
+        let index = Ghoul2Animator::bone_index(gla, original)
+            .or_else(|| fallback.and_then(|name| Ghoul2Animator::bone_index(gla, name)))?;
+        let base = &gla.skeleton[index].base_pose;
+        let pivot = [base[0][3], base[1][3], base[2][3]];
+        let point = jka_assets::ghoul2::transform_point(pose.get(index)?, pivot);
+        Some(glam::Vec3::from_array(crate::scene::render_position(
+            transform_jka_model_point(point, axis, origin),
+        )))
+    });
+    let mut base = origin;
+    base[2] += super::DEFAULT_PLAYER_MINS[2] * scale;
+    let mut forward = glam::Vec3::from_array(crate::scene::render_position(axis[0]));
+    forward.y = 0.0;
+    crate::ninja_fire_debug::PlayerPose {
+        id, time_ms, origin: glam::Vec3::from_array(crate::scene::render_position(base)),
+        forward: forward.normalize_or_zero(),
+        velocity: glam::Vec3::from_array(crate::scene::render_position(velocity)),
+        emitting: true, suppress_wind: false, joints, scale,
+    }
+}
+
 /// One 1x1 material per resolved player skin variant, uploaded through the
 /// existing dynamic-model material cache. The caller already applied OpenJK's
 /// BG_ValidateSkinForTeam (and cg_forceModel) before choosing this override.
@@ -173,6 +254,12 @@ impl PlayerPresenter {
         forced_models: Option<&ForcedPlayerModels>,
     ) -> Vec<DynamicModelSurface> {
         self.stage_time_ms = current_time;
+        self.ninja_fire_pose = None;
+        if jka_river::river_ninja::wake_joints_requested() || crate::ninja_fog_debug::wants_actors() {
+            self.river_ninja_bones.get_or_insert_with(HashMap::new).clear();
+        } else {
+            self.river_ninja_bones = None;
+        }
         self.grapple_owners.clear();
         self.grapple_hands.clear();
         // Network missiles identify grapple owners in jaPRO / JA+. Reusing
@@ -202,10 +289,13 @@ impl PlayerPresenter {
         // JK2 MVSDK's CG_FootstepForSurface ALWAYS uses CG_Trace (brush models
         // and solid entities included). Preserve the original allocation-free
         // JKA world-only path unless its diagnostic cg_footstepTrace is enabled.
-        if self.footstep_trace
+        self.expire_saber_gore_hits(current_time);
+        if !self.saber_gore_hits.is_empty()
+            || self.pending_gore.iter().any(|hit| hit.trace && hit.time <= current_time)
+            || self.footstep_trace
             || (jka_assets::pk3::active_jk2().is_some() && self.footstep_stages.sounds)
         {
-            crate::net::solid_entities_into(entities, current_time, &mut self.footstep_solids);
+            crate::net::solid_entities_into(entities, current_time, &mut self.presentation_solids);
         }
         // TaystJK CG_Player reads the viewing player's authoritative snapshot.
         // Never use the target's forcePowersActive to decide whether we see it.
@@ -596,6 +686,11 @@ impl PlayerPresenter {
         live_ragdolls.extend(self.active_impulse_ragdolls.keys().copied());
         self.entities
             .retain(|entity_num, _| live_entities.contains(entity_num));
+        if self.assets.jk2_version().is_some() {
+            // The Rust presenter drops out-of-PVS instances. Do not let an
+            // old body handoff survive after its corresponding instance dies.
+            self.body_queue_copies.retain(|entity_num, _| live_entities.contains(entity_num));
+        }
         self.breath_puff_times
             .retain(|entity_num, _| live_entities.contains(entity_num));
         self.vehicle_animations
@@ -1075,15 +1170,19 @@ impl PlayerPresenter {
         // CG_SetInitialSnapshot calls CG_ResetEntity for every entity, and
         // CG_TransitionEntity does the same whenever interpolation breaks. A
         // newly-created Rust runtime is the initial-snapshot/PVS equivalent.
+        let jk2_version = self.assets.jk2_version();
+        let jk2_body = jk2_version.is_some() && entity.entity_type == ET_BODY && model.humanoid;
+        let copied_dead_source = !recreate && body_copy.is_some() && previous_e_flags & EF_DEAD != 0;
         let reset_player_entity = recreate
-            || openjk_player_entity_needs_reset(
+            || (jk2_body && time_rewound)
+            || (!jk2_body && openjk_player_entity_needs_reset(
                 previous_e_flags,
                 runtime.last_client_num,
                 e_flags,
                 client_num,
                 force_reset,
                 time_rewound,
-            );
+            ));
         if reset_player_entity {
             // OpenJK CG_TransitionEntity -> CG_ResetEntity ->
             // CG_ResetPlayerEntity when interpolation is broken.  This resets
@@ -1258,7 +1357,9 @@ impl PlayerPresenter {
         // copied at respawn. Our renderer still owns the equivalent corpse pose
         // and Rapier handoff here; once ragging, preserve the existing yaw-only
         // corpse orientation used by this port.
-        runtime.animation.animator.clear_bone_angle_overrides();
+        if !jk2_body {
+            runtime.animation.animator.clear_bone_angle_overrides();
+        }
         // Match OpenJK CG_G2PlayerAngles/CG_G2Animated: dead entities and
         // explicit EF_RAG entities enter the ragdoll seam regardless of whether
         // they have already been copied into the ET_BODY queue. This is crucial
@@ -1284,7 +1385,6 @@ impl PlayerPresenter {
         // Force-grip handoff must instead sample the exact normal player pose on
         // its first frame, then Rapier freezes that skinning pose internally.
         let rapier_corpse = corpse_ragdoll_requested && self.ragdolls.active();
-        let jk2_version = self.assets.jk2_version();
         let anim_blend = super::animation_blend_enabled();
         let swing_fix = if anim_blend { super::saber_swing_fix() } else { 0 };
         let swing_eligible = jk2_version.is_none() && model.humanoid && entity.entity_type == ET_PLAYER
@@ -1306,6 +1406,11 @@ impl PlayerPresenter {
         let (mut axis, torso_angles) = if rapier_corpse {
             runtime.last_angle_time = current_time;
             (angles_to_axis([0.0, entity.angles[1], 0.0]), [0.0; 3])
+        } else if jk2_body {
+            // MVSDK ET_BODY -> CG_General: render the copied Ghoul2 pose
+            // with the server's body orientation, not living player angles.
+            runtime.last_angle_time = current_time;
+            (angles_to_axis(entity.angles), [0.0; 3])
         } else if !model.humanoid {
             // TaystJK's non-humanoid G2 path does not run BG_G2PlayerAngles or
             // require the humanoid Motion/lumbar chain. Ordinary creatures are
@@ -1575,18 +1680,29 @@ impl PlayerPresenter {
         // Keep that exact taunt instance masked after the clip ends; only this
         // animation input copy changes, never Pmove or the received entity.
         let emote_animation_state = runtime.emote_taunt.animation_state(&entity.state, local_emote.is_some());
-        let animation_update = runtime.animation.update(
-            emote_animation_state.as_ref().unwrap_or(&entity.state),
-            animations,
-            &model.animation_gla,
-            info,
-            &self.saber_scales,
-            current_time,
-            // Never blend idle through the hidden native taunt's bone state.
-            anim_blend && emote_animation_state.is_none() && !(swing_fix == 1 && swing_boundary),
-            model.humanoid,
-            jk2_version,
-        );
+        let animation_update = if let Some(version) = jk2_version.filter(|_| jk2_body) {
+            runtime.animation.update_jk2_body(
+                version,
+                entity.state.field_i32("torsoAnim").unwrap_or(0),
+                animations,
+                &model.animation_gla,
+                current_time,
+                copied_dead_source,
+            )
+        } else {
+            runtime.animation.update(
+                emote_animation_state.as_ref().unwrap_or(&entity.state),
+                animations,
+                &model.animation_gla,
+                info,
+                &self.saber_scales,
+                current_time,
+                // Never blend idle through the hidden native taunt's bone state.
+                anim_blend && emote_animation_state.is_none() && !(swing_fix == 1 && swing_boundary),
+                model.humanoid,
+                jk2_version,
+            )
+        };
         if let (Err(error), Some(_)) = (&animation_update, jk2_version) {
             // A failed update leaves no frame pair for this frame: say so rather
             // than let it look like a missed footstep.
@@ -1735,7 +1851,7 @@ impl PlayerPresenter {
                                 );
                                 if let Some(world) = self.collision_world.as_mut() {
                                     footsteps::jk2_probe_step(
-                                        world, &self.footstep_solids, self.viewer_client,
+                                        world, &self.presentation_solids, self.viewer_client,
                                         &mut self.jk2_footstep_diag, &mut self.jk2_footsteps,
                                         footsteps::Jk2StepContext {
                                             time: current_time,
@@ -1759,7 +1875,7 @@ impl PlayerPresenter {
                                 let bolt = |_| footsteps::unposed_foot(entity.origin);
                                 if self.footstep_trace {
                                     let mut trace = footsteps::FootstepEntityTrace::new(
-                                        world, &self.footstep_solids, self.viewer_client,
+                                        world, &self.presentation_solids, self.viewer_client,
                                         i32::from(entity.number),
                                     );
                                     footsteps::push_footsteps(
@@ -1882,6 +1998,20 @@ impl PlayerPresenter {
                 impulse_ragdoll.map(|impulse| impulse.seed_velocity),
                 current_time,
             )?;
+            if crate::ninja_blood::enabled() && !jk2_body {
+                // NinjaLive_BloodOrb2 selects calf_l/calf_r from the skeletal mesh.
+                let calves = [("calf_l", "ltibia"), ("calf_r", "rtibia")].map(|(name, jka)| {
+                    let index = Ghoul2Animator::bone_index(&model.gla, name)
+                        .or_else(|| Ghoul2Animator::bone_index(&model.gla, jka))?;
+                    let joint = multiply_3x4(pose.get(index)?, &model.gla.skeleton[index].base_pose);
+                    Some(transform_jka_model_point(
+                        [joint[0][3], joint[1][3], joint[2][3]], render_axis, render_origin,
+                    ))
+                });
+                if calves.iter().any(Option::is_some) {
+                    self.fx_requests.push(crate::cgame::player_presenter::PlayerFxRequest::RagdollBlood { calves });
+                }
+            }
         } else {
             self.ragdolls
                 .apply_living_recovery(entity.number, &model.key, &mut pose, current_time);
@@ -1950,6 +2080,9 @@ impl PlayerPresenter {
         // after animation, bone smoothing and procedural deformations. The
         // result is in renderer Y-up space and matches skinning/attachments.
         if entity.entity_type == ET_PLAYER {
+            if let Some(bones) = &mut self.river_ninja_bones {
+                bones.insert(entity.number, river_ninja_pose(&model.gla, &pose, render_axis, render_origin));
+            }
             if let Some(&mask)=self.studio_bone_masks.get(&entity.number) {
                 let scale=ghoul2_model_scale(entity);
                 let points=std::array::from_fn(|i| {
@@ -1964,6 +2097,12 @@ impl PlayerPresenter {
             }
         }
         if entity.entity_type == ET_PLAYER && i32::from(entity.number) == self.viewer_client {
+            if let Some(id) = crate::ninja_fire_debug::player_id() {
+                self.ninja_fire_pose = Some(burning_man_pose(
+                    id, current_time, &model.gla, &pose, render_axis, render_origin,
+                    presented_entity_velocity(entity), ghoul2_model_scale(entity),
+                ));
+            }
             self.viewer_foot_bolts =
                 foot_bolts_timed(&mut self.perf, &model, &pose, ghoul2_model_scale(entity));
             let key_hash = {
@@ -2026,7 +2165,7 @@ impl PlayerPresenter {
                     |bolt| jk2_lumbar_footstep_ray(bolt, render_axis, render_origin),
                 );
                 footsteps::jk2_probe_step(
-                    world, &self.footstep_solids, self.viewer_client,
+                    world, &self.presentation_solids, self.viewer_client,
                     &mut self.jk2_footstep_diag, &mut self.jk2_footsteps,
                     footsteps::Jk2StepContext {
                         time: current_time,
@@ -2055,7 +2194,7 @@ impl PlayerPresenter {
             };
             if self.footstep_trace {
                 let mut trace = footsteps::FootstepEntityTrace::new(
-                    world, &self.footstep_solids, self.viewer_client,
+                    world, &self.presentation_solids, self.viewer_client,
                     i32::from(entity.number),
                 );
                 footsteps::push_footsteps(
@@ -2554,26 +2693,25 @@ impl PlayerPresenter {
                 usize::from(!draws.is_empty()),
             ),
         );
-        if self.gore_limit > 0 {
-            let snaps = draws
-                .iter()
-                .filter_map(|surface| {
-                    surface
-                        .ghoul2_gpu
-                        .as_ref()
-                        .map(|skin| crate::cgame::player_gore::GpuSnap {
-                            mesh_key: Arc::clone(&skin.mesh_key),
-                            vertices: Arc::clone(&skin.vertices),
-                            indices: Arc::clone(&skin.indices),
-                            bones: Arc::clone(&skin.bones),
-                            jiggle_offsets: skin.jiggle_offsets,
-                            axis: skin.axis,
-                            origin: skin.origin,
-                        })
-                })
-                .collect();
+        if self.gore_marks_enabled() {
+            let mut snaps = Vec::<crate::cgame::player_gore::GpuSnap>::new();
+            for skin in draws.iter().filter_map(|surface| surface.ghoul2_gpu.as_ref()) {
+                // Multi-stage materials and player trails can submit the same
+                // mesh again. Only the base submission owns the damage.
+                if snaps.iter().any(|snap| snap.mesh_key == skin.mesh_key) { continue; }
+                snaps.push(crate::cgame::player_gore::GpuSnap {
+                    mesh_key: Arc::clone(&skin.mesh_key),
+                    vertices: Arc::clone(&skin.vertices),
+                    indices: Arc::clone(&skin.indices),
+                    bones: Arc::clone(&skin.bones),
+                    jiggle_offsets: skin.jiggle_offsets,
+                    axis: skin.axis,
+                    origin: skin.origin,
+                });
+            }
+            if self.skin_gore_enabled { self.skin_gore.retain_entity_surfaces(entity.number, &snaps); }
             self.last_gpu.insert(entity.number, snaps);
-            self.append_gore(entity.number, current_time, &mut draws);
+            self.append_gore(entity.number, current_time, body_surfaces, body_lod, &mut draws);
         }
         let shells = self.force_shells(entity, info.team, current_time);
         if !shells.is_empty() {

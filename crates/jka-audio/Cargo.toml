@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+jka-echofield = { path = "../jka-echofield" }
 jka-assets = { path = "../jka-assets" }
 jka-emotes = { path = "../jka-emotes" }
 serde_json = "=1.0.151"

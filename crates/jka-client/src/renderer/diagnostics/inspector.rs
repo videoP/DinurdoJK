@@ -1090,7 +1090,7 @@ impl Renderer {
                 self.ocean_enabled,
                 source.water_primary,
                 inspector_ocean_is_upward(source_vertices),
-                batch.ocean_replaced,
+                batch.ocean_owners != 0,
                 decision,
             ))
         } else { None };

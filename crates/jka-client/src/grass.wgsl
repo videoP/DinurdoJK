@@ -78,6 +78,7 @@ struct VertexOutput {
     @location(5) baked_light: vec3<f32>,
     @location(6) ground_tint: vec4<f32>,
     @location(7) @interpolate(flat) fog_slot: u32,
+    // BLADE_MATERIAL_VARYINGS
 };
 
 // Source: https://www.shadertoy.com/view/Xt3cDn
@@ -441,6 +442,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
         camera_right = normalize(camera_right);
     }
     vertex_m += camera_right * thicken_factor * thicken_direction;
+    // BLADE_MATERIAL_OFFSET
 
     let world_position = root_world + vertex_m / world_scale;
     var out: VertexOutput;
@@ -455,6 +457,7 @@ fn vs_main(input: VertexInput) -> VertexOutput {
     out.baked_light = instance.baked_light.rgb;
     out.ground_tint = instance.ground_tint;
     out.fog_slot = instance.fog_slot;
+    // BLADE_MATERIAL_TANGENT
     return out;
 }
 
@@ -473,8 +476,8 @@ fn grass_legacy_authored_fog_color(color: vec3<f32>) -> vec3<f32> {
 
 // Legacy fog: procedural grass is not a BSP material stage, so it fogs itself
 // with the same curves as bsp.wgsl legacy_fog_color_amount (see
-// FogSystem::legacy_self_fog). Legacy 1 authored global fog is instead composited
-// in post over the grass using the ground depth behind it.
+// FogSystem::legacy_self_fog). Authored global fog (both Legacy modes) is instead
+// applied by the in-scene fullscreen pass using the ground depth behind it.
 fn apply_grass_legacy_fog(rgb: vec3<f32>, world_position: vec3<f32>, fog_slot: u32) -> vec3<f32> {
     if (!ENABLE_LEGACY_FOG) {
         return rgb;

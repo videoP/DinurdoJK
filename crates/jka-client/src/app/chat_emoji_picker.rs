@@ -169,16 +169,11 @@ impl App {
     }
 
     pub(in crate::app) fn insert_picked_chat_emoji(&mut self, text: &str) {
-        // Same 160-byte JKA/Unicode input budget as handle_chat_key/paste.
-        let used = if self.chat_input_selected { 0 } else {
-            crate::cgame::unicode_input_wire_len(&self.chat_input)
-        };
-        let extra: usize = text.chars().map(|ch| if ch as u32 <= 0xFF { 1 } else { ch.len_utf8() }).sum();
-        if used + extra > 160 { return; }
-        if self.chat_input_selected { self.chat_input.clear(); }
-        self.chat_input_selected = false;
-        self.chat_input.push_str(text);
-        self.chat_player_completion = None;
+        let extra = crate::cgame::unicode_input_wire_len(text);
+        if self.chat_input_len_for_insert() + extra > super::chat::CHAT_INPUT_LIMIT {
+            return;
+        }
+        self.insert_chat_at_cursor(text);
         self.publish_ui();
         self.egui_repaint_requested = true;
     }

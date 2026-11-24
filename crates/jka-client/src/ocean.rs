@@ -38,12 +38,28 @@ mod native_optics;
 pub use native_optics::BlueWaterOptics;
 pub use native_waves::BlueWaterWaves;
 mod original_surface;
+pub(crate) use original_surface::near_plane_reach;
+mod ninja_ocean;
+mod ninja_coast;
+mod ninja_coast_adaptive;
+mod ninja_coast_wave_clipmap;
+mod ninja_coast_whitewater;
+mod ninja_coast_dump;
+mod ninja_underwater;
+pub(crate) mod source_underwater;
+pub(crate) use ninja_underwater::{Textures as NinjaUnderwaterTextures, View as NinjaUnderwaterView};
+/// r_blueWaterUnderwaterMode / r_hybridUnderwaterMode 5: the Fluid Ninja
+/// river's submerged post material in place of Blue Water's composite.
+pub(crate) const NINJA_UNDERWATER_MODE: u8 = 5;
+/// r_lakeUnderwaterMode 6: HL2's underwater view for Source lake water.
+pub(crate) const SOURCE_UNDERWATER_MODE: u8 = 6;
+pub(crate) use ninja_ocean::{Assets as NinjaOceanAssets, Authority as NinjaOceanAuthority};
 pub mod coastal;
 pub mod upstream_coast;
-pub mod gerstner_contact;
-mod gerstner_patterns;
+mod lake_noise;
 mod lakes;
 mod lake_wakes;
+mod ninja_lake;
 pub use lakes::LakeSettings;
 pub mod sky_extend;
 pub mod volume;
@@ -1580,7 +1596,7 @@ pub struct OceanSettings {
     /// Hybrid-only: 1 = original Blue Water FFT, 0 = authored Gerstner swell.
     /// Independent of Godot's authored.slosh; Native backend ignores this setting.
     pub hybrid_fft_blend: f32,
-    /// A/B: 0 original; 1 compression limit; 2 bounded spilling crests.
+    /// A/B: 0 original; 1 compression limit; 2 bounded spilling crests; 3 conservative spill.
     pub hybrid_breaker: u8,
     /// Separate authored swell for Hybrid; never changes Godot map-authored
     /// waves, their amplitude links, or Blue Water's simulation parameters.
@@ -1601,21 +1617,6 @@ pub struct OceanSettings {
     /// `r_oceanMediumWaveDetail`: height gain on the FFT's medium tile. These
     /// waves are physics waves, so the server must use the same gain.
     pub medium_wave_detail: f32,
-    /// `r_oceanType 5` (backend 2 + this): Hybrid with godot-water-shader's
-    /// waves, surface colour and persistent foam (vendor/godot-water-shader)
-    /// in place of the FFT displacement, water body and foam. Blue Water lights it.
-    pub gerstner_water: bool,
-    /// `r_gerstnerWaveScale`: the upstream sea this many times larger (Froude-similar).
-    pub gerstner_wave_scale: f32,
-    /// `r_gerstnerFoam` bits: persistent foam cascades 1 near (15 m), 2 far (30 m); 4 distant (per-pixel
-    /// compression foam past the cascades).
-    pub gerstner_foam: u8,
-    /// `r_gerstnerFoamRate`: persistent foam steps per second per cascade (staggered); 0 every frame, as upstream.
-    pub gerstner_foam_rate: f32,
-    /// `r_gerstnerWaterColor`: upstream's water `color` (sRGB 0..1; FoamScene 0, 55, 65).
-    pub gerstner_water_color: [f32; 3],
-    /// `r_gerstnerCrestColor`: the colour crests blend toward (sRGB 0..1; upstream's linear 0, 0.08, 0.02).
-    pub gerstner_crest_color: [f32; 3],
     pub blue_water_optics: BlueWaterOptics,
     /// Blue Water scene-bending refraction; independent of legacy optics.
     pub blue_water_refraction: f32,
@@ -1655,12 +1656,82 @@ pub struct OceanSettings {
     /// Hybrid quality: 0 original; 1 optimized honoring SSR; 2 optimized sky-only.
     /// 0 original; 1 compact; 2 compact without SSR; 3 adaptive compact with fine ripples and cheap glints.
     pub hybrid_material: u8,
+    /// Private Fluid Ninja preset for r_hybridMaterial 4: 0 Ocean2 (sparse sea ship), 1 Coast (dense sea, 100 m).
+    pub ninja_preset: u8,
+    /// Coast simulation debug view (r_ninjaCoastDebug): 0 off, 1 density/wet, 2 velocity,
+    /// 3 pressure/divergence, 4 landscape gradient/peaks, 5 bed height; lit components:
+    /// 6 SLW volume, 7 opaque surface layer, 8 water path / refraction validity / opacity.
+    pub ninja_coast_debug: u8,
+    /// `r_ninjaCoastDump`: a change to a nonzero value writes one f32 readback of the
+    /// Coast targets to `<DinurdoJK>/debug/ninja_coast` (startup value never dumps).
+    pub ninja_coast_dump: u32,
+    /// `r_ninjaCoastWhitewater`: whitewater spawn-rate scale (UE's 300k/s x this; 0 off).
+    pub ninja_coast_whitewater: f32,
+    /// `r_ninjaCoastWhitewaterOpacity`: host scale on the whitewater sprites' displayed alpha (1 = calibrated).
+    pub ninja_coast_whitewater_opacity: f32,
+    /// `r_ninjaCoastWaveGain`: multiplier on the bed-calibrated wave-drive gain (1 = auto).
+    pub ninja_coast_wave_gain: f32,
+    /// `r_ninjaCoastTileMap`: the Coast material's passive tile map (density streaks, foam boost
+    /// and its mesh distortion). Off reads no tile map.
+    pub ninja_coast_tile_map: bool,
+    /// `r_ninjaCoastTileNormals`: the Coast tile height normals (the honeycomb ripple pattern).
+    pub ninja_coast_tile_normals: bool,
+    /// `r_ninjaCoastWakeFoam`: the Coast material's velocity-to-foam weights. True = the FNL
+    /// Lake (MI_Water_DENSE_Lagoon_murky) values, whose actor wakes leave foam trails; false =
+    /// the Coastline MI (weak wake foam).
+    pub ninja_coast_wake_foam: bool,
+    /// `r_lakeNinjaWake`: Fluid Ninja lake wake on Source lakes (a player-following
+    /// Water_Dense_Lake window: wake normals and foam). Needs cg_waterwake != 0.
+    pub lake_ninja_wake: bool,
+    /// `r_ninjaCoastSimDistance` (m, 0 = always): hold the Coast solver and whitewater while the
+    /// eye is farther than this (3D) from the nearest water in the sim window.
+    pub ninja_coast_sim_distance: f32,
+    /// `r_ninjaCoastFarMeshLevels`: Coast clipmap levels dropped while the eye is past the sim's reach.
+    pub ninja_coast_far_mesh_levels: u8,
+    /// `r_ninjaCoastShoreDepth` (m, 0 = everywhere): Coast sim detail and whitewater only over
+    /// a captured bed shallower than this (open sea has none).
+    pub ninja_coast_shore_depth: f32,
+    /// `r_ninjaCoastOpenFoam`: Coast foam strength on the FFT wave crests over open sea (0 off).
+    pub ninja_coast_open_foam: f32,
+    /// `r_ninjaCoastFollowSwell`: the Coast sim's wave drive follows the Blue Water swell
+    /// direction (shore exposure), wavelength (speed) and height (strength).
+    pub ninja_coast_follow_swell: bool,
+    /// `r_ninjaCoastFarLod` (m, 0 off): Coast pixels past 1.5x this eye distance use the far
+    /// material (`r_ninjaCoastFarDetail` 0 flat, 1 tile density, 2 + tile normals); lossy A/B.
+    pub ninja_coast_far_lod: f32,
+    pub ninja_coast_far_detail: u8,
+    /// `r_ninjaCoastSSRDistance` (m, 0 unlimited): Coast SSR fades out by this eye distance.
+    pub ninja_coast_ssr_distance: f32,
+    /// `r_ninjaCoastFftDistance` (m, 0 unlimited): the Coast FFT slope fades out by this eye distance.
+    pub ninja_coast_fft_distance: f32,
+    /// `r_ninjaCoastFftLite`: slope past `ninja_coast_fft_distance`: 0 none, 1 4:1 anisotropy,
+    /// 2 4:1 without strain reads, 3 2:1 without strain reads.
+    pub ninja_coast_fft_lite: u8,
+    /// `r_ninjaCoastDeepWater` (> 0 on): water past the shore band is drawn by a separate
+    /// compact adaptive Hybrid pipeline; Coast shades and blends only the shore band.
+    pub ninja_coast_deep_water: f32,
+    /// `r_ninjaCoastDeepFoam`: gain on the split pass's persistent foam.
+    pub ninja_coast_deep_foam: f32,
+    pub ninja_coast_wave_clipmap: bool,
+    pub ninja_coast_shore_clipmap: bool,
+    pub ninja_coast_adaptive: bool,
+    pub ninja_coast_shore_blend: f32,
+    pub ninja_coast_fft_detail: f32,
+    /// `r_ninjaCoastSimQuality`: 3 = 2048 solver + 2048 velocity export, 2 = 2048 + UE 512 export,
+    /// 1 = 1024 solver, 0 = 512 solver (both with the 512 export).
+    pub ninja_coast_sim_quality: u8,
+    pub ninja_coast_foam_lace: bool,
+    pub ninja_coast_deep_red: f32,
+    pub ninja_coast_fft_late: bool,
+    /// `r_ninjaCoastCostProbe`: diagnostic bits removing Coast shader features (cost bisection).
+    pub ninja_coast_cost_probe: u32,
+    /// `r_ninjaCoastCostProbe2`: finer per-operation ablation bits (diagnostic).
+    pub ninja_coast_cost_probe2: u32,
     pub hybrid_fast_foam: f32,
     pub hybrid_fast_foam_detail: bool,
     /// Hybrid owns its appearance; editing it must not overwrite native Blue Water.
     /// 1x uses the stock Godot fog-distance and native Blue Water calibration.
     pub hybrid_transparency: f32,
-    pub hybrid_fog_color: [f32; 3],
     pub hybrid_water_color: [f32; 3],
     /// Blue Water mid-cascade spans 181m, Godot's caustic cascade spans 57m.
     /// Rescale only Hybrid's receiver sampling to recover a finer pattern.
@@ -1784,20 +1855,46 @@ impl Default for OceanSettings {
             hybrid_waterline_debug: 0,
             hybrid_ssr: false,
             hybrid_material: 1,
+            ninja_preset: 1,
+            ninja_coast_debug: 0,
+            ninja_coast_whitewater: 0.3,
+            ninja_coast_whitewater_opacity: 0.2,
+            ninja_coast_wave_gain: 1.0,
+            ninja_coast_tile_map: true,
+            ninja_coast_tile_normals: true,
+            ninja_coast_wake_foam: true,
+            lake_ninja_wake: true,
+            ninja_coast_sim_distance: 0.0,
+            ninja_coast_far_mesh_levels: 2,
+            ninja_coast_shore_depth: 8.0,
+            ninja_coast_open_foam: 4.0,
+            ninja_coast_follow_swell: true,
+            ninja_coast_far_lod: 0.0,
+            ninja_coast_far_detail: 1,
+            ninja_coast_ssr_distance: 0.0,
+            ninja_coast_fft_distance: 0.0,
+            ninja_coast_fft_lite: 2,
+            ninja_coast_deep_water: 1.0,
+            ninja_coast_deep_foam: 1.0,
+            ninja_coast_wave_clipmap: false,
+            ninja_coast_shore_clipmap: false,
+            ninja_coast_adaptive: false,
+            ninja_coast_shore_blend: 1.5,
+            ninja_coast_fft_detail: 1.0,
+            ninja_coast_sim_quality: 3,
+            ninja_coast_foam_lace: false,
+            ninja_coast_deep_red: 0.0,
+            ninja_coast_fft_late: false,
+            ninja_coast_cost_probe: 0,
+            ninja_coast_cost_probe2: 0,
+            ninja_coast_dump: 0,
             hybrid_fast_foam: 1.0,
             hybrid_fast_foam_detail: true,
             hybrid_transparency: 1.0,
-            hybrid_fog_color: optics::Settings::default().fog_color,
             hybrid_water_color: BlueWaterOptics::default().water_color,
             hybrid_caustics_scale: 3.0,
             hybrid_caustics_gain: 1.5,
             hybrid_caustics_fast: false,
-            gerstner_water: false,
-            gerstner_wave_scale: 1.0,
-            gerstner_foam: 7,
-            gerstner_foam_rate: 60.0,
-            gerstner_water_color: GERSTNER_WATER_COLOR,
-            gerstner_crest_color: GERSTNER_CREST_COLOR,
             blue_water_ssr_steps: 16,
             blue_wake: 0,
             spindrift: 0,
@@ -1861,27 +1958,126 @@ impl OceanSettings {
         }
     }
 
-    /// Use Hybrid's Godot submerged optics and ray-length fog. Cheapwater
-    /// shares the optics while retaining its own animated mesh and normals.
+    /// Use Hybrid's Godot submerged optics and ray-length fog. Lakes share
+    /// the optics while retaining their own animated mesh and normals.
     pub fn uses_godot_underwater(&self) -> bool {
-        (self.backend == 2 && self.blue_water_underwater_mode == 4)
-            || (self.backend == 3 && self.lake.shader == 1)
+        matches!(self.backend, 2 | 3) && self.blue_water_underwater_mode == 4
     }
 
-    /// Only Hybrid substitutes the Godot material/mesh draw. Cheapwater shades
+    /// Only Hybrid substitutes the Godot material/mesh draw. Lakes shade
     /// its existing animated clipmap below water, including its ripple normals.
+    /// Fluid Ninja (5) over Hybrid takes the same cheap submerged path (sparse
+    /// native mesh, Godot underside material, ray-length fog capture); only its
+    /// post material replaces Godot's fog composite.
     pub fn uses_godot_submerged_mesh(&self) -> bool {
-        self.backend == 2 && self.uses_godot_underwater()
+        self.backend == 2 && (self.uses_godot_underwater() || self.blue_water_underwater_mode == NINJA_UNDERWATER_MODE)
+    }
+
+    /// The Godot ray-length fog capture runs below the surface (it feeds the
+    /// Godot composite and the Godot underside material).
+    pub fn uses_godot_fog_capture(&self) -> bool {
+        self.uses_godot_underwater() || self.uses_godot_submerged_mesh()
     }
 
     /// Absorption-matched world/clipmap culling distance for the active water
     /// backend. Blue Water derives this from its native RGB extinction; Unified
     /// retains its own transparency-distance and user multiplier.
     pub fn underwater_cull_distance(self) -> f32 {
-        if matches!(self.backend, 1 | 2) && (self.backend != 2 || self.hybrid_underwater_mode != 4) {
-            self.blue_water_optics.absorption_cull_distance_units()
+        // Underwater mode 5 (settings resolved for GPU): the Fluid Ninja look's host fade end.
+        if self.blue_water_underwater_mode == NINJA_UNDERWATER_MODE && matches!(self.backend, 1 | 2 | 3) {
+            return ninja_underwater::cull_distance_units(self.ninja_underwater_distance_mult());
+        }
+        // Godot submerged under a Ninja surface: the same medium as compact Hybrid,
+        // not the Ninja surface's above-water transmission depth.
+        if self.uses_godot_underwater() && self.ninja_requested() {
+            return self.blue_water_optics.absorption_cull_distance_units();
+        }
+        // Source underwater: radial distance where its fog passes 99.8%.
+        if self.backend == 3 && self.blue_water_underwater_mode == SOURCE_UNDERWATER_MODE {
+            return source_underwater::Fog::of(&self.lake).cull_distance();
+        }
+        // Lakes under Godot fog: the submerged view's own visibility, not the
+        // above-water depth cut (that hid geometry ~2.5 m away while still
+        // visible). lake_underwater / the fog capture attenuate the
+        // least-absorbed (blue) channel as exp2(-4.32 * path / range), range =
+        // `optics.absorption_distance()`; cull where it drops below 0.2%.
+        if self.backend == 3 && self.uses_godot_underwater() {
+            const MIN_TRANSMISSION_LOG2: f32 = -8.965784; // log2(0.002)
+            return self.optics.absorption_distance() * (-MIN_TRANSMISSION_LOG2 / 4.321928);
+        }
+        self.surface_cull_depth()
+    }
+
+    /// Underwater mode 5 fog density. Native/Hybrid Transparency (Hybrid's is
+    /// copied into `blue_water_optics` when resolved for GPU) scales the fog
+    /// distance and with it the cull distance. Lakes use their underwater
+    /// visibility slider (the one Godot fog uses), relative to its default, so
+    /// the default keeps the authored Ninja look.
+    pub fn ninja_underwater_distance_mult(self) -> f32 {
+        let transparency = match self.backend {
+            1 | 2 => self.blue_water_optics.transparency,
+            3 => self.lake.transparency / LakeSettings::default().transparency,
+            _ => 1.0,
+        };
+        ninja_underwater::distance_mult(transparency)
+    }
+
+    /// Above-water depth cut (JKA units below the water plane): submerged geometry
+    /// seen through the surface is hidden by the surface material's own
+    /// transmission, not by the underwater post effect, so this ignores the
+    /// underwater mode. Call on settings resolved for GPU.
+    pub fn surface_cull_depth(self) -> f32 {
+        match self.backend {
+            // Source water's fog end (source_water.wgsl) below the displaced
+            // surface; the trough adds the amplitude.
+            3 => (self.lake.opaque_depth * 0.3048 + self.lake.amplitude * 0.0254) * OCEAN_UNITS_PER_METER,
+            2 if self.ninja_requested() => self.ninja_surface_cull_depth().unwrap_or_else(|| self.optics.cull_distance()),
+            // Native and Hybrid keep the Blue Water surface above water in every underwater mode.
+            1 | 2 => self.blue_water_optics.absorption_cull_distance_units(),
+            _ => self.optics.cull_distance(),
+        }
+    }
+
+    /// Ninja surface (Coast / Ocean2): the bed reaches the eye through the Single
+    /// Layer Water path, at least twice its vertical depth (down the view ray and
+    /// up `to_top`, jka-water river/slw.wgsl), with the Coast's Hybrid
+    /// water color / transparency applied as in ninja_coast_surface.wgsl. Cut
+    /// where the least-extinguished channel keeps 0.2% of a doubled
+    /// (ColorScale / caustics headroom) scene, plus the FFT trough.
+    fn ninja_surface_cull_depth(self) -> Option<f32> {
+        const MIN_TRANSMISSION: f32 = 0.002;
+        const SCALE_HEADROOM: f32 = 2.0;
+        let coast = self.ninja_preset != 0;
+        let (scattering, absorption) = jka_ninja::ocean_surface_volume(coast)?;
+        let (tint, clarity) = if coast {
+            let base = native_optics::BlueWaterOptics::default().water_color;
+            (std::array::from_fn::<f32, 3, _>(|i| self.hybrid_water_color[i] / base[i].max(1e-3)),
+                self.hybrid_transparency.clamp(0.1, 10.0))
         } else {
-            self.optics.cull_distance()
+            ([1.0; 3], 1.0)
+        };
+        let extinction = (0..3).map(|i| (scattering[i] * tint[i] + absorption[i]) / clarity)
+            .fold(f32::INFINITY, f32::min);
+        if !(extinction > 0.0) || !extinction.is_finite() {
+            return None;
+        }
+        let depth_cm = (SCALE_HEADROOM / MIN_TRANSMISSION).ln() / (2.0 * extinction);
+        let trough = if self.ninja_fft() { self.blue_water_waves.height.max(0.0) * 0.5 } else { 0.0 };
+        Some(depth_cm / 2.5 + trough * OCEAN_UNITS_PER_METER)
+    }
+
+    /// Render units the animated surface of an opaque, depth-writing water (the
+    /// Source lakes, the Ninja FFT surface) can rise above its plane, plus a
+    /// unit of slack. `None` for the other waters, whose blended surfaces stay
+    /// in the post-water queue. Call on settings resolved for GPU.
+    pub fn submerged_blend_crest(self) -> Option<f32> {
+        match self.backend {
+            3 => Some(self.lake.amplitude.max(0.0) * 0.0254 * OCEAN_UNITS_PER_METER + 1.0),
+            2 if self.ninja_requested() => {
+                let crest = if self.ninja_fft() { self.blue_water_waves.height.max(0.0) * 0.5 } else { 0.0 };
+                Some(crest * OCEAN_UNITS_PER_METER + 1.0)
+            }
+            _ => None,
         }
     }
 
@@ -1902,10 +2098,11 @@ impl OceanSettings {
     /// fields at the render boundary. Pure Blue Water remains independent.
     pub fn resolved_for_gpu(mut self) -> Self {
         if self.backend == 3 {
-            // Lakes retain flat-plane classification; Cheapwater shares Hybrid's
+            // Lakes retain flat-plane classification; they share Hybrid's
             // submerged material/fog while all lake simulation stays disabled.
             self.blue_water_caustics_mode = 2;
-            self.blue_water_underwater_mode = 4;
+            // r_lakeUnderwaterMode: Godot submerged fog (4), Fluid Ninja (5) or Source (6).
+            self.blue_water_underwater_mode = self.lake.underwater_mode;
             self.blue_water_adapter = false;
             self.blue_water_ssr = false;
             self.blue_water_prepare_godot_mesh = false;
@@ -1916,18 +2113,35 @@ impl OceanSettings {
             self.interaction = false;
             self.optics.caustics = 0.0;
             self.optics.transparency = optics::Settings::default().transparency * self.lake.transparency;
-            self.optics.fog_color = self.lake.fog_color;
+            // One lake color: the Source water color ($fogcolor) is also the underwater fog.
+            self.optics.fog_color = self.lake.deep_color;
         } else if self.backend == 2 {
-            if self.gerstner_water {
-                // Its waves have no FFT component and no crest limiter (`hybrid_swell_uniform`).
-                self.hybrid_breaker = 0;
-                self.hybrid_fft_blend = 0.0;
-            }
             self.blue_water_refraction_mode = self.hybrid_refraction_mode;
             self.blue_water_caustics_mode = self.hybrid_caustics_mode;
             self.blue_water_underwater_mode = self.hybrid_underwater_mode;
             self.blue_water_ssr = self.hybrid_ssr;
-            if self.hybrid_material > 0 && !self.gerstner_water {
+            if self.ninja_requested() && !jka_ninja::INCLUDED {
+                static WARN: std::sync::Once = std::sync::Once::new();
+                WARN.call_once(|| eprintln!("[OCEAN NINJA] private provider absent; using compact Hybrid"));
+                self.hybrid_material = 1;
+            }
+            if self.ninja_requested() {
+                // Ninja owns surface presentation above water. Godot submerged
+                // (4) works as for compact Hybrid: below the surface the
+                // sparse native mesh with the Godot underside material and the
+                // cheap ray-length fog replace the Ninja surface.
+                self.hybrid_breaker = if self.ninja_fft() { 3 } else { 0 };
+                self.hybrid_fft_blend = if self.ninja_fft() { 1.0 } else { 0.0 };
+                self.blue_water_caustics_mode = 2;
+                self.blue_water_refraction_mode = 0;
+                self.blue_water_prepare_godot_mesh = false;
+                self.blue_wake = 0;
+                self.interaction = false;
+                self.spindrift = 0;
+                self.sea_spray = false;
+                self.wind_foam_streaks = false;
+            }
+            if self.hybrid_material > 0 {
                 self.pixel_detail_mode = 0;
                 if self.hybrid_material == 2 { self.blue_water_ssr = false; }
             }
@@ -1935,7 +2149,8 @@ impl OceanSettings {
             // observe Hybrid's own appearance. Preserve each pure backend's
             // saved appearance for switching/A-B.
             self.blue_water_optics.transparency = self.hybrid_transparency;
-            self.blue_water_optics.fog_color = self.hybrid_fog_color;
+            // One Hybrid color: the water color is also the underwater fog.
+            self.blue_water_optics.fog_color = self.hybrid_water_color;
             self.blue_water_optics.water_color = self.hybrid_water_color;
             // Hybrid owns its clarity like its fog color: scale the stock
             // Godot distance, never the saved Godot preset. A murky saved
@@ -1943,25 +2158,64 @@ impl OceanSettings {
             // submerged view to black while the native medium looks fine.
             self.optics.transparency = (optics::Settings::default().transparency
                 * self.hybrid_transparency).clamp(1.0, 65536.0);
-            self.optics.fog_color = self.hybrid_fog_color;
+            self.optics.fog_color = self.hybrid_water_color;
         } else if self.backend == 1 {
             // Old configs may still contain the pre-split hybrid-only modes.
             // Never let them silently turn Godot optics back on in Native.
             if self.blue_water_caustics_mode >= 3 { self.blue_water_caustics_mode = 0; }
             if self.blue_water_underwater_mode == 4 { self.blue_water_underwater_mode = 0; }
         }
+        if self.blue_water_underwater_mode == NINJA_UNDERWATER_MODE && !jka_ninja::INCLUDED {
+            self.blue_water_underwater_mode = 0;
+        }
         self
     }
 
-    /// `r_oceanType 5`: Hybrid with godot-water-shader's waves and surface.
-    pub fn gerstner_active(&self) -> bool {
-        self.backend == 2 && self.gerstner_water
+    pub fn ninja_requested(&self) -> bool {
+        self.backend == 2 && self.hybrid_material == 4
+    }
+
+    /// Any promoted water that consumes the shared Fluid Ninja actor wake:
+    /// the Ninja ocean material or the Source-lake Ninja wake.
+    pub fn ninja_wake_requested(&self) -> bool {
+        self.ninja_requested() || (self.backend == 3 && self.lake_ninja_wake)
+    }
+
+    /// r_hybridMaterial 4 with a nonzero FFT wave height. At height 0 mode 4
+    /// draws exactly mode 5, so it runs as mode 5: no FFT update, crest
+    /// limits or FFT-sampling surface pipeline.
+    pub fn ninja_fft(&self) -> bool {
+        self.ninja_requested() && self.hybrid_material == 4 && self.blue_water_waves.height > 0.0
+    }
+
+    /// Effective Fluid Ninja surface mode: 0 none, 4 with FFT, 5 Ninja only
+    /// (r_hybridMaterial 4 at FFT wave height 0; not a user setting).
+    pub fn ninja_mode(&self) -> u8 {
+        if !self.ninja_requested() { 0 } else if self.ninja_fft() { 4 } else { 5 }
     }
 
     pub fn sanitize(mut self) -> Self {
         self.backend = self.backend.min(3);
-        self.hybrid_breaker = self.hybrid_breaker.min(2);
-        self.hybrid_material = self.hybrid_material.min(3);
+        self.hybrid_breaker = self.hybrid_breaker.min(3);
+        self.hybrid_material = self.hybrid_material.min(4);
+        self.ninja_preset = self.ninja_preset.min(1);
+        self.ninja_coast_debug = self.ninja_coast_debug.min(11);
+        self.ninja_coast_whitewater = if self.ninja_coast_whitewater.is_finite() { self.ninja_coast_whitewater.clamp(0.0, 1.0) } else { 0.3 };
+        self.ninja_coast_whitewater_opacity = if self.ninja_coast_whitewater_opacity.is_finite() { self.ninja_coast_whitewater_opacity.clamp(0.0, 1.0) } else { 0.2 };
+        self.ninja_coast_wave_gain = if self.ninja_coast_wave_gain.is_finite() { self.ninja_coast_wave_gain.clamp(0.0, 4.0) } else { 1.0 };
+        self.ninja_coast_far_lod = if self.ninja_coast_far_lod.is_finite() { self.ninja_coast_far_lod.clamp(0.0, 10000.0) } else { 0.0 };
+        self.ninja_coast_far_detail = self.ninja_coast_far_detail.min(2);
+        self.ninja_coast_ssr_distance = if self.ninja_coast_ssr_distance.is_finite() { self.ninja_coast_ssr_distance.clamp(0.0, 100000.0) } else { 0.0 };
+        self.ninja_coast_fft_distance = if self.ninja_coast_fft_distance.is_finite() { self.ninja_coast_fft_distance.clamp(0.0, 100000.0) } else { 0.0 };
+        self.ninja_coast_fft_lite = self.ninja_coast_fft_lite.min(4);
+        self.ninja_coast_open_foam = if self.ninja_coast_open_foam.is_finite() { self.ninja_coast_open_foam.clamp(0.0, 10.0) } else { 4.0 };
+        self.ninja_coast_sim_distance = if self.ninja_coast_sim_distance.is_finite() { self.ninja_coast_sim_distance.clamp(0.0, 10000.0) } else { 0.0 };
+        self.ninja_coast_far_mesh_levels = self.ninja_coast_far_mesh_levels.min(3);
+        self.ninja_coast_sim_quality = self.ninja_coast_sim_quality.min(3);
+        self.ninja_coast_shore_depth = if self.ninja_coast_shore_depth.is_finite() { self.ninja_coast_shore_depth.clamp(0.0, 1000.0) } else { 8.0 };
+        self.ninja_coast_deep_water = if self.ninja_coast_deep_water > 0.0 { 1.0 } else { 0.0 };
+        self.ninja_coast_cost_probe = self.ninja_coast_cost_probe.min(65535);
+        self.ninja_coast_cost_probe2 = self.ninja_coast_cost_probe2.min(524287);
         self.hybrid_fast_foam = if self.hybrid_fast_foam.is_finite() {
             self.hybrid_fast_foam.clamp(0.0, 3.0)
         } else { 1.0 };
@@ -1971,13 +2225,6 @@ impl OceanSettings {
             self.hybrid_fft_blend.clamp(0.0, 1.0)
         } else { 1.0 };
         self.hybrid_swell = self.hybrid_swell.sanitize();
-        self.gerstner_wave_scale = if self.gerstner_wave_scale.is_finite() {
-            self.gerstner_wave_scale.clamp(0.1, 20.0)
-        } else { 1.0 };
-        self.gerstner_foam = self.gerstner_foam.min(7);
-        self.gerstner_foam_rate = if self.gerstner_foam_rate.is_finite() {
-            self.gerstner_foam_rate.clamp(0.0, 60.0)
-        } else { 60.0 };
         self.blue_water_optics = self.blue_water_optics.sanitize();
         self.blue_water_refraction = if self.blue_water_refraction.is_finite() {
             self.blue_water_refraction.clamp(0.0, 0.15)
@@ -1987,8 +2234,19 @@ impl OceanSettings {
         self.blue_water_mesh_levels = self.blue_water_mesh_levels.clamp(6, 9);
         self.blue_water_boundary_mode = self.blue_water_boundary_mode.min(3);
         self.blue_water_caustics_mode = self.blue_water_caustics_mode.min(4);
-        self.blue_water_underwater_mode = self.blue_water_underwater_mode.min(4);
-        self.hybrid_underwater_mode = self.hybrid_underwater_mode.min(4);
+        // Source (6) is a lake-only mode. Settings are
+        // sanitized again after `resolved_for_gpu` (OceanGpu::set_settings),
+        // so it must survive here rather than collapse to Fluid Ninja.
+        if self.blue_water_underwater_mode > NINJA_UNDERWATER_MODE {
+            self.blue_water_underwater_mode = if self.blue_water_underwater_mode == SOURCE_UNDERWATER_MODE
+                && self.backend == 3
+            {
+                SOURCE_UNDERWATER_MODE
+            } else {
+                NINJA_UNDERWATER_MODE
+            };
+        }
+        self.hybrid_underwater_mode = self.hybrid_underwater_mode.min(NINJA_UNDERWATER_MODE);
         self.hybrid_caustics_mode = self.hybrid_caustics_mode.min(4);
         self.hybrid_refraction_mode = self.hybrid_refraction_mode.min(2);
         fn bounded(v: f32, fallback: f32, min: f32, max: f32) -> f32 {
@@ -2000,10 +2258,7 @@ impl OceanSettings {
         self.hybrid_procedural_scale = bounded(self.hybrid_procedural_scale, 1.0, 0.25, 4.0);
         self.hybrid_procedural_speed = bounded(self.hybrid_procedural_speed, 1.0, 0.0, 3.0);
         for (color, fallback) in [
-            (&mut self.hybrid_fog_color, optics::Settings::default().fog_color),
             (&mut self.hybrid_water_color, BlueWaterOptics::default().water_color),
-            (&mut self.gerstner_water_color, GERSTNER_WATER_COLOR),
-            (&mut self.gerstner_crest_color, GERSTNER_CREST_COLOR),
         ] {
             for (value, default) in color.iter_mut().zip(fallback) {
                 *value = bounded(*value, default, 0.0, 1.0);
@@ -2211,11 +2466,11 @@ pub struct OceanGpu {
     blue_water: Option<blue_water::BlueWaterOcean>,
     lakes: Option<lakes::LakeRenderer>,
     lake_normal: wgpu::TextureView,
+    /// HL2 `dev/water_normal` frames for lake water, loaded on first use.
+    source_water_normal: Option<wgpu::TextureView>,
     lake_actors: std::sync::Arc<Vec<interaction::ActorSample>>,
     /// Lazily created: only Hybrid classification asks for the real eye-wave height.
     eye_wave: Option<eye_wave::EyeWaveProbe>,
-    /// `r_oceanType 5`'s intersection-foam contact fields, once their worker has built them.
-    gerstner_contact: Option<gerstner_contact::ContactFields>,
     sky_extend_enabled: bool,
     sky_infinite_enabled: bool,
     sky_extend_regions: [Option<sky_extend::SkyExtension>; OCEAN_MAX_SURFACES],
@@ -2356,6 +2611,9 @@ pub(crate) fn create_spray_pipeline(
 }
 
 impl OceanGpu {
+    pub fn set_source_water_normal(&mut self, view: Option<wgpu::TextureView>) {
+        self.source_water_normal = view;
+    }
     pub fn create_inert_render_bind_group(
         device: &wgpu::Device,
         render_layout: &wgpu::BindGroupLayout,
@@ -2682,7 +2940,7 @@ impl OceanGpu {
             ],
         });
 
-        let mut ocean = Self { blue_water, lakes:None, lake_normal:lake_normal.clone(), lake_actors:std::sync::Arc::new(Vec::new()), eye_wave:None, gerstner_contact:None, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
+        let mut ocean = Self { blue_water, lakes:None, lake_normal:lake_normal.clone(), source_water_normal:None, lake_actors:std::sync::Arc::new(Vec::new()), eye_wave:None, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
             render_displacement_view, render_normal_view,
             render_sampler:sampler, spray_view:spray_albedo_view.clone(), promoted_surfaces:Vec::new(),
             sky_admission: None,
@@ -2708,14 +2966,44 @@ impl OceanGpu {
         if let Some(blue) = self.blue_water.as_mut() { blue.set_sailing_sea(sea); }
     }
 
+    /// The map's BSP bed source for the Fluid Ninja Coast preset.
+    pub(crate) fn set_ninja_terrain_source(&mut self, source: Option<&std::sync::Arc<upstream_coast::Source>>) {
+        if let Some(ninja) = self.blue_water.as_mut().and_then(|blue| blue.original_surface.as_mut()).and_then(|surface| surface.ninja.as_mut()) {
+            // Hybrid "Water color" tints the Coast water body relative to the default color (default =
+            // UE's coefficients); "Transparency" divides its extinction.
+            let base = native_optics::BlueWaterOptics::default().water_color;
+            let color = self.settings.hybrid_water_color;
+            let tint = std::array::from_fn(|i| color[i] / base[i].max(1e-3));
+            // r_ninjaCoastFollowSwell: Coast wave-drive speed follows deep-water phase speed
+            // (sqrt of the peak wavelength) and its strength the wave height, both relative
+            // to Blue Water's default sea.
+            let default_waves = native_waves::BlueWaterWaves::default();
+            let waves = self.settings.blue_water_waves;
+            let follow_speed = (waves.wavelength.max(1.0) / default_waves.wavelength.max(1.0)).sqrt().clamp(0.25, 4.0);
+            let follow_height = if default_waves.height > 1e-3 { (waves.height / default_waves.height).clamp(0.0, 3.0) } else { 1.0 };
+            ninja.set_terrain_source(source, self.settings.ninja_coast_debug, self.settings.ninja_coast_dump,
+                self.settings.blue_water_waves.direction, tint, self.settings.hybrid_transparency,
+                [self.settings.ninja_coast_whitewater, self.settings.ninja_coast_whitewater_opacity,
+                    self.settings.ninja_coast_wave_gain,
+                    f32::from(u8::from(!self.settings.ninja_coast_tile_map) | u8::from(!self.settings.ninja_coast_tile_normals) << 1
+                        | u8::from(self.settings.ninja_coast_wake_foam) << 2),
+                    self.settings.ninja_coast_sim_distance, f32::from(self.settings.ninja_coast_far_mesh_levels),
+                    self.settings.ninja_coast_shore_depth, self.settings.ninja_coast_open_foam,
+                    if self.settings.ninja_coast_follow_swell { 1.0 } else { 0.0 }, follow_speed, follow_height,
+                    f32::from(self.settings.ninja_coast_sim_quality)],
+                [[self.settings.ninja_coast_far_lod, f32::from(self.settings.ninja_coast_far_detail),
+                    self.settings.ninja_coast_ssr_distance, self.settings.ninja_coast_cost_probe as f32],
+                    [self.settings.ninja_coast_fft_distance, f32::from(self.settings.ninja_coast_fft_lite),
+                        self.settings.ninja_coast_deep_water, self.settings.ninja_coast_cost_probe2 as f32]],
+                [self.settings.ninja_coast_shore_blend, self.settings.ninja_coast_fft_detail,
+                    f32::from(u8::from(self.settings.ninja_coast_foam_lace)), self.settings.ninja_coast_deep_red]);
+        }
+    }
+
     pub(crate) fn set_blue_water_shore(&mut self,device:&wgpu::Device,queue:&wgpu::Queue,maps:Option<std::sync::Arc<upstream_coast::Maps>>) {
         if let Some(blue)=self.blue_water.as_mut() {blue.set_shore(device,queue,maps,self.settings.blue_water_coast_shelter);}
     }
 
-    /// `r_oceanType 5`'s contact fields (`upstream_coast::Source::request_contact`); `None` until they are built.
-    pub(crate) fn set_gerstner_contact(&mut self, fields: Option<gerstner_contact::ContactFields>) {
-        self.gerstner_contact = fields;
-    }
 
 
     pub fn set_time(&mut self, seconds: f32) {
@@ -2726,6 +3014,7 @@ impl OceanGpu {
             .ok()?.parse::<f32>().ok().filter(|v| v.is_finite())).unwrap_or(seconds);
         if !seconds.is_finite() { return; }
         if (seconds - self.elapsed).abs() > 0.05 {
+            if self.settings.ninja_requested(){self.eye_wave=None;}
             self.elapsed = seconds;
             if let Some(blue) = &mut self.blue_water { blue.set_time(seconds); }
             self.times = std::array::from_fn(|i| seconds + 120.0 + i as f32 * std::f32::consts::PI);
@@ -2786,8 +3075,7 @@ impl OceanGpu {
             local.appearance_a[3] = promoted_seam_flatten(has_infinite_seam);
             // Hybrid: lift the Godot mesh so it passes through the surface the
             // native mesh draws at the eye (see eye_wave.rs). Metres; y = active.
-            if let Some(shift) = self.eye_wave.as_ref()
-                .and_then(|probe| probe.latest(surface.descriptor.index))
+            if let Some(shift) = self.eye_wave_sample(surface.descriptor.index)
                 .and_then(|sample| sample.mesh_shift())
             {
                 local.hybrid_eye[0] = shift / OCEAN_UNITS_PER_METER;
@@ -3138,6 +3426,7 @@ impl OceanGpu {
             let new_period=1.0/(settings.updates_per_second+1e-10);
             self.next_update -= old_period-new_period;
         }
+        if (self.settings.ninja_requested() || settings.ninja_requested()) && (self.settings.ninja_mode()!=settings.ninja_mode() || self.settings.ninja_preset!=settings.ninja_preset) {self.eye_wave=None;}
         self.settings=settings;
         if change_schedule {
             // A partially encoded job can be discarded safely: FFT output
@@ -3316,6 +3605,19 @@ impl OceanGpu {
             if let Some(probe) = self.eye_wave.as_mut() { probe.clear(); }
             return;
         };
+        let ninja = if self.settings.ninja_requested() {
+            let Some(surface) = blue.original_surface.as_ref() else {
+                if let Some(probe) = self.eye_wave.as_mut() { probe.clear(); }
+                return;
+            };
+            let Some(source) = surface.ninja_eye_source(slot) else {
+                if let Some(probe) = self.eye_wave.as_mut() { probe.clear(); }
+                return;
+            };
+            Some((surface, source))
+        } else {
+            None
+        };
         let settings = self.promoted_surfaces.iter().find(|s| s.descriptor.index == slot)
             .map_or(&self.settings, |s| &s.settings);
         let mut uniform = make_render_uniform(self.enabled, settings);
@@ -3333,15 +3635,20 @@ impl OceanGpu {
         });
         // The mesh's finest ring; the probe reads the waves at that detail.
         const NATIVE_PROBE_SPACING_METRES: f32 = 0.5;
-        let native = probe.has_native().then(|| eye_wave::NativeProbeInput {
+        let native = (ninja.is_none() && probe.has_native()).then(|| eye_wave::NativeProbeInput {
             swell: hybrid_swell_uniform(settings, self.elapsed),
             breaker_mode: if settings.backend == 2 { settings.hybrid_breaker } else { 0 },
-            godot: gerstner_uniform(settings, self.elapsed, [0.0; 4])[0],
             waves_group: blue.waves(slot).group(&blue.field),
             eye_xz_metres: [eye[0] / OCEAN_UNITS_PER_METER, eye[2] / OCEAN_UNITS_PER_METER],
             spacing_metres: NATIVE_PROBE_SPACING_METRES,
         });
-        probe.encode(queue, encoder, &params, native, slot);
+        let time = self.elapsed;
+        probe.encode(queue, encoder, &params, native, slot, ninja.map(|(_, source)| source), |encoder, result| {
+            ninja.and_then(|(surface, _)| surface.ninja.as_ref()).is_some_and(|renderer| {
+                renderer.encode_eye(device, queue, encoder, slot, blue.waves(slot).group(&blue.field),
+                    eye.map(|v| v / OCEAN_UNITS_PER_METER), time, NATIVE_PROBE_SPACING_METRES, result)
+            })
+        });
     }
 
     /// Latest rasterized-surface height above pool `slot`'s flat plane at the eye, in
@@ -3355,8 +3662,31 @@ impl OceanGpu {
         })
     }
 
+    /// Metres the surface over the eye may have risen since `sample` was solved: a floor for Coast surges and
+    /// readback jitter, plus the swell's peak vertical speed (about 2 ω_p Hs) over the sample's age. None when
+    /// the sample is too old, from before a timeline reset, or the sea has no wavelength.
+    pub fn eye_wave_rise_m(&self, sample: &eye_wave::EyeWaveSample) -> Option<f32> {
+        let age = self.elapsed - sample.time;
+        if !(0.0..=eye_wave::MAX_SAMPLE_AGE_S).contains(&age) {
+            return None;
+        }
+        let field = &self.blue_water.as_ref()?.field;
+        let peak = field.sea().peak_wavelength;
+        if !(peak > 0.0) {
+            return None;
+        }
+        let omega = (std::f64::consts::TAU * 9.81 / peak).sqrt();
+        let height = field.input_parameters().significant_height.max(0.0);
+        Some(eye_wave::RISE_FLOOR_M + (2.0 * omega * height) as f32 * age)
+    }
+
     pub fn eye_wave_sample(&self, slot: usize) -> Option<eye_wave::EyeWaveSample> {
-        self.eye_wave.as_ref()?.latest(slot)
+        let ninja_source = if self.settings.ninja_requested() {
+            Some(self.blue_water.as_ref()?.original_surface.as_ref()?.ninja_eye_source(slot)?)
+        } else {
+            None
+        };
+        self.eye_wave.as_ref()?.latest(slot, ninja_source)
     }
 
     pub fn encode_frame(&mut self, queue:&wgpu::Queue, encoder:&mut wgpu::CommandEncoder, delta:f32) {
@@ -3364,6 +3694,11 @@ impl OceanGpu {
         if self.settings.backend == 3 {
             self.elapsed += delta.max(0.0);
             return;
+        }
+        if self.settings.ninja_requested() && !self.settings.ninja_fft() {
+            self.elapsed+=delta.max(0.0);
+            if let Some(blue)=&mut self.blue_water {blue.set_time(self.elapsed);blue.updated_this_frame=false;}
+            self.write_render_uniform(queue);return;
         }
         if let Some(blue) = &mut self.blue_water {
             blue.adapter_enabled = self.settings.blue_water_adapter;
@@ -3595,9 +3930,9 @@ mod night_sky_reflection_tests {
 /// xy: travel direction, z: radians/metre, w: amplitude in metres.
 /// xyzw motion: radians/s, horizontal displacement ratio, FFT weight, seconds.
 pub(super) fn hybrid_swell_uniform(settings: &OceanSettings, seconds: f32) -> [[f32; 4]; 2] {
-    // `r_oceanType 5` replaces both the FFT and the authored swell with its own waves.
-    let gerstner = settings.gerstner_active();
-    let mix = if gerstner { 0.0 } else if settings.backend == 2 { settings.hybrid_fft_blend.clamp(0.0, 1.0) } else { 1.0 };
+    let mix = if settings.ninja_requested() && !settings.ninja_fft() { 0.0 }
+        else if settings.ninja_requested() { 1.0 }
+        else if settings.backend == 2 { settings.hybrid_fft_blend.clamp(0.0, 1.0) } else { 1.0 };
     let authored = settings.hybrid_swell;
     // Travel direction follows the FFT swell direction (same angle convention).
     let angle = settings.blue_water_waves.direction.to_radians();
@@ -3615,7 +3950,7 @@ pub(super) fn hybrid_swell_uniform(settings: &OceanSettings, seconds: f32) -> [[
     let wave_height_scale = if settings.hybrid_swell_absolute { 1.0 } else {
         settings.blue_water_waves.height.max(0.0) / reference_height
     };
-    let amplitude = if gerstner { 0.0 } else {
+    let amplitude = if settings.ninja_requested() { 0.0 } else {
         authored.amplitude / OCEAN_UNITS_PER_METER * (1.0 - mix) * wave_height_scale
     };
     let horizontal = 0.9 * authored.steepness
@@ -3624,46 +3959,6 @@ pub(super) fn hybrid_swell_uniform(settings: &OceanSettings, seconds: f32) -> [[
         [angle.cos(), -angle.sin(), frequency, amplitude],
         [std::f32::consts::TAU * authored.speed / authored.wavelength, horizontal, mix, seconds],
     ]
-}
-
-/// godot-water-shader's water `color` as FoamScene sets it (sRGB 0, 55, 65).
-pub const GERSTNER_WATER_COLOR: [f32; 3] = [0.0, 55.0 / 255.0, 65.0 / 255.0];
-/// g_wave's crest colour, linear (0, 0.08, 0.02), as sRGB.
-pub const GERSTNER_CREST_COLOR: [f32; 3] = [0.0, 0.31330, 0.15170];
-
-/// godot-water-shader's highest crest above the plane (upstream metres; `godot_water.wgsl`'s `JKA_GODOT_CREST`).
-pub(super) const GERSTNER_CREST_METRES: f32 = 0.73;
-
-/// The analytic crest height (m) the Hybrid-family vertex stage adds to the FFT: Hybrid's authored swell, or
-/// `r_oceanType 5`'s waves at their scale.
-pub(super) fn hybrid_analytic_height(settings: &OceanSettings, seconds: f32) -> f32 {
-    if settings.gerstner_active() {
-        GERSTNER_CREST_METRES * settings.gerstner_wave_scale
-    } else {
-        hybrid_swell_uniform(settings, seconds)[0][3]
-    }
-}
-
-/// The analytic swell the adaptive mesh plans its curvature for ([direction x, z, radians/m, amplitude m]): Hybrid's
-/// authored swell, or for `r_oceanType 5` its most curved wave (the third: 0.12 m at 2 rad/m, scaled).
-pub(super) fn hybrid_mesh_swell(settings: &OceanSettings, seconds: f32) -> [f32; 4] {
-    if settings.gerstner_active() {
-        let scale = settings.gerstner_wave_scale;
-        let direction = glam::Vec2::new(0.5, 1.0).normalize();
-        [direction.x, direction.y, 2.0 / scale, 0.12 * scale]
-    } else {
-        hybrid_swell_uniform(settings, seconds)[0]
-    }
-}
-
-/// `r_oceanType 5`'s surface uniform (`hybrid_gerstner.wgsl`'s `godot`, `godot_foam` and `godot_color`): [1 on, wave
-/// scale, seconds, foam bits], the persistent foam maps' centres [near x, z, far x, z] (m) and the linear water and
-/// crest colours.
-/// All zero in other modes.
-pub(super) fn gerstner_uniform(settings: &OceanSettings, seconds: f32, foam: [f32; 4]) -> [[f32; 4]; 4] {
-    if !settings.gerstner_active() { return [[0.0; 4]; 4]; }
-    [[1.0, settings.gerstner_wave_scale, seconds, f32::from(settings.gerstner_foam)], foam,
-        linear_color(settings.gerstner_water_color), linear_color(settings.gerstner_crest_color)]
 }
 
 fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform {
@@ -3754,7 +4049,7 @@ fn make_render_uniform(enabled:bool,settings:&OceanSettings)->OceanRenderUniform
         // analytic-only budget is known exactly on the CPU.
         if settings.backend == 2 && settings.hybrid_breaker > 0 && swell[1][2] <= 0.0 {
             let compression = (swell[0][3] * swell[0][2] * swell[1][1]).abs();
-            let budget = if settings.hybrid_breaker == 1 { 0.9 } else { 1.15 };
+            let budget = if settings.hybrid_breaker == 2 { 1.15 } else { 0.9 };
             uniform.swell_motion[1] *= (budget / compression.max(1e-5)).min(1.0);
         }
         uniform.surface[2] = 0.0;
@@ -3877,19 +4172,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cheapwater_underwater_shares_hybrid_optics_without_fft_or_saved_setting_changes() {
+    fn lake_underwater_shares_hybrid_optics_without_fft_or_saved_setting_changes() {
         let mut settings = OceanSettings::default();
         settings.backend = 3;
-        settings.lake.shader = 1;
         settings.lake.water_color = [0.8, 0.4, 0.2];
         settings.lake.tint_color = [0.5, 1.0, 1.0];
-        settings.lake.fog_color = [0.2, 0.3, 0.4];
+        settings.lake.deep_color = [0.2, 0.3, 0.4];
         settings.lake.transparency = 2.0;
         let saved = settings;
         let resolved = settings.resolved_for_gpu().sanitize();
         assert!(resolved.uses_godot_underwater());
-        assert!(!resolved.uses_godot_submerged_mesh(), "Cheapwater must retain its animated mesh");
-        assert_eq!(resolved.optics.fog_color, settings.lake.fog_color);
+        assert!(!resolved.uses_godot_submerged_mesh(), "lakes must retain their animated mesh");
+        assert_eq!(resolved.optics.fog_color, settings.lake.deep_color);
         assert_eq!(resolved.optics.transparency, optics::Settings::default().transparency * 2.0);
         assert!(!resolved.blue_water_adapter && !resolved.interaction);
         assert_eq!(resolved.optics.caustics, 0.0);
@@ -3901,12 +4195,13 @@ mod tests {
         assert_eq!(uniform.water_color, [0.4, 0.4, 0.2, 1.0]);
         assert_eq!(uniform.appearance_b[0], 1.0);
         assert_eq!(settings, saved);
-        settings.lake.shader = 0;
-        assert!(!settings.resolved_for_gpu().uses_godot_underwater());
         settings.backend = 2;
         settings.hybrid_underwater_mode = 4;
         assert!(settings.resolved_for_gpu().uses_godot_underwater());
         assert!(settings.resolved_for_gpu().uses_godot_submerged_mesh());
+        settings.hybrid_underwater_mode = NINJA_UNDERWATER_MODE;
+        assert!(!settings.resolved_for_gpu().uses_godot_underwater());
+        assert_eq!(settings.resolved_for_gpu().uses_godot_submerged_mesh(), jka_ninja::INCLUDED);
         settings.hybrid_underwater_mode = 0;
         assert!(!settings.resolved_for_gpu().uses_godot_underwater());
         settings.backend = 1;
@@ -4007,7 +4302,7 @@ mod tests {
         let raw = hybrid_swell_uniform(&settings, 0.0);
         let original = make_render_uniform(true, &settings);
         assert_eq!(original.swell_motion[1], raw[1][1]);
-        for (mode, budget) in [(1, 0.9), (2, 1.15)] {
+        for (mode, budget) in [(1, 0.9), (2, 1.15), (3, 0.9)] {
             settings.hybrid_breaker = mode;
             let adapter = make_render_uniform(true, &settings);
             let compression = (adapter.swell[3] * adapter.swell[2] * adapter.swell_motion[1]).abs();
@@ -4819,7 +5114,7 @@ mod ocean_backend_selection_tests {
         let mut settings = OceanSettings::default();
         settings.backend = 2;
         settings.hybrid_transparency = 2.0;
-        settings.hybrid_fog_color = [0.8, 0.3, 0.1];
+        settings.hybrid_water_color = [0.8, 0.3, 0.1];
         let saved = settings;
         let resolved = settings.resolved_for_gpu().sanitize();
         assert_eq!(resolved.optics.fog_color, [0.8, 0.3, 0.1]);

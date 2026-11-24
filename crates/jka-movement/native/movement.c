@@ -1,5 +1,6 @@
-/* The host owns state and services. Build this once for stock OpenJK and once
- * for the pinned TaystJK/JAPRO sources, with isolated native symbols. */
+/* The host owns state and services for the pinned TaystJK BG/Pmove sources.
+ * Server identity (Base, JA+, jaPRO) is runtime state in cgs, set from
+ * jka_predict_settings; there is one native implementation for every server. */
 #include "qcommon/q_shared.h"
 #include "cgame/cg_local.h"
 #include "game/bg_local.h"
@@ -7,7 +8,6 @@
 #include <setjmp.h>
 #include "taunt_cancel.h"
 
-#ifndef JKA_JAPRO
 /* Pure query: no Pmove globals, playerState mutations, or native lock needed. */
 extern qboolean BG_FullBodyTauntAnim(int anim);
 int jka_full_body_taunt(int torso_anim, int legs_anim) {
@@ -19,7 +19,6 @@ int jka_taunt_should_cancel(int torso_anim, int legs_anim, int buttons, int upmo
 int jka_taunt_action_should_cancel(int buttons) {
     return jka_taunt_cancel_input(buttons, 0);
 }
-#endif
 
 cgs_t cgs;
 centity_t cg_entities[MAX_GENTITIES];
@@ -27,7 +26,6 @@ vmCvar_t bg_fighterAltControl;
 vehWeaponInfo_t g_vehWeaponInfo[MAX_VEH_WEAPONS];
 static cgameImport_t imports;
 cgameImport_t *trap = &imports;
-#ifdef JKA_JAPRO
 cg_t cg;
 vmCvar_t cp_pluginDisable, cg_jumpHeight, cg_legstuck, pmove_fixed;
 int cg_dueltypes[MAX_CLIENTS];
@@ -37,7 +35,7 @@ static char legacy_fixes_string[32] = "0";
 static uint32_t previous_legacy_fixes;
 static int legacy_fixes_initialized;
 static uint64_t next_entities_revision = 1;
-void japro_configure(const jka_predict_settings *settings) {
+static void configure_cgs(const jka_predict_settings *settings) {
     /* Server identity and native implementation are deliberately separate.
      * TaystJK uses this same BG/Pmove for Base, JA+ and jaPRO; the cgs values
      * select the exact compatibility branches inside the shared code. */
@@ -74,7 +72,6 @@ void japro_configure(const jka_predict_settings *settings) {
         legacy_fixes_initialized = 1;
     }
 }
-#endif
 static jmp_buf error_target;
 static char last_error[1024];
 static const unsigned char *animation_file;
@@ -103,9 +100,7 @@ NORETURN_PTR void (*Com_Error)(int, const char *, ...) = host_error;
 void (*Com_Printf)(const char *, ...) = host_print;
 
 const char *CG_ConfigString(int index) {
-#ifdef JKA_JAPRO
     if (index == CS_LEGACY_FIXES) return legacy_fixes_string;
-#endif
     return "0";
 }
 void CG_GetVehicleCamPos(vec3_t position) { host_error(ERR_DROP, "Vehicle camera is outside the offline player host"); }
@@ -187,15 +182,16 @@ typedef struct jka_player_s {
      * PM_AdjustStandAnimForSlope (leg dangle) runs during prediction. */
     qboolean foot_valid;
     float foot_bolt[2][3];
-#ifdef JKA_JAPRO
+    /* Last settings from jka_player_configure/jka_player_predict; the local
+     * authority steps with these (zeroed-out defaults from jka_player_new). */
+    jka_predict_settings settings;
+    int local_force_jump_slope_fix;
     jka_roll_debug roll_debug;
     jka_prediction_entity entities[MAX_GENTITIES];
     int entity_count;
     uint64_t entities_revision;
-#endif
 } jka_player;
 
-#ifdef JKA_JAPRO
 static jka_roll_debug *roll_tracking;
 int jka_roll_debug_enabled;
 /* Called with the value returned by the actual GetFixRoll branch. Never recompute it. */
@@ -214,10 +210,11 @@ void jka_pmove_record_roll(playerState_t *ps, int mode) {
     roll_tracking->command_time = ps->commandTime;
     roll_tracking->legs_anim = ps->legsAnim;
 }
-void japro_player_roll_debug(const void *player, jka_roll_debug *out) {
-    *out = ((const jka_player *)player)->roll_debug;
+void jka_player_roll_debug(const void *player, jka_roll_debug *out) {
+    const jka_player *p = player;
+    memset(out, 0, sizeof(*out));
+    if (p->settings.roll_debug) *out = p->roll_debug;
 }
-#endif
 
 /* PM_SetPMViewAngle is OpenJK's authoritative "pmove owns the view" path.
  * Pmove may split one command into several PmoveSingle calls, so reset at the
@@ -248,8 +245,7 @@ static qboolean end_pmove_view_tracking(void) {
     return forced;
 }
 
-#ifdef JKA_JAPRO
-int japro_set_entities(void *player, const jka_prediction_entity *entities, int count) {
+int jka_player_set_entities(void *player, const jka_prediction_entity *entities, int count) {
     jka_player *p = player;
     int i;
     if (count < 0 || count > MAX_GENTITIES) return 0;
@@ -263,14 +259,14 @@ int japro_set_entities(void *player, const jka_prediction_entity *entities, int 
 
 /* CG_ClipMoveToEntities' JAPRO prediction rules. PointContents deliberately
  * retains all inline models, as in the reference. */
-int japro_clip_entity(const void *player, const jka_prediction_entity *ent) {
+int jka_player_clip_entity(const void *player, const jka_prediction_entity *ent) {
     const playerState_t *ps = &((const jka_player *)player)->ps;
     if (ent->entity_type == ET_SPECIAL && ent->model_index == HI_SHIELD) return 0;
     if (ps->duelInProgress) {
         if (ent->number != ps->duelIndex && ent->entity_type != ET_MOVER) return 0;
     } else {
         if (ent->bolt1 && ent->entity_type == ET_PLAYER) return 0;
-        if (cgs.serverMod == SVMOD_JAPRO && ps->stats[STAT_RACEMODE]) {
+        if (((const jka_player *)player)->settings.server_mod == 1 /* jaPRO */ && ps->stats[STAT_RACEMODE]) {
             /* A jaPRO server may still collide with moving func_train brushes.
              * Do not discard a server-solid ET_MOVER during prediction. */
             if (ent->entity_type != ET_MOVER) return 0;
@@ -326,7 +322,6 @@ static void install_prediction_entities(const jka_player *p) {
     installed_player = p;
     installed_revision = p->entities_revision;
 }
-#endif
 extern stringID_table_t animTable[MAX_ANIMATIONS+1];
 const char *jka_animation_name(int index) { return GetStringForID(animTable, index); }
 void jka_player_jump_level(void *player, int level) {
@@ -750,6 +745,7 @@ static void stop_offline_power(playerState_t *ps, int power, int time) {
 }
 void jka_player_offline_force_tick(void *player, int time, int requested_power) {
     playerState_t *ps = &((jka_player *)player)->ps;
+    configure_cgs(&((jka_player *)player)->settings);
     if (ps->pm_type != PM_NORMAL) return;
     // ForceSpeed / ForceRage, stock level-three FFA setup. Sound/entity services
     // do not alter these state transitions and are outside the offline host.
@@ -836,12 +832,36 @@ static void begin_foot_bolts(jka_player *p) {
 }
 static void end_foot_bolts(void) { foot_bolt_player = NULL; }
 
+/* Mirrors Rust PredictSettings::default(): an OpenJK-style, non-fixed game. */
+static const jka_predict_settings default_settings = {
+    .pmove_msec = 8, .step_slide_fix = 1, .tracemask = 0x1111, .plugin_disable = 1536,
+};
+
+static int settings_valid(const jka_predict_settings *s) {
+    if (s->server_mod < 0 || s->server_mod > 2) return 0;
+    if (s->pmove_fixed && (s->pmove_msec < 1 || s->pmove_msec > 66)) return 0;
+    return 1;
+}
+
+/* Configure before loading the authoritative snapshot and before fixed-step
+ * view-angle updates. */
+int jka_player_configure(void *player, const jka_predict_settings *settings) {
+    jka_player *p = player;
+    if (!p || !settings || !settings_valid(settings)) return 0;
+    p->settings = *settings;
+    configure_cgs(settings);
+    return 1;
+}
+
+void jka_player_local_force_jump_slope_fix(void *player, int enabled) {
+    ((jka_player *)player)->local_force_jump_slope_fix = enabled != 0;
+}
+
 void *jka_player_new(const float *origin, float yaw, int spectator) {
     jka_player *p = calloc(1, sizeof(*p));
     if (!p) return NULL;
-#ifdef JKA_JAPRO
+    p->settings = default_settings;
     p->entities_revision = next_entities_revision++;
-#endif
     playerState_t *ps = &p->ps;
     VectorCopy(origin, ps->origin);
     ps->viewangles[YAW] = yaw;
@@ -885,9 +905,7 @@ void jka_player_free(void *player) { free(player); }
 void *jka_player_clone(const void *player) {
     jka_player *p = malloc(sizeof(*p));
     if (p) memcpy(p, player, sizeof(*p));
-#ifdef JKA_JAPRO
     if (p) p->entities_revision = next_entities_revision++;
-#endif
     return p;
 }
 static void host_trace(trace_t *result, const vec3_t start, const vec3_t mins, const vec3_t maxs,
@@ -944,8 +962,8 @@ static void local_process_generic_cmd(jka_player *p, int generic_cmd) {
     }
 }
 
-int jka_player_step(void *player, const jka_cmd *input, int tick, jka_trace_fn trace,
-                    jka_contents_fn contents, void *context) {
+static int step_inner(void *player, const jka_cmd *input, int tick, jka_trace_fn trace,
+                      jka_contents_fn contents, void *context) {
     if (setjmp(error_target)) return 0;
     jka_player *p = player;
     trace_callback = trace; contents_callback = contents; callback_context = context;
@@ -965,11 +983,9 @@ int jka_player_step(void *player, const jka_cmd *input, int tick, jka_trace_fn t
      * path instead, with that server's pmove_msec. */
     p->move.pmove_fixed = 0;
     p->move.pmove_msec = tick; /* ignored while non-fixed */
-#ifdef JKA_JAPRO
     /* Some jaPRO compatibility branches consult the mirrored cvar directly
      * rather than pmove_t. Local play is the ordinary non-fixed regime. */
     pmove_fixed.integer = 0;
-#endif
     p->move.pmove_float = 0;
     p->move.stepSlideFix = 1;
     p->move.gametype = GT_FFA;
@@ -996,6 +1012,17 @@ int jka_player_step(void *player, const jka_cmd *input, int tick, jka_trace_fn t
     local_process_generic_cmd(p, input->generic_command);
     return 1;
 }
+int jka_player_step(void *player, const jka_cmd *input, int tick, jka_trace_fn trace,
+                    jka_contents_fn contents, void *context) {
+    jka_player *p = player;
+    int result;
+    configure_cgs(&p->settings);
+    jka_force_jump_slope_enabled = p->local_force_jump_slope_fix;
+    result = step_inner(player, input, tick, trace, contents, context);
+    jka_force_jump_slope_enabled = 0;
+    return result;
+}
+
 void jka_player_view(const void *player, jka_view *view) {
     const jka_player *p = player;
     const playerState_t *ps = &p->ps;
@@ -1221,9 +1248,7 @@ int jka_player_set_network(void *player, const int32_t *fields, int count, const
     memcpy(p->ps.powerups, powerups, sizeof(int32_t) * MAX_POWERUPS);
     p->ps.slopeRecalcTime = slope_recalc_time;
     p->view_forced = qfalse;
-#ifdef JKA_JAPRO
     p->entities_revision = next_entities_revision++;
-#endif
     return 1;
 }
 
@@ -1259,34 +1284,28 @@ static void fill_cmd(usercmd_t *cmd, const jka_cmd *input) {
 void jka_player_update_view_angles(void *player, const jka_cmd *input) {
     jka_player *p = player;
     usercmd_t cmd;
+    configure_cgs(&p->settings);
     fill_cmd(&cmd, input);
-#ifdef JKA_JAPRO
     p->move.ps = &p->ps;
     pm = &p->move;
-#endif
     PM_UpdateViewAngles(&p->ps, &cmd);
 }
 
 /* One CG_PredictPlayerState replay step: stock Pmove (which itself chops the
  * command into PmoveSingle steps) with the server's pmove settings. */
-int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_settings *settings,
-                       jka_trace_fn trace, jka_contents_fn contents, void *context) {
+static int predict_inner(void *player, const jka_cmd *input, const jka_predict_settings *settings,
+                         jka_trace_fn trace, jka_contents_fn contents, void *context) {
     jka_player *p = player;
     int client;
-#ifdef JKA_JAPRO
     roll_tracking = NULL;
     jka_roll_debug_enabled = 0;
-#endif
     if (setjmp(error_target)) {
-#ifdef JKA_JAPRO
         roll_tracking = NULL;
         jka_roll_debug_enabled = 0;
-#endif
         return 0;
     }
     trace_callback = trace; contents_callback = contents; callback_context = context;
     client = p->ps.clientNum;
-#ifdef JKA_JAPRO
     /* User-selected scope: only jaPRO race prediction adopts the correction.
      * The authoritative jaPRO server must carry the matching movement patch. */
     jka_force_jump_slope_enabled = IsRacemode(&p->ps);
@@ -1295,21 +1314,16 @@ int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_set
     cg.clientNum = client;
     prediction_snapshot.ps = p->ps;
     cg.predictedPlayerState = p->ps;
-#endif
     if (client < 0 || client >= MAX_CLIENTS) host_error(ERR_DROP, "Predicted clientNum %d out of range", client);
     memset(&cg_entities[client], 0, sizeof(cg_entities[client]));
-#ifdef JKA_JAPRO
     cg_entities[client].currentState.number = client;
     cg_entities[client].currentState.eType = ET_PLAYER;
-#endif
     cg_entities[client].playerState = &p->ps;
     p->move.ps = &p->ps;
-#ifdef JKA_JAPRO
     /* The reference sometimes writes cg.predictedPlayerState directly. Keep
      * exactly that alias while Pmove runs, including SP/surf crouch jumps. */
     cg_entities[client].playerState = &cg.predictedPlayerState;
     p->move.ps = &cg.predictedPlayerState;
-#endif
     VectorClear(p->move.modelScale);
     p->move.nonHumanoid = qfalse;
     p->move.baseEnt = (bgEntity_t *)cg_entities;
@@ -1346,24 +1360,18 @@ int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_set
     }
     begin_foot_bolts(p);
     begin_pmove_view_tracking(p->move.ps);
-#ifdef JKA_JAPRO
     if (settings->roll_debug) memset(&p->roll_debug, 0, sizeof(p->roll_debug));
     roll_tracking = settings->roll_debug ? &p->roll_debug : NULL;
     jka_roll_debug_enabled = settings->roll_debug;
-#endif
     Pmove(&p->move);
-#ifdef JKA_JAPRO
     roll_tracking = NULL;
     jka_roll_debug_enabled = 0;
-#endif
     p->view_forced = end_pmove_view_tracking();
     end_foot_bolts();
     clear_player_saber_info(saber_client_num);
-#ifdef JKA_JAPRO
     p->ps = cg.predictedPlayerState;
     p->move.ps = &p->ps;
     cg_entities[client].playerState = &p->ps;
-#endif
     return 1;
 }
 
@@ -1374,4 +1382,16 @@ int jka_weapon_info(int weapon, int *ammo_index, int *energy_per_shot, int *alt_
     *energy_per_shot = weaponData[weapon].energyPerShot;
     *alt_energy_per_shot = weaponData[weapon].altEnergyPerShot;
     return 1;
+}
+
+int jka_player_predict(void *player, const jka_cmd *input, const jka_predict_settings *settings,
+                       jka_trace_fn trace, jka_contents_fn contents, void *context) {
+    int result;
+    /* predict_inner enables this only for IsJaPRO() && IsRacemode(ps). Other
+     * servers and a subsequent local step must never inherit it. */
+    jka_force_jump_slope_enabled = 0;
+    if (!jka_player_configure(player, settings)) return 0;
+    result = predict_inner(player, input, settings, trace, contents, context);
+    jka_force_jump_slope_enabled = 0;
+    return result;
 }

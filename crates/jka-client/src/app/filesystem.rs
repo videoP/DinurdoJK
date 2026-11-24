@@ -73,6 +73,9 @@ impl App {
                 Ok(count) => retried += count,
                 Err(error) => errors.push(error),
             }
+            if let Err(error) = session.weapon_fx.reload_blood_assets(&self.base, self.game.as_deref()) {
+                errors.push(format!("[BLOOD] {error}"));
+            }
             if let Some(sound) = session.sound_presenter.as_mut() {
                 match sound.retry_failed_assets() {
                     Ok(count) => retried += count,

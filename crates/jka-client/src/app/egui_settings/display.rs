@@ -78,7 +78,7 @@ impl App {
             VideoSection::Materials => ("MATERIAL RENDERING", "Physically based material shading and texture sources."),
             VideoSection::Effects => (
                 "EFFECTS",
-                "Particles, saber effects, flares and reflections.",
+                "Particles, saber effects, water wake, flares and reflections.",
             ),
 
             VideoSection::Color => (
@@ -418,6 +418,7 @@ impl App {
                     });
                 if self.video.resolution != self.applied_resolution
                     || self.video.resolution_desktop != self.applied_resolution_desktop
+                    || self.video.resolution_mode != self.applied_resolution_mode
                 {
                     theme::hint(ui, "needs apply", theme::WARNING());
                 }

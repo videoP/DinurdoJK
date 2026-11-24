@@ -200,7 +200,7 @@ mod tests {
             indices: Arc::new(vec![0, 2, 1]),
             lighting_origin: Some([0.0; 3]),
             rt_rigid: None, rt_skinned_key: None, ghoul2_gpu: None,
-            fx_gpu_sprites: None, authored_glow: false, texture: None,
+            cloth_gpu: None, fx_gpu_sprites: None, authored_glow: false, texture: None,
             alpha_mode: DynamicModelAlphaMode::Blend,
         }
     }
@@ -226,7 +226,7 @@ mod tests {
             if !cache.append(surface, light, &mut vertices, &mut indices) {
                 vertices.extend_from_slice(&surface.vertices);
                 indices.extend_from_slice(&surface.indices);
-                jobs.push(CpuPackJob { vertices: v..vertices.len(), indices: i..indices.len(), light, water: None });
+                jobs.push(CpuPackJob { vertices: v..vertices.len(), indices: i..indices.len(), light, water: None, translation: None });
             }
         }
         // Also verifies worker packing leaves cached gaps untouched.

@@ -356,6 +356,10 @@ impl PlayerPresenter {
                 } else {
                     definition.no_wall_marks
                 };
+                if entity_alpha >= 8.0 / 255.0 {
+                    self.queue_saber_gore_blade(entity.number, &definition, (saber_num, blade_index),
+                        origin_world, dir_world, presented_length, current_time);
+                }
                 if let Some(request) = saber_blade_fx_request(
                     origin_world,
                     dir_world,
@@ -653,6 +657,10 @@ impl PlayerPresenter {
             } else {
                 definition.no_wall_marks
             };
+            if entity_alpha >= 8.0 / 255.0 {
+                self.queue_saber_gore_blade(owner.number, &definition, (0, blade_index),
+                    origin_world, dir_world, presented_length, current_time);
+            }
             if let Some(request) = saber_blade_fx_request(
                 origin_world,
                 dir_world,

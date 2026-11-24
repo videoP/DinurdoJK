@@ -26,6 +26,7 @@ pub struct CosmeticDraw {
 /// Force-power visuals CG_Player hands to the FX system / local entities.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlayerFxRequest {
+    RagdollBlood { calves: [Option<[f32; 3]>; 2] },
     /// CG_PlayerPowerups: a flag carrier or quad light at the player origin.
     PowerupLight { origin: [f32; 3], rgb: [f32; 3] },
     /// FX_PlayEntityEffectID at a hand bolt (lightning, drain).

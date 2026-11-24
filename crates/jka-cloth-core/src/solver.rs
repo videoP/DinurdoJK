@@ -206,6 +206,11 @@ impl Solver {
                 let ids = hinge.vertices.map(|i| i as usize);
                 let (angle, g) = angle_and_gradients(ids.map(|i| self.positions[i]))
                     .ok_or(ClothError::DegenerateConstraint)?;
+                let fold = angle_difference(angle, hinge.rest_angle)
+                    / (core::f64::consts::FRAC_PI_2 as Real);
+                let stiffness = cloth.hinge_stiffness.get(j).copied().unwrap_or(1.0)
+                    * (1.0 + cloth.material.bend_hardening * fold * fold);
+                let bend_alpha = bend_alpha / stiffness;
                 let denom: Real = g
                     .iter()
                     .zip(ids)

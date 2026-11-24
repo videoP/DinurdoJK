@@ -147,6 +147,42 @@
       "sha256": "40fd23a75eb036035b0609ae79f1a841ecbe0b22e3dd59b201d97f80d7f6f894"
     },
     {
+      "path": "codemp/qcommon/cm_load.cpp",
+      "sha256": "75486a4c3c5a45c342293d15bc1851ae93625fb40890fe520b4ac5cf6bb60622"
+    },
+    {
+      "path": "codemp/qcommon/cm_local.h",
+      "sha256": "6761e4e7014306b9826c50d7f258860d797c4f49081e783b8b68844313dc317d"
+    },
+    {
+      "path": "codemp/qcommon/cm_patch.cpp",
+      "sha256": "8f89dd78e94dead4e9a3c71a006243a6b0280c52a42647daae739924ce1a591b"
+    },
+    {
+      "path": "codemp/qcommon/cm_patch.h",
+      "sha256": "ab3a006b17fd199ad12682e3f4ee88266a082481782c42a53802ca401607199d"
+    },
+    {
+      "path": "codemp/qcommon/cm_polylib.cpp",
+      "sha256": "6c81b50fff3176f39f6ee2146749f355c90019297b92f605d8a50ae0ad89db28"
+    },
+    {
+      "path": "codemp/qcommon/cm_polylib.h",
+      "sha256": "763656dbc91058db76ea1ecff99fcac221b7dce354e503e433a6fe12c0b77bec"
+    },
+    {
+      "path": "codemp/qcommon/cm_public.h",
+      "sha256": "65c6771b1145b9e822ae6ce08894963a720cd8aef5424b135ccace143625f381"
+    },
+    {
+      "path": "codemp/qcommon/cm_test.cpp",
+      "sha256": "f2d15d65fbe89ef066b99a5d6fc0bbcb8290a5de7237e7594c8a62ddadae5aab"
+    },
+    {
+      "path": "codemp/qcommon/cm_trace.cpp",
+      "sha256": "995f6d6805f792904b7f25774ab558029eb0c588a48b3bbc987a706b3a65fae3"
+    },
+    {
       "path": "codemp/qcommon/disablewarnings.h",
       "sha256": "af37bc176dad5f6a2308de4388d14cce5b33c641efa8701735204dd4f147a19e"
     },
@@ -297,6 +333,10 @@
     {
       "path": "shared/qcommon/q_string.h",
       "sha256": "b6ae4dee643d94014d6c81c8aeb4d2676390283527e2023e98dd2bdb3b6c52de"
+    },
+    {
+      "path": "shared/sys/snapvector.cpp",
+      "sha256": "ae7696a1ffef3e0b0aceb44e18419b01d01dcbd0ed72d5e01617effb8d2ddd79"
     },
     {
       "path": "shared/sys/sys_public.h",

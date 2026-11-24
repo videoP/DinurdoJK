@@ -28,7 +28,7 @@
 #import naval_ocean::water_properties::{WaterField, sample_water, water_beam, water_pigment}
 #import naval_ocean::foam::{FOAM_GLOSS, STREAK_TEAR_STRETCH, foam_patterns, foam_footprint, foam_tear, torn_cover, foam_share, whitecap_foam, windrow_opacity, billows, thin_foam, foam_radiance, aeration_with_wake, aerated_reflectance, bubble_cloud, foam_over, churned_water, gale_streaks}
 #import naval_ocean::wake::{wake_height, wake_surface, hull_shelter, shelter_light, shelter_reflect, wake_sampler}
-#import naval_ocean::waves::{waves, field_displacement, field_derivatives, field_extras, field_sampler, field_uv, scatter, copies_grad, mix_zero, mix_mean, mix_variance, displacement, HullSurface, hull_surface, hull_sea_active, breaking_group, Shore, shore_at, shore_whitecaps, surf}
+#import naval_ocean::waves::{waves, field_displacement, field_derivatives, field_extras, field_sampler, field_uv, scatter, copies_grad, mix_zero, mix_mean, mix_variance, displacement, HullSurface, hull_surface, hull_sea_active, breaking_group, Shore, shore_at, shore_whitecaps, surf_at}
 #import naval_ocean::underwater_ray::water_path_light
 #import naval::aerial::aerial_apply
 #import naval::lights::{PointLights, point_light_count}
@@ -454,7 +454,7 @@ fn wave_surface(xz: vec2<f32>, calm: f32, at: vec2<f32>) -> WaveSample {
         ripple_unresolved = min(waves.slopes[finest], waves.tail.y) * drawn * still * gain * kept * kept;
     }
     // The surf: the breakers' white water where the waves break on a shoaling shore, and the bubbles they drive under.
-    let surf_cover = surf(xz, shore, wide, footprint);
+    let surf_cover = surf_at(at, wide, footprint);
     bubbles = max(bubbles, surf_cover.x);
     // Foam rides the water: per area of sea it is as dense as the surface is compressed.
     let gathered = 1.0 / clamp(jacobian, FOAM_JACOBIAN_MIN, FOAM_JACOBIAN_MAX);

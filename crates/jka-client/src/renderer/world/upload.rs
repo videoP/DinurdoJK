@@ -182,9 +182,7 @@ pub(in crate::renderer) fn build_world(
     cull_debug_layout: &wgpu::BindGroupLayout,
     lighting_settings_buffer: &wgpu::Buffer,
     pbr_settings_buffer: &wgpu::Buffer,
-    surface_deformation_buffer: &wgpu::Buffer,
-    deformation_field_views: [&wgpu::TextureView; 2],
-    deformation_field_sampler: &wgpu::Sampler,
+    surface_deformation: &crate::surface_deformation::SurfaceDeformationGpu,
     grass_renderer: &GrassRenderer,
     surface_sprite_effect_renderer: &SurfaceSpriteEffectRenderer,
     build_ocean_meshes: bool,
@@ -221,6 +219,8 @@ pub(in crate::renderer) fn build_world(
     let sky_portal = map.sky_portal;
     let compiled_world_flare_count = map.world_flares.len();
     let PreparedMap {
+        river_plans,
+        river_promotion_mode,
         vertices,
         patch_draws,
         inline_patch_draws,
@@ -1231,11 +1231,15 @@ pub(in crate::renderer) fn build_world(
             texture_data.len()
         );
     }
-    let footprint_marks: [&GpuImage; 2] = std::array::from_fn(|slot| {
-        footprint_mark_textures[slot]
+    let footprint_marks = surface_deformation.mark_views(std::array::from_fn(|slot| {
+        &footprint_mark_textures[slot]
             .and_then(|index| textures.get(index))
             .unwrap_or(white)
-    });
+            .view
+    }));
+    let surface_deformation_buffer = surface_deformation.buffer();
+    let deformation_field_views = surface_deformation.field_views();
+    let deformation_field_sampler = surface_deformation.field_sampler();
     let surface_sprite_effects = surface_sprite_effect_sources
         .into_iter()
         .filter_map(|source| {
@@ -1341,7 +1345,8 @@ pub(in crate::renderer) fn build_world(
         inline_baked_lightmap: bool,
         ocean_clipmap: Option<[std::ops::Range<u32>; 2]>,
         ocean_clipmap_id: u8,
-        ocean_replaced: bool,
+        ocean_owners: u8,
+        river_owner: Option<u64>,
         fragment_key: MaterialFragmentKey,
         material_buffer: UniformSlot,
         additive_uniforms: [UniformSlot; 2],
@@ -1357,6 +1362,9 @@ pub(in crate::renderer) fn build_world(
         bounds_min: [f32; 3],
         bounds_max: [f32; 3],
     }
+    let river_owners: std::collections::BTreeMap<_, _> = river_plans.iter()
+        .filter(|p| river_promotion_mode == 3 && p.replace)
+        .flat_map(|p| p.world_ranges.iter().map(move |&range| (range, p.id))).collect();
     let mut upload_batches = |sources: Vec<DrawBatch>,
                               index_ranges: Vec<std::ops::Range<u32>>,
                               source_vertices: &[GpuVertex],
@@ -1366,6 +1374,7 @@ pub(in crate::renderer) fn build_world(
         for (source_index, (mut source, index_range)) in sources.into_iter().zip(index_ranges).enumerate() {
             let inline_baked_lightmap = inline_sources
                 && inline_bake_eligible.get(source_index).copied().unwrap_or(false);
+            let river_owner = if inline_sources || river_owners.is_empty() { None } else { river_owners.get(&(source.vertices.start, source.vertices.end)).copied() };
             let mut water_plane: Option<(f32, [f32; 2], [f32; 2])> = None;
             if source.water_primary {
                 if is_upward_water_face(&source, source_vertices) {
@@ -1386,13 +1395,17 @@ pub(in crate::renderer) fn build_world(
             // A demoted overlay sheet lying over a promoted ocean is a duplicate of
             // the surf and foam that ocean draws. Same suppression as a replaced
             // face, so it still returns when r_ocean is off.
-            let overlay_covered = source.water_overlay
-                && crate::ocean::surfaces::overlay_covered_by_ocean(
+            let overlay_slots = if source.water_overlay {
+                crate::ocean::surfaces::overlay_ocean_slots(
                     &source_vertices[source.vertices.start as usize..source.vertices.end as usize],
                     &ocean_surfaces,
-                );
-            let ocean_replaced = overlay_covered
-                || surface_key.is_some_and(|key| ocean_clipmaps.contains_key(&key));
+                )
+            } else {
+                0
+            };
+            let surface_slot = surface_key.and_then(|key| ocean_clipmaps.get(&key))
+                .map_or(0, |(_, slot)| 1u8 << *slot);
+            let ocean_owners = overlay_slots | surface_slot;
             let (ocean_clipmap, ocean_clipmap_id) =
                 match water_plane.and_then(|(plane, minimum, maximum)| {
                     ocean_clipmaps
@@ -1583,7 +1596,8 @@ pub(in crate::renderer) fn build_world(
                 inline_baked_lightmap,
                 ocean_clipmap,
                 ocean_clipmap_id,
-                ocean_replaced,
+                ocean_owners,
+                river_owner,
                 fragment_key,
                 material_buffer,
                 additive_uniforms,
@@ -1798,7 +1812,8 @@ pub(in crate::renderer) fn build_world(
                 inline_baked_lightmap,
                 ocean_clipmap,
                 ocean_clipmap_id,
-                ocean_replaced,
+                ocean_owners,
+                river_owner,
                 fragment_key,
                 material_buffer,
                 additive_uniforms,
@@ -1828,7 +1843,9 @@ pub(in crate::renderer) fn build_world(
                 inline_group: u32::MAX,
                 ocean_clipmap,
                 ocean_clipmap_id,
-                ocean_replaced,
+                ocean_owners,
+                river_owner,
+                river_replaced: false,
                 source,
                 bind_group,
                 fragment_key,

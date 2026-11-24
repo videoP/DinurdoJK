@@ -231,8 +231,9 @@ impl HudAnchor {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HudElementLayout {
     pub anchor: HudAnchor,
-    /// Pixel offset from the selected screen anchor. Positive X is right and
-    /// positive Y is down; the element is aligned to the same anchor point.
+    /// X/Y offset in fixed 1280x720 HUD reference units, independent of the
+    /// framebuffer resolution. Positive X is right, positive Y is down.
+    /// The cvar stores these units directly: no viewport or migration metadata.
     pub offset: [f32; 2],
     pub scale: f32,
     /// Independent bounds size. Currently used by the chat box so resizing its
@@ -287,6 +288,23 @@ impl HudElementLayout {
             extent: [extent_x.clamp(0.25, 4.0), extent_y.clamp(0.25, 8.0)],
         })
     }
+}
+
+
+/// All gameplay HUD position cvars use this fixed virtual reference space.
+/// Only convert at pixel-based render/editor boundaries; never modify saved
+/// values in response to resizing, fullscreen changes, or renderer restarts.
+const HUD_REFERENCE_WIDTH: f32 = 1280.0;
+const HUD_REFERENCE_HEIGHT: f32 = 720.0;
+
+pub(crate) fn hud_offset_to_pixels(offset: [f32; 2], w: u32, h: u32) -> [f32; 2] {
+    [offset[0] * w as f32 / HUD_REFERENCE_WIDTH,
+     offset[1] * h as f32 / HUD_REFERENCE_HEIGHT]
+}
+
+pub(crate) fn hud_pixel_delta_to_offset(delta: [f32; 2], w: u32, h: u32) -> [f32; 2] {
+    [delta[0] * HUD_REFERENCE_WIDTH / w.max(1) as f32,
+     delta[1] * HUD_REFERENCE_HEIGHT / h.max(1) as f32]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -476,34 +494,6 @@ impl HudLayout {
         *self.element_mut(id) = HudLayout::default().element(id);
     }
 
-    /// Render Studio stores positional offsets in a stable 1280x720 reference
-    /// frame. Apply the conversion at the actual offscreen target resolution,
-    /// not at the editor size, so preview and rendered output remain aligned.
-    pub fn studio_for_frame(self, width:u32, height:u32)->Self {
-        let mut scaled=self;
-        let sx=width.max(1) as f32/1280.0;
-        let sy=height.max(1) as f32/720.0;
-        for id in HudElementId::ALL {
-            let element=scaled.element_mut(id);
-            element.offset[0]*=sx;
-            element.offset[1]*=sy;
-        }
-        scaled
-    }
-
-    /// Convert existing gameplay pixel offsets into Studio reference offsets
-    /// when the user explicitly chooses Copy gameplay.
-    pub fn studio_from_frame(self,width:u32,height:u32)->Self {
-        let mut virtual_layout=self;
-        let sx=width.max(1) as f32/1280.0;
-        let sy=height.max(1) as f32/720.0;
-        for id in HudElementId::ALL {
-            let element=virtual_layout.element_mut(id);
-            element.offset[0]/=sx;
-            element.offset[1]/=sy;
-        }
-        virtual_layout
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -908,10 +898,9 @@ pub fn snap_hud_rect_position(
     (position, matched)
 }
 
-/// Quantize default scales and position all HUD rectangles on editor entry
-/// or reset. Keep custom scales while normalizing their visible screen edges;
-/// old archived offsets can otherwise leave the default grid misaligned.
-/// The grid is in real screen pixels, not 640x480 stock coordinates.
+/// Quantize default scales and align HUD rectangles when the user explicitly
+/// resets the layout. The editor grid is measured in screen pixels, while
+/// persistent offsets stay in 1280x720 reference units.
 impl HudLayout {
     pub fn align_default_elements_to_grid(
         &mut self, ctx: &HudRectContext, w: u32, h: u32,
@@ -922,26 +911,15 @@ impl HudLayout {
         let mut changed = false;
         for id in HudElementId::ALL {
             let original = self.element(id);
-            // The preceding release used -58 / -28 for the core bars.
-            // Treat those untouched archived offsets as defaults as well.
-            let legacy_core = if id.is_anchored() && original.scale == 1.0
-                && original.extent == [1.0, 1.0] {
-                let old_offset = match id {
-                    HudElementId::Health => Some([24.0, -58.0]),
-                    HudElementId::Shield => Some([24.0, -28.0]),
-                    HudElementId::Ammo => Some([-24.0, -58.0]),
-                    HudElementId::Force => Some([-24.0, -28.0]),
-                    _ => None,
-                };
-                old_offset == Some(original.offset) && original.anchor == defaults.element(id).anchor
-            } else { false };
-            if original != defaults.element(id) && !legacy_core { continue; }
+            if original != defaults.element(id) { continue; }
             let mut layout = original;
             layout.scale = snap_hud_scale_to_grid(id, layout, layout.scale, ctx, w, h, grid);
             let rect = hud_element_rect(id, layout, ctx, w, h);
             let (position, _) = snap_hud_rect_position(rect, [], grid, 0.0, 0.0);
-            layout.offset[0] += position[0] - rect.x;
-            layout.offset[1] += position[1] - rect.y;
+            let delta = hud_pixel_delta_to_offset(
+                [position[0] - rect.x, position[1] - rect.y], w, h);
+            layout.offset[0] += delta[0];
+            layout.offset[1] += delta[1];
             if layout != original {
                 *self.element_mut(id) = layout;
                 changed = true;
@@ -951,11 +929,8 @@ impl HudLayout {
         changed
     }
 
-    /// Explicit editor reset and entry always normalize every displayed
-    /// rectangle's actual position, even when old archived HUD offsets are
-    /// present. Snapping only layouts equal to `Default` left existing configs
-    /// visibly off-grid after opening HUD Edit. Keep customized scale/size;
-    /// RESET ALL starts from defaults so those will be quantized separately.
+    /// Align displayed rectangles on an explicit Reset All. Keep the snapping
+    /// deltas in screen pixels, then convert before storing the HUD offsets.
     pub fn align_all_positions_to_grid(
         &mut self, ctx: &HudRectContext, w: u32, h: u32,
     ) -> bool {
@@ -972,8 +947,9 @@ impl HudLayout {
             let dy = (rect.y / grid).round() * grid - rect.y;
             if dx.abs() > 0.0001 || dy.abs() > 0.0001 {
                 let target = self.element_mut(id);
-                target.offset[0] += dx;
-                target.offset[1] += dy;
+                let delta = hud_pixel_delta_to_offset([dx, dy], w, h);
+                target.offset[0] += delta[0];
+                target.offset[1] += delta[1];
                 changed = true;
             }
         }
@@ -989,8 +965,10 @@ impl HudLayout {
         layout.scale = snap_hud_scale_to_grid(id, layout, layout.scale, ctx, w, h, grid);
         let rect = hud_element_rect(id, layout, ctx, w, h);
         let (position, _) = snap_hud_rect_position(rect, [], grid, 0.0, 0.0);
-        layout.offset[0] += position[0] - rect.x;
-        layout.offset[1] += position[1] - rect.y;
+        let delta = hud_pixel_delta_to_offset(
+            [position[0] - rect.x, position[1] - rect.y], w, h);
+        layout.offset[0] += delta[0];
+        layout.offset[1] += delta[1];
         *self.element_mut(id) = layout;
     }
 }
@@ -1048,6 +1026,7 @@ pub(crate) fn apply_hud_layout(
         return;
     }
     let stock = hud_stock_rect(id, ctx, w, h);
+    let offset_px = hud_offset_to_pixels(layout.offset, w, h);
     // Chat's authored rectangle is bottom-left anchored: history grows upward from
     // CHATBOX_Y. Its editor rectangle uses the same anchor so scaling the chat
     // cannot visually drift outside the selected bounds. Other HUD elements keep
@@ -1061,8 +1040,8 @@ pub(crate) fn apply_hud_layout(
     for vertex in vertices {
         let px = (vertex.position[0] + 1.0) * 0.5 * wf;
         let py = (1.0 - vertex.position[1]) * 0.5 * hf;
-        let px = anchor_x + (px - anchor_x) * scale + layout.offset[0];
-        let py = anchor_y + (py - anchor_y) * scale + layout.offset[1];
+        let px = anchor_x + (px - anchor_x) * scale + offset_px[0];
+        let py = anchor_y + (py - anchor_y) * scale + offset_px[1];
         vertex.position = [px / wf * 2.0 - 1.0, 1.0 - py / hf * 2.0];
     }
 }
@@ -1100,6 +1079,7 @@ pub fn hud_element_rect(
     h: u32,
 ) -> HudRect {
     let scale = layout.scale.clamp(0.5, 2.0);
+    let offset_px = hud_offset_to_pixels(layout.offset, w, h);
     if !id.is_anchored() {
         let stock = hud_stock_rect(id, ctx, w, h);
         let extent = if id == HudElementId::Chat {
@@ -1113,15 +1093,15 @@ pub fn hud_element_rect(
         );
         if id == HudElementId::Chat {
             return HudRect {
-                x: stock.x + layout.offset[0],
-                y: stock.y + stock.height + layout.offset[1] - height,
+                x: stock.x + offset_px[0],
+                y: stock.y + stock.height + offset_px[1] - height,
                 width,
                 height,
             };
         }
         return HudRect {
-            x: stock.x + stock.width * 0.5 + layout.offset[0] - width * 0.5,
-            y: stock.y + stock.height * 0.5 + layout.offset[1] - height * 0.5,
+            x: stock.x + stock.width * 0.5 + offset_px[0] - width * 0.5,
+            y: stock.y + stock.height * 0.5 + offset_px[1] - height * 0.5,
             width,
             height,
         };
@@ -1139,8 +1119,9 @@ pub fn hud_element_rect(
         let place = |entry: HudElementLayout| {
             let screen = entry.anchor.screen_fraction();
             let align = entry.anchor.element_fraction();
-            [screen[0] * w as f32 + entry.offset[0] - align[0] * width,
-             screen[1] * h as f32 + entry.offset[1] - align[1] * height]
+            let position = hud_offset_to_pixels(entry.offset, w, h);
+            [screen[0] * w as f32 + position[0] - align[0] * width,
+             screen[1] * h as f32 + position[1] - align[1] * height]
         };
         let actual = place(layout);
         let original = place(reference);
@@ -1157,8 +1138,8 @@ pub fn hud_element_rect(
     let height = base_size[1] * scale;
     let screen = layout.anchor.screen_fraction();
     let align = layout.anchor.element_fraction();
-    let anchor_x = screen[0] * w as f32 + layout.offset[0];
-    let anchor_y = screen[1] * h as f32 + layout.offset[1];
+    let anchor_x = screen[0] * w as f32 + offset_px[0];
+    let anchor_y = screen[1] * h as f32 + offset_px[1];
     HudRect {
         x: anchor_x - align[0] * width,
         y: anchor_y - align[1] * height,
@@ -1200,6 +1181,61 @@ mod neighbor_resize_tests {
         }
     }
 
+
+    #[test]
+    fn hud_cvar_offset_is_resolution_independent() {
+        use super::{hud_element_rect, HudElementId, HudElementLayout, HudLayout, HudRectContext};
+        let ctx = HudRectContext::new(
+            Default::default(), &Default::default(), &Default::default(),
+            1, &Default::default(), Default::default(), false, [0.0; 2], 0,
+        );
+        // The same value parsed at a new resolution must render at the same
+        // relative position, and no config write or viewport rebase is needed.
+        let saved = "tl 160.000 -48.000 1.000 1.000 1.000";
+        let saved_layout = HudElementLayout::from_config(saved).unwrap();
+        assert_eq!(saved_layout.to_config(), saved);
+        let mut layout = HudLayout::default();
+        layout.speedometer = saved_layout;
+        let low = hud_element_rect(HudElementId::Speedometer,
+            layout.speedometer, &ctx, 640, 480);
+        let high = hud_element_rect(HudElementId::Speedometer,
+            layout.speedometer, &ctx, 1920, 1080);
+        assert!((high.x / 1920.0 - low.x / 640.0).abs() < 0.0001);
+        assert!((high.y / 1080.0 - low.y / 480.0).abs() < 0.0001);
+        assert_eq!(layout.speedometer.to_config(), saved);
+    }
+
+    #[test]
+    fn hud_studio_and_gameplay_offsets_share_1280x720_units() {
+        use super::{hud_offset_to_pixels, hud_pixel_delta_to_offset};
+        let saved = [320.0, -72.0];
+        assert_eq!(hud_offset_to_pixels(saved, 1280, 720), saved);
+        for (w, h) in [(640,480), (1280,720), (1920,1080), (2560,1440)] {
+            let projected = hud_offset_to_pixels(saved, w, h);
+            let restored = hud_pixel_delta_to_offset(projected, w, h);
+            assert!((restored[0] - saved[0]).abs() < 0.0001);
+            assert!((restored[1] - saved[1]).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn hud_anchor_offsets_use_the_same_virtual_space() {
+        use super::{hud_element_rect, HudElementId, HudLayout, HudRectContext};
+        let ctx = HudRectContext::new(
+            Default::default(), &Default::default(), &Default::default(),
+            1, &Default::default(), Default::default(), false, [0.0; 2], 0,
+        );
+        let mut changed = HudLayout::default();
+        changed.health.offset[0] += 20.0;
+        changed.health.offset[1] -= 12.0;
+        let defaults = HudLayout::default();
+        for (w,h) in [(640,480),(1280,720),(2560,1440)] {
+            let origin = hud_element_rect(HudElementId::Health,defaults.health,&ctx,w,h);
+            let moved = hud_element_rect(HudElementId::Health,changed.health,&ctx,w,h);
+            assert!(((moved.x-origin.x) * 1280.0 / w as f32 - 20.0).abs()<0.01);
+            assert!(((moved.y-origin.y) * 720.0 / h as f32 + 12.0).abs()<0.01);
+        }
+    }
 
     #[test]
     fn flag_status_has_independent_archived_layout_and_stock_bounds() {

@@ -572,6 +572,298 @@ commands! {
         }
     }
 
+    cmd_testgib ["testgib"] ("testgib", "Spawn a visual-only ten-part TaystJK gib burst at your living local player, with cg_blood 2 Ninja blood and MD3 availability diagnostics. The player is unaffected.", CommandScope::Always) |self, command| {
+        if command.split_whitespace().count() != 1 {
+            self.push_console_line("usage: testgib");
+            return CommandResult::Handled;
+        }
+        if self.audio.game.blood != 2 {
+            self.push_console_line("^3[TESTGIB]^7 Set cg_blood 2 first");
+            return CommandResult::Handled;
+        }
+        if self.live_input.is_jk2() {
+            self.push_console_line("^3[TESTGIB]^7 Requires a Jedi Academy game");
+            return CommandResult::Handled;
+        }
+        if !crate::fx::simulation_enabled() {
+            self.push_console_line("^3[TESTGIB]^7 FX simulation is disabled");
+            return CommandResult::Handled;
+        }
+        let Some(session) = self.game_session.as_mut().filter(|session| {
+            !self.front_end && session.live && session.phase == SessionPhase::Playing
+        }) else {
+            self.push_console_line("^3[TESTGIB]^7 Requires a loaded live game");
+            return CommandResult::Handled;
+        };
+        const PMF_FOLLOW: i32 = 4096;
+        const PERS_TEAM: usize = 3;
+        const TEAM_SPECTATOR: i32 = 3;
+        let Some(position) = session.player_position.filter(|_| session.presented_player_state().is_some_and(|ps| {
+            ps.stats[0] > 0 && ps.persistant[PERS_TEAM] != TEAM_SPECTATOR
+                && ps.field_i32("pm_type") != Some(jka_movement::PM_SPECTATOR)
+                && ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW == 0
+        })) else {
+            self.push_console_line("^3[TESTGIB]^7 Requires your living player (not spectator/follow)");
+            return CommandResult::Handled;
+        };
+        // player_position is in renderer coordinates; gib_specs and the
+        // shared fragment physics expect the original JKA coordinate system.
+        let origin = crate::scene::jka_position(position.to_array());
+        let (count, paths) = session.weapon_fx.queue_test_gib_burst(origin);
+        // AssetSearchPath belongs to the app/VFS, not WeaponFx. Reopening it
+        // here checks the current fs_game and mounted PK3s on explicit command
+        // invocation only; it never runs in the frame/fragment path.
+        match jka_assets::pk3::AssetSearchPath::open_game(&self.base, self.game.as_deref()) {
+            Ok(assets) => {
+                let available = paths.iter().filter(|path| assets.contains_qpath(path)).count();
+                let mut missing = paths.into_iter()
+                    .filter(|path| !assets.contains_qpath(path)).collect::<Vec<_>>();
+                missing.sort();
+                missing.dedup(); // TaystJK launches the leg twice.
+                self.push_console_line(format!("^3[TESTGIB]^7 Queued {count} gibs on your player (visual only); {available}/{count} MD3 entries found"));
+                for path in missing {
+                    self.push_console_line(format!("^3[TESTGIB]^7 Missing MD3: {path}"));
+                }
+                if available == 0 {
+                    self.push_console_line("^3[TESTGIB]^7 Install the original models/gibs/*.md3 files in a mounted PK3 to see fragments");
+                }
+            }
+            Err(error) => {
+                self.push_console_line(format!("^3[TESTGIB]^7 Queued {count} gibs (visual only), but MD3 availability could not be checked: {error}"));
+            }
+        }
+        CommandResult::Handled
+    }
+
+    cmd_ninjablood ["ninjablood"] ("ninjablood [leak|gush|hit|spurt]", "Toggle an airborne emitter, test a surface impact, or test a 3D spurt and its landing.", CommandScope::Always) |self, command| {
+        let mut args = command.split_whitespace().skip(1);
+        let selection = match (args.next(), args.next()) {
+            (None, None) => None,
+            (Some(s), None) if s.eq_ignore_ascii_case("hit") => Some("hit"),
+            (Some(s), None) if s.eq_ignore_ascii_case("leak") => Some("leak"),
+            (Some(s), None) if s.eq_ignore_ascii_case("gush") => Some("gush"),
+            (Some(s), None) if s.eq_ignore_ascii_case("spurt") => Some("spurt"),
+            _ => { self.push_console_line("usage: ninjablood [leak|gush|hit|spurt]"); return CommandResult::Handled; }
+        };
+        if !jka_ninja::blood_material_available() {
+            self.push_console_line("^3[NINJA BLOOD]^7 Blood1 is unavailable in this build");
+            return CommandResult::Handled;
+        }
+        if !crate::ninja_blood::enabled() {
+            self.push_console_line("^3[BLOOD]^7 Set cg_blood 1 first");
+            return CommandResult::Handled;
+        }
+        if self.live_input.is_jk2() {
+            self.push_console_line("^3[NINJA BLOOD]^7 This command requires a Jedi Academy game");
+            return CommandResult::Handled;
+        }
+        if !crate::fx::simulation_enabled() {
+            self.push_console_line("^3[NINJA BLOOD]^7 FX simulation is disabled");
+            return CommandResult::Handled;
+        }
+        let Some(session) = self.game_session.as_mut().filter(|session| {
+            !self.front_end && session.live && session.phase == SessionPhase::Playing
+        }) else {
+            self.push_console_line("ninjablood requires a loaded game");
+            return CommandResult::Handled;
+        };
+        if selection == Some("hit") {
+            let eye = crate::scene::jka_position(self.camera.position.to_array());
+            let dir = crate::scene::jka_position(self.camera.forward().to_array());
+            let placed = session.weapon_fx.test_ninja_blood_surface(eye, dir);
+            self.push_console_line(if placed { "^3[NINJA BLOOD]^7 Surface hit" } else { "^3[NINJA BLOOD]^7 No markable world surface or blood field limit" });
+            return CommandResult::Handled;
+        }
+        if selection == Some("spurt") {
+            let eye = crate::scene::jka_position(self.camera.position.to_array());
+            let dir = crate::scene::jka_position(self.camera.forward().to_array());
+            let played = session.weapon_fx.test_ninja_blood_spurt(eye, dir);
+            self.push_console_line(if played { "^3[NINJA BLOOD AIR]^7 Playing 3D hit mesh" } else { "^3[NINJA BLOOD AIR]^7 3D hit mesh unavailable or spurt limit reached" });
+            return CommandResult::Handled;
+        }
+        let was_running = session.weapon_fx.stop_local_ninja_blood();
+        if selection.is_none() && was_running {
+            self.push_console_line("^3[NINJA BLOOD]^7 Player emitter off");
+            return CommandResult::Handled;
+        }
+        let (Some(position), Some(_)) = (session.player_position, session.presented_player_state().filter(|ps| {
+            const PMF_FOLLOW: i32 = 4096;
+            const PERS_TEAM: usize = 3;
+            const TEAM_SPECTATOR: i32 = 3;
+            ps.stats[0] > 0 && ps.persistant[PERS_TEAM] != TEAM_SPECTATOR
+                && ps.field_i32("pm_type") != Some(jka_movement::PM_SPECTATOR)
+                && ps.field_i32("pm_flags").unwrap_or(0) & PMF_FOLLOW == 0
+        })) else {
+            self.push_console_line("ninjablood requires a living player outside spectator mode");
+            return CommandResult::Handled;
+        };
+
+        let style = if selection == Some("gush") {
+            crate::ninja_blood::BleedStyle::Gush
+        } else { crate::ninja_blood::BleedStyle::Leak };
+        session.weapon_fx.start_local_ninja_blood(crate::scene::jka_position(position.to_array()), style);
+        self.push_console_line(if style == crate::ninja_blood::BleedStyle::Gush {
+            "^3[NINJA BLOOD]^7 Airborne gush on. Use ninjablood to stop."
+        } else {
+            "^3[NINJA BLOOD]^7 Airborne leak on. Use ninjablood to stop."
+        });
+        CommandResult::Handled
+    }
+
+    cmd_ninjafog ["ninjafog", ] ("ninjafog [mist|lowlying|plastic|scattered] [size]", "Enable Fog_Mist around the player, or place a legacy fog preset. Size applies to legacy presets. Enable r_ninjaFog first.", CommandScope::Always) |self, command| {
+        use jka_ninja::FogPreset;
+        if !crate::ninja_fog_debug::enabled() {
+            self.push_console_line("^3[NINJA FOG]^7 Set r_ninjaFog 1 first".to_owned());
+            return CommandResult::Handled;
+        }
+        let usage = "usage: ninjafog [mist|lowlying|plastic|scattered] [legacy size in metres, 1–200]";
+        let mut args = command.split_whitespace().skip(1);
+        let preset = match args.next().unwrap_or("mist").to_ascii_lowercase().as_str() {
+            "mist" => FogPreset::Mist,
+            "lowlying" => FogPreset::LowLying,
+            "plastic" => FogPreset::Plastic,
+            "scattered" => FogPreset::Scattered,
+            _ => {
+                self.push_console_line(usage.to_owned());
+                return CommandResult::Handled;
+            }
+        };
+        let Some(mut desc) = jka_ninja::fog_desc(preset) else {
+            self.push_console_line("^3[NINJA FOG]^7 Fluid Ninja is not included in this build".to_owned());
+            return CommandResult::Handled;
+        };
+        if let Some(size) = args.next() {
+            let Some(metres) = size.parse::<f32>().ok().filter(|m| preset != FogPreset::Mist && (1.0..=200.0).contains(m) && args.next().is_none()) else {
+                self.push_console_line(usage.to_owned());
+                return CommandResult::Handled;
+            };
+            desc.width_cm = metres * 100.0;
+        }
+        let Some(session) = self.game_session.as_ref() else {
+            self.push_console_line("ninjafog requires a loaded map".to_owned());
+            return CommandResult::Handled;
+        };
+        let (Some(map), Some(origin), Some(world)) = (
+            session.map_name.clone(),
+            session.player_position.or_else(|| self.local_server.as_ref().map(|server| server.world_position())),
+            self.map_collision.as_mut(),
+        ) else {
+            self.push_console_line("ninjafog needs a presented player and map collision".to_owned());
+            return CommandResult::Handled;
+        };
+        let start = crate::scene::jka_position(origin.to_array());
+        let eye_z = start[2] + session.presented_player_state()
+            .and_then(|player| player.field_i32("viewheight"))
+            .filter(|&height| height > 0)
+            .unwrap_or(26) as f32;
+        if !crate::ninja_fog_debug::spawn(map, start, eye_z, world, desc, preset) {
+            self.push_console_line("ninjafog could not find ground below the player".to_owned());
+            return CommandResult::Handled;
+        }
+        let behavior = if preset == FogPreset::Mist {
+            "Follows the player. Use ninjafogclear to remove it."
+        } else {
+            "Fixed at placement. Use ninjafog mist for player-following fog."
+        };
+        self.push_console_line(format!("^3[NINJA FOG]^7 {preset:?}, {:.1} m simulation. {behavior}", desc.width_cm / 100.0));
+        CommandResult::Handled
+    }
+
+    cmd_ninjafogclear ["ninjafogclear", ] ("ninjafogclear", "Remove the active Fluid Ninja ground fog volume.", CommandScope::Always) |self, _command| {
+        crate::ninja_fog_debug::clear();
+        self.push_console_line("^3[NINJA FOG]^7 Cleared the placed volume".to_owned());
+        CommandResult::Handled
+    }
+
+    cmd_ninjafire ["ninjafire", ] ("ninjafire [bonfire|candle|torch|logfire] [distance]", "Place a Fluid Ninja flame along the view in a loaded map. Aim at the desired source point. Distance defaults to 96 map units.", CommandScope::Always) |self, command| {
+        if !jka_ninja::INCLUDED {
+            self.push_console_line("^3[NINJA FIRE]^7 Fluid Ninja is not included in this build".to_owned());
+            return CommandResult::Handled;
+        }
+        let mut args = command.split_whitespace().skip(1);
+        let (preset, label) = match args.next() {
+            None => (jka_ninja::FlamePreset::Bonfire, "bonfire"),
+            Some(name) if name.eq_ignore_ascii_case("bonfire") => (jka_ninja::FlamePreset::Bonfire, "bonfire"),
+            Some(name) if name.eq_ignore_ascii_case("candle") => (jka_ninja::FlamePreset::Candle, "candle"),
+            Some(name) if name.eq_ignore_ascii_case("torch") => (jka_ninja::FlamePreset::Torch, "torch"),
+            Some(name) if name.eq_ignore_ascii_case("logfire") => (jka_ninja::FlamePreset::Logfire, "logfire"),
+            _ => {
+                self.push_console_line("usage: ninjafire [bonfire|candle|torch|logfire] [distance]".to_owned());
+                return CommandResult::Handled;
+            }
+        };
+        let distance = args.next().map_or(Some(96.0), |value| value.parse::<f32>().ok());
+        let Some(distance) = distance.filter(|value| value.is_finite() && (0.0..=4096.0).contains(value) && args.next().is_none()) else {
+            self.push_console_line("usage: ninjafire [bonfire|candle|torch|logfire] [distance]".to_owned());
+            return CommandResult::Handled;
+        };
+        let Some(map) = self.game_session.as_ref().and_then(|session| session.map_name.clone()) else {
+            self.push_console_line("ninjafire requires a loaded map".to_owned());
+            return CommandResult::Handled;
+        };
+        self.ensure_ninja_fire_brushes(&map);
+        let point = self.camera.position + self.camera.forward() * distance;
+        match crate::ninja_fire_debug::spawn(&map, point, preset) {
+            Some(count) => self.push_console_line(format!(
+                "^3[NINJA FIRE]^7 {label} at ({:.0} {:.0} {:.0}); {count} active. Use ninjafireclear to clear.",
+                point.x, -point.z, point.y,
+            )),
+            None => self.push_console_line(format!(
+                "^3[NINJA FIRE]^7 emitter limit ({}) reached", crate::ninja_fire_debug::MAX_EMITTERS,
+            )),
+        }
+        CommandResult::Handled
+    }
+
+    cmd_ninjafireclear ["ninjafireclear", ] ("ninjafireclear", "Clear Fluid Ninja test flames and release their GPU resources.", CommandScope::Always) |self, command| {
+        let _ = command;
+        let count = crate::ninja_fire_debug::clear();
+        self.push_console_line(format!("^3[NINJA FIRE]^7 cleared {count} emitter(s)"));
+        CommandResult::Handled
+    }
+
+    cmd_ninjafireon ["ninjafireon", ] ("ninjafireon [burningman|smokingman|smokingman2|burningman3|burningman3b|fist]", "Apply a Fluid Ninja Fire_Smoke_Explosive pawn effect to your presented player: burningman (Stage 13, default), smokingman (Stage 15 volume smoke, demo key 2), smokingman2 (the same, also smoking while standing still), burningman3 (Stage 14 fire and volume smoke, demo key 3), burningman3b (the same, also smoking while standing still) or fist (Stage 11 Flaming Fist B blue smoke). Use third person to see the whole body.", CommandScope::Always) |self, command| {
+        use crate::ninja_fire_debug::PlayerEffect;
+        let mut args = command.split_whitespace().skip(1);
+        let effect = match args.next() {
+            None => PlayerEffect::BurningMan,
+            Some(name) if name.eq_ignore_ascii_case("burningman") => PlayerEffect::BurningMan,
+            Some(name) if name.eq_ignore_ascii_case("fist") || name.eq_ignore_ascii_case("smokingfist") => PlayerEffect::SmokingFist,
+            Some(name) if name.eq_ignore_ascii_case("burningman3") => PlayerEffect::BurningMan3,
+            Some(name) if name.eq_ignore_ascii_case("burningman3b") => PlayerEffect::BurningMan3Constant,
+            Some(name) if name.eq_ignore_ascii_case("smokingman") || name.eq_ignore_ascii_case("smoke") => PlayerEffect::SmokingMan,
+            Some(name) if name.eq_ignore_ascii_case("smokingman2") => PlayerEffect::SmokingManConstant,
+            Some(_) => {
+                self.push_console_line("usage: ninjafireon [burningman|smokingman|smokingman2|burningman3|burningman3b|fist]".to_owned());
+                return CommandResult::Handled;
+            }
+        };
+        if args.next().is_some() {
+            self.push_console_line("usage: ninjafireon [burningman|smokingman|smokingman2|burningman3|burningman3b|fist]".to_owned());
+        } else if !jka_ninja::INCLUDED {
+            self.push_console_line("^3[NINJA FIRE]^7 Fluid Ninja is not included in this build".to_owned());
+        } else if let Some(map) = self.game_session.as_ref().and_then(|session| session.map_name.clone()) {
+            self.ensure_ninja_fire_brushes(&map);
+            crate::ninja_fire_debug::start_player(&map, effect);
+            self.push_console_line(format!("^3[NINJA FIRE]^7 {} enabled. Use ninjafireoff to stop.", effect.label()));
+        } else {
+            self.push_console_line("ninjafireon requires a loaded map".to_owned());
+        }
+        CommandResult::Handled
+    }
+
+    cmd_ninjafireoff ["ninjafireoff", ] ("ninjafireoff", "Cut the player effect's fuel and let the flame or smoke fade out.", CommandScope::Always) |self, command| {
+        let _ = command;
+        let pose = self.game_session.as_ref().and_then(|session| {
+            session.player_presenter.ninja_fire_pose.map(|mut pose| {
+                pose.time_ms = session.cgame_time;
+                pose
+            })
+        });
+        crate::ninja_fire_debug::stop_player(pose);
+        CommandResult::Handled
+    }
+
     cmd_menudevmap ["menudevmap", ] ("menudevmap", "devmap mp/duel9 with the main-menu look (Yavin retextures, water, campfire and waterfall fx) but without the props. Then run `menuent` to stage the props as editable Map Mods placements.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {
@@ -805,10 +1097,10 @@ commands! {
         CommandResult::Handled
     }
 
-    cmd_riverclear ["riverclear", ] ("riverclear", "Remove all developer rivers (spawnriver) and drains (spawndrain).", CommandScope::Always) |self, _command| {
+    cmd_clearriver ["clearriver", ] ("clearriver", "Remove all developer rivers (spawnriver) and drains (spawndrain).", CommandScope::Always) |self, _command| {
         self.river_editor.clear();
         self.render_command(RenderCommand::RiverClear);
-        self.push_console_line("riverclear: removed rivers and drains".to_owned());
+        self.push_console_line("clearriver: removed rivers and drains".to_owned());
         CommandResult::Handled
     }
 
@@ -1031,7 +1323,27 @@ commands! {
                         "^3AUDIO PAN:^7 largest per-frame gain step {:.3} (glided per sample, not stepped)",
                         info.largest_gain_step
                     ));
-                    if let Some(path) = &info.eal_file {
+                    if info.eal_enabled {
+                        self.push_console_line(format!(
+                            "^3ECHOFIELD SOUNDSCAPE:^7 {} sources", info.echofield_ambience_sources
+                        ));
+                        if let Some(echo) = info.echofield_diagnostics {
+                            self.push_console_line(format!(
+                                "^3ECHOFIELD GEOMETRY:^7 {} movers | {} contacts | {} reflection taps | {} source updates | {:.2} ms queued | {:.2} ms compute",
+                                echo.movers, echo.contacts, echo.room_taps, echo.evaluated_voices, echo.queue_ms, echo.compute_ms
+                            ));
+                            self.push_console_line(format!(
+                                "^3ECHOFIELD ROOM:^7 wind {:.0}% | enclosure {:.0}% | RT60 {:.2} s",
+                                echo.wind_exposure * 100.0, echo.enclosure * 100.0, echo.rt60
+                            ));
+                        }
+                    }
+                    if info.echo_field_selected {
+                        self.push_console_line(format!(
+                            "^3ECHOFIELD:^7 Static BSP | {} reverb slots | {} filtered sources",
+                            info.eal_rooms, info.eal_filtered_sources
+                        ));
+                    } else if let Some(path) = &info.eal_file {
                         self.push_console_line(format!(
                             "^3EAL ZONES:^7 {} | {} presets | listener: {} | authored acoustics: {}",
                             path, info.eal_preset_count,
@@ -1040,7 +1352,7 @@ commands! {
                         ));
                     } else {
                         self.push_console_line(format!(
-                            "^3EAL ZONES:^7 no .eal dataset loaded | s_eal {} | authored acoustics inactive",
+                            "^3ECHOFIELD:^7 s_echoField {} | no active map acoustics",
                             u8::from(info.eal_enabled)
                         ));
                     }
@@ -1142,6 +1454,24 @@ commands! {
             _ => self.push_console_line("^3CHAT MODEL:^7 usage: chatLlmDownload confirm|cancel"),
         }
         CommandResult::Handled
+    }
+
+}
+
+impl App {
+    pub(super) fn ensure_ninja_fire_brushes(&mut self, map: &str) {
+        if !crate::ninja_fire_debug::brushes_wanted() || crate::ninja_fire_debug::world_brushes_loaded(map) {
+            return;
+        }
+        match crate::scene::ninja_fire_world_brushes(
+            &self.base,
+            self.game.as_deref(),
+            &self.initial_source,
+            self.video.allow_asset_overrides,
+        ) {
+            Ok(brushes) => crate::ninja_fire_debug::set_world_brushes(map, brushes),
+            Err(error) => self.push_console_line(format!("^3[NINJA FIRE]^7 brush collision unavailable: {error}")),
+        }
     }
 
 }

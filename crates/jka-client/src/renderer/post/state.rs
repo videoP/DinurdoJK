@@ -3,7 +3,7 @@ use crate::renderer::{
     cloud_wind, create_auto_exposure_bind_group, create_bloom_bind_groups, create_bloom_pipeline,
     create_cloud_resolve_bind_group, create_dof_bind_group,
     create_gamma_post_bind_group, create_post_bind_group, create_post_pipeline, create_post_pipeline_for,
-    create_cloud_shadow_opaque_pipeline,
+    create_cloud_shadow_opaque_pipeline, create_legacy_global_fog_pipeline,
     create_rain_post_pipeline,
     create_ssao_temporal_bind_groups, create_ssr_temporal_bind_groups, pipeline_hash,
     CloudLayerSettings, CloudRenderSettings, CloudSunSettings, GlowMode, Mat4, PipelineJobKey,
@@ -287,6 +287,41 @@ impl Renderer {
         });
     }
 
+    /// In-scene legacy global fog pass, queued on the shader workers only while
+    /// a Legacy mode applies BSP global fog. Called every frame; cheap when ready.
+    pub(in crate::renderer) fn ensure_legacy_global_fog_pipeline(&mut self) {
+        if !self.weather.fog.legacy_global_fog_active() {
+            return;
+        }
+        let scene = self.scene_format();
+        let samples = self.msaa_samples;
+        let (format, entry) = if scene.is_srgb() {
+            (scene.remove_srgb_suffix(), "fs_legacy_global_fog_encoded")
+        } else {
+            (scene, "fs_legacy_global_fog_linear")
+        };
+        if self.legacy_global_fog_pipeline.as_ref()
+            .is_some_and(|(key, _)| *key == (format, samples))
+        {
+            return;
+        }
+        let key = PipelineJobKey::new(
+            "legacy-global-fog", 0, pipeline_hash(&(format, samples)),
+        );
+        if let Some(ready) = self.pipeline_jobs.take_ready(key) {
+            self.legacy_global_fog_pipeline = Some(((format, samples), ready));
+            return;
+        }
+        let (device, layout, shader) = (
+            self.device.clone(),
+            self.post_pipeline_layout.clone(),
+            self.post_shader.clone(),
+        );
+        self.pipeline_jobs.request(key, "legacy global fog", move || {
+            create_legacy_global_fog_pipeline(&device, &layout, &shader, format, samples, entry)
+        });
+    }
+
     /// r_postSpecialize: the full-post pipeline compiled for `mask`, or None
     /// while it compiles on the pipeline workers (the caller then draws with the
     /// general pipeline, which renders the same image).
@@ -396,10 +431,13 @@ impl Renderer {
             Vec3::new(camera_pos_time[0], camera_pos_time[1], camera_pos_time[2]),
         );
         let ocean_void_fog = self.ocean_void_fog_params(camera_pos_time[1]);
-        let legacy1_global_fog = self.weather.fog.legacy1_global_post_params();
-        let (legacy_fog, legacy_fog_scale) = legacy1_global_fog
-            .map_or(([0.0; 4], 0.0), |(color, depth, scale)| {
-                ([color[0], color[1], color[2], depth], scale)
+        // Read by the in-scene fullscreen legacy global fog pass (post.wgsl
+        // fs_legacy_global_fog_*), not by the final post composite. A negative
+        // scale selects r_drawfog 2's GL_EXP2 curve.
+        let legacy_global_fog = self.weather.fog.legacy_global_fog_params();
+        let (legacy_fog, legacy_fog_scale) = legacy_global_fog
+            .map_or(([0.0; 4], 0.0), |(color, depth, scale, exp2)| {
+                ([color[0], color[1], color[2], depth], if exp2 { -scale } else { scale })
             });
         let uniform = PostUniform {
             color: PostColorSettings {
@@ -1006,7 +1044,6 @@ pub(in crate::renderer) fn post_feature_mask(uniform: &PostUniform) -> u32 {
     set(64, on(uniform.color.bloom));
     set(128, on(uniform.film.halation));
     set(256, on(uniform.exposure_controls[1]));
-    set(512, on(uniform.taa_params[3]));
     set(1024, on(uniform.taa_params[1]));
     mask
 }

@@ -663,6 +663,8 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
     let mark_surfaces = mark_surfaces_from_batches(&vertices, &batches);
     let world_effect_registrations = map_world_effect_registrations(&document.entities);
     Ok(PreparedMap {
+        river_plans: Arc::default(),
+        river_promotion_mode: 0,
         patch_draws: Vec::new(),
         inline_patch_draws: Vec::new(),
         coastal_bathymetry: None,
@@ -701,6 +703,7 @@ pub(in crate::scene) fn prepare_map_document_with_assets_options(
         deluxemaps: Arc::default(),
         static_bsp_ao_cache: None,
         steam_audio_acoustic_mesh: None,
+        echo_geometry: None,
         steam_audio_bake: None,
         steam_audio_bake_request: None,
         visibility: None,

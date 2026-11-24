@@ -31,16 +31,58 @@ pub(crate) fn canonical_shader_name(name: &str) -> String {
 pub(crate) struct ShaderRemapState {
     redirects: BTreeMap<String, String>,
     time_offsets: BTreeMap<String, f32>,
+    /// World-only `q3map_dinurdoPromoted` overrides for the currently active
+    /// promotion systems: canonical source -> replacement (None hides the
+    /// surface). Explicit redirects above take precedence. Kept apart from
+    /// `redirects` so listRemaps, the remap editor and model presenters only
+    /// see authored/server R_RemapShader state.
+    promotion: BTreeMap<String, Option<String>>,
 }
 
 impl ShaderRemapState {
+    /// Clears R_RemapShader state. Promotion overrides follow the loaded map
+    /// and the promotion toggles, so they survive a server/console reset.
     pub(crate) fn clear(&mut self) {
         self.redirects.clear();
         self.time_offsets.clear();
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.redirects.is_empty() && self.time_offsets.is_empty()
+        self.redirects.is_empty() && self.time_offsets.is_empty() && self.promotion.is_empty()
+    }
+
+    /// True when only promotion overrides (no R_RemapShader state) are present.
+    pub(crate) fn has_authored_remaps(&self) -> bool {
+        !self.redirects.is_empty() || !self.time_offsets.is_empty()
+    }
+
+    pub(crate) fn promotion(&self) -> &BTreeMap<String, Option<String>> {
+        &self.promotion
+    }
+
+    /// Replace the promotion layer. Returns whether it changed.
+    pub(crate) fn set_promotion(&mut self, promotion: BTreeMap<String, Option<String>>) -> bool {
+        if self.promotion == promotion {
+            return false;
+        }
+        self.promotion = promotion;
+        true
+    }
+
+    /// The same promotion layer with no R_RemapShader state, for a world that
+    /// does not belong to the session owning the redirects.
+    pub(crate) fn promotion_only(&self) -> Self {
+        Self { promotion: self.promotion.clone(), ..Self::default() }
+    }
+
+    /// World resolution for one BSP shader: an explicit redirect wins, then a
+    /// promotion override. Outer None = draw the source; Some(None) = hide.
+    fn world_override(&self, source: &str) -> Option<Option<&str>> {
+        let key = canonical_shader_name(source);
+        if let Some(target) = self.redirects.get(&key) {
+            return Some(Some(target.as_str()));
+        }
+        self.promotion.get(&key).map(|target| target.as_deref())
     }
 
     /// Local and server-provided shader redirects for console diagnostics.
@@ -89,10 +131,6 @@ impl ShaderRemapState {
             .get(&canonical_shader_name(effective_shader))
             .copied()
             .unwrap_or(0.0)
-    }
-
-    pub(crate) fn has_redirect_for(&self, source: &str) -> bool {
-        self.redirects.contains_key(&canonical_shader_name(source))
     }
 }
 
@@ -182,9 +220,15 @@ fn rebuild_batches(
 
         let source_name = batch_shader_name(map, first);
         let effective = source_name.map(|name| state.effective_name(name));
-        let redirected = source_name.is_some_and(|name| state.has_redirect_for(name));
-        if redirected {
-            let target = effective.as_deref().unwrap_or_default();
+        let world_override = source_name.and_then(|name| state.world_override(name));
+        if let Some(None) = world_override {
+            // q3map_dinurdoPromoted <system> with no replacement: the active
+            // promotion owns this surface's look, so emit no draw at all.
+            // Geometry, collision and surface flags are untouched.
+            index = end;
+            continue;
+        }
+        if let Some(Some(target)) = world_override {
             if let Some(material) = replacements.get(target) {
                 let start = out.len();
                 append_material_batches(
@@ -363,7 +407,8 @@ fn resolve_remap_targets(
     let texture_base = map.textures.len();
     let mut replacements = BTreeMap::<String, SurfaceMaterial>::new();
 
-    for target in state.redirects.values() {
+    let promotion_targets = state.promotion.values().filter_map(Option::as_ref);
+    for target in state.redirects.values().chain(promotion_targets) {
         if replacements.contains_key(target) {
             continue;
         }
@@ -403,6 +448,19 @@ fn resolve_remap_targets(
     Ok((replacements, textures))
 }
 
+/// Trace Inspector source -> target per BSP shader, for explicit redirects and
+/// promotion replacements. A hidden surface emits no draw, so it has no entry.
+fn remap_diagnostics(
+    entries: &[super::MaterialDebugEntry],
+    state: &ShaderRemapState,
+    replacements: &BTreeMap<String, SurfaceMaterial>,
+) -> Vec<Option<(String, bool)>> {
+    entries.iter().map(|entry| match state.world_override(&entry.name) {
+        Some(Some(target)) => Some((target.to_owned(), replacements.contains_key(target))),
+        _ => None,
+    }).collect()
+}
+
 /// Re-resolve all currently active redirects into an already-prepared map.
 /// The caller must supply an unremapped map: stage flattening is rebuilt from
 /// its original batches so `old -> old` restores the authored material exactly.
@@ -418,6 +476,12 @@ pub(crate) fn apply_shader_remaps_in_place(
     }
 
     let (replacements, mut textures) = resolve_remap_targets(map, root, game, options, state)?;
+    // Promotion overrides keep the BSP's vertex ranges, which is all a river
+    // plan owns, so only an R_RemapShader can invalidate its hydraulic claim.
+    if state.has_authored_remaps() {
+        map.river_plans = Default::default();
+        map.river_promotion_mode = 0;
+    }
     let texture_base = map.textures.len();
 
     // Only these comparatively small flattened stage lists must be copied.
@@ -440,10 +504,10 @@ pub(crate) fn apply_shader_remaps_in_place(
     // shader-table index still names the *source*, while the uploaded stages
     // may belong entirely to the target. This is a cold remap-only update:
     // no extra strings, lookups, or branches in world draw submission.
-    for entry in &mut map.material_debug.entries {
-        let target = state.redirects.get(&canonical_shader_name(&entry.name));
-        entry.remapped_to = target.cloned();
-        entry.remap_target_resolved = target.is_some_and(|name| replacements.contains_key(name));
+    let diagnostics = remap_diagnostics(&map.material_debug.entries, state, &replacements);
+    for (entry, remap) in map.material_debug.entries.iter_mut().zip(diagnostics) {
+        entry.remapped_to = remap.as_ref().map(|(name, _)| name.clone());
+        entry.remap_target_resolved = remap.is_some_and(|(_, resolved)| resolved);
     }
 
     if let Some(visibility) = &map.visibility {
@@ -575,10 +639,7 @@ pub(crate) fn prepare_remap_plan(
     rverbose!(1, "[SHADER REMAP] material-only CPU plan {:.2} ms; {} coarse / {} PVS / {} inline stages (no PreparedMap clone)",
         started.elapsed().as_secs_f64() * 1000.0, coarse.len(), full.len(), inline.len());
     if reuse_portal { rverbose!(2, "[SHADER REMAP] AUTO4 geometries reused; existing merged members remain compatible"); }
-    let remap_diagnostics = base.material_debug.entries.iter().map(|entry| {
-        state.redirects.get(&canonical_shader_name(&entry.name))
-            .map(|target| (target.clone(), replacements.contains_key(target)))
-    }).collect();
+    let remap_diagnostics = remap_diagnostics(&base.material_debug.entries, state, &replacements);
     Ok(PreparedRemapPlan {
         base,
         batches: coarse,

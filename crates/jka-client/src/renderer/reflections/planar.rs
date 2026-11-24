@@ -6,7 +6,6 @@ use crate::renderer::{
     Renderer, Vec2, Vec3, Vec4, WorldBatch, WorldGpu, depth_format, PLANAR_AUTHORED_SCALE_DIVISOR,
     PLANAR_ENVIRONMENT_SCALE_DIVISOR, PLANAR_REFLECTION_HYSTERESIS, PLANAR_REFLECTION_SLOTS,
 };
-use wgpu::util::DeviceExt;
 
 #[path = "planar_target.rs"]
 mod target;
@@ -21,6 +20,9 @@ impl Renderer {
     }
 
     pub(in crate::renderer) fn rebuild_planar_reflection_resources(&mut self) {
+        if crate::renderer::device_lost() {
+            return;
+        }
         let lake_planar = (self.ocean_settings.backend == 3).then(|| self.lake_planar_enabled());
         for flare_view in &mut self.world_flares_planar {
             flare_view.invalidate_depth_binding();
@@ -75,13 +77,17 @@ impl Renderer {
         } else {
             (1, 1)
         };
-        self.planar_reflection = create_planar_reflection_resources(
+        self.planar_reflection = match create_planar_reflection_resources(
             &self.device,
             &self.planar_reflection_layout,
             width,
             height,
             active,
-        );
+        ) {
+            Ok(resources) => resources,
+            Err(_) if crate::renderer::device_lost() => return,
+            Err(error) => panic!("{error}"),
+        };
         self.planar_slot_history = [None; PLANAR_REFLECTION_SLOTS];
         self.last_planar_debug_selection = None;
         if active {
@@ -1020,13 +1026,35 @@ pub(in crate::renderer) fn select_planar_reflection_views(
     views
 }
 
+fn create_planar_uniform_buffer(
+    device: &wgpu::Device,
+    label: &str,
+    uniform: &PlanarReflectionUniform,
+    usage: wgpu::BufferUsages,
+) -> Result<wgpu::Buffer, String> {
+    let contents = bytemuck::bytes_of(uniform);
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: contents.len() as wgpu::BufferAddress,
+        usage,
+        mapped_at_creation: true,
+    });
+    // The device can be lost during the allocation itself.
+    buffer
+        .get_mapped_range_mut(..)
+        .map_err(|error| format!("Could not initialize {label}: {error}"))?
+        .copy_from_slice(contents);
+    buffer.unmap();
+    Ok(buffer)
+}
+
 pub(in crate::renderer) fn create_planar_reflection_resources(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     width: u32,
     height: u32,
     active: bool,
-) -> PlanarReflectionResources {
+) -> Result<PlanarReflectionResources, String> {
     let color_format = PLANAR_COLOR_FORMAT;
     let width = width.max(1);
     let height = height.max(1);
@@ -1105,22 +1133,23 @@ pub(in crate::renderer) fn create_planar_reflection_resources(
         ],
         debug: [0.0; 4],
     };
-    let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("JKA planar reflection uniform"),
-        contents: bytemuck::bytes_of(&uniform),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    });
+    let uniform_buffer = create_planar_uniform_buffer(
+        device,
+        "JKA planar reflection uniform",
+        &uniform,
+        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    )?;
     let reflection_pass_uniform = PlanarReflectionUniform {
         planes: [[0.0; 4]; PLANAR_REFLECTION_SLOTS],
         viewport: [width as f32, height as f32, 0.0, 0.0],
         debug: [0.0; 4],
     };
-    let reflection_pass_uniform_buffer =
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("JKA planar reflection recursion-disabled uniform"),
-            contents: bytemuck::bytes_of(&reflection_pass_uniform),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+    let reflection_pass_uniform_buffer = create_planar_uniform_buffer(
+        device,
+        "JKA planar reflection recursion-disabled uniform",
+        &reflection_pass_uniform,
+        wgpu::BufferUsages::UNIFORM,
+    )?;
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("JKA planar reflection bind group"),
         layout,
@@ -1168,7 +1197,7 @@ pub(in crate::renderer) fn create_planar_reflection_resources(
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    PlanarReflectionResources {
+    Ok(PlanarReflectionResources {
         _color: color,
         color_views,
         _color_array_view: color_array_view,
@@ -1185,5 +1214,5 @@ pub(in crate::renderer) fn create_planar_reflection_resources(
         _width: width,
         _height: height,
         active,
-    }
+    })
 }

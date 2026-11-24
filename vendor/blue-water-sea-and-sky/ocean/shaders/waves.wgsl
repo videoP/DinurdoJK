@@ -205,7 +205,7 @@ fn breaking_group(xz: vec2<f32>, foam: f32, bubbles: f32, i: i32) -> f32 {
 // arriving there before the depth breaks them (m).
 struct Shore {
     scales: vec4<f32>,
-    depth: f32,
+    depth: f32, // signed still-water depth (negative above the waterline)
     arriving: f32,
 }
 
@@ -232,6 +232,11 @@ fn shore_inside(uv: vec2<f32>) -> bool {
     return all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
 }
 
+fn shore_height(uv: vec2<f32>) -> vec2<f32> {
+    let height = textureSampleLevel(shore_heights, shore_sampler, uv, 0.0).rg;
+    return vec2<f32>(height.x / max(height.y, 0.5), height.y);
+}
+
 fn shore_at(xz: vec2<f32>) -> Shore {
     if waves.shore.x < 0.5 {
         return Shore(vec4<f32>(1.0), SHORE_DEEP, 0.0);
@@ -239,7 +244,8 @@ fn shore_at(xz: vec2<f32>) -> Shore {
     let heights_uv = (xz - waves.shore_heights.xy) * waves.shore_heights.zw;
     var depth = SHORE_DEEP;
     if shore_inside(heights_uv) {
-        depth = max(-textureSampleLevel(shore_heights, shore_sampler, heights_uv, 0.0).r, 0.0);
+        let height = shore_height(heights_uv);
+        depth = select(SHORE_DEEP, -height.x, height.y >= 0.5);
     }
     let exposure_uv = (xz - waves.shore_exposure.xy) * waves.shore_exposure.zw;
     var fetch = vec2<f32>(SHORE_OPEN_KM);
@@ -256,7 +262,7 @@ fn shore_at(xz: vec2<f32>) -> Shore {
     scales.w = min(fill / (1.0 - exp(-SHORE_OPEN_KM * waves.shore.z)), 1.0);
     let arriving = length(waves.shore_waves * scales);
     // Shoaling water: no wave higher than the breaking share of its depth.
-    scales = min(scales, SHORE_BREAKING * depth / max(waves.shore_waves, vec4<f32>(1e-3)));
+    scales = min(scales, SHORE_BREAKING * max(depth, 0.0) / max(waves.shore_waves, vec4<f32>(1e-3)));
     return Shore(scales, depth, arriving);
 }
 
@@ -272,19 +278,23 @@ fn shore_whitecaps(shore: Shore) -> f32 {
 }
 
 // The seabed's rise over its run at world position `xz`, across a sample of the coast's height grid either way.
-fn shore_slope(xz: vec2<f32>) -> f32 {
+fn shore_slope(xz: vec2<f32>, bed: f32) -> f32 {
     let size = vec2<f32>(textureDimensions(shore_heights));
     let uv = (xz - waves.shore_heights.xy) * waves.shore_heights.zw;
     let du = vec2<f32>(1.0 / size.x, 0.0);
     let dv = vec2<f32>(0.0, 1.0 / size.y);
-    let rise = vec2<f32>(
-        textureSampleLevel(shore_heights, shore_sampler, uv + du, 0.0).r
-            - textureSampleLevel(shore_heights, shore_sampler, uv - du, 0.0).r,
-        textureSampleLevel(shore_heights, shore_sampler, uv + dv, 0.0).r
-            - textureSampleLevel(shore_heights, shore_sampler, uv - dv, 0.0).r,
-    );
-    // The two samples lie 2 / (size · frame scale) metres apart.
-    return length(rise * size * waves.shore_heights.zw * 0.5);
+    let right = shore_height(uv + du);
+    let left = shore_height(uv - du);
+    let next = shore_height(uv + dv);
+    let prev = shore_height(uv - dv);
+    let forward_valid = vec2<f32>(right.y, next.y) >= vec2<f32>(0.5);
+    let backward_valid = vec2<f32>(left.y, prev.y) >= vec2<f32>(0.5);
+    let forward = select(vec2<f32>(bed), vec2<f32>(right.x, next.x), forward_valid);
+    let backward = select(vec2<f32>(bed), vec2<f32>(left.x, prev.x), backward_valid);
+    // Use a one-sided slope at the edge of known bed coverage.
+    let steps = vec2<f32>(select(1.0, 2.0, forward_valid.x && backward_valid.x),
+        select(1.0, 2.0, forward_valid.y && backward_valid.y));
+    return length((forward - backward) * size * waves.shore_heights.zw / steps);
 }
 
 // The surf at world position `xz` (x: its cover 0 … 1, y: the fresh white water's share of it), for a pixel `across`
@@ -297,11 +307,11 @@ fn shore_slope(xz: vec2<f32>) -> f32 {
 fn surf(xz: vec2<f32>, shore: Shore, across: f32, along: f32) -> vec2<f32> {
     let breaking = shore.arriving / SHORE_BREAKING;
     let frequency = waves.shore.y;
-    if breaking < 0.1 || shore.depth >= breaking || frequency <= 0.0 {
+    if breaking < 0.1 || shore.depth <= 0.0 || shore.depth >= breaking || frequency <= 0.0 {
         return vec2<f32>(0.0);
     }
-    let depth = max(shore.depth, 0.0);
-    let slope = clamp(shore_slope(xz), SURF_GENTLEST, 1.0);
+    let depth = shore.depth;
+    let slope = clamp(shore_slope(xz, -depth), SURF_GENTLEST, 1.0);
     let phase = waves.shore.w + frequency * 2.0 * sqrt(depth) / (slope * sqrt(SURF_GRAVITY));
     let spacing = 6.2831853 * sqrt(SURF_GRAVITY * depth) / frequency;
     let resolved = smoothstep(2.0, 6.0, spacing / max(across, 1e-3));
@@ -312,6 +322,14 @@ fn surf(xz: vec2<f32>, shore: Shore, across: f32, along: f32) -> vec2<f32> {
     let fresh = line * mix(SURF_TORN_MEAN, smoothstep(0.2, 0.5, tear), tear_shown);
     let zone = smoothstep(1.0, 0.75, depth / breaking);
     return vec2<f32>(mix(SURF_RESIDUE, 1.0, fresh), fresh) * zone;
+}
+
+// Anchor breaker foam to the drawn surface, including horizontal chop.
+fn surf_at(xz: vec2<f32>, across: f32, along: f32) -> vec2<f32> {
+    if waves.shore.x < 0.5 {
+        return vec2<f32>(0.0);
+    }
+    return surf(xz, shore_at(xz), across, along);
 }
 
 // The first cascade low-passed to the hull sea's split and never finer than mip `fine`: the long waves hulls replace

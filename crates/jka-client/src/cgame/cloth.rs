@@ -21,8 +21,10 @@ const METRES_PER_JKA_UNIT: f32 = 0.0254;
 const TELEPORT_DISTANCE_METRES: f32 = 1.5;
 /// Last-resort safety net for malformed/custom surfaces or an unstable step.
 /// Cloth is simulated in player-local space, so a vertex this far from its
-/// corresponding animated pose is unquestionably runaway state.
-const RUNAWAY_DISTANCE_METRES: f32 = 1.0;
+/// corresponding animated pose is unquestionably runaway state. It must
+/// exceed the sweep of a long cape swinging about its attachment (~1.5 m
+/// garments), otherwise a legitimate swing is rejected or reset.
+const RUNAWAY_DISTANCE_METRES: f32 = 3.0;
 /// Auto-promoted GLM garments were authored for skeletal skinning, not as
 /// completely free cloth. Use the solver's native XPBD target constraints to
 /// keep secondary displacement near its reference. The correction strength
@@ -34,7 +36,105 @@ const RUNAWAY_DISTANCE_METRES: f32 = 1.0;
 const FOLLOW_NEAR_STRENGTH: f32 = 0.18;
 const FOLLOW_FAR_STRENGTH: f32 = 0.025;
 const FOLLOW_FALLOFF_JKA: f32 = 32.0;
+/// Capes/cloaks: attached only at the top and much freer below it.
+/// Effectively none (build_follow_targets floors it at 0.0001): away from its
+/// attachment a cape is pure physics, so it can stay draped over a head or
+/// shoulder instead of a shape-memory spring dragging it back to neutral.
+const HANGING_FOLLOW_FAR_STRENGTH: f32 = 0.0;
+/// Fabric on a body grips rather than sliding off like ice.
+const BODY_CONTACT_FRICTION: f32 = 0.45;
+/// Firm at the attachment so a cape cannot be turned around over its collar,
+/// fading quadratically: the hold is concentrated near the pins instead of
+/// gluing the upper half of the garment to the back.
+const HANGING_FOLLOW_NEAR_STRENGTH: f32 = 0.6;
+const HANGING_FOLLOW_FALLOFF_JKA: f32 = 14.0;
+/// Relative airflow saturates here (m/s, ~195 knots). The per-particle
+/// acceleration bound below is the actual stability guard.
+const MAX_RELATIVE_AIR_SPEED: f32 = 100.0;
+/// Air acceleration bound per particle (m/s^2, ~10 g). It must clearly exceed
+/// gravity plus the loose shape-memory spring, otherwise strong wind hits a
+/// visible ceiling instead of streaming the garment out.
+const MAX_AIR_ACCELERATION: f32 = 100.0;
+/// Ceiling on free-particle speed in the player-local frame (metres/s). A cape
+/// flicking back when a run starts legitimately exceeds a few m/s.
+pub(crate) const MAX_LOCAL_PARTICLE_SPEED: f32 = 10.0;
+/// Allowed stretch beyond a particle's geodesic rest distance from its
+/// attachment (long-range attachment constraint).
+const TETHER_SLACK: f32 = 0.03;
+const MAX_CONSECUTIVE_REJECTIONS: u32 = 3;
+
+#[derive(Debug, Clone, Copy)]
+struct FollowFalloff {
+    near: f32,
+    far: f32,
+    distance_jka: f32,
+    /// Quadratic ease-out concentrates the firm region right at the
+    /// attachment; otherwise smoothstep.
+    concentrated: bool,
+}
+
+impl FollowFalloff {
+    /// 0 at an attachment, 1 where the fabric is as free as it gets.
+    fn freedom(self, strength: f32) -> f32 {
+        ((self.near - strength) / (self.near - self.far)).clamp(0.0, 1.0)
+    }
+
+    fn strength(self, distance_jka: f32) -> f32 {
+        let t = (distance_jka / self.distance_jka).clamp(0.0, 1.0);
+        let weight = if self.concentrated {
+            (1.0 - t) * (1.0 - t)
+        } else {
+            1.0 - t * t * (3.0 - 2.0 * t)
+        };
+        self.far + (self.near - self.far) * weight
+    }
+}
+
+/// Bending stiffness multiplier at the attachment, fading quadratically to 1.
+const ATTACHMENT_BEND_BOOST: f32 = 25.0;
+const ATTACHMENT_BEND_FALLOFF_JKA: f32 = 14.0;
+
+fn attachment_bend_boost(distance_jka: f32) -> f32 {
+    if !distance_jka.is_finite() {
+        return 1.0;
+    }
+    let t = (distance_jka / ATTACHMENT_BEND_FALLOFF_JKA).clamp(0.0, 1.0);
+    1.0 + (ATTACHMENT_BEND_BOOST - 1.0) * (1.0 - t) * (1.0 - t)
+}
+
+/// Garments that hang from an edge rather than being worn around the body.
+fn is_hanging_garment_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("cape") || name.contains("cloak")
+}
 const MAX_DRIVE_ACCELERATION: f32 = 35.0;
+/// Bending compliance at r_clothStiffness 1 (the original tuning).
+/// Bending compliance relative to each hinge's own rest mobility
+/// (sum of w|grad|^2). Absolute compliance was meaningless here: with ~0.1 g
+/// particles a hinge's mobility is ~1e6, so any practical absolute value was
+/// already rigid per iteration and r_clothStiffness changed nothing.
+/// Per-iteration correction fraction is `s / (s + K)`: 0.1 -> 29%,
+/// 2 -> 89%, 100 -> 99.75%, independent of mass and mesh density.
+const BEND_RELATIVE_COMPLIANCE: f32 = 0.25;
+/// Past full per-iteration correction, more stiffness needs more Gauss-Seidel
+/// iterations for a correction to travel along the garment.
+const BASE_SOLVER_ITERATIONS: usize = 8;
+const MAX_SOLVER_ITERATIONS: usize = 20;
+const STIFFNESS_ITERATION_THRESHOLD: f32 = 10.0;
+const MAX_STIFFNESS: f32 = 100.0;
+
+/// r_clothStiffness as a per-iteration correction fraction, `s / (s + K)`
+/// (see `BEND_RELATIVE_COMPLIANCE`).
+pub(crate) fn per_iteration_correction(stiffness: f32) -> f32 {
+    let stiffness = stiffness.clamp(0.1, MAX_STIFFNESS);
+    stiffness / (stiffness + BEND_RELATIVE_COMPLIANCE)
+}
+
+pub(crate) fn solver_iterations(stiffness: f32) -> usize {
+    let extra = (stiffness / STIFFNESS_ITERATION_THRESHOLD).max(1.0).sqrt();
+    ((BASE_SOLVER_ITERATIONS as f32 * extra).round() as usize)
+        .clamp(BASE_SOLVER_ITERATIONS, MAX_SOLVER_ITERATIONS)
+}
 const SECONDARY_GRAVITY: f32 = 1.0;
 const INSTANCE_TTL_MS: i32 = 5_000;
 const DEBUG_INTERVAL_MS: i32 = 500;
@@ -58,6 +158,12 @@ pub(crate) struct ClothConfig {
     pub air_resistance: f32,
     pub turn_response: f32,
     pub animation_influence: f32,
+    /// Bending stiffness (see `BEND_RELATIVE_COMPLIANCE`), 0.1..100.
+    pub stiffness: f32,
+    /// Exponential velocity damping, 1/s.
+    pub damping: f32,
+    /// Bending stiffens with fold size (see `ClothMaterial::bend_hardening`).
+    pub stiffening: f32,
     /// World JKA units/second, sampled from shared weather wind.
     pub wind_velocity: [f32; 3],
 }
@@ -73,6 +179,9 @@ impl Default for ClothConfig {
             air_resistance: 1.0,
             turn_response: 1.8,
             animation_influence: 0.35,
+            stiffness: 2.0,
+            damping: 8.0,
+            stiffening: 3.0,
             wind_velocity: [0.0; 3],
         }
     }
@@ -88,6 +197,84 @@ pub(crate) struct ClothCapsule {
     pub radius: f32,
     /// Optional world/local JKA-unit axes of a unit-radius stretched capsule.
     pub basis: Option<[[f32; 3]; 3]>,
+    /// The same proxy in the model's bind pose. Cloth that already lies inside
+    /// it at bind time is a proxy-fit inaccuracy and keeps that overlap; any
+    /// overlap the animation adds (an arm swung back through a cape) is
+    /// resolved. `None` keeps the older rule of preserving authored overlap.
+    pub rest: Option<ClothRestCapsule>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClothRestCapsule {
+    pub a: [f32; 3],
+    pub b: [f32; 3],
+    pub radius: f32,
+    pub basis: Option<[[f32; 3]; 3]>,
+}
+
+impl ClothRestCapsule {
+    fn shape(self) -> BodyShape {
+        BodyShape::new(&ClothCapsule {
+            a: self.a,
+            b: self.b,
+            radius: self.radius,
+            basis: self.basis,
+            rest: None,
+        })
+    }
+}
+
+/// Bind-pose overlap each particle may keep against each body proxy.
+/// Built once per garment instance from the bind-space capsules.
+struct RestAllowance {
+    capsule_count: usize,
+    /// Capsules without a bind shape keep the legacy unlimited allowance.
+    known: Vec<bool>,
+    /// Sparse (capsule index, metres) per particle.
+    per_particle: Vec<Vec<(u32, f32)>>,
+}
+
+/// Slack for skinning drift on proxies the cloth already rests inside.
+const REST_OVERLAP_SLACK_JKA: f32 = 0.5;
+
+impl RestAllowance {
+    fn new(bind_particles: &[Vec3], capsules: &[ClothCapsule], particle_radius: f32) -> Self {
+        let shapes = capsules
+            .iter()
+            .map(|capsule| capsule.rest.map(ClothRestCapsule::shape))
+            .collect::<Vec<_>>();
+        let per_particle = bind_particles
+            .iter()
+            .map(|&point| {
+                shapes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, shape)| {
+                        let overlap = shape.as_ref()?.overlap(point, particle_radius);
+                        (overlap > 0.0).then_some((index as u32, overlap))
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            capsule_count: capsules.len(),
+            known: shapes.iter().map(Option::is_some).collect(),
+            per_particle,
+        }
+    }
+
+    fn allowance(&self, particle: usize, capsule: usize, capsule_count: usize) -> f32 {
+        if capsule_count != self.capsule_count || !self.known.get(capsule).copied().unwrap_or(false)
+        {
+            return f32::INFINITY;
+        }
+        self.per_particle
+            .get(particle)
+            .and_then(|entries| entries.iter().find(|(index, _)| *index as usize == capsule))
+            .map_or(0.0, |(_, overlap)| {
+                overlap + REST_OVERLAP_SLACK_JKA * METRES_PER_JKA_UNIT
+            })
+    }
 }
 
 /// Actual render transform, including model scale. World motion is sampled at
@@ -167,6 +354,22 @@ pub(crate) struct ClothRenderTopology {
     /// Flattened render copies belonging to each welded physical particle.
     particle_members: Vec<Vec<usize>>,
     layouts: Vec<ClothSurfaceLayout>,
+    /// Body-contact data shared by the solver and the presentation pass.
+    contact: ClothContactFit,
+}
+
+/// Immutable per-garment body-contact description. The solver uses it for its
+/// target projection; presentation repeats that projection against the
+/// CURRENT body pose, because solver results are one or more ticks old and a
+/// fast limb would otherwise pass through fabric pushed out of its old pose.
+struct ClothContactFit {
+    pinned: Vec<u32>,
+    clearance_weights: Vec<f32>,
+    edges: Vec<(u32, u32, f32)>,
+    /// Long-range attachment limits, shared with the solver.
+    tethers: Vec<(u32, f32)>,
+    rest: RestAllowance,
+    particle_radius: f32,
 }
 
 impl ClothRenderTopology {
@@ -181,10 +384,13 @@ impl ClothRenderTopology {
             })
     }
 
-    pub(crate) fn reconstruct(
+    /// `body`: current-pose capsules and clearance (JKA units, as configured)
+    /// when body collision is enabled.
+    pub(crate) fn reconstruct_with_body(
         &self,
         surfaces: &[ClothSurfaceFrame],
         offsets: &HashMap<usize, Vec<[f32; 3]>>,
+        body: Option<(&[ClothCapsule], f32)>,
     ) -> HashMap<usize, ClothOutput> {
         if !self.matches(surfaces)
             || surfaces.iter().any(|surface| {
@@ -200,7 +406,36 @@ impl ClothRenderTopology {
         }).collect::<Vec<_>>();
         // Average the CURRENT animated copies plus their interpolated offsets.
         // Old per-copy seam corrections must not reopen the current seam.
-        let shared = particle_targets(&self.particle_members, &displaced);
+        let mut shared = particle_targets(&self.particle_members, &displaced);
+        limit_display_stretch(
+            &mut shared,
+            &self.contact.edges,
+            &self.contact.tethers,
+            &self.contact.pinned,
+        );
+        if let Some((capsules, clearance)) = body.filter(|(capsules, _)| !capsules.is_empty()) {
+            let posed = flatten_positions(surfaces, |surface| &surface.posed_positions);
+            let authored = particle_targets(&self.particle_members, &posed);
+            let unprojected = shared.clone();
+            let fit = &self.contact;
+            project_body_reference(
+                &mut shared,
+                &authored,
+                capsules,
+                &fit.pinned,
+                &fit.clearance_weights,
+                clearance.clamp(0.0, 4.0) * METRES_PER_JKA_UNIT,
+                fit.particle_radius,
+                Some(&fit.rest),
+            );
+            soften_body_projection(
+                &mut shared,
+                &unprojected,
+                &fit.edges,
+                &fit.pinned,
+                &fit.clearance_weights,
+            );
+        }
         let mut outputs = HashMap::with_capacity(surfaces.len());
         let mut global = 0;
         for (layout, surface) in self.layouts.iter().zip(surfaces) {
@@ -261,6 +496,14 @@ struct ClothInstance {
     last_debug_ms: i32,
     last_report: Option<StepReport>,
     rejected_steps: u32,
+    consecutive_rejections: u32,
+    /// Gauss-Seidel iterations per step, raised for very stiff fabric.
+    iterations: usize,
+    /// Per particle: (nearest attachment, geodesic rest distance in metres);
+    /// `u32::MAX` for pinned particles and pin-less components.
+    tethers: Vec<(u32, f32)>,
+    /// Deviation from reference beyond which state is invalid (metres).
+    runaway_limit: f32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -295,6 +538,10 @@ impl ClothSystem {
             || self.config.animation_influence != config.animation_influence
             || self.config.body_clearance != config.body_clearance
             || self.config.body_collision != config.body_collision
+            || self.config.stiffness != config.stiffness
+            || self.config.damping != config.damping
+            || self.config.stiffening != config.stiffening
+            || self.config.hz != config.hz
         {
             self.instances.clear();
         }
@@ -328,6 +575,15 @@ impl ClothSystem {
 
     pub fn reset(&mut self) {
         self.instances.clear();
+    }
+
+    /// Elapsed time not yet integrated (fixed-tick remainder), in seconds.
+    /// The solver state therefore represents `now - pending` rather than the
+    /// request time.
+    pub(crate) fn pending_seconds(&self, entity_num: u16) -> Option<f32> {
+        self.instances
+            .get(&ClothKey { entity_num })
+            .map(|instance| instance.accumulator)
     }
 
     pub(crate) fn render_topology(&self, entity_num: u16) -> Option<Arc<ClothRenderTopology>> {
@@ -437,7 +693,7 @@ impl ClothSystem {
                 || instance.topology.signature != signature
         });
         if rebuild {
-            match build_instance(model_label, lod_index, surfaces, capsules, motion, now_ms) {
+            match build_instance(model_label, lod_index, surfaces, capsules, motion, now_ms, self.config) {
                 Ok(instance) => {
                     self.instances.insert(key.clone(), instance);
                 }
@@ -472,6 +728,7 @@ impl ClothSystem {
             config.animation_influence,
         );
         if config.body_collision {
+            let unprojected = targets.clone();
             project_body_reference(
                 &mut targets,
                 &authored_targets,
@@ -480,6 +737,14 @@ impl ClothSystem {
                 &instance.clearance_weights,
                 config.body_clearance.clamp(0.0, 4.0) * METRES_PER_JKA_UNIT,
                 instance.cloth.material().contact_radius,
+                Some(&instance.topology.contact.rest),
+            );
+            soften_body_projection(
+                &mut targets,
+                &unprojected,
+                &instance.debug_edges,
+                &instance.pinned,
+                &instance.clearance_weights,
             );
         }
         if let Some(reason) = reset_reason(instance, &targets, motion, now_ms) {
@@ -552,6 +817,7 @@ impl ClothSystem {
                     clearance_weights: &instance.clearance_weights,
                     contact_limits: &instance.contact_limits,
                     prepared: Vec::new(),
+                    rest: Some(&instance.topology.contact.rest),
                     clearance: config.body_clearance.clamp(0.0, 4.0) * METRES_PER_JKA_UNIT,
                 };
                 let follow_targets = build_follow_targets(
@@ -568,6 +834,7 @@ impl ClothSystem {
                     Vec3::ZERO,
                     &SolverSettings {
                         max_substep: h,
+                        iterations: instance.iterations,
                         ..SolverSettings::default()
                     },
                     &follow_targets,
@@ -591,9 +858,16 @@ impl ClothSystem {
                     }
                 };
 
+                // Eight XPBD iterations cannot hold a long, dense garment
+                // inextensible under strong drag. Long-range attachments bound
+                // every particle's distance from its attachment regardless of
+                // iteration count or mesh density.
+                enforce_tethers(&mut instance.cloth, &instance.tethers)?;
+
                 // Validate each native result before another substep or output.
                 // Restore the last valid displacement rather than displaying a
                 // stretched garment for a frame and resetting it afterwards.
+                let runaway_sq = instance.runaway_limit * instance.runaway_limit;
                 if instance
                     .cloth
                     .positions()
@@ -601,11 +875,11 @@ impl ClothSystem {
                     .zip(&instance.reference)
                     .any(|(position, reference)| {
                         !position.is_finite()
-                            || (*position - *reference).length_squared()
-                                > RUNAWAY_DISTANCE_METRES.powi(2)
+                            || (*position - *reference).length_squared() > runaway_sq
                     })
                 {
                     instance.rejected_steps += 1;
+                    instance.consecutive_rejections += 1;
                     instance
                         .cloth
                         .set_positions(&stable_positions)
@@ -623,13 +897,29 @@ impl ClothSystem {
                         "CLOTH: {} rejected unstable collision step; previous valid state restored",
                         instance.model_label
                     );
+                    // A state that keeps producing rejected steps would freeze
+                    // the garment in place. Start over from its reference.
+                    if instance.consecutive_rejections >= MAX_CONSECUTIVE_REJECTIONS {
+                        instance
+                            .cloth
+                            .set_positions(&instance.reference)
+                            .map_err(|error| format!("cloth stuck-state reset failed: {error}"))?;
+                        instance.consecutive_rejections = 0;
+                        devprintln!(1, "CLOTH: {} repeatedly rejected; reset", instance.model_label);
+                    }
+                } else {
+                    instance.consecutive_rejections = 0;
                 }
 
                 // A malformed custom mesh should not be able to poison later
                 // frames with absurd local-space velocity even when all values
                 // remain finite. This is only a safety ceiling; normal cloth
                 // motion is far below it.
-                clamp_free_particle_speeds(&mut instance.cloth, &instance.pinned, 3.0)?;
+                clamp_free_particle_speeds(
+                    &mut instance.cloth,
+                    &instance.pinned,
+                    MAX_LOCAL_PARTICLE_SPEED,
+                )?;
 
                 instance.last_report = Some(report);
                 instance.accumulator -= h;
@@ -668,7 +958,7 @@ impl ClothSystem {
                 }
             })
             .fold(0.0f32, f32::max);
-        let runaway = max_deviation_sq > RUNAWAY_DISTANCE_METRES * RUNAWAY_DISTANCE_METRES;
+        let runaway = max_deviation_sq > instance.runaway_limit * instance.runaway_limit;
         if runaway {
             devprintln!(
                 1,
@@ -1039,6 +1329,7 @@ fn build_instance(
     capsules: &[ClothCapsule],
     motion: ClothMotion,
     now_ms: i32,
+    config: ClothConfig,
 ) -> Result<ClothInstance, String> {
     let total_vertices: usize = surfaces
         .iter()
@@ -1230,8 +1521,15 @@ fn build_instance(
     // clothing is driven every frame by an animated skeleton, so stronger
     // damping is appropriate and prevents small animation/contact corrections
     // from ringing for seconds.
-    material.damping = 8.0;
-    material.bend_compliance = 5.0e-3;
+    material.damping = config.damping.clamp(0.0, 30.0);
+    // Dihedral-angle compliance per hinge: for a given curvature the summed
+    // bending energy is independent of edge length, so one multiplier means
+    // the same on stock and remeshed garments.
+    // Per-hinge compliance is set relative to hinge mobility below; the
+    // material value is the unit that scale divides.
+    material.bend_compliance = 1.0;
+    // Soft for gentle drape, increasingly stiff for sharp folds.
+    material.bend_hardening = config.stiffening.clamp(0.0, 10.0);
     let mut cloth = Cloth::new(mesh, material)
         .map_err(|error| format!("could not create stitched cloth: {error}"))?;
 
@@ -1242,8 +1540,30 @@ fn build_instance(
     // nearly rigid. Keep only a tiny, spatially-spread set of anchors per
     // authored cloth surface. This preserves the skeleton's structural joints
     // while leaving the fabric between them dynamic.
-    let (mut pinned, pin_debug) =
-        choose_structural_surface_anchors(surfaces, &offsets, &mut dsu, &root_to_particle);
+    // A cape/cloak hangs from its top edge only. Its authored pieces are
+    // stacked (torso_cape over hips_cape), so the lower piece's top band is
+    // a stitched seam in the middle of the fabric, not an attachment.
+    let hanging = surfaces
+        .iter()
+        .any(|surface| is_hanging_garment_name(&surface.surface_name));
+    let seam_particles = hanging.then(|| {
+        particle_members
+            .iter()
+            .map(|members| {
+                let ordinal = |global: usize| offsets.partition_point(|&start| start <= global);
+                members
+                    .first()
+                    .is_some_and(|&first| members.iter().any(|&m| ordinal(m) != ordinal(first)))
+            })
+            .collect::<Vec<_>>()
+    });
+    let (mut pinned, pin_debug) = choose_structural_surface_anchors(
+        surfaces,
+        &offsets,
+        &mut dsu,
+        &root_to_particle,
+        seam_particles.as_deref(),
+    );
     // Small closed openings around the body act as sewn cuffs/collars. Large
     // free hems remain dynamic. This uses topology and proximity, not names.
     let opening_pins = fitted_opening_anchors(&rest_positions, &sim_triangles, capsules);
@@ -1252,21 +1572,39 @@ fn build_instance(
     pinned.dedup();
     devprintln!(1, "CLOTHDBG fitted opening anchors={}", opening_pins.len());
     let component_count = cloth_components(rest_positions.len(), &sim_triangles).len();
-    let mut follow_strengths = compute_follow_strengths(&rest_positions, &sim_triangles, &pinned);
+    // Hanging fabric follows its authored shape only loosely away from the
+    // attachment, so drag and inertia can swing it behind a running player.
+    let follow = if hanging {
+        FollowFalloff {
+            near: HANGING_FOLLOW_NEAR_STRENGTH,
+            far: HANGING_FOLLOW_FAR_STRENGTH,
+            distance_jka: HANGING_FOLLOW_FALLOFF_JKA,
+            concentrated: true,
+        }
+    } else {
+        FollowFalloff {
+            near: FOLLOW_NEAR_STRENGTH,
+            far: FOLLOW_FAR_STRENGTH,
+            distance_jka: FOLLOW_FALLOFF_JKA,
+            concentrated: false,
+        }
+    };
+    let mut follow_strengths =
+        compute_follow_strengths(&rest_positions, &sim_triangles, &pinned, follow);
     // Collision padding tapers into sewn attachments, which cannot move outward.
     let clearance_weights = follow_strengths
         .iter()
-        .map(|strength| {
-            ((FOLLOW_NEAR_STRENGTH - strength) / (FOLLOW_NEAR_STRENGTH - FOLLOW_FAR_STRENGTH))
-                .clamp(0.0, 1.0)
-                .sqrt()
-        })
-        .collect();
+        .map(|&strength| follow.freedom(strength).sqrt())
+        .collect::<Vec<_>>();
     for (layout, surface) in layouts.iter().zip(surfaces) {
         let name = surface.surface_name.to_ascii_lowercase();
         let minimum = if name.contains("hood") || name.contains("head") {
             0.16
-        } else if name.contains("shoulder") || name.contains("torso") {
+        } else if (name.contains("shoulder") || name.contains("torso"))
+            && !is_hanging_garment_name(&name)
+        {
+            // Body-region stiffness is for worn robes. A cape surface named
+            // after the region it hangs over must not be held rigid there.
             0.12
         } else {
             0.0
@@ -1279,6 +1617,8 @@ fn build_instance(
         }
     }
     let bind_reference = particle_targets(&particle_members, &flat_bind);
+    let rest_allowance =
+        RestAllowance::new(&bind_reference, capsules, cloth.material().contact_radius);
     let (driver_particles, attachment_drivers) =
         compute_attachment_drivers(&bind_reference, &sim_triangles, &pinned);
     let animation_freedom = follow_strengths
@@ -1288,12 +1628,70 @@ fn build_instance(
             if pinned.binary_search(&(particle as u32)).is_ok() {
                 0.0
             } else {
-                ((FOLLOW_NEAR_STRENGTH - strength) / (FOLLOW_NEAR_STRENGTH - FOLLOW_FAR_STRENGTH))
-                    .clamp(0.0, 1.0)
+                follow.freedom(*strength)
             }
         })
         .collect();
     let debug_edges = build_debug_edges(&rest_positions, &sim_triangles);
+    let (tethers, attachment_distance) =
+        compute_tethers(rest_positions.len(), &debug_edges, &pinned);
+    // A garment can legitimately swing anywhere within twice its reach from
+    // its attachments; only beyond that is the state runaway.
+    let runaway_limit = tethers
+        .iter()
+        .filter(|(anchor, _)| *anchor != u32::MAX)
+        .map(|(_, rest)| 2.0 * rest * (1.0 + TETHER_SLACK) + 0.25)
+        .fold(RUNAWAY_DISTANCE_METRES, f32::max);
+    // Fabric is stiffest where it is sewn on (collar, yoke, waistband) and
+    // relaxes to the configured stiffness away from it, so an attachment
+    // region cannot fold over or flip around its pins.
+    let stiffness = config.stiffness.clamp(0.1, MAX_STIFFNESS);
+    let tick = 1.0 / config.hz.clamp(15, 240) as f32;
+    let inverse_masses = cloth
+        .masses()
+        .iter()
+        .enumerate()
+        .map(|(particle, mass)| {
+            if pinned.binary_search(&(particle as u32)).is_ok() {
+                0.0
+            } else {
+                1.0 / mass
+            }
+        })
+        .collect::<Vec<_>>();
+    let hinge_stiffness = cloth
+        .mesh()
+        .hinges()
+        .iter()
+        .map(|hinge| {
+            let distance = (attachment_distance[hinge.vertices[0] as usize]
+                + attachment_distance[hinge.vertices[1] as usize])
+                * 0.5;
+            let local = stiffness * attachment_bend_boost(distance / METRES_PER_JKA_UNIT);
+            // Solver alpha = bend_compliance / (h^2 * scale); choose scale so
+            // alpha = K * mobility / local.
+            let ids = hinge.vertices.map(|i| i as usize);
+            let mobility = rapier_cloth_core::constraints::bend::angle_and_gradients(
+                ids.map(|i| rest_positions[i]),
+            )
+            .map_or(0.0, |(_, gradients)| {
+                gradients
+                    .iter()
+                    .zip(ids)
+                    .map(|(gradient, i)| inverse_masses[i] * gradient.length_squared())
+                    .sum::<f32>()
+            });
+            let scale = local / (BEND_RELATIVE_COMPLIANCE * mobility * tick * tick);
+            if scale.is_finite() && scale > 0.0 {
+                scale
+            } else {
+                1.0
+            }
+        })
+        .collect::<Vec<_>>();
+    cloth
+        .set_hinge_stiffness(hinge_stiffness)
+        .map_err(|error| format!("could not set attachment stiffness: {error}"))?;
     for &particle in &pinned {
         cloth
             .pin(particle, rest_positions[particle as usize])
@@ -1328,6 +1726,14 @@ fn build_instance(
         lod_index,
         topology: Arc::new(ClothRenderTopology {
             signature: garment_signature(surfaces), particle_members, layouts,
+            contact: ClothContactFit {
+                pinned: pinned.clone(),
+                clearance_weights: clearance_weights.clone(),
+                edges: debug_edges.clone(),
+                tethers: tethers.clone(),
+                rest: rest_allowance,
+                particle_radius: cloth.material().contact_radius,
+            },
         }),
         cloth,
         solver: Solver::new(),
@@ -1375,6 +1781,58 @@ fn build_instance(
         last_debug_ms: now_ms.saturating_sub(DEBUG_INTERVAL_MS),
         last_report: None,
         rejected_steps: 0,
+        consecutive_rejections: 0,
+        iterations: solver_iterations(config.stiffness),
+        tethers,
+        runaway_limit,
+    })
+}
+
+/// The stitched garment the CPU solver would build, reduced to what the GPU
+/// solver (gpu-cloth-sim port) consumes. Welds, attachment pins and the
+/// attachment falloff are this system's; the solver itself is the reference's.
+pub(crate) struct GpuGarmentTopology {
+    /// Flat (surface after surface) render vertex -> particle, `u32::MAX` unused.
+    pub render_to_particle: Vec<u32>,
+    pub particle_members: Vec<Vec<usize>>,
+    /// Reference cloth weight: 0 at sewn attachments, 1 for free fabric.
+    pub cloth_weights: Vec<f32>,
+    /// Bind-pose particle positions in metres (reference mesh rest positions).
+    pub bind_particles: Vec<Vec3>,
+    pub triangles: Vec<[u32; 3]>,
+    /// `garment_targets` inputs: attachment particles and per-particle weights.
+    pub driver_particles: Vec<u32>,
+    pub attachment_drivers: Vec<Vec<(usize, f32)>>,
+    /// Deviation from the animated pose beyond which state is runaway (metres).
+    pub runaway_limit: f32,
+}
+
+pub(crate) fn build_gpu_garment_topology(
+    model_label: &str,
+    lod_index: usize,
+    surfaces: &[ClothSurfaceFrame],
+    capsules: &[ClothCapsule],
+    config: ClothConfig,
+) -> Result<GpuGarmentTopology, String> {
+    let motion = ClothMotion {
+        axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        origin: [0.0; 3],
+    };
+    let instance = build_instance(model_label, lod_index, surfaces, capsules, motion, 0, config)?;
+    Ok(GpuGarmentTopology {
+        render_to_particle: instance
+            .topology
+            .layouts
+            .iter()
+            .flat_map(|layout| layout.render_to_particle.iter().copied())
+            .collect(),
+        particle_members: instance.topology.particle_members.clone(),
+        cloth_weights: instance.animation_freedom.clone(),
+        bind_particles: instance.bind_reference.clone(),
+        triangles: instance.cloth.mesh().triangles().to_vec(),
+        driver_particles: instance.driver_particles.clone(),
+        attachment_drivers: instance.attachment_drivers.clone(),
+        runaway_limit: instance.runaway_limit,
     })
 }
 
@@ -1536,6 +1994,9 @@ fn choose_structural_surface_anchors(
     offsets: &[usize],
     dsu: &mut DisjointSet,
     root_to_particle: &HashMap<usize, u32>,
+    // Hanging garments: particles stitched across authored surfaces. Those
+    // are mid-fabric seams and never attachments.
+    seams: Option<&[bool]>,
 ) -> (Vec<u32>, Vec<(String, usize)>) {
     fn anchor_priority(name: &str) -> u8 {
         let name = name.to_ascii_lowercase();
@@ -1608,6 +2069,7 @@ fn choose_structural_surface_anchors(
         let offset = offsets[surface_ordinal];
 
         let mut candidate_sums = HashMap::<u32, (Vec3, f32)>::new();
+        let mut seam_band = false;
         for (local, &position) in surface.bind_positions.iter().enumerate() {
             if position[2] < max_z - band {
                 continue;
@@ -1616,9 +2078,22 @@ fn choose_structural_surface_anchors(
             let Some(&particle) = root_to_particle.get(&root) else {
                 continue;
             };
+            if seams.is_some_and(|seams| seams.get(particle as usize).copied().unwrap_or(false)) {
+                seam_band = true;
+                continue;
+            }
             let entry = candidate_sums.entry(particle).or_insert((Vec3::ZERO, 0.0));
             entry.0 += Vec3::from_array(position);
             entry.1 += 1.0;
+        }
+        if seam_band {
+            // Its top is sewn to another piece of the same hanging garment,
+            // so the whole piece hangs from that seam. The band is several
+            // units deep and (especially after remeshing) also holds
+            // non-seam vertices just below the seam; pinning those nailed
+            // the piece's side corners in place.
+            debug.push((surface.surface_name.clone(), 0));
+            continue;
         }
         if candidate_sums.is_empty() {
             for (local, &position) in surface.bind_positions.iter().enumerate() {
@@ -1642,6 +2117,10 @@ fn choose_structural_surface_anchors(
         pinned.extend(chosen);
     }
 
+    if pinned.is_empty() && seams.is_some() {
+        // Never leave a garment without attachments.
+        return choose_structural_surface_anchors(surfaces, offsets, dsu, root_to_particle, None);
+    }
     pinned.sort_unstable();
     pinned.dedup();
     (pinned, debug)
@@ -1721,6 +2200,7 @@ fn compute_follow_strengths(
     rest_positions: &[Vec3],
     triangles: &[[u32; 3]],
     pinned: &[u32],
+    follow: FollowFalloff,
 ) -> Vec<f32> {
     let count = rest_positions.len();
     let mut adjacency = vec![Vec::<(usize, f32)>::new(); count];
@@ -1780,11 +2260,9 @@ fn compute_follow_strengths(
             let distance_jka = if distance_metres.is_finite() {
                 distance_metres / METRES_PER_JKA_UNIT
             } else {
-                FOLLOW_FALLOFF_JKA
+                follow.distance_jka
             };
-            let t = (distance_jka / FOLLOW_FALLOFF_JKA).clamp(0.0, 1.0);
-            let smooth = t * t * (3.0 - 2.0 * t);
-            FOLLOW_NEAR_STRENGTH * (1.0 - smooth) + FOLLOW_FAR_STRENGTH * smooth
+            follow.strength(distance_jka)
         })
         .collect()
 }
@@ -1825,6 +2303,165 @@ fn build_follow_targets(
         });
     }
     out
+}
+
+/// Multi-source shortest paths over rest edges. Returns each particle's tether
+/// (nearest attachment, geodesic rest distance) and its geodesic distance to
+/// any attachment (0 at pins, infinite in pin-less components).
+fn compute_tethers(
+    count: usize,
+    edges: &[(u32, u32, f32)],
+    pinned: &[u32],
+) -> (Vec<(u32, f32)>, Vec<f32>) {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut adjacency = vec![Vec::<(usize, f32)>::new(); count];
+    for &(a, b, length) in edges {
+        adjacency[a as usize].push((b as usize, length));
+        adjacency[b as usize].push((a as usize, length));
+    }
+    let mut best = vec![(u32::MAX, f32::INFINITY); count];
+    let mut heap = BinaryHeap::new();
+    for &pin in pinned {
+        if (pin as usize) < count {
+            best[pin as usize] = (pin, 0.0);
+            heap.push(Reverse((0.0f32.to_bits(), pin as usize)));
+        }
+    }
+    while let Some(Reverse((distance_bits, vertex))) = heap.pop() {
+        // Non-negative finite f32 bit patterns order like the values.
+        let distance = f32::from_bits(distance_bits);
+        if distance > best[vertex].1 {
+            continue;
+        }
+        for &(next, length) in &adjacency[vertex] {
+            let candidate = distance + length;
+            if candidate < best[next].1 {
+                best[next] = (best[vertex].0, candidate);
+                heap.push(Reverse((candidate.to_bits(), next)));
+            }
+        }
+    }
+    let distances = best.iter().map(|(_, distance)| *distance).collect();
+    let tethers = best
+        .into_iter()
+        .enumerate()
+        .map(|(particle, (anchor, rest))| {
+            if anchor == u32::MAX || anchor as usize == particle || !rest.is_finite() {
+                (u32::MAX, 0.0)
+            } else {
+                (anchor, rest)
+            }
+        })
+        .collect();
+    (tethers, distances)
+}
+
+/// Displayed cloth is the CURRENT skinned pose plus a solved offset computed
+/// against an older pose that is not rotated with the body. Leaning, twisting
+/// and authored limb weights therefore stretch the result even though the
+/// solver held its own edges. Clamp only stretching on the final shape (folds
+/// and compression stay free); attachments never move.
+const DISPLAY_EDGE_SLACK: f32 = 0.04;
+const DISPLAY_STRETCH_PASSES: usize = 4;
+
+fn limit_display_stretch(
+    positions: &mut [Vec3],
+    edges: &[(u32, u32, f32)],
+    tethers: &[(u32, f32)],
+    pinned: &[u32],
+) {
+    let count = positions.len();
+    if tethers.len() != count {
+        return;
+    }
+    let weight = (0..count)
+        .map(|i| {
+            if pinned.binary_search(&(i as u32)).is_ok() {
+                0.0
+            } else {
+                1.0
+            }
+        })
+        .collect::<Vec<f32>>();
+    // Tethers bound total reach in one pass; edge passes then remove the
+    // remaining local (row-to-row and lateral) stretch.
+    for (particle, &(anchor, rest)) in tethers.iter().enumerate() {
+        if anchor == u32::MAX || weight[particle] == 0.0 {
+            continue;
+        }
+        let origin = positions[anchor as usize];
+        let delta = positions[particle] - origin;
+        let length = delta.length();
+        let limit = rest * (1.0 + TETHER_SLACK);
+        if length > limit && length > 1.0e-6 {
+            positions[particle] = origin + delta * (limit / length);
+        }
+    }
+    for _ in 0..DISPLAY_STRETCH_PASSES {
+        for &(a, b, rest) in edges {
+            let (a, b) = (a as usize, b as usize);
+            if a >= count || b >= count {
+                continue;
+            }
+            let total = weight[a] + weight[b];
+            if total == 0.0 {
+                continue;
+            }
+            let delta = positions[b] - positions[a];
+            let length = delta.length();
+            let limit = rest * (1.0 + DISPLAY_EDGE_SLACK);
+            if length <= limit || length <= 1.0e-6 {
+                continue;
+            }
+            let correction = delta * ((length - limit) / (length * total));
+            positions[a] += correction * weight[a];
+            positions[b] -= correction * weight[b];
+        }
+    }
+}
+
+/// Unilateral long-range attachments: pull a particle back onto the sphere of
+/// its geodesic rest distance around its attachment and remove the outward
+/// velocity along that tether. Inward motion and folding stay free.
+fn enforce_tethers(cloth: &mut Cloth, tethers: &[(u32, f32)]) -> Result<(), String> {
+    if tethers.len() != cloth.positions().len() {
+        return Ok(());
+    }
+    let mut positions = cloth.positions().to_vec();
+    let mut velocities = cloth.velocities().to_vec();
+    let mut changed = false;
+    for (particle, &(anchor, rest)) in tethers.iter().enumerate() {
+        if anchor == u32::MAX {
+            continue;
+        }
+        let origin = positions[anchor as usize];
+        let delta = positions[particle] - origin;
+        let length = delta.length();
+        let limit = rest * (1.0 + TETHER_SLACK);
+        if length > limit && length > 1.0e-6 {
+            let direction = delta / length;
+            positions[particle] = origin + direction * limit;
+            let outward = velocities[particle].dot(direction);
+            if outward > 0.0 {
+                velocities[particle] -= direction * outward;
+            }
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    // set_positions also resets velocities; restore the corrected ones.
+    cloth
+        .set_positions(&positions)
+        .map_err(|error| format!("cloth tether projection failed: {error}"))?;
+    for (index, velocity) in velocities.into_iter().enumerate() {
+        cloth
+            .set_velocity(index as u32, velocity)
+            .map_err(|error| format!("cloth tether velocity restore failed: {error}"))?;
+    }
+    Ok(())
 }
 
 fn clamp_free_particle_speeds(
@@ -1889,7 +2526,7 @@ fn aerodynamic_forces(
         let normal = cross / twice_area;
         let relative = (wind
             - (world_velocities[a] + world_velocities[b] + world_velocities[c]) / 3.0)
-            .clamp_length_max(30.0);
+            .clamp_length_max(MAX_RELATIVE_AIR_SPEED);
         // A continuous field advected in world space gives small eddies, with
         // no random per-frame impulses. Still air exerts no force.
         let center = (points[a] + points[b] + points[c]) / 3.0 + to_metres(motion.origin);
@@ -1993,7 +2630,7 @@ fn drive_secondary_motion(
         let mass = instance.cloth.masses()[index];
         // Bound aerodynamic impulses to avoid reversing relative flow in one
         // low-frequency tick or injecting huge gust energy into tiny triangles.
-        let air_limit = ((wind - world_velocities[index]).length() / h).min(40.0);
+        let air_limit = ((wind - world_velocities[index]).length() / h).min(MAX_AIR_ACCELERATION);
         let air_acceleration = (air_forces[index] / mass).clamp_length_max(air_limit);
         let world_drive = Vec3::new(0.0, 0.0, -9.81 * SECONDARY_GRAVITY)
             - accelerations[index] * 0.95
@@ -2031,8 +2668,58 @@ fn interpolate_capsules(old: &[ClothCapsule], new: &[ClothCapsule], t: f32) -> V
                 (Some(a), Some(b)) => Some(interpolate_body_basis(a, b, t)),
                 _ => None,
             },
+            rest: b.rest,
         })
         .collect()
+}
+
+/// Per-vertex body projection makes a narrow tent where a limb pushes a
+/// single particle. Spread each push to neighbouring fabric with a halving
+/// falloff per edge ring. A vertex never receives less than its own push, so
+/// the hard projection is preserved; attachments taper through the clearance
+/// weights and pinned particles never move.
+const PROJECTION_SPREAD_PASSES: usize = 3;
+
+fn soften_body_projection(
+    targets: &mut [Vec3],
+    unprojected: &[Vec3],
+    edges: &[(u32, u32, f32)],
+    pinned: &[u32],
+    weights: &[f32],
+) {
+    if targets.len() != unprojected.len() || weights.len() != targets.len() {
+        return;
+    }
+    let mut delta = targets
+        .iter()
+        .zip(unprojected)
+        .map(|(target, base)| *target - *base)
+        .collect::<Vec<_>>();
+    if delta.iter().all(|push| push.length_squared() < 1.0e-10) {
+        return;
+    }
+    let free = |index: usize| pinned.binary_search(&(index as u32)).is_err();
+    for _ in 0..PROJECTION_SPREAD_PASSES {
+        let mut next = delta.clone();
+        for &(a, b, _) in edges {
+            let (a, b) = (a as usize, b as usize);
+            for (to, from) in [(a, b), (b, a)] {
+                if !free(to) {
+                    continue;
+                }
+                let spread = delta[from] * (0.5 * weights[to]);
+                if spread.length_squared() > next[to].length_squared() {
+                    next[to] = spread;
+                }
+            }
+        }
+        delta = next;
+    }
+    for (index, target) in targets.iter_mut().enumerate() {
+        if free(index) {
+            *target = unprojected[index] + delta[index];
+        }
+    }
 }
 
 /// Clearance belongs to the posed reference surface. Asking secondary-offset
@@ -2047,6 +2734,7 @@ fn project_body_reference(
     weights: &[f32],
     clearance: f32,
     particle_radius: f32,
+    rest: Option<&RestAllowance>,
 ) {
     let bodies = capsules.iter().map(BodyShape::new).collect::<Vec<_>>();
     for (i, target) in targets.iter_mut().enumerate() {
@@ -2056,7 +2744,13 @@ fn project_body_reference(
         let margin = clearance * weights[i] + particle_radius + 0.0005;
         let overlaps = bodies
             .iter()
-            .map(|body| body.overlap(authored[i], particle_radius))
+            .enumerate()
+            .map(|(index, body)| {
+                let authored_overlap = body.overlap(authored[i], particle_radius);
+                rest.map_or(authored_overlap, |rest| {
+                    authored_overlap.min(rest.allowance(i, index, capsules.len()))
+                })
+            })
             .collect::<Vec<_>>();
         // Intersecting shapes form a body union. Follow its deepest boundary
         // instead of projecting a particle between opposing internal planes.
@@ -2312,6 +3006,7 @@ struct CapsuleContactSource<'a> {
     clearance_weights: &'a [f32],
     contact_limits: &'a [f32],
     prepared: Vec<BodyShape>,
+    rest: Option<&'a RestAllowance>,
     clearance: f32,
 }
 
@@ -2336,7 +3031,7 @@ impl ContactSource for CapsuleContactSource<'_> {
             let position = reference_position + pose_delta;
             let clearance =
                 self.clearance * self.clearance_weights.get(particle).copied().unwrap_or(1.0);
-            let mut best: Option<(f32, Contact)> = None;
+            let mut best: Option<(f32, Contact, usize, f32)> = None;
             for (index, shape) in self.prepared.iter().enumerate() {
                 let (distance, surface, normal) =
                     if shape.may_contact(position, clearance + radius + QUERY_MARGIN) {
@@ -2346,8 +3041,14 @@ impl ContactSource for CapsuleContactSource<'_> {
                     };
                 // Authored animation can place an arm inside the torso. A cloth
                 // solver cannot repair that skeleton pose. Preserve only that
-                // existing overlap; reject further dynamic penetration.
-                let allowed_overlap = shape.overlap(self.fit_targets[particle], radius);
+                // existing overlap; reject further dynamic penetration. With
+                // bind-pose proxies, only overlap the garment already had at
+                // bind time survives: a limb animated through the fabric is
+                // resolved instead of preserved.
+                let authored_overlap = shape.overlap(self.fit_targets[particle], radius);
+                let allowed_overlap = self.rest.map_or(authored_overlap, |rest| {
+                    authored_overlap.min(rest.allowance(particle, index, self.capsules.len()))
+                });
                 let margin = clearance + radius - allowed_overlap;
                 let (surface, normal) = if distance <= margin + QUERY_MARGIN {
                     (surface, normal)
@@ -2375,27 +3076,35 @@ impl ContactSource for CapsuleContactSource<'_> {
                     normal,
                     point,
                     surface_velocity: Vec3::ZERO,
-                    friction: 0.12,
+                    friction: BODY_CONTACT_FRICTION,
                 };
                 // One boundary of the body union per particle avoids opposed
                 // planes inside intersecting animated body parts.
                 if best
                     .as_ref()
-                    .is_none_or(|(old_depth, _)| depth > *old_depth)
+                    .is_none_or(|(old_depth, ..)| depth > *old_depth)
                 {
-                    best = Some((depth, contact));
+                    best = Some((depth, contact, index, margin));
                 }
             }
-            if let Some((depth, mut contact)) = best {
-                // Limit each native correction relative to local mesh spacing.
-                // A single deep animated overlap must not collapse adjacent
-                // triangles or inject an unbounded position correction.
+            if let Some((depth, mut contact, shape, margin)) = best {
+                // Limit each native correction relative to local mesh spacing,
+                // but only for overlap the particle already had against the
+                // CURRENT body: that is the animation moving a limb into the
+                // fabric, where a deep one-step correction would collapse
+                // adjacent triangles. Fabric that moved into the body this
+                // step (falling onto the head, swinging into a leg) is
+                // resolved fully; throttling it let cloth sink through.
+                let entered = self.prepared[shape]
+                    .surface(previous[particle] + pose_delta)
+                    .0
+                    > margin;
                 let limit = self
                     .contact_limits
                     .get(particle)
                     .copied()
                     .unwrap_or(f32::INFINITY);
-                if depth > limit {
+                if !entered && depth > limit {
                     contact.point -= contact.normal * (depth - limit);
                 }
                 out.push(contact);
@@ -2671,6 +3380,7 @@ mod tests {
             b: [0.0, 0.0, 48.0],
             radius: 20.0,
             basis: None,
+            rest: None,
         }];
         let mut system = system(60, true);
         for tick in 0..120 {
@@ -2697,6 +3407,7 @@ mod tests {
             clearance_weights: &instance.clearance_weights,
             contact_limits: &instance.contact_limits,
             prepared: Vec::new(),
+            rest: None,
             clearance: 0.0,
         };
         let mut contacts = Vec::new();
@@ -2817,6 +3528,7 @@ mod tests {
             b: [0.0, 0.0, 48.0],
             radius: 9.0,
             basis: None,
+            rest: None,
         }];
         for hz in [15, 60, 240] {
             let mut system = system(hz, true);
@@ -2898,6 +3610,7 @@ mod tests {
             b: [20.0, 0.0, 0.0],
             radius: 5.5,
             basis: None,
+            rest: None,
         }];
         let mut source = CapsuleContactSource {
             capsules: &capsules,
@@ -2908,6 +3621,7 @@ mod tests {
             clearance_weights: &[],
             contact_limits: &[],
             prepared: Vec::new(),
+            rest: None,
             clearance: 0.0,
         };
         let mut contacts = Vec::new();
@@ -3181,6 +3895,7 @@ mod tests {
             b: [0.0, 0.0, 48.0],
             radius: 9.0,
             basis: None,
+            rest: None,
         }];
         for tick in 0..240 {
             let phase = (tick as f32 * 0.017) % 1.0;
@@ -3211,6 +3926,7 @@ mod body_contact_regressions {
             b: center,
             radius,
             basis: None,
+            rest: None,
         }
     }
     #[test]
@@ -3220,6 +3936,7 @@ mod body_contact_regressions {
             b: [0.0; 3],
             radius: 7.0,
             basis: Some([[7.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]]),
+            rest: None,
         };
         let shape = BodyShape::new(&capsule);
         assert!(shape.surface(to_metres([0.0, 2.0, 0.0])).0.abs() < 1e-6);
@@ -3256,6 +3973,7 @@ mod body_contact_regressions {
             clearance_weights: &[],
             contact_limits: &[],
             prepared: Vec::new(),
+            rest: None,
             clearance: 0.0,
         };
         let mut contacts = Vec::new();
@@ -3296,6 +4014,7 @@ mod body_contact_regressions {
             clearance_weights: &[],
             contact_limits: &[],
             prepared: Vec::new(),
+            rest: None,
             clearance: 0.0254,
         };
         let mut contacts = Vec::new();
@@ -3324,6 +4043,7 @@ mod body_contact_regressions {
             &[0.0, 1.0],
             4.0 * METRES_PER_JKA_UNIT,
             0.005,
+            None,
         );
         assert_eq!(targets[0], authored[0]);
         assert!(targets[1].x > to_metres([9.0, 0.0, 0.0]).x);
@@ -3336,6 +4056,7 @@ mod body_contact_regressions {
             clearance_weights: &[0.0, 1.0],
             contact_limits: &[],
             prepared: Vec::new(),
+            rest: None,
             clearance: 4.0 * METRES_PER_JKA_UNIT,
         };
         let mut contacts = Vec::new();

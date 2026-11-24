@@ -1,111 +1,153 @@
 # DinurdoJK
 
-**A modern multiplayer client for *Star Wars Jedi Knight: Jedi Academy*, built in Rust with a custom WGPU renderer.**
+DinurdoJK is a multiplayer client for **Jedi Knight: Jedi Academy (JKA)** and **Jedi Knight II: Jedi Outcast (JK2)**. It uses a custom engine written primarily in Rust with a WGPU renderer.
 
-DinurdoJK lets you play on existing Jedi Academy multiplayer servers with a new rendering engine, extensive graphics and performance options, and tools for demos, cinematics, and modded content. It uses the original game's maps and assets and aims to preserve its gameplay and movement rather than reinvent them.
-
-**Status:** Playable, actively developed, and still being refined. Compatibility and visual issues remain; see [Project status](#project-status).
+The project prioritizes performance, low input latency, compatibility with existing multiplayer servers, and accuracy to the original games. Graphics enhancements are optional.
 
 ## Features
 
-### A modern renderer, your choice of visuals
+### Multiplayer and Gameplay
 
-- Render classic JKA maps, shaders, models, lightsabers, and effects through a native Rust/WGPU renderer.
-- Choose between a restrained, classic-style look and optional enhancements such as advanced lighting, dynamic shadows, reflections, volumetric fog and clouds, weather, and enhanced water.
-- Customize post-processing with anti-aliasing, bloom, depth of field, HDR-related controls, and color grading.
-- Experiment with optional visual effects and physics, including grass, cloth, and character jiggle physics.
+- JKA 1.01 and JK2 1.02/1.04 support.
+- Compatibility with base JKA, JA+, jaPRO and JK2MV servers.
+- Native movement and prediction code from established upstream implementations.
+- Race ghosts, strafe helpers and 3D strafe trails.
+- Customizable HUD, scoreboard and spectator modes.
+- Server browser, automatic downloads and automatic login.
+- Custom character animations and emotes.
+- Local AI-powered chat translation and filtering.
 
-### Performance and responsiveness
+### Performance
 
-- Performance-focused graphics presets, including **Minimal (Unified)**, let you trade visual effects for frame rate.
-- Visibility culling, batching, and shader/pipeline optimizations target the high frame rates common in JKA multiplayer.
-- Raw mouse input, subframe input handling, and configurable display/presentation settings help keep controls responsive.
-- In-game diagnostics make it easier to identify rendering and performance problems.
+- Vulkan and DirectX 12 rendering.
+- Raw mouse input, subframe input and camera late latching.
+- Heavily multithreaded, asset loading and pipeline compilation.
+- Optimized map loadtimes.
+- Graphics presets for competitive play and visual quality.
+- CPU, GPU, frame time and input latency diagnostics.
 
-*Frame rates depend on your hardware, map, server, and enabled effects; no fixed FPS is guaranteed.*
+### Rendering
 
-### Multiplayer and movement
+- Original Quake 3 shader and material support.
+- GPU-accelerated Ghoul2 skeletal animation.
+- Physically based rendering (PBR).
+- Clustered dynamic lighting.
+- Hardware ray-traced lighting and shadows.
+- Cascaded shadow maps and point light shadows.
+- Planar and screen-space reflections.
+- Baked and real-time world relighting.
+- Automatic light generation from existing map effects.
+- HDR rendering and tone mapping.
+- TAA, FXAA, SMAA and NVIDIA DLAA (optional).
+- Bloom, halation, depth of field, motion blur and color grading.
+- CRT display emulation.
 
-- Connect to existing **Jedi Academy protocol-26** servers without requiring a custom server.
-- Play on vanilla servers and test compatibility with popular mods such as **JA+** and **jaPRO**. Some mod-specific behavior is still a work in progress.
-- Browse Internet and LAN servers, save favorites, revisit recent servers, and filter or search for players.
-- Download missing maps and other required server assets through the client when supported.
-- Use familiar player, Force, and lightsaber customization, chat, HUD, scoreboard, and spectator features.
-- Explore movement-focused tools such as race ghosts, strafe helpers, trails, and spectator camera controls.
+### Environment and Simulation
 
-Movement prediction uses pinned native code from OpenJK and TaystJK/jaPRO where appropriate, with the aim of matching established JKA behavior.
+- Dynamic time of day and atmospheric sky rendering.
+- Volumetric clouds, fog and cloud shadows.
+- FFT and Gerstner ocean simulation.
+- GPU-based river and shallow-water simulation.
+- Water foam, caustics, wakes and underwater effects.
+- Rain, snow, surface wetness, puddles and ripples.
+- Procedural grass.
+- Wind simulation.
+- Ragdoll, cloth and jiggle physics.
+- NVG, IR, Thermal vision simulation.
+
+### Audio
+
+- Original game audio and positional sound.
+- Valve Steam Audio integration.
+- Binaural audio with HRTF.
+- Geometry-based sound occlusion and transmission.
+- Original EAX environmental audio through EAL files and OpenAL Soft.
+- Separate volume controls for effects, voices and music.
 
 ### Demos and Render Studio
 
-- Record and play JKA multiplayer demos, with playback controls, camera modes, and demo browsing.
-- Use **Render Studio**, the built-in timeline editor, to assemble scenes from demos and character animations.
-- Edit camera motion, shot timing, lighting, transitions, and audio while previewing the result in-engine.
-- Export finished sequences using FFmpeg, with formats including H.264, ProRes, VP9, GIF, and NVIDIA GPU-encoded H.264/HEVC where supported. Some formats also support transparency or separate depth output.
+- Multiplayer demo recording and playback.
+- Demo timeline with playback and seek controls.
+- First-person, third-person, orbit and free cameras.
+- Smooth camera motion and variable playback speed.
+- Integrated cinematic timeline editor.
+- Camera, character, lighting and audio tracks.
+- Video export through FFmpeg.
+- H.264, HEVC, ProRes, VP9 and GIF export.
+- Hardware video encoding.
+- Transparency and depth export.
+- Spout2 real-time video output.
 
-### Tools for players and modders
+### Developer Tools
 
-- **Asset Viewer** — browse and inspect installed game assets and models.
-- **Map Viewer/Editor** — inspect and edit supported `.map` source files.
-- **PK3 Manager** — enable and disable installed PK3 archives and rebuild the active asset set.
-- **Material and trace inspection** — investigate world surfaces, shaders, and rendering behavior in-game.
-- **Solo Game** — load maps locally without joining an Internet server.
+- Asset Viewer.
+- Map Viewer and Editor.
+- PK3 Manager.
+- Material and shader inspection.
+- Collision and trace inspection.
+- Rendering and physics debugging tools.
+- Second-monitor companion window.
 
-## Project status
+## Project Status
 
-DinurdoJK is a **playable development build**, not a finished replacement for every JKA setup. Multiplayer, demos, rendering, and the tools above are implemented, but some server/mod combinations, custom assets, and rendering situations still need fixes.
+DinurdoJK is playable and under active development. JK2 support and some rendering, simulation and mod compatibility features are experimental.
 
-The goal is compatibility with existing Jedi Academy multiplayer and its community, not changes to server-side game rules. The graphics enhancements and creator tools are client-side features.
+The project does not require modifications to existing multiplayer servers. Single-player campaign support is not a project goal.
 
-## Getting started (Windows)
+## Build
 
-You need a Windows machine, a Rust/MSVC build environment, and **your own copy of Jedi Academy's game assets**. Retail assets are not included in this repository.
+### Requirements
 
-From PowerShell in the repository root:
+- Windows
+- Rust
+- Microsoft Visual C++ build tools
+- CMake and libclang
+- Original game assets
+
+Run the following commands from the repository root in PowerShell:
 
 ```powershell
-.\build.ps1 -Fetch   # First build: fetch pinned dependencies
-.\build.ps1          # Later release builds
-.\build.ps1 -Fast    # Faster development iteration
+.\build.ps1 -Fetch
+.\build.ps1
 ```
 
-Run `target\release\DinurdoJK.exe`. Place your game's `base` folder (with the original `assets0.pk3`–`assets3.pk3`) beside the executable, or point the client at an existing installation:
+Additional build options:
+
+```powershell
+.\build.ps1 -Fast
+.\build.ps1 -Faster
+.\build.ps1 -Check
+.\build.ps1 -Dlss
+```
+
+The release executable is located at:
+
+`target\release\DinurdoJK.exe`
+
+Copy the original game's `base` directory next to the executable or specify an existing installation:
 
 ```powershell
 .\target\release\DinurdoJK.exe --base "C:\Games\Jedi Academy\GameData\base"
 ```
 
-In the main menu, choose **Play → Join a Game**, **Solo Game**, or **Play Demo**. Render Studio, Asset Viewer, Map Viewer, and PK3 Manager are under **Developer Tools**.
+For video export, place `ffmpeg.exe` next to the executable.
 
-**Optional:** Put a compatible `ffmpeg.exe` next to `DinurdoJK.exe` to enable Render Studio video export.
+Original game assets are not included in this repository.
 
-On the `jk2-support` branch, the JK2 installation is configured separately from
-JKA's `fs_cdpath`:
+## Technology
 
-```text
-set fs_jk2path "C:\Games\JK21.02\GameData"
-```
+- Rust
+- WGPU / WGSL
+- winit
+- egui
+- Rapier
+- OpenAL Soft
+- Rodio
+- llama.cpp
+- FFmpeg
 
-The setting persists in `DinurdoJK/DinurdoJK-paths.ini` (next to `base/`) and takes effect after restarting.
-It records the JK2 root for upcoming JK2 support; it does not add those packages
-to the JKA search path. Inspect a JK2 1.02/1.04 demo without starting the renderer:
+## Credits
 
-```powershell
-.\target\release\DinurdoJK.exe --jk2-demo-info "CoS-WickedR1"
-.\target\release\DinurdoJK.exe --jk2-demo-info "imp495xAMoMAx"
-```
+DinurdoJK uses code and technical references from OpenJK, TaystJK, jaPRO, JK2MV, MVSDK and other open-source projects.
 
-The in-game command `jk2_demoInfo <name or absolute path>` provides the same
-version, map, duration, and snapshot-integrity report. Names resolve under the
-JK2 installation's `base/demos` and `base/jk2demos` folders. JK2 visual playback,
-live connections, and gameplay are not implemented yet. See
-[JK2 implementation notes](JK2_SUPPORT.md) for source revisions and scope.
-
-## Technical notes and credits
-
-DinurdoJK uses **Rust**, **WGPU/WGSL**, **winit**, and **egui** for most client systems, graphics, and UI. Selected native **OpenJK**, **TaystJK/jaPRO**, and collision/movement code is retained for compatibility. It is an independent client, not an official Jedi Academy release or a single-player campaign port.
-
-For implementation details, see [mod compatibility notes](crates/jka-movement/MOD_SUPPORT.md), [emote documentation](crates/jka-emotes/README.md), and [third-party source and license information](THIRD_PARTY.md).
-
-## AI-assisted development
-
-AI tools have been used extensively to help develop and document DinurdoJK. AI-generated changes can contain mistakes and should be reviewed and tested against actual behavior and authoritative upstream implementations.
+AI-assisted development is used extensively throughout the project.

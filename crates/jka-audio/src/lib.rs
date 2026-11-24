@@ -30,3 +30,9 @@ pub mod eal_native;
 mod eal_openal;
 pub mod eal_worker;
 pub mod steam_audio;
+
+mod echo_runtime;
+pub use echo_runtime::GeometryInput as EchoGeometryInput;
+pub use echo_runtime::Diagnostics as EchoDiagnostics;
+pub use jka_echofield::geometry::Mover as EchoMover;
+pub use jka_echofield::settings::Settings as EchoSettings;

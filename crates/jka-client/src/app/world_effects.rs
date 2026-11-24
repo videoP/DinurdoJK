@@ -7,6 +7,23 @@ use crate::{
 };
 
 impl App {
+    pub(in crate::app) fn sync_echofield_weather(&mut self) {
+        if !self.audio.echofield { return; }
+        let weather = self.effective_weather_type();
+        let wind = self.world_effects.wind_override().unwrap_or(self.video.weather_wind);
+        let temperature = match weather {
+            WeatherType::Snow => 0.1,
+            WeatherType::Sand => 1.5,
+            _ => 0.7,
+        };
+        if let Some(sound) = self.game_session.as_mut().and_then(|session| session.sound_presenter.as_mut()) {
+            sound.set_echofield_weather(
+                self.video.relight_time, weather.is_rain(),
+                matches!(weather, WeatherType::HeavyRain | WeatherType::HeavyRainFog),
+                wind.speed / crate::ocean::OCEAN_UNITS_PER_METER, temperature,
+            );
+        }
+    }
     pub(in crate::app) fn reset_world_effects(&mut self) {
         self.world_effects = crate::world_effects::LegacyWorldEffects::default();
         let _ = self.world_effects.set_weather_type(self.video.weather_type);

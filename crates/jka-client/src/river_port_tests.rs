@@ -1378,13 +1378,6 @@ fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
     });
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let mut water = crate::river_surface::RiverSurface::new(device, queue).unwrap();
-    // The generated native foam detail when present locally (gitignored).
-    let archive = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../jka-water/src/river/foam-detail.zip");
-    if let Ok(bytes) = std::fs::read(&archive) {
-        let detail = crate::river_foam::Detail::from_archive(device, queue, &bytes).unwrap();
-        water.set_foam_detail(detail.texture.create_view(&Default::default()));
-    }
-    std::eprintln!("live river water body foam detail: {}", water.has_foam_detail());
     let format = wgpu::TextureFormat::Rgba32Float;
     water.ensure_pipeline(device, &camera_layout, &shadow_layout, format, 1, wgpu::TextureFormat::Depth32Float, wgpu::CompareFunction::GreaterEqual, false);
     // One submission per rendered frame, as the renderer does: each solver
@@ -1423,8 +1416,7 @@ fn check_live_river(device: &wgpu::Device, queue: &wgpu::Queue) {
         let mut camera = crate::camera::Camera::new(crate::scene::render_position([-512.0, 0.0, 400.0]), 0.0);
         camera.pitch = -1.4;
         let sun = crate::river_slw::SceneSun::classic(crate::scene::render_position([0.3, 0.2, -1.0]), [1.0, 0.95, 0.9], 255.0);
-        let foam = water.has_foam_detail();
-        let view = crate::river_surface::ViewUniform::new(&camera, [SIZE, SIZE], sun, false, 4.0, 1.0 / 60.0, foam);
+        let view = crate::river_surface::ViewUniform::new(&camera, [SIZE, SIZE], sun, false, 4.0, 1.0 / 60.0);
         water.prepare(device, queue, [SIZE, SIZE], 1, &view);
         let mut uniform = [0u8; 512];
         uniform[..64].copy_from_slice(bytemuck::cast_slice(&camera.view_projection(SIZE, SIZE).to_cols_array()));

@@ -7,7 +7,7 @@ pub use jka_render_core::color::linear_color;
 
 mod cull;
 mod procedural;
-pub use cull::{submerged_cull_radius, WaterCull};
+pub use cull::{submerged_cull_radius, under_water_plane, WaterCull};
 
 /// Absorption distances of water before culling may remove anything. Blue light
 /// is 5% transmitted after 1 absorption distance, 0.2% after 2, 0.007% after 3.

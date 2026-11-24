@@ -202,10 +202,12 @@ impl App {
         }
 
         if weather.uses_footprints() {
-            const FOOTPRINTS: [(FootprintMode, &str); 3] = [
+            const FOOTPRINTS: [(FootprintMode, &str); 5] = [
                 (FootprintMode::Off, "Off"),
                 (FootprintMode::TwoD, "2D stamp"),
                 (FootprintMode::ThreeD, "3D + 2D stamp"),
+                (FootprintMode::Ninja, "Ninja"),
+                (FootprintMode::NinjaComposite, "Ninja composite"),
             ];
             if let Some(target) = quality_table_row(
                 ui,

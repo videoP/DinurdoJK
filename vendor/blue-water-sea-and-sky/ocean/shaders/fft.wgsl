@@ -30,6 +30,9 @@ struct FieldParams {
     // xy: unit vector the wind blows toward, z: N, w: cascade count.
     wind: vec4<f32>,
     cascades: array<CascadeParams, 3>,
+    // DinurdoJK: xyz = 1 when cascade 0/1/2 carries visible waves. An inactive cascade's FFT is skipped and resolve
+    // writes zeros for it (WaveField::rebuild_spectrum).
+    cascade_on: vec4<f32>,
 }
 
 struct PassParams {
@@ -101,6 +104,9 @@ fn transform(@builtin(global_invocation_id) id: vec3<u32>) {
     let span = i32(pass_params.span);
     let horizontal = pass_params.horizontal == 1u;
     let tile = pixel.x / n;
+    if field.cascade_on[tile] < 0.5 {
+        return;
+    }
     let j = select(pixel.y, pixel.x - tile * n, horizontal);
     let block = radix * span;
     let first = (j / block) * span + j % span;

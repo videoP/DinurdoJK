@@ -14,6 +14,14 @@ pub struct PlayerBlobShadowSettings {
     pub contact: bool,
 }
 
+/// Stock OpenJK `r_mode` indices from shared/sdl/sdl_window.cpp.
+/// Keep these numeric IDs unchanged for compatibility with existing cfgs.
+pub(crate) const OPENJK_R_MODES: [[u32; 2]; 13] = [
+    [320, 240], [400, 300], [512, 384], [640, 480], [800, 600],
+    [960, 720], [1024, 768], [1152, 864], [1280, 1024],
+    [1600, 1200], [2048, 1536], [856, 480], [2400, 600],
+];
+
 #[derive(Debug, Clone, Copy)]
 pub struct VideoSettings {
     pub patch_subdivisions: f32,
@@ -41,6 +49,10 @@ pub struct VideoSettings {
     /// Desktop uses the monitor desktop mode at startup, not a fixed pixel size.
     /// resolution always holds the resolved dimensions used by the renderer.
     pub resolution_desktop: bool,
+    /// -2 desktop, -1 custom dimensions, 0..12 stock OpenJK presets.
+    /// This is separate from `resolution` so a custom size equal to a preset
+    /// can still round-trip as r_mode -1.
+    pub resolution_mode: i32,
     pub resolution: [u32; 2],
     pub window_position: Option<[i32; 2]>,
     pub window_maximized: bool,
@@ -88,6 +100,8 @@ pub struct VideoSettings {
     pub fx_count_scale: f32,
     /// `r_fxLodScale`: multiplies authored EFX cullRange (default 5, like r_lodscale).
     pub fx_lod_scale: f32,
+    /// `r_fxSmokeDurationScale`: promoted EFX smoke lifetime multiplier.
+    pub fx_smoke_duration_scale: f32,
     /// TaystJK r_markcount: maximum live authored EFX decals (100 default).
     pub mark_count: u32,
     /// `r_lodScale`: Ghoul2 and MD3 projected-size LOD scale (OpenJK default 5).
@@ -304,6 +318,15 @@ pub struct VideoSettings {
     pub cloth_turn_response: f32,
     pub cloth_animation_influence: f32,
     pub cloth_wind: bool,
+    /// Bending stiffness multiplier (r_clothStiffness).
+    pub cloth_stiffness: f32,
+    /// Velocity damping per second (r_clothDamping).
+    pub cloth_damping: f32,
+    /// Bend stiffening with fold size (r_clothStiffening).
+    pub cloth_stiffening: f32,
+    /// r_clothSolver: 0 CPU XPBD worker, 1 GPU (gpu-cloth-sim port). Both
+    /// solvers use the same r_cloth* settings.
+    pub cloth_solver: u8,
     pub physics_props: bool,
     pub physics_prop_max: u32,
     pub physics_debris: bool,
@@ -509,6 +532,7 @@ pub struct VideoSettings {
     pub grass: bool,
     /// Runtime A/B diagnostic: hoist root wind/clump work to a compute pass.
     pub grass_precompute: bool,
+    pub grass_ninja_style: bool,
     /// Runtime A/B diagnostic: use the 5-triangle middle blade LOD.
     pub grass_mid_lod: bool,
     /// Runtime A/B diagnostic: order opaque grass near-to-far for early-Z.
@@ -816,6 +840,7 @@ impl Default for VideoSettings {
             texture_compression: 0,
             msaa_samples: 1,
             resolution_desktop: true,
+            resolution_mode: -2,
             resolution: [1280, 800], // Safe pre-monitor fallback; resolved on window creation.
             window_position: None,
             window_maximized: false,
@@ -843,6 +868,7 @@ impl Default for VideoSettings {
             fx_lod: crate::fx::FX_LOD_DEFAULT,
             fx_count_scale: 1.0,
             fx_lod_scale: crate::fx::LOD_SCALE_DEFAULT,
+            fx_smoke_duration_scale: crate::fx::SMOKE_DURATION_SCALE_DEFAULT,
             mark_count: 100,
             lod_scale: crate::fx::LOD_SCALE_DEFAULT,
             fx_geometry: FxGeometryMode::Gpu,
@@ -972,6 +998,10 @@ impl Default for VideoSettings {
             cloth_turn_response: 1.8,
             cloth_animation_influence: 0.35,
             cloth_wind: false,
+            cloth_stiffness: 2.0,
+            cloth_damping: 8.0,
+            cloth_stiffening: 3.0,
+            cloth_solver: 0,
             physics_props: true,
             physics_prop_max: 96,
             physics_debris: true,
@@ -1099,6 +1129,7 @@ impl Default for VideoSettings {
             footprints: FootprintMode::ThreeD,
             grass: true,
             grass_precompute: true,
+            grass_ninja_style: false,
             grass_mid_lod: true,
             grass_front_to_back: true,
             contact_shadow_debug: 0,
@@ -1107,7 +1138,7 @@ impl Default for VideoSettings {
             water_wake: 1,
             river_settings: crate::river_settings::Settings::default(),
             ocean_settings: crate::ocean::OceanSettings {
-                // New promoted water uses Cheapwater; keep the unused FFT
+                // New promoted water uses lakes; keep the unused FFT
                 // allocations at the saved preset's minimum size.
                 backend: 3,
                 map_size: 128,

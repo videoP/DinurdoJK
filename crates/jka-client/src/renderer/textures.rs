@@ -4,6 +4,33 @@ use crate::renderer::{
 };
 use wgpu::util::DeviceExt;
 
+pub(in crate::renderer) fn load_ninja_grass_views(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    base: &Path,
+    game: Option<&Path>,
+    images: &[jka_ninja::GrassImage; 5],
+) -> Result<[wgpu::TextureView; 5], String> {
+    let mut assets = AssetSearchPath::open_game(base, game).map_err(|error| error.to_string())?;
+    let mut load = |spec: &jka_ninja::GrassImage, mipmaps| {
+        let asset = assets.read(spec.qpath, 16 * 1024 * 1024).map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("required texture missing: {}", spec.qpath))?;
+        let data = crate::materials::decode_texture_data_with_color_space(
+            spec.qpath, &asset.bytes, true, mipmaps, spec.srgb,
+        )?;
+        if [data.width, data.height] != spec.size {
+            return Err(format!("{} has unexpected dimensions {}x{}", spec.qpath, data.width, data.height));
+        }
+        Ok(data)
+    };
+    let [albedo, normal, roughness, mask, noise] = images;
+    let decoded = [
+        load(albedo, true)?, load(normal, true)?, load(roughness, true)?,
+        load(mask, false)?, load(noise, true)?,
+    ];
+    Ok(decoded.map(|data| upload_texture(device, queue, &data).view.clone()))
+}
+
 #[derive(Clone)]
 pub(in crate::renderer) struct GpuImage(pub(in crate::renderer) std::sync::Arc<GpuImageInner>);
 

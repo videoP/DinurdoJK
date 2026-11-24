@@ -121,6 +121,9 @@ struct Md3SurfaceAsset {
 struct Md3ExtraStage {
     index: usize,
     texture: Option<Arc<TextureData>>,
+    animation: Option<crate::fx::draw::FxTextureAnimation>,
+    shader_time_offset: f32,
+    shader_clamp_time: Option<f32>,
     alpha_mode: DynamicModelAlphaMode,
     authored_glow: bool,
     rgb_gen: RgbGen,
@@ -243,7 +246,7 @@ fn force_shockwave_surface(
         rt_rigid: None,
         rt_skinned_key: None,
         ghoul2_gpu: None,
-        fx_gpu_sprites: None,
+        cloth_gpu: None, fx_gpu_sprites: None,
         authored_glow: false,
         texture: None,
         alpha_mode: DynamicModelAlphaMode::Glass,
@@ -333,6 +336,7 @@ pub struct EntityPresenter {
     /// (EV_SHIELD_HIT: armor absorbed part of a hit), keyed by client number.
     shield_hits: HashMap<u16, ShieldHit>,
     material_clock: std::time::Instant,
+    md3_shader_seconds: Option<f32>,
     imported_props: HashMap<String,Arc<jka_emotes::prop_mesh::Mesh>>,
     prop_indices: HashMap<PropIndexKey, CachedPropIndices>,
     prop_index_bytes: usize,
@@ -641,6 +645,7 @@ impl EntityPresenter {
             static_props_rt: false,
             shield_hits: HashMap::new(),
             material_clock: std::time::Instant::now(),
+            md3_shader_seconds: None,
             imported_props:HashMap::new(),
             prop_indices: HashMap::new(),
             prop_index_bytes: 0,
@@ -1167,7 +1172,7 @@ impl EntityPresenter {
                     gpu_draw.vertices = Arc::new(Vec::new());
                     gpu_draw.indices = Arc::new(Vec::new());
                     gpu_draw.rt_rigid = None;
-                    gpu_draw.ghoul2_gpu = Some(Ghoul2GpuSkinning { foliage_wind: surface_asset.foliage_wind,
+                    gpu_draw.ghoul2_gpu = Some(Ghoul2GpuSkinning { skin_gore: None, foliage_wind: surface_asset.foliage_wind,
                         mesh_key: Arc::from(key),
                         vertices: Arc::clone(vertices),
                         indices: Arc::clone(indices),
@@ -1232,6 +1237,9 @@ impl EntityPresenter {
         rt_rigid_casters_enabled: bool,
     ) -> (Vec<DynamicModelSurface>, Vec<InlineModelInstance>, EntityDispatchSummary) {
         self.rt_rigid_casters_enabled = rt_rigid_casters_enabled;
+        // Authored MD3 material animation uses the same CGame clock as FX,
+        // including demo seek, instead of monotonic time since map load.
+        self.md3_shader_seconds = Some(time as f32 * 0.001);
         let mut draws = Vec::new();
         let mut inline_models = Vec::new();
         let mut summary = EntityDispatchSummary::default();
@@ -1555,7 +1563,7 @@ impl EntityPresenter {
                     rt_rigid: None,
                     rt_skinned_key: None,
                     ghoul2_gpu: None,
-                    fx_gpu_sprites: None,
+                    cloth_gpu: None, fx_gpu_sprites: None,
                     texture: material.texture.clone(),
                     alpha_mode: blend_for_alpha(material.blend.custom_shader_alpha_mode(), color[3]),
 
@@ -2016,10 +2024,10 @@ impl EntityPresenter {
             }
             let gpu=if stage==0&&material.tc_mods.is_empty()&&program.is_none(){normal.as_ref().map(|normal|{
                 let vertices=self.prop_gpu_vertices.entry(path.into()).or_insert_with(||Arc::new(mesh.vertices.iter().map(|v|crate::renderer::Ghoul2GpuVertex{position:v.position,normal:v.normal,uv:v.uv,bone_indices:v.bones.map(|n|n as u32),weights:v.weights,weight_count:4,jiggle_region:u32::MAX,jiggle_weight:0.,jiggle_coord:4.}).collect())).clone();
-                crate::renderer::Ghoul2GpuSkinning{ foliage_wind: false,mesh_key:Arc::from(format!("{path}#native{}",section.first)),vertices,indices:indices.clone(),bones:bones.clone(),heat_bone:0,axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:Default::default(),source_material:Some(crate::renderer::SourceMaterialParams{normal_map:Some(normal.clone()),phong_boost:0.15,phong_exponent:32.,phong_fresnel:[0.,0.5,1.],rimlight_boost:0.,rimlight_exponent:1.,half_lambert:false})}
+                crate::renderer::Ghoul2GpuSkinning{ skin_gore: None, foliage_wind: false,mesh_key:Arc::from(format!("{path}#native{}",section.first)),vertices,indices:indices.clone(),bones:bones.clone(),heat_bone:0,axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:Default::default(),source_material:Some(crate::renderer::SourceMaterialParams{normal_map:Some(normal.clone()),phong_boost:0.15,phong_exponent:32.,phong_fresnel:[0.,0.5,1.],rimlight_boost:0.,rimlight_exponent:1.,half_lambert:false})}
             })}else{None};
             let masked=definition.as_ref().and_then(|s|s.stages.get(stage)).is_some_and(|s|!s.alpha_test.is_empty());
-            draws.push(DynamicModelSurface{geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true, portal_only: false,vertices:Arc::new(tinted),indices:Arc::clone(&indices),lighting_origin:if program.as_ref().is_some_and(|p|p.unlit){None}else{Some(origin)},rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture,alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{material.blend.custom_shader_alpha_mode()},authored_glow:material.authored_glow||program.as_ref().is_some_and(|p|p.unlit)});
+            draws.push(DynamicModelSurface{geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true, portal_only: false,vertices:Arc::new(tinted),indices:Arc::clone(&indices),lighting_origin:if program.as_ref().is_some_and(|p|p.unlit){None}else{Some(origin)},rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,cloth_gpu: None, fx_gpu_sprites:None,texture:material.texture,alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{material.blend.custom_shader_alpha_mode()},authored_glow:material.authored_glow||program.as_ref().is_some_and(|p|p.unlit)});
         }}Ok(draws)
     }
 
@@ -2103,8 +2111,13 @@ impl EntityPresenter {
         opacity: f32,
     ) {
         let camera = self.md3_lod_view.map(|view| view.camera_position());
+        let seconds = self.md3_shader_seconds
+            .unwrap_or_else(|| self.material_clock.elapsed().as_secs_f32());
         for stage in &surface_asset.extra_stages {
-            let mut stage_color = md3_stage_color(stage, entity_color);
+            let stage_time = jka_assets::shader::shader_time(
+                seconds, stage.shader_time_offset, stage.shader_clamp_time,
+            );
+            let mut stage_color = md3_stage_color_at_time(stage, entity_color, stage_time);
             stage_color[3] *= opacity;
             let (vertices, indices) = self.md3_geometry(
                 asset, surface_asset, entity_num, stage.index + 1, frame,
@@ -2115,7 +2128,7 @@ impl EntityPresenter {
             } else {
                 Arc::new(vertices.iter().map(|vertex| {
                     let mut transformed = *vertex;
-                    transformed.uv = md3_stage_uv(vertex, stage, camera);
+                    transformed.uv = md3_stage_uv_at_time(vertex, stage, camera, stage_time);
                     transformed
                 }).collect())
             };
@@ -2138,8 +2151,10 @@ impl EntityPresenter {
                 rt_rigid: None,
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
-                fx_gpu_sprites: None,
-                texture: stage.texture.clone(),
+                cloth_gpu: None, fx_gpu_sprites: None,
+                texture: stage.animation.as_ref()
+                    .and_then(|animation| animation.frames.get(animation.frame_index(stage_time)))
+                    .cloned().or_else(|| stage.texture.clone()),
                 alpha_mode: blend_for_alpha(stage.alpha_mode, opacity),
                 authored_glow: stage.authored_glow,
             });
@@ -2253,7 +2268,7 @@ impl EntityPresenter {
                 )),
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
-                fx_gpu_sprites: None,
+                cloth_gpu: None, fx_gpu_sprites: None,
                 texture,
                 alpha_mode: blend_for_alpha(alpha_mode, submission.rgba[3]),
 
@@ -2353,7 +2368,7 @@ impl EntityPresenter {
                 )),
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
-                fx_gpu_sprites: None,
+                cloth_gpu: None, fx_gpu_sprites: None,
                 texture: surface_asset.texture.clone(),
                 alpha_mode: if color[3] < 1.0 {
                     match surface_asset.alpha_mode {
@@ -2596,7 +2611,7 @@ impl EntityPresenter {
                 rt_rigid: None,
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
-                fx_gpu_sprites: None,
+                cloth_gpu: None, fx_gpu_sprites: None,
                 // Use one opaque material for first person gun and barrel
                 // surfaces in collision-world contrast mode.
                 texture: if flat_equipment { flat_texture.clone() } else { surface_asset.texture.clone() },
@@ -2683,7 +2698,7 @@ impl EntityPresenter {
                 )),
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
-                fx_gpu_sprites: None,
+                cloth_gpu: None, fx_gpu_sprites: None,
                 texture: surface_asset.texture.clone(),
                 alpha_mode: if rgba[3] < 1.0 {
                     match surface_asset.alpha_mode {
@@ -2720,11 +2735,11 @@ impl EntityPresenter {
                 if !material.tc_mods.is_empty(){for vertex in Arc::make_mut(&mut vertices){for modifier in &material.tc_mods{vertex.uv=crate::fx::draw::modified_uv(vertex.uv,vertex.position,*modifier,seconds-material.shader_time_offset);}}}
                 if definition.as_ref().is_some_and(|s|s.cull.eq_ignore_ascii_case("none")||s.cull.eq_ignore_ascii_case("twosided")){let original=indices.clone();for tri in original.chunks_exact(3){Arc::make_mut(&mut indices).extend([tri[2],tri[1],tri[0]]);}}
                 let masked=definition.as_ref().and_then(|s|s.stages.get(stage)).is_some_and(|s|!s.alpha_test.is_empty());
-                let gpu=if stage==0&&frame==0&&material.tc_mods.is_empty(){surface.gpu_vertices.as_ref().map(|gpu|crate::renderer::Ghoul2GpuSkinning { foliage_wind: surface.foliage_wind,
+                let gpu=if stage==0&&frame==0&&material.tc_mods.is_empty(){surface.gpu_vertices.as_ref().map(|gpu|crate::renderer::Ghoul2GpuSkinning { skin_gore: None, foliage_wind: surface.foliage_wind,
                     mesh_key:Arc::from(format!("{}#surface{}",asset.key,surface.surface_index)),vertices:gpu.clone(),indices:indices.clone(),
                     bones:Arc::new(vec![crate::renderer::Ghoul2GpuBone{row0:[1.,0.,0.,0.],row1:[0.,1.,0.,0.],row2:[0.,0.,1.,0.]}]),heat_bone:0,axis,origin,color,uv_xform:[1.,1.,0.,0.],uv_cross:[0.;4],specular:None,bulge_height:0.,env_map:false,jiggle_offsets:Default::default(),source_material:surface.source_material.clone()
                 })}else{None};
-                draws.push(DynamicModelSurface {geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true, portal_only: false,vertices,indices,lighting_origin:Some(origin),rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,fx_gpu_sprites:None,texture:material.texture.clone(),alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{blend_for_alpha(material.blend.custom_shader_alpha_mode(),color[3])},authored_glow:material.authored_glow});
+                draws.push(DynamicModelSurface {geometry_source:crate::renderer::ModelGeometrySource::Md3,authored_lighting:false,material_trace:None,entity_num,wireframe_class:DynamicWireframeClass::Entity,raster_visible:true, portal_only: false,vertices,indices,lighting_origin:Some(origin),rt_rigid:None,rt_skinned_key:None,ghoul2_gpu:gpu,cloth_gpu: None, fx_gpu_sprites:None,texture:material.texture.clone(),alpha_mode:if masked{DynamicModelAlphaMode::Mask}else{blend_for_alpha(material.blend.custom_shader_alpha_mode(),color[3])},authored_glow:material.authored_glow});
             }
         }Ok(draws)
     }
@@ -2804,6 +2819,8 @@ impl EntityPresenter {
             matches!(shader.cull.trim().to_ascii_lowercase().as_str(), "none" | "twosided" | "two-sided" | "disable")
         });
         let two_sided_indices = two_sided.then(|| md3_two_sided_indices(&cached_indices, true));
+        let shader_time_offset = self.shader_remaps.time_offset_for(&effective);
+        let shader_clamp_time = definition.as_ref().and_then(|shader| shader.clamp_time);
         let mut extra_stages = Vec::new();
         if !invisible_without_override && alpha_mode != DynamicModelAlphaMode::Glass {
             if let Some(shader) = definition.as_ref() {
@@ -2824,8 +2841,18 @@ impl EntityPresenter {
                     } else {
                         Some(self.load_texture_arc_or_missing(&stage.image, stage.clamp, "MD3 STAGE"))
                     };
+                    // Animated MD3 overlay stages previously disappeared
+                    // entirely, preventing authored pulse/blink effects.
+                    let animation = stage.animation.as_ref().map(|animation| {
+                        let frames = animation.frames.iter().map(|image| {
+                            self.load_texture_arc_or_missing(image, stage.clamp, "MD3 ANIMMAP")
+                        }).collect();
+                        crate::fx::draw::FxTextureAnimation {
+                            fps: animation.fps, one_shot: animation.one_shot, frames,
+                        }
+                    });
                     extra_stages.push(Md3ExtraStage {
-                        index, texture,
+                        index, texture, animation, shader_time_offset, shader_clamp_time,
                         alpha_mode: md3_stage_alpha_mode(stage),
                         authored_glow: stage.glow,
                         rgb_gen: stage.rgb_gen,
@@ -3102,6 +3129,7 @@ impl EntityPresenter {
             animation: None,
             texture: Some(texture),
             blend: FxBlend::Alpha,
+            rgb_identity_light: true,
             rgb_vertex: true,
             alpha_vertex: true,
             rgb_const: [1.0; 3],
@@ -3200,7 +3228,7 @@ impl EntityPresenter {
                 rt_rigid: None,
                 rt_skinned_key: None,
                 ghoul2_gpu: None,
-                fx_gpu_sprites: None,
+                cloth_gpu: None, fx_gpu_sprites: None,
                 authored_glow: stage.authored_glow,
                 texture: stage.texture_at_time(seconds),
                 alpha_mode: stage.blend.custom_shader_alpha_mode(),
@@ -3215,6 +3243,33 @@ impl EntityPresenter {
         use crate::fx::draw::{FxBlend, FxMaterial};
         use jka_assets::shader::{AlphaGen, RgbGen};
         let key = scene::canonical_shader_name(shader_name);
+        // Blood tracks use the STOCK JKA footprint artwork and UVs, but not
+        // the stock footprint shader's potentially lightening/additive blend.
+        // An FX-only material alias avoids changing ordinary marks or adding
+        // an external PNG/shader asset. Resolve the existing texture first.
+        if matches!(key.as_str(), "$blood_footstep_r" | "$blood_footstep_heavy_r") {
+            if let Some(cached) = self.fx_materials.get(&key) {
+                return cached.clone();
+            }
+            let stock = if key == "$blood_footstep_heavy_r" { "footstep_heavy_r" } else { "footstep_r" };
+            let original = self.fx_material_stages(stock);
+            let mut blood = original.into_iter().find(|stage| stage.texture.is_some() || stage.animation.is_some())
+                .expect("FX material resolver always returns a fallback stage");
+            blood.blend = FxBlend::Alpha;
+            blood.rgb_vertex = true;
+            blood.alpha_vertex = true;
+            blood.rgb_identity_light = false;
+            blood.rgb_const = [1.0; 3];
+            blood.alpha_const = 1.0;
+            blood.rgb_wave = None;
+            blood.alpha_wave = None;
+            blood.rgb_one_minus_vertex = false;
+            blood.alpha_one_minus_vertex = false;
+            blood.alpha_test = 0.0;
+            let material = vec![blood];
+            self.fx_materials.insert(key, material.clone());
+            return material;
+        }
         // Engine-built material: untextured vertex-colour additive (enhanced
         // saber melt glow). Not an authored shader, so it never hits the loaders.
         // DestroHook-style rope: the core/glow use untextured vertex-colour
@@ -3222,6 +3277,7 @@ impl EntityPresenter {
         if key == "$grapple_rope" {
             return vec![FxMaterial {
                 animation: None, texture: None, blend: FxBlend::Alpha,
+                rgb_identity_light: false,
                 rgb_vertex: true, alpha_vertex: true,
                 rgb_const: [1.0; 3], alpha_const: 1.0,
                 rgb_wave: None, alpha_wave: None,
@@ -3235,6 +3291,7 @@ impl EntityPresenter {
                 animation: None,
                 texture: None,
                 blend: FxBlend::Add,
+                rgb_identity_light: false,
                 rgb_vertex: true,
                 alpha_vertex: false,
                 rgb_const: [1.0; 3],
@@ -3292,6 +3349,8 @@ impl EntityPresenter {
                 animation,
                 texture,
                 blend: FxBlend::from_blend_func(&stage.blend),
+                rgb_identity_light: !stage.entity_rgb && matches!(stage.rgb_gen,
+                    RgbGen::IdentityLighting | RgbGen::Vertex | RgbGen::OneMinusVertex),
                 rgb_vertex: stage.rgb_gen.uses_vertex_color() || stage.entity_rgb,
                 alpha_vertex: matches!(stage.alpha_gen, AlphaGen::Vertex | AlphaGen::OneMinusVertex),
                 rgb_const: if stage.rgb_gen == RgbGen::Const { stage.color.unwrap_or([1.0; 3]) } else { [1.0; 3] },
@@ -3327,6 +3386,7 @@ impl EntityPresenter {
                     animation: None,
                     texture: Some(Arc::clone(&self.missing_texture)),
                     blend: FxBlend::Opaque,
+                    rgb_identity_light: false,
                     rgb_vertex: true,
                     alpha_vertex: true,
                     rgb_const: [1.0; 3],
@@ -3352,6 +3412,7 @@ impl EntityPresenter {
                         animation: None,
                         texture: Some(texture),
                         blend: FxBlend::Alpha,
+                        rgb_identity_light: true,
                         rgb_vertex: true,
                         alpha_vertex: true,
                         rgb_const: [1.0; 3],
@@ -3371,6 +3432,7 @@ impl EntityPresenter {
                                 animation: None,
                                 texture: Some(texture),
                                 blend: FxBlend::Add,
+                                rgb_identity_light: false,
                                 rgb_vertex: true,
                                 alpha_vertex: false,
                                 rgb_const: [1.0; 3],
@@ -3396,6 +3458,7 @@ impl EntityPresenter {
                                 animation: None,
                                 texture: Some(Arc::clone(&self.missing_texture)),
                                 blend: FxBlend::Opaque,
+                                rgb_identity_light: false,
                                 rgb_vertex: true,
                                 alpha_vertex: true,
                                 rgb_const: [1.0; 3],
@@ -3519,19 +3582,18 @@ impl EntityPresenter {
     }
 }
 
-/// Only submit stage forms this MD3 path actually implements. Complex wave,
-/// animation and scroll stages still require the world shader evaluator; don't
-/// silently render incorrect approximation passes on unrelated models.
+/// Keep unsupported depth/video passes explicit, but preserve authored
+/// pulsing/scrolling/animMap overlays on ordinary MD3s. Both the time-varying
+/// colour and texture frame are evaluated for each presented snapshot.
 fn md3_extra_stage_supported(stage: &Stage) -> bool {
     matches!(stage.tc_gen, TcGen::Base | TcGen::Environment | TcGen::Vector(..))
-        && stage.tc_mods.iter().all(|op| matches!(op, TcMod::Scale(..) | TcMod::Transform(..)))
         && matches!(stage.rgb_gen,
             RgbGen::Identity | RgbGen::IdentityLighting | RgbGen::LightingDiffuse
             | RgbGen::LightingDiffuseEntity | RgbGen::Vertex | RgbGen::ExactVertex
-            | RgbGen::OneMinusVertex | RgbGen::Const)
+            | RgbGen::OneMinusVertex | RgbGen::Const | RgbGen::Wave(..))
         && matches!(stage.alpha_gen,
-            AlphaGen::Identity | AlphaGen::Const | AlphaGen::Vertex | AlphaGen::OneMinusVertex)
-        && stage.animation.is_none()
+            AlphaGen::Identity | AlphaGen::Const | AlphaGen::Vertex | AlphaGen::OneMinusVertex
+            | AlphaGen::Wave(..))
         && !stage.depth_equal
         && !stage.video
         && stage.unsupported.is_empty()
@@ -3563,16 +3625,28 @@ fn md3_stage_alpha_mode(stage: &Stage) -> DynamicModelAlphaMode {
 }
 
 fn md3_stage_color(stage: &Md3ExtraStage, entity: [f32; 4]) -> [f32; 4] {
+    md3_stage_color_at_time(stage, entity, 0.0)
+}
+
+fn md3_wave_value(wave: jka_assets::shader::Wave, seconds: f32) -> f32 {
+    (wave.base + wave.amplitude * crate::fx::draw::fx_wave(
+        wave.func, crate::fx::draw::fx_wave_phase(wave, seconds),
+    )).clamp(0.0, 1.0)
+}
+
+fn md3_stage_color_at_time(stage: &Md3ExtraStage, entity: [f32; 4], seconds: f32) -> [f32; 4] {
     let rgb = match stage.rgb_gen {
         RgbGen::Vertex | RgbGen::ExactVertex | RgbGen::LightingDiffuseEntity => [entity[0], entity[1], entity[2]],
         RgbGen::OneMinusVertex => [1.0 - entity[0], 1.0 - entity[1], 1.0 - entity[2]],
         RgbGen::Const => stage.rgb_const,
+        RgbGen::Wave(wave) => [md3_wave_value(wave, seconds); 3],
         _ => [1.0; 3],
     };
     let alpha = match stage.alpha_gen {
         AlphaGen::Const => stage.alpha_const,
         AlphaGen::Vertex => entity[3],
         AlphaGen::OneMinusVertex => 1.0 - entity[3],
+        AlphaGen::Wave(wave) => md3_wave_value(wave, seconds),
         _ => 1.0,
     };
     [rgb[0], rgb[1], rgb[2], alpha]
@@ -3582,6 +3656,13 @@ fn md3_stage_color(stage: &Md3ExtraStage, entity: [f32; 4]) -> [f32; 4] {
 /// world and view positions are stored in the renderer's Y-up axes.
 fn md3_stage_uv(
     vertex: &DynamicModelVertex, stage: &Md3ExtraStage, camera: Option<[f32; 3]>,
+) -> [f32; 2] {
+    md3_stage_uv_at_time(vertex, stage, camera, 0.0)
+}
+
+fn md3_stage_uv_at_time(
+    vertex: &DynamicModelVertex, stage: &Md3ExtraStage,
+    camera: Option<[f32; 3]>, seconds: f32,
 ) -> [f32; 2] {
     let mut uv = match stage.tc_gen {
         TcGen::Environment => {
@@ -3609,7 +3690,7 @@ fn md3_stage_uv(
             TcMod::Transform([a,b,c,d,e,f]) => {
                 uv = [uv[0] * a + uv[1] * b + e, uv[0] * c + uv[1] * d + f];
             }
-            _ => {} // time-dependent operations require shader time; not faked
+            _ => { uv = crate::fx::draw::modified_uv(uv, vertex.position, *op, seconds); }
         }
     }
     uv
@@ -4438,7 +4519,9 @@ mod tests {
         let (_fixture, mut presenter) = synthetic_md3_presenter();
         let asset = Arc::get_mut(presenter.md3_models.get_mut("synthetic.md3").unwrap()).unwrap();
         asset.surfaces[0].extra_stages.push(Md3ExtraStage {
-            index: 1, texture: None, alpha_mode: DynamicModelAlphaMode::Opaque,
+            index: 1, texture: None, animation: None,
+            shader_time_offset: 0.0, shader_clamp_time: None,
+            alpha_mode: DynamicModelAlphaMode::Opaque,
             authored_glow: false, rgb_gen: RgbGen::Identity, alpha_gen: AlphaGen::Identity,
             rgb_const: [1.0; 3], alpha_const: 1.0, tc_gen: TcGen::Base, tc_mods: vec![],
         });
@@ -4447,6 +4530,57 @@ mod tests {
         let draws = presenter.present_static_models(None);
         assert_eq!(draws.len(), 4);
         assert!(draws.iter().all(|draw| draw.ghoul2_gpu.is_none()));
+    }
+
+    #[test]
+    fn mp_health_item_overlays_keep_authored_wave_scroll_and_screen_blend() {
+        // Stock shaders/models.shader: medpac_mp and bacta_mp share these stages.
+        let source = r#"
+models/map_objects/mp/medpac_mp
+{
+    {
+        map models/map_objects/mp/medpac_mp
+        rgbGen lightingDiffuse
+    }
+    {
+        map models/map_objects/mp/health
+        blendFunc GL_ONE_MINUS_DST_COLOR GL_ONE
+        rgbGen wave sin 0 1 0 0.75
+        tcMod scroll 0 3
+    }
+    {
+        map models/map_objects/mp/health_field2
+        blendFunc GL_DST_COLOR GL_ONE
+        tcGen environment
+        tcMod scroll 0.5 0.5
+    }
+}
+"#;
+        let shaders = jka_assets::shader::parse(source).unwrap();
+        let stages = &shaders["models/map_objects/mp/medpac_mp"].stages;
+        assert_eq!(stages.len(), 3);
+        assert_eq!(md3_stage_alpha_mode(&stages[0]), DynamicModelAlphaMode::Opaque);
+        assert_eq!(md3_stage_alpha_mode(&stages[1]), DynamicModelAlphaMode::Screen);
+        assert_eq!(md3_stage_alpha_mode(&stages[2]), DynamicModelAlphaMode::DstColorAdd);
+        assert!(md3_extra_stage_supported(&stages[1]));
+        assert!(md3_extra_stage_supported(&stages[2]));
+        let stage = Md3ExtraStage {
+            index: 1, texture: None, animation: None,
+            shader_time_offset: 0.0, shader_clamp_time: None,
+            alpha_mode: md3_stage_alpha_mode(&stages[1]), authored_glow: false,
+            rgb_gen: stages[1].rgb_gen, alpha_gen: stages[1].alpha_gen,
+            rgb_const: [1.0; 3], alpha_const: 1.0,
+            tc_gen: stages[1].tc_gen, tc_mods: stages[1].tc_mods.clone(),
+        };
+        let off = md3_stage_color_at_time(&stage, [1.0; 4], 0.0);
+        let on = md3_stage_color_at_time(&stage, [1.0; 4], 1.0 / 3.0);
+        assert!(off[0] < 0.0001 && on[0] > 0.99);
+        let vertex = DynamicModelVertex {
+            position: [0.0; 3], normal: [0.0, 1.0, 0.0],
+            uv: [0.1, 0.2], color: [1.0; 4], depth_hack: 0.0,
+            water_wetness: 0.0, foliage_wind: 0.0,
+        };
+        assert_eq!(md3_stage_uv_at_time(&vertex, &stage, None, 0.25), [0.1, 0.95]);
     }
 
     #[test]
@@ -4479,7 +4613,8 @@ models/map_objects/factory/glass_b
         assert!(md3_extra_stage_supported(&shader.stages[1]));
         assert!(matches!(shader.stages[0].rgb_gen, RgbGen::LightingDiffuse));
         let stage = Md3ExtraStage {
-            index: 1, texture: None,
+            index: 1, texture: None, animation: None,
+            shader_time_offset: 0.0, shader_clamp_time: None,
             alpha_mode: md3_stage_alpha_mode(&shader.stages[1]),
             authored_glow: false,
             rgb_gen: shader.stages[1].rgb_gen,
@@ -5043,7 +5178,7 @@ models/map_objects/factory/glass_b
         let mut textured = 0usize;
         let mut surfaces_total = 0usize;
         let mut kinds = std::collections::BTreeSet::new();
-        let view = crate::fx::draw::FxView { origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], fov_x: 90.0, seconds: 0.0 };
+        let view = crate::fx::draw::FxView { origin: [0.0; 3], axis: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], fov_x: 90.0, seconds: 0.0, identity_light: 1.0 };
         while let Some(record) = reader.next_record().unwrap() {
             let packet = decoder.parse_packet(record.sequence, &record.payload).unwrap();
             for event in packet.events {

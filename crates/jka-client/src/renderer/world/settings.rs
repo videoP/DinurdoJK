@@ -170,6 +170,7 @@ impl Renderer {
             return;
         }
         self.detail_texture_game = next_game;
+        self.grass_renderer.clear_ninja_material(&mut self.pipeline_jobs);
         // The HUD image worker holds a filesystem snapshot and parsed shaders
         // for the previous mod. Drop it before requesting new mod artwork.
         self.ui_ext_image_loader = None;
@@ -635,13 +636,50 @@ impl Renderer {
     /// world bind groups hold, so rebind once on that change only.
     pub(in crate::renderer) fn set_footprint_mode(&mut self, mode: FootprintMode) {
         self.surface_deformation.set_mode(&self.queue, mode);
-        let snow_field = self.surface_deformation_shader_needed();
-        if self.surface_deformation.set_field_enabled(&self.device, snow_field) {
+        if self.sync_surface_deformation_resources() {
             if let Some(mut world) = self.world.take() {
                 self.rebuild_world_surface_bind_groups(&mut world);
                 self.world = Some(world);
             }
         }
+    }
+
+    pub(in crate::renderer) fn sync_surface_deformation_resources(&mut self) -> bool {
+        let snow = self.surface_deformation_shader_needed();
+        let ninja = self.surface_deformation.mode().ninja_profile();
+        let changed = self.surface_deformation.set_field_enabled(&self.device, snow && ninja.is_none());
+        let ninja_changed = self.surface_deformation.set_ninja_enabled(
+            &self.device,
+            &self.queue,
+            if snow { ninja } else { None },
+            |profile| {
+                let shader = jka_ninja::snow_material_wgsl(profile)
+                    .ok_or("Fluid Ninja snow is unavailable in this build")?;
+                let mut assets = AssetSearchPath::open_game(&self.base, self.detail_texture_game.as_deref())
+                    .map_err(|error| error.to_string())?;
+                let mut views: Vec<(&str, wgpu::TextureView)> = Vec::with_capacity(6);
+                for image in shader.surface_images.into_iter().chain(shader.painter_images) {
+                    if let Some((_, view)) = views.iter().find(|(qpath, _)| *qpath == image.qpath) {
+                        views.push((image.qpath, view.clone()));
+                        continue;
+                    }
+                    let asset = assets.read(image.qpath, 16 * 1024 * 1024)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("required local texture missing: {}", image.qpath))?;
+                    let data = crate::materials::decode_texture_data_with_color_space(
+                        image.qpath, &asset.bytes, false, true, image.srgb,
+                    )?;
+                    if [data.width, data.height] != image.size {
+                        return Err(format!("{} requires {}×{}", image.qpath, image.size[0], image.size[1]));
+                    }
+                    let view = super::super::textures::upload_texture(&self.device, &self.queue, &data).view.clone();
+                    views.push((image.qpath, view));
+                }
+                let views: [(_, _); 6] = views.try_into().map_err(|_| "invalid Ninja snow texture set")?;
+                Ok(views.map(|(_, view)| view))
+            },
+        );
+        changed || ninja_changed
     }
 
     /// Deluxe needs the PBR material path; the shader override is what removes its
@@ -974,7 +1012,8 @@ impl Renderer {
     /// One authority for froxel uniforms, dispatch and final compositing.
     /// In particular, snow must not launch froxels in Off/Legacy modes.
     pub(in crate::renderer) fn weather_froxels_needed(&self) -> bool {
-        self.weather.fog.volumetric_effective()
+        self.ninja_fog.active()
+            || self.weather.fog.volumetric_effective()
             || (!self.weather_uses_2d_haze()
                 && (self.weather.rain.enabled
                     || (self.weather.snow.enabled && self.weather.snow.density_scale > 0.001)))

@@ -139,7 +139,9 @@ impl Renderer {
     pub(in crate::renderer) fn resize(&mut self, size: PhysicalSize<u32>) {
         // Windows can repeat a resize notification without changing dimensions.
         // Reallocating every target then briefly retains two full target sets.
-        if self.size == size { return; }
+        if self.size == size || super::device_lost() {
+            return;
+        }
         self.size = size;
         if size.width == 0 || size.height == 0 {
             return;
@@ -150,6 +152,10 @@ impl Renderer {
             self.offscreen_output = Some(self.make_offscreen_output());
         }
         self.configure_surface();
+        // Reconfiguring waits for in-flight GPU work and can report a device loss.
+        if super::device_lost() {
+            return;
+        }
         self.note_surface_configured("resize");
         self.resize_hdr_output();
         self.dlss.release();
@@ -172,10 +178,16 @@ impl Renderer {
             self.cloud_render_resolution,
             (self.config.width, self.config.height),
         );
+        if super::device_lost() {
+            return;
+        }
         self.world_flares.invalidate_depth_binding();
         self.world_flares_sky.invalidate_depth_binding();
         self.rebind_scene_depth_resolve();
         self.rebuild_planar_reflection_resources();
+        if super::device_lost() {
+            return;
+        }
         self.rebuild_post_bind_group();
         self.rebuild_rain_haze_mask_bind_group();
         if let Some(target) = &mut self.smaa_target {
@@ -370,9 +382,7 @@ impl Renderer {
                 &self.detail_texture,
                 self.detail_texture_auto,
                 &self.detail_auto_textures,
-                self.surface_deformation.buffer(),
-                self.surface_deformation.field_views(),
-                self.surface_deformation.field_sampler(),
+                &self.surface_deformation,
                 world,
             );
             for effect in &mut world.surface_sprite_effects {

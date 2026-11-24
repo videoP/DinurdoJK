@@ -215,7 +215,7 @@ fn local_game_loads_eal_before_live_toggles_and_sound_restart() {
     assert!(info.eal_effects_active, "{:?}", info.eal_effects_error);
     assert_eq!(info.eal_file.as_deref(), Some("eagle/ffa3.eal"));
     app.flush_config();
-    assert!(crate::config::load_audio_settings(&fixture.0.join("DinurdoJK.cfg")).eal_enabled);
+    assert!(crate::config::load_audio_settings(&fixture.0.join("DinurdoJK.cfg")).echofield);
     assert!(crate::config::load_audio_settings(&fixture.0.join("DinurdoJK.cfg")).eal_hrtf);
 }
 
@@ -233,14 +233,14 @@ fn hybrid_breaker_applies_live_and_round_trips_without_changing_sea_state() {
     assert_eq!(app.video.ocean_settings.hybrid_breaker, 0);
     assert_eq!(crate::app::cvar_registry().find("r_hybridBreaker").unwrap().entry.latch,
         crate::console::LatchScope::None);
-    for mode in [2, 1, 0] {
+    for mode in [3, 2, 1, 0] {
         app.set_console_cvar("r_hybridBreaker", &mode.to_string()).unwrap();
         assert_eq!(app.video.ocean_settings.hybrid_breaker, mode);
         assert_eq!(app.video.ocean_settings.blue_water_waves, waves);
         app.flush_config();
         assert_eq!(crate::config::load_video_settings(&path).ocean_settings.hybrid_breaker, mode);
     }
-    assert!(app.set_console_cvar("r_hybridBreaker", "3").is_err());
+    assert!(app.set_console_cvar("r_hybridBreaker", "4").is_err());
 }
 
 #[test]
@@ -318,7 +318,6 @@ fn lake_promotion_switches_live_and_round_trips_without_overwriting_ocean() {
     app.set_console_cvar("r_oceanType","3").unwrap();
     let ocean=app.video.ocean_settings;
     app.set_console_cvar("r_oceanType","4").unwrap();
-    app.set_console_cvar("r_lakeWindSpeed","7.5").unwrap();
     app.set_console_cvar("r_lakeDirection","-35").unwrap();
     app.set_console_cvar("r_lakeTransparency","2").unwrap();
     app.set_console_cvar("r_lakeReflections","0.35").unwrap();
@@ -328,32 +327,21 @@ fn lake_promotion_switches_live_and_round_trips_without_overwriting_ocean() {
     app.set_console_cvar("r_lakeReflectionMode","2").unwrap();
     assert_eq!(app.video.ocean_settings.lake.reflection_mode,2);
     assert_eq!(app.video.reflection_quality,crate::ui::ReflectionQuality::Off);
-    app.set_console_cvar("r_lakeShader","1").unwrap();
-    app.set_console_cvar("r_lakeTransmission","0.65").unwrap();
     app.set_console_cvar("r_lakeRefraction","0.02").unwrap();
     app.set_console_cvar("r_lakeOpaqueDepth","12.5").unwrap();
     app.set_console_cvar("r_lakeWake","0.6").unwrap();
     assert_eq!(app.video.ocean_settings.lake.wake_strength,0.6);
     assert_eq!(app.video.ocean_settings.lake.opaque_depth,12.5);
-    app.set_console_cvar("r_lakeDepthColor","0.8").unwrap();
-    app.set_console_cvar("r_lakeColorDepth","6").unwrap();
-    app.set_console_cvar("r_lakeShallowColor","0.3 0.6 0.5").unwrap();
     app.set_console_cvar("r_lakeDeepColor","0.02 0.1 0.2").unwrap();
-    assert_eq!(app.video.ocean_settings.lake.depth_color_strength,0.8);
-    assert_eq!(app.video.ocean_settings.lake.color_depth,6.0);
-    assert_eq!(app.video.ocean_settings.lake.shallow_color,[0.3,0.6,0.5]);
     assert_eq!(app.video.ocean_settings.lake.deep_color,[0.02,0.1,0.2]);
-    assert_eq!(app.video.ocean_settings.lake.cheap_transmission,0.65);
     assert_eq!(app.video.ocean_settings.lake.cheap_refraction,0.02);
     app.set_console_cvar("r_lakeReflectionMode","1").unwrap();
     app.set_console_cvar("r_lakeAmplitude","12").unwrap();
     app.set_console_cvar("r_lakeWaterColor","0.2 0.5 0.8").unwrap();
-    app.set_console_cvar("r_lakeFogColor","0.1 0.3 0.4").unwrap();
     assert_eq!(app.video.ocean_settings.lake.amplitude,12.0);
     assert_eq!(app.video.ocean_settings.lake.reflections,0.35);
     assert_eq!(app.video.ocean_settings.lake.speed,1.8);
     assert_eq!(app.video.ocean_settings.lake.tint_color,[0.4,0.8,0.9]);
-    assert_eq!(app.video.ocean_settings.lake.shader,1);
     assert_eq!(app.video.ocean_settings.lake.reflection_mode,1);
     assert_eq!(app.video.reflection_quality,crate::ui::ReflectionQuality::Off);
     assert_eq!(app.video.ocean_settings.lake.water_color,[0.2,0.5,0.8]);

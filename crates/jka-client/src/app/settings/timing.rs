@@ -175,6 +175,12 @@ impl App {
         }
     }
 
+    pub(in crate::app) fn apply_fx_smoke_duration_scale(&mut self) {
+        if let Some(session) = self.game_session.as_mut() {
+            session.weapon_fx.set_fx_smoke_duration_scale(self.video.fx_smoke_duration_scale);
+        }
+    }
+
     /// One client-side movement/input cadence for both live and solo play.
     /// Remote fixed-Pmove servers still advertise pmove_fixed/pmove_msec and
     /// the predictor obeys those values independently.

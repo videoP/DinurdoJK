@@ -42,6 +42,8 @@ pub(crate) struct PendingGore {
     pub end: [f32; 3],
     pub trace: bool,
     pub size: f32,
+    pub skin_scale: f32,
+    pub life_ms: i32,
     pub shader: String,
     pub time: i32,
     pub sequence: u64,
@@ -51,6 +53,7 @@ pub(crate) struct Gore {
     pub entity: u16,
     pub start_time: i32,
     pub life_ms: i32,
+    pub fade_out_ms: i32,
     pub shader: String,
     pub surfaces: Vec<GoreSurface>,
 }
@@ -166,6 +169,26 @@ fn segment_triangle(start: [f32; 3], end: [f32; 3], a: [f32; 3], b: [f32; 3], c:
     (0.0..=1.0).contains(&t).then_some(t)
 }
 
+/// Resolve a server Ghoul2 impact using the same nearest-triangle trace as
+/// the legacy projector. SkinGore receives a *point*, not a projected quad.
+pub(crate) fn impact_position(
+    snaps: &[GpuSnap], start: [f32; 3], end: [f32; 3],
+) -> Option<[f32; 3]> {
+    let mut best: Option<f32> = None;
+    for snap in snaps {
+        let world: Vec<[f32;3]> = snap.vertices.iter().map(|v| skin_vertex(v,snap).0).collect();
+        for tri in snap.indices.chunks_exact(3) {
+            let at = |idx: u32| world.get(idx as usize).copied();
+            if let (Some(a), Some(b), Some(c)) = (at(tri[0]),at(tri[1]),at(tri[2])) {
+                if let Some(t) = segment_triangle(start,end,a,b,c) {
+                    best = Some(best.map_or(t, |old| old.min(t)));
+                }
+            }
+        }
+    }
+    best.map(|t| std::array::from_fn(|i| start[i]+(end[i]-start[i])*t))
+}
+
 /// Build the decal for a hit at `hit` travelling along `dir`, half-extent `size`.
 ///
 /// With `trace`, `hit` is only the start of a segment towards `hit + dir` (the
@@ -179,86 +202,77 @@ pub(crate) fn build_gore(
     trace: bool,
     size: f32,
 ) -> Vec<GoreSurface> {
-    let skinned: Vec<Vec<([f32; 3], [f32; 3])>> = snaps
-        .iter()
-        .map(|snap| snap.vertices.iter().map(|vertex| skin_vertex(vertex, snap)).collect())
-        .collect();
-    let dir = normalize(sub(end, start));
     let hit = if trace {
-        let mut best: Option<f32> = None;
-        for (snap, world) in snaps.iter().zip(&skinned) {
-            for tri in snap.indices.chunks_exact(3) {
-                let at = |i: u32| world.get(i as usize).map(|(p, _)| *p);
-                if let (Some(a), Some(b), Some(c)) = (at(tri[0]), at(tri[1]), at(tri[2])) {
-                    if let Some(t) = segment_triangle(start, end, a, b, c) {
-                        best = Some(best.map_or(t, |current| current.min(t)));
-                    }
-                }
-            }
-        }
-        match best {
-            Some(t) => std::array::from_fn(|i| start[i] + (end[i] - start[i]) * t),
+        match impact_position(snaps, start, end) {
+            Some(hit) => hit,
             None => return Vec::new(),
         }
     } else {
         start
     };
-    let up_hint = if dir[2].abs() > 0.95 { [1.0, 0.0, 0.0] } else { [0.0, 0.0, 1.0] };
-    let right = normalize(cross(dir, up_hint));
-    let up = cross(right, dir);
-    let inv = 1.0 / (2.0 * size.max(0.1));
+    project_gore(snaps, id, hit, end, size, id.into())
+}
+
+/// jaPRO G2_GorePolys projects its S/T axes through both sides of the model.
+pub(crate) fn project_gore(
+    snaps: &[GpuSnap],
+    id: u32,
+    hit: [f32; 3],
+    end: [f32; 3],
+    size: f32,
+    seed: u64,
+) -> Vec<GoreSurface> {
+    let ray = sub(end, hit);
+    if !dot(ray, ray).is_finite() || dot(ray, ray) < 0.01 || !size.is_finite() || size <= 0.0 {
+        return Vec::new();
+    }
+    let dir = normalize(ray);
+    let mut basis1 = cross(dir, [0.0, 0.0, 1.0]);
+    if dot(basis1, basis1) < 0.1 {
+        basis1 = cross(dir, [0.0, 1.0, 0.0]);
+    }
+    let basis1 = normalize(basis1);
+    let basis2 = cross(dir, basis1);
+    // Derive jaPRO's uniformly rotated stamp from the event sequence for
+    // deterministic playback.
+    let fraction = (seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40) as f32 / 16_777_216.0;
+    let (sin, cos) = (fraction * std::f32::consts::TAU).sin_cos();
+    let inv = 0.5 / size;
+    let s_axis = std::array::from_fn(|i| (-sin * basis1[i] + cos * basis2[i]) * inv);
+    let t_axis = std::array::from_fn(|i| (cos * basis1[i] + sin * basis2[i]) * inv);
 
     let mut out = Vec::new();
-    for (snap, world) in snaps.iter().zip(&skinned) {
-        let mut vertices: Vec<Ghoul2GpuVertex> = snap.vertices.as_ref().clone();
-        let mut uvs = vec![None::<[f32; 2]>; vertices.len()];
+    for snap in snaps {
+        let uvs: Vec<_> = snap.vertices.iter().map(|vertex| {
+            let delta = sub(skin_vertex(vertex, snap).0, hit);
+            [dot(delta, s_axis) + 0.5, dot(delta, t_axis) + 0.5]
+        }).collect();
+        let mut vertices = Vec::new();
+        let mut remap = vec![None; snap.vertices.len()];
         let mut indices = Vec::new();
         for tri in snap.indices.chunks_exact(3) {
-            let mut inside = false;
-            let mut facing = 0.0;
-            let mut ok = true;
-            let mut tri_uv = [[0.0f32; 2]; 3];
-            for (slot, &index) in tri.iter().enumerate() {
-                let Some(&(position, normal)) = world.get(index as usize) else {
-                    ok = false;
-                    break;
-                };
-                let rel = sub(position, hit);
-                let uv = [dot(rel, right) * inv + 0.5, dot(rel, up) * inv + 0.5];
-                if dot(rel, dir).abs() > size * 1.5 {
-                    ok = false;
-                    break;
-                }
-                facing += dot(normal, dir);
-                tri_uv[slot] = uv;
+            let at = |i: u32| uvs.get(i as usize).copied();
+            let (Some(a), Some(b), Some(c)) = (at(tri[0]), at(tri[1]), at(tri[2])) else {
+                continue;
+            };
+            if (0..2).any(|axis| {
+                a[axis].max(b[axis]).max(c[axis]) <= 0.0
+                    || a[axis].min(b[axis]).min(c[axis]) >= 1.0
+            }) {
+                continue;
             }
-            // The triangle's UV bounds overlap the decal square (a large triangle
-            // can cover it without any corner being inside).
-            if ok {
-                let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
-                for uv in &tri_uv {
-                    for axis in 0..2 {
-                        lo[axis] = lo[axis].min(uv[axis]);
-                        hi[axis] = hi[axis].max(uv[axis]);
-                    }
-                }
-                inside = hi[0] >= 0.0 && lo[0] <= 1.0 && hi[1] >= 0.0 && lo[1] <= 1.0;
-            }
-            // Only the side of the body the projectile came from.
-            if ok && inside && facing / 3.0 < 0.2 {
-                indices.extend_from_slice(tri);
-                for (slot, &index) in tri.iter().enumerate() {
-                    uvs[index as usize] = Some(tri_uv[slot]);
-                }
+            for (&index, uv) in tri.iter().zip([a, b, c]) {
+                let index = index as usize;
+                let projected = remap[index].get_or_insert_with(|| {
+                    let next = vertices.len() as u32;
+                    vertices.push(Ghoul2GpuVertex { uv, ..snap.vertices[index] });
+                    next
+                });
+                indices.push(*projected);
             }
         }
         if indices.is_empty() {
             continue;
-        }
-        for (vertex, uv) in vertices.iter_mut().zip(&uvs) {
-            if let Some(uv) = uv {
-                vertex.uv = *uv;
-            }
         }
         out.push(GoreSurface {
             base_key: Arc::clone(&snap.mesh_key),
@@ -317,7 +331,16 @@ mod tests {
     }
 
     #[test]
-    fn a_mark_covers_nearby_triangles_from_the_shooters_side_only() {
+    fn projection_reaches_surfaces_behind_the_impact_plane() {
+        let mut snap = quad();
+        snap.origin[1] = 12.0;
+        let snaps = [snap];
+        assert!(!project_gore(&snaps, 4, [0.0; 3], [0.0, 1.0, 0.0], 4.0, 0).is_empty());
+        assert!(project_gore(&snaps, 4, [0.0; 3], [0.0; 3], 4.0, 0).is_empty());
+    }
+
+    #[test]
+    fn a_mark_covers_nearby_triangles_on_both_sides() {
         let snap = quad();
         // Shot travelling +Y hits the front (-Y) face at the centre.
         let gore = build_gore(&[snap.clone()], 7, [0.0, -5.0, 0.0], [0.0, 5.0, 0.0], false, 8.0);
@@ -327,8 +350,8 @@ mod tests {
         // UVs centre on the hit: the quad corners lie outside 0..1.
         let centre_uv = gore[0].vertices[0].uv;
         assert!(centre_uv[0] < 0.0 || centre_uv[0] > 1.0);
-        // From behind the same quad is back-facing: no mark.
-        assert!(build_gore(&[snap.clone()], 8, [0.0, 5.0, 0.0], [0.0, -5.0, 0.0], false, 8.0).is_empty());
+        // TaystJK sets frontFaces AND backFaces for Ghoul2 gore.
+        assert_eq!(build_gore(&[snap.clone()], 8, [0.0, 5.0, 0.0], [0.0, -5.0, 0.0], false, 8.0).len(), 1);
         // A special trace that misses the mesh places nothing.
         assert!(build_gore(&[snap.clone()], 9, [100.0, -5.0, 0.0], [100.0, 5.0, 0.0], true, 8.0).is_empty());
         // ...and one that hits it centres the mark on the surface.

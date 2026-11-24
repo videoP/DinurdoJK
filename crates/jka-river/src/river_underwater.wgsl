@@ -1,5 +1,4 @@
-// Host presentation adapter: Hybrid/Godot submerged optics over the native
-// solved river mesh. Above-water SLW and the hydraulic/foam producers are intact.
+// Host presentation adapter for submerged optics over the native solved river.
 
 fn river_vertex_height(uv: vec2<f32>, eye: vec3<f32>) -> f32 {
     let local = vec3<f32>((uv - 0.5) * body.grid.xy, 0.0);
@@ -87,7 +86,7 @@ fn river_hybrid_underside(input: RiverOut, graph_normal: vec3<f32>, foam: RiverF
 
 // Listener probe: an isolated 1x1 pass, after the solver, not a CPU
 // approximation of the river source bounds. Alpha is always opaque so the
-// MAX-blended red channel ORs overlapping rivers without extra readbacks.
+// MAX-blended channels OR overlapping rivers without extra readbacks.
 struct RiverAudioListener {
     eye: vec4<f32>,
     foot: vec4<f32>,
@@ -102,7 +101,10 @@ struct RiverAudioListener {
     // Separate foot contact from eye submersion: JKA EV_WATER_TOUCH fires
     // when feet enter water, before the eye goes below the surface.
     let foot = river_eye_water_at(river_audio_listener.foot.xyz);
-    return vec4<f32>(eye.z, foot.z, 0.0, 1.0);
+    // The river optics use the render eye, which can be below the surface
+    // even when the third-person player's eye is still in air.
+    let render_eye = river_eye_water_at(river_view.eye.xyz);
+    return vec4<f32>(eye.z, foot.z, render_eye.z, 1.0);
 }
 
 struct RiverSubmergedOut {
@@ -118,6 +120,16 @@ struct RiverSubmergedOut {
     return out;
 }
 
+@group(4) @binding(0) var ninja_underwater_noise: texture_2d<f32>;
+@group(4) @binding(1) var ninja_underwater_gradient: texture_2d<f32>;
+@group(4) @binding(2) var ninja_underwater_volume: texture_3d<f32>;
+
+fn river_underwater_ray(uv: vec2<f32>) -> vec3<f32> {
+    let ndc = uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
+    return river_view.forward.xyz + river_view.right.xyz * ndc.x / river_view.distortion.x
+        + river_view.up.xyz * ndc.y / (river_view.distortion.x * river_view.distortion.y);
+}
+
 // Final color/depth has the underside and opaque bed already rasterized. Its
 // nearest depth terminates the water path at that exact surface/receiver.
 // The patch footprint clips sideways escape into clear sky at the grid edge.
@@ -125,10 +137,18 @@ struct RiverSubmergedOut {
     if input.eye_water.z < 0.5 { discard; }
     let size = vec2<f32>(textureDimensions(scene_depth));
     let uv = input.clip.xy / size;
-    let ndc = uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
-    let ray = river_view.forward.xyz + river_view.right.xyz * ndc.x / river_view.distortion.x
-        + river_view.up.xyz * ndc.y / (river_view.distortion.x * river_view.distortion.y);
-    var end = river_scene_depth(textureLoad(scene_depth, vec2<i32>(input.clip.xy), 0));
+    let pixel = vec2<i32>(input.clip.xy);
+    let scene = textureLoad(scene_color, pixel, 0);
+    if authored.underwater_depth.y > 1.5 && river_view.up.w > 0.5 {
+        let distorted_uv = clamp(uv + ninja_underwater_distortion(uv, river_view.right.w),
+            0.5 / size, 1.0 - 0.5 / size);
+        let distorted_pixel = vec2<i32>(distorted_uv * size);
+        let distorted_scene = textureSampleLevel(scene_color, normal_sampler, distorted_uv, 0.0).rgb;
+        let distorted_depth = river_scene_depth(textureLoad(scene_depth, distorted_pixel, 0));
+        return vec4<f32>(ninja_underwater_color(distorted_scene, distorted_depth, uv, pixel), scene.a);
+    }
+    let ray = river_underwater_ray(uv);
+    var end = river_scene_depth(textureLoad(scene_depth, pixel, 0));
     for (var axis = 0u; axis < 2u; axis += 1u) {
         if abs(ray[axis]) > 1e-8 {
             let side = body.origin[axis] + sign(ray[axis]) * body.grid[axis] * 0.5;
@@ -139,7 +159,6 @@ struct RiverSubmergedOut {
     // Distances and tint are independent authored values for this river.
     let eye_depth = max(input.eye_water.x - river_view.eye.z, 0.0);
     let path = end * length(ray);
-    let scene = textureLoad(scene_color, vec2<i32>(input.clip.xy), 0);
     // Both modes share the exact spectral attenuation equations. The old
     // renderer already used these; duplicating them was not a useful A/B.
     let medium = jka_underwater_spectral_medium(

@@ -15,24 +15,24 @@ use glam::{Mat4, Vec3};
 /// Render original Blue Water optics at 1/2 or 1/4 framebuffer resolution.
 /// The full-resolution reconstruction still rasterizes the actual displaced
 /// clipmap against the host's depth buffer and JKA footprint mask.
-struct ReducedOcean {
+pub(super) struct ReducedOcean {
     _color: wgpu::Texture,
-    color_view: wgpu::TextureView,
+    pub color_view: wgpu::TextureView,
     _depth: wgpu::Texture,
-    depth_view: wgpu::TextureView,
+    pub depth_view: wgpu::TextureView,
     /// The glitter's mean/density and the glint share the reconstruction draws full-resolution glints from
     /// (`shader_composer::jka_reduced_glints`).
-    _glitter: [wgpu::Texture; 2],
-    glitter_views: [wgpu::TextureView; 2],
-    binding: wgpu::BindGroup,
+    glitter_views: Option<[wgpu::TextureView; 2]>,
+    pub binding: wgpu::BindGroup,
     /// `r_oceanPixelDetail` 5: the classifier's parameters (x `r_oceanPixelContrast`), its bind group and tile counts.
-    adaptive_params: wgpu::Buffer,
+    pub adaptive_params: wgpu::Buffer,
+    pub tile_buffer: wgpu::Buffer,
     adaptive: Option<(wgpu::BindGroup, (u32, u32))>,
 }
 
 impl ReducedOcean {
-    fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, classify: Option<&wgpu::BindGroupLayout>,
-        width: u32, height: u32, factor: u32) -> Self {
+    pub fn new(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, classify: Option<&wgpu::BindGroupLayout>,
+        width: u32, height: u32, factor: u32, glitter: bool) -> Self {
         let extent = wgpu::Extent3d {
             width: width.max(1).div_ceil(factor),
             height: height.max(1).div_ceil(factor),
@@ -56,7 +56,7 @@ impl ReducedOcean {
             view_formats: &[],
         });
         let depth_view = _depth.create_view(&Default::default());
-        let _glitter = ["Blue Water reduced glitter mean/density", "Blue Water reduced glint share"].map(|label|
+        let glitter_views = glitter.then(|| ["Blue Water reduced glitter mean/density", "Blue Water reduced glint share"].map(|label|
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: extent, mip_level_count: 1, sample_count: 1,
@@ -64,14 +64,13 @@ impl ReducedOcean {
                 format: wgpu::TextureFormat::Rgba16Float,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
-            }));
-        let glitter_views = _glitter.each_ref().map(|texture| texture.create_view(&Default::default()));
+            }).create_view(&Default::default())));
         // One decision per 16x16-pixel tile (`adaptive_tiles.wgsl`); unread outside mode 5.
         let tiles = blue_water_gpu::shader_composer::adaptive_tile_counts(width, height);
         let tile_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Blue Water adaptive tile decisions"),
             size: u64::from(tiles.0 * tiles.1).max(1) * 4,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let adaptive_params = device.create_buffer(&wgpu::BufferDescriptor {
@@ -80,15 +79,21 @@ impl ReducedOcean {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let mut entries = vec![
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&color_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: tile_buffer.as_entire_binding() },
+        ];
+        if let Some([mean, transfer]) = &glitter_views {
+            entries.extend([
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(mean) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(transfer) },
+            ]);
+        } else {
+            entries.push(wgpu::BindGroupEntry { binding: 3, resource: adaptive_params.as_entire_binding() });
+        }
         let binding = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Blue Water reduced shaded color/depth"), layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&color_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&depth_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: tile_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&glitter_views[0]) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&glitter_views[1]) },
-            ],
+            label: Some("Blue Water reduced shaded color/depth"), layout, entries: &entries,
         });
         let adaptive = classify.map(|classify| (device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Blue Water adaptive tiles"), layout: classify,
@@ -99,7 +104,17 @@ impl ReducedOcean {
                 wgpu::BindGroupEntry { binding: 3, resource: adaptive_params.as_entire_binding() },
             ],
         }), tiles));
-        Self { _color, color_view, _depth, depth_view, _glitter, glitter_views, binding, adaptive_params, adaptive }
+        Self { _color, color_view, _depth, depth_view, glitter_views, binding, adaptive_params, tile_buffer, adaptive }
+    }
+
+    fn classify(&self, encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::ComputePipeline) {
+        let Some((group, tiles)) = &self.adaptive else { return; };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Blue Water adaptive tiles"), timestamp_writes: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, group, &[]);
+        pass.dispatch_workgroups(tiles.0, tiles.1, 1);
     }
 }
 
@@ -358,6 +373,10 @@ struct NativePruneKey {
     pvs: Option<OceanPvsTileMask>,
     /// Cells past the sky walls are split into their own range for `r_oceanFarShader`.
     far_split: bool,
+    /// `coast_admission_margin` bits.
+    margin: u32,
+    /// Ninja past its sim's reach at Wave height 0: one flat quad (`OriginalClipmap::local_flat_mesh`).
+    flat: bool,
 }
 
 struct NativePrunedGeometry {
@@ -395,6 +414,40 @@ impl NativePrunedGeometry {
         self.upload_generation += 1;
         self.key = Some(key);
     }
+
+    /// Replace the pool's geometry with its own vertices (drawn instead of the
+    /// shared clipmap vertices by every native pass), growing the buffers as needed.
+    fn upload_local(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
+        vertices: &[blue_water_gpu::geometry::OceanVertex], indices: &[u32]) {
+        if indices.len() > self.index_capacity {
+            self.index_capacity = indices.len().next_power_of_two();
+            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Blue Water local-tile indices"),
+                size: (self.index_capacity * std::mem::size_of::<u32>()) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if vertices.len() > self.local_vertex_capacity || self.local_vertices.is_none() {
+            self.local_vertex_capacity = vertices.len().max(4).next_power_of_two();
+            self.local_vertices = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Blue Water adaptive tile vertices and morph weights"),
+                size: (self.local_vertex_capacity * std::mem::size_of::<blue_water_gpu::geometry::OceanVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        if !indices.is_empty() {
+            queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(indices));
+        }
+        if let Some(buffer) = self.local_vertices.as_ref() {
+            if !vertices.is_empty() {
+                queue.write_buffer(buffer, 0, bytemuck::cast_slice(vertices));
+            }
+        }
+        self.count = indices.len() as u32;
+        self.far_start = self.count;
+    }
 }
 
 /// Everything one native pool prune reads, owned so it can run off the render
@@ -408,6 +461,8 @@ struct NativePruneJob {
     extension: Option<super::sky_extend::SkyExtension>,
     frames: [[f32; 4]; 10],
     extra_pad: f32,
+    /// Coast admission margin (map units, `coast_admission_margin`).
+    margin: f32,
     context: u64,
     key: NativePruneKey,
 }
@@ -423,7 +478,7 @@ struct NativePruneResult {
 impl NativePruneJob {
     fn run(self, mut cache: PruneSegmentCache) -> NativePruneResult {
         let started = std::time::Instant::now();
-        let Self { source, surface, masks, index, pvs_tiles, extension, frames, extra_pad, context, key } = self;
+        let Self { source, surface, masks, index, pvs_tiles, extension, frames, extra_pad, margin, context, key } = self;
         // `r_oceanFarShader`: cells admitted only by the sky extension (past the walls, nothing of the map's
         // own water footprint in them) and the horizon skirt go to the far range.
         let far_split = key.far_split;
@@ -431,8 +486,8 @@ impl NativePruneJob {
             &mut cache, context, key.first, key.outer, &key.steps, key.fill_step, key.horizon, far_split,
             &frames, extra_pad,
             |lo, hi| {
-                let lo = lo.map(|v| v * OCEAN_UNITS_PER_METER);
-                let hi = hi.map(|v| v * OCEAN_UNITS_PER_METER);
+                let lo = lo.map(|v| v * OCEAN_UNITS_PER_METER - margin);
+                let hi = hi.map(|v| v * OCEAN_UNITS_PER_METER + margin);
                 if !super::promoted_ocean_cell_may_contain(
                     surface, &masks, Some(index), pvs_tiles.as_ref(), extension.as_ref(), lo, hi,
                 ) {
@@ -484,9 +539,16 @@ struct SurfaceSlot {
     fill_step: u8,
     pruned: Option<NativePrunedGeometry>,
     submerged: Option<SubmergedGeometry>,
+    wave_clipmap: Option<super::ninja_coast_wave_clipmap::Slot>,
+    wave_clipmap_ready: bool,
     local_state: LocalTileState,
     ready: bool,
     horizon: bool,
+    /// The eye is in water deeper below this pool's lowest trough than the
+    /// underwater cull distance: the fog absorbs the whole surface (and its
+    /// whitewater), so its colour passes skip it. Sim, probe and the
+    /// underwater composite still run.
+    absorbed: bool,
     underwater: UnderwaterBindings,
     caustic_receiver: blue_water_gpu::caustics::Receiver,
     rain: Option<blue_water_gpu::rain_heights::SurfaceRead>,
@@ -497,10 +559,23 @@ struct SurfaceSlot {
     wake_generation: u64,
 }
 
+impl SurfaceSlot {
+    /// Colour passes: ready, admitted (or a qualified horizon) and not absorbed.
+    fn drawn(&self, admitted: u8, index: usize) -> bool {
+        self.ready && !self.absorbed && (admitted >> index & 1 != 0 || self.horizon)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct SurfaceConfig {
     target: (u32, u32, u32, wgpu::TextureFormat),
     reflection_steps: u32,
+    ninja_mode: u8,
+    /// `r_ninjaOceanPreset`: 0 Ocean2, 1 Coast.
+    ninja_preset: u8,
+    ninja_ssr: bool,
+    /// Coast: the shader carries the deep-water (compact Hybrid) pass for r_ninjaCoastDeepWater.
+    ninja_open_sea: bool,
     pixel_detail_mode: u8,
     cost_probe: u32,
     ssr_tiles: bool,
@@ -511,9 +586,27 @@ struct SurfaceConfig {
 }
 
 impl SurfaceConfig {
+    fn same_pipelines(self, other: Self) -> bool {
+        Self { segments: other.segments, levels: other.levels, ..self } == other
+    }
+
+    fn can_reuse_renderer(self, other: Self) -> bool {
+        use blue_water_gpu::shader_composer::{COST_PROBE_SSR, SURFACE_FAST_HYBRID};
+        self.same_pipelines(other) || (self.ninja_mode == 0 && self.pixel_detail_mode == 0 && self.far_variant == 0
+            && self.cost_probe & SURFACE_FAST_HYBRID != 0 && self.cost_probe ^ other.cost_probe == COST_PROBE_SSR
+            && Self { cost_probe: other.cost_probe, ..self }.same_pipelines(other))
+    }
+
     fn new(target: (u32, u32, u32, wgpu::TextureFormat), settings: super::OceanSettings) -> Self {
-        let fast = settings.backend == 2 && !settings.gerstner_active() && settings.hybrid_material > 0;
+        let fast = settings.backend == 2 && settings.hybrid_material > 0;
+        let coast = settings.ninja_requested() && settings.ninja_preset != 0;
         Self { target, reflection_steps: settings.blue_water_ssr_steps,
+            ninja_mode: settings.ninja_mode(),
+            ninja_preset: if settings.ninja_requested() { settings.ninja_preset } else { 0 },
+            ninja_ssr: settings.ninja_requested() && settings.blue_water_ssr,
+            // Always built with Coast so r_ninjaCoastDeepWater toggles live (no pipeline rebuild):
+            // the draw loop picks the deep pass and the shader reads the same switch.
+            ninja_open_sea: coast,
             // Compare actual full-resolution materials. Keep the user's saved
             // coarse/adaptive setting available when returning to material 0.
             pixel_detail_mode: if fast { 0 } else { settings.pixel_detail_mode }, cost_probe: settings.surface_cost_probe
@@ -529,64 +622,52 @@ impl SurfaceConfig {
                     _ => blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS
                         | blue_water_gpu::shader_composer::SURFACE_WAVE_STATISTICS_DEBUG,
                 }}
-                | if settings.gerstner_active() { blue_water_gpu::shader_composer::SURFACE_GODOT_WATER } else { 0 }
                 | if fast { blue_water_gpu::shader_composer::SURFACE_FAST_HYBRID
                     | if settings.hybrid_material == 3 { blue_water_gpu::shader_composer::SURFACE_ADAPTIVE_HYBRID } else { 0 }
                     | if settings.blue_water_ssr { 0 } else { blue_water_gpu::shader_composer::COST_PROBE_SSR }
                 } else { 0 },
             ssr_tiles: settings.blue_water_ssr_tiles,
-            far_variant: match settings.far_shader {
+            far_variant: match if settings.ninja_requested() { 0 } else { settings.far_shader } {
                 0 => 0,
                 1 => blue_water_gpu::shader_composer::FAR_SHADER_DEFAULT,
                 mask => mask,
             },
-            segments: settings.blue_water_mesh_segments, levels: settings.blue_water_mesh_levels }
+            segments: if coast { settings.blue_water_mesh_segments.max(COAST_MESH_SEGMENTS) } else { settings.blue_water_mesh_segments },
+            levels: if coast { COAST_MESH_LEVELS } else { settings.blue_water_mesh_levels } }
     }
 }
 
-/// `r_oceanType 5`'s textures and persistent foam (`blue_water_gpu::godot_water`).
-struct GerstnerResources {
-    foam: blue_water_gpu::godot_water::GodotFoam,
-    /// The contact fields and the field bound to the foam (`Arc` address, index), and its plane (map units).
-    contact_key: Option<(usize, usize)>,
-    contact_level: Option<f32>,
-}
+/// Fluid Ninja Coast draws its WPO (512² capture over 100 m, 19.5 cm cells) on
+/// the clipmap: the default 64 x 6 shape puts 4 m cells at the eye, which
+/// aliases the surf-zone pressure lift away. 128 x 9 gives 0.25 m within
+/// 16 m, 0.5 m to 32 m and 1 m to 64 m (~150k vertices).
+const COAST_MESH_SEGMENTS: u32 = 128;
 
-impl GerstnerResources {
-    /// Bind the contact field of the pool at `plane` (map units) under the camera (grid xz, m): the field on that
-    /// plane whose extent holds the camera, else the nearest such one. None when no field lies on the plane.
-    fn select_contact(&mut self, device: &wgpu::Device, queue: &wgpu::Queue,
-        fields: Option<&super::gerstner_contact::ContactFields>, plane: Option<f32>, camera_xz: [f32; 2]) {
-        let chosen = fields.zip(plane).and_then(|(fields, plane)| {
-            let outside = |field: &super::gerstner_contact::ContactField| (0..2).map(|axis| {
-                let low = field.origin[axis];
-                let high = low + (field.size[axis].max(1) - 1) as f32 * field.cell;
-                (low - camera_xz[axis]).max(camera_xz[axis] - high).max(0.0)
-            }).fold(0.0f32, f32::max);
-            fields.iter().enumerate()
-                .filter(|(_, field)| (field.level - plane).abs() < 1.0)
-                .min_by(|(_, a), (_, b)| outside(a).total_cmp(&outside(b)))
-                .map(|(index, field)| ((std::sync::Arc::as_ptr(fields) as usize, index), field))
-        });
-        let key = chosen.as_ref().map(|(key, _)| *key);
-        if key == self.contact_key { return; }
-        self.contact_key = key;
-        let field = chosen.map(|(_, field)| field);
-        self.contact_level = field.map(|field| field.level);
-        self.foam.set_contact(device, queue, field.map(|field| blue_water_gpu::godot_water::ContactField {
-            texels: &field.texels,
-            size: field.size,
-            origin: field.origin,
-            cell: field.cell,
-        }));
-    }
+/// Fluid Ninja Coast swash runs past the authored water brushes (often a
+/// staircase under the sand): cells within this many map units of the
+/// footprint stay in the mesh, and `ninja_coast_contains`
+/// (ninja_coast_surface.wgsl) admits fragments there by the captured bed's
+/// run-up band (<= 150 UE cm = 60 units above the plane). 400 units covers that
+/// rise on beach slopes down to ~1:7; costadelsol's are steeper.
+const COAST_ADMISSION_MARGIN: f32 = 400.0;
+fn coast_admission_margin(ninja_preset: u8) -> f32 {
+    if ninja_preset != 0 { COAST_ADMISSION_MARGIN } else { 0.0 }
 }
+const COAST_MESH_LEVELS: u8 = 9;
 
 pub(super) struct SurfaceRenderer {
     config: SurfaceConfig,
+    /// First screen row the main scene copy must cover (0 = all): Coast without SSR from
+    /// above every pool reads the scene only below the sea horizon (`water_copy_top_row`).
+    copy_top: u32,
     key: (u32, u32, u32, wgpu::TextureFormat),
     pipeline: OriginalSurfacePipeline,
     clipmap: OriginalClipmap,
+    mesh_job: Option<(u32, u8)>,
+    ssr_job: Option<u32>,
+    /// The other compact Hybrid SSR variant shares this renderer's layouts,
+    /// scene copy, wave field, and mesh. Both directions can switch live.
+    alternate_ssr: Option<(u32, wgpu::RenderPipeline)>,
     reduced: Option<ReducedOcean>,
     scene: SceneCopy,
     /// Upstream's reflection tile table over `scene.depth` (`r_blueWaterSSRTiles`), rebuilt after each scene capture.
@@ -605,10 +686,134 @@ pub(super) struct SurfaceRenderer {
     /// This frame's camera x, z (m) and whether the aerial volume is live, for the spindrift draw later in the frame.
     eye: [f64; 2],
     aerial: bool,
-    gerstner: Option<GerstnerResources>,
+    pub(super) ninja: Option<super::ninja_ocean::Surface>,
+    /// r_ninjaOceanUnderwater pass, built on first submerged use.
+    ninja_underwater: Option<super::ninja_underwater::NinjaUnderwater>,
 }
 
 impl SurfaceRenderer {
+    pub(super) fn ninja_eye_source(&self, index: usize) -> Option<&wgpu::Buffer> {
+        self.slots.get(index)?.as_ref().filter(|slot| slot.ready)?;
+        self.ninja.as_ref()?.eye_source(index)
+    }
+
+    fn ensure_mesh(&mut self, jobs: &mut crate::pipeline_jobs::PipelineJobManager,
+        device: &wgpu::Device, segments: u32, levels: u8,
+    ) {
+        use crate::pipeline_jobs::{hash_config, PipelineJobKey};
+        const FAMILY: &str = "native-ocean-clipmap";
+        let desired = (segments, levels);
+        if desired == (self.config.segments, self.config.levels) {
+            if self.mesh_job.take().is_some() { jobs.cancel_slot(FAMILY, 0); }
+            return;
+        }
+        let key = PipelineJobKey::new(FAMILY, 0, hash_config(&(desired, &self.pipeline.camera_layout)));
+        if let Some(mesh) = jobs.take_ready::<OriginalClipmap>(key) {
+            // The old indices refer to a different vertex layout. Surface
+            // bindings and Coasts' wave, bed and simulation state stay live.
+            self.clipmap = mesh;
+            self.config.segments = segments;
+            self.config.levels = levels;
+            self.mesh_job = None;
+            for slot in self.slots.iter_mut().flatten() {
+                slot.pruned = None;
+                slot.submerged = None;
+                slot.local_state = LocalTileState::default();
+            }
+        } else if self.mesh_job != Some(desired) {
+            self.mesh_job = Some(desired);
+            let device = device.clone();
+            jobs.request(key, "native ocean clipmap geometry", move || OriginalClipmap::new(&device, segments, levels as usize));
+        }
+    }
+
+    fn ensure_ssr_variant(&mut self, jobs: &mut crate::pipeline_jobs::PipelineJobManager,
+        device: &wgpu::Device, cost_probe: u32,
+    ) {
+        use crate::pipeline_jobs::{hash_config, PipelineJobKey};
+        const FAMILY: &str = "native-ocean-ssr";
+        if self.config.cost_probe == cost_probe {
+            if self.ssr_job.take().is_some() { jobs.cancel_slot(FAMILY, 0); }
+            return;
+        }
+        let layout = self.pipeline.full_resolution_layout();
+        let key = PipelineJobKey::new(FAMILY, 0, hash_config(&(cost_probe, layout)));
+        let next = if self.alternate_ssr.as_ref().is_some_and(|(probe, _)| *probe == cost_probe) {
+            self.alternate_ssr.take().map(|(_, pipeline)| pipeline)
+        } else if let Some(result) = jobs.take_ready::<Result<wgpu::RenderPipeline, String>>(key) {
+            match result {
+                Ok(pipeline) => Some(pipeline),
+                Err(error) => { eprintln!("[OCEAN] Compact Hybrid SSR variant unavailable: {error}"); None }
+            }
+        } else {
+            if self.ssr_job != Some(cost_probe) {
+                self.ssr_job = Some(cost_probe);
+                let (device, layout) = (device.clone(), layout.clone());
+                let (color, samples, steps) = (self.key.3, self.key.2, self.config.reflection_steps);
+                jobs.request(key, "compact Hybrid SSR variant", move || {
+                    OriginalSurfacePipeline::full_resolution_variant(&device, &layout, color, samples, steps, cost_probe)
+                });
+            }
+            None
+        };
+        if let Some(pipeline) = next {
+            let probe = std::mem::replace(&mut self.config.cost_probe, cost_probe);
+            let previous = std::mem::replace(&mut self.pipeline.pipeline, pipeline);
+            self.alternate_ssr = Some((probe, previous));
+            self.ssr_job = None;
+        }
+    }
+
+    fn ensure_coast_variants(
+        &mut self, jobs: &mut crate::pipeline_jobs::PipelineJobManager,
+        device: &wgpu::Device, waves: &wgpu::BindGroupLayout, settings: super::OceanSettings,
+    ) {
+        use crate::pipeline_jobs::{hash_config, PipelineJobKey};
+
+        let Some(super::ninja_ocean::Surface::Coast(coast)) = &mut self.ninja else { return; };
+        let hash = hash_config(&coast.draw_layout);
+        let target = self.key;
+        let (steps, ssr) = (self.config.reflection_steps, self.config.ninja_ssr);
+        let layouts = || [self.pipeline.camera_layout.clone(), self.pipeline.surface_layout.clone(),
+            waves.clone(), self.pipeline.environment_layout.clone(), coast.draw_layout.clone()];
+        if settings.ninja_coast_adaptive {
+            Self::ensure_coast_shader(jobs, PipelineJobKey::new("coast-adaptive", 0, hash),
+                "Coast adaptive shading", &mut coast.adaptive, || {
+                    let (device, layouts) = (device.clone(), layouts());
+                    move || super::ninja_coast_adaptive::Pipeline::new(&device, &layouts, target, steps, ssr)
+                });
+        }
+        if settings.ninja_coast_wave_clipmap {
+            Self::ensure_coast_shader(jobs, PipelineJobKey::new("coast-wave-clipmap", 0, hash),
+                "Coast FFT clipmap", &mut coast.wave_clipmap, || {
+                    let (device, layouts) = (device.clone(), layouts());
+                    move || super::ninja_coast_wave_clipmap::Pipeline::new(&device, &layouts, (target.3, target.2, steps, ssr))
+                });
+        }
+        if settings.ninja_coast_fft_late {
+            Self::ensure_coast_shader(jobs, PipelineJobKey::new("coast-late-fft", 0, hash),
+                "Coast late FFT", &mut coast.late_fft, || {
+                    let (device, layouts) = (device.clone(), layouts());
+                    move || super::ninja_coast::late_fft_pipeline(&device, &layouts, (target.3, target.2, steps, ssr))
+                });
+        }
+    }
+
+    fn ensure_coast_shader<T, F>(jobs: &mut crate::pipeline_jobs::PipelineJobManager,
+        key: crate::pipeline_jobs::PipelineJobKey, label: &'static str, shader: &mut Option<Result<T, String>>,
+        prepare: impl FnOnce() -> F,
+    ) where T: Send + 'static, F: FnOnce() -> Result<T, String> + Send + 'static {
+        if shader.is_some() { return; }
+        if let Some(result) = jobs.take_ready::<Result<T, String>>(key) {
+            if let Err(error) = &result {
+                eprintln!("[OCEAN NINJA] {label} unavailable: {error}");
+            }
+            *shader = Some(result);
+        } else if !jobs.is_compiling(key) {
+            jobs.request(key, label, prepare());
+        }
+    }
+
     fn build(device: &wgpu::Device, queue: &wgpu::Queue, waves: &wgpu::BindGroupLayout, config: SurfaceConfig,
         sky_faces: Option<[wgpu::TextureView; 6]>) -> Self {
         let key = config.target;
@@ -616,6 +821,13 @@ impl SurfaceRenderer {
             device, waves, key.3, key.2, config.reflection_steps, config.pixel_detail_mode, config.cost_probe)
             .with_far_variant(device, key.3, key.2, config.reflection_steps, config.pixel_detail_mode,
                 config.cost_probe, config.far_variant);
+        let ninja = if config.ninja_mode != 0 {
+            match super::ninja_ocean::Surface::new(config.ninja_preset != 0, device, queue, waves, &pipeline, key.3, key.2,
+                config.reflection_steps, config.ninja_ssr, config.ninja_mode == 4, config.ninja_open_sea) {
+                Ok(n) => Some(n),
+                Err(e) => { eprintln!("[OCEAN NINJA] pipeline unavailable: {e}; switch material to retry"); None }
+            }
+        } else { None };
         let underwater = UnderwaterPipelines::new(device, waves, key.3, key.2);
         let caustics = blue_water_gpu::caustics::Caustics::new(device, waves, key.3, key.2);
         let clipmap = OriginalClipmap::new(device, config.segments, config.levels as usize);
@@ -624,18 +836,10 @@ impl SurfaceRenderer {
             blue_water_gpu::reflection_tiles::ReflectionTiles::new(device, &scene.depth, (key.0, key.1))
         });
         let foam = FoamMap::new(device, queue);
-        let gerstner = (config.cost_probe & blue_water_gpu::shader_composer::SURFACE_GODOT_WATER != 0).then(|| {
-            let patterns = blue_water_gpu::godot_water::GodotPatterns::new(device, queue, &super::gerstner_patterns::patterns());
-            GerstnerResources {
-                foam: blue_water_gpu::godot_water::GodotFoam::new(device, &patterns),
-                contact_key: None,
-                contact_level: None,
-            }
-        });
         let reduced = (config.pixel_detail_mode != 0).then(|| ReducedOcean::new(
             device, pipeline.reconstruct_layout.as_ref().expect("reconstruction layout"),
             pipeline.adaptive_classify.as_ref().map(|(_, layout)| layout),
-            key.0, key.1, pixel_factor(config.pixel_detail_mode)));
+            key.0, key.1, pixel_factor(config.pixel_detail_mode), true));
         let map_environment = sky_faces.as_ref().map(|faces| {
             let mut environment = blue_water_gpu::map_environment::MapEnvironment::new(device);
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -645,9 +849,10 @@ impl SurfaceRenderer {
             queue.submit([encoder.finish()]);
             environment
         });
-        Self { config, key, pipeline, underwater, caustics, clipmap, scene, reflection_tiles, foam, reduced,
+        Self { config, copy_top: 0, key, pipeline, underwater, caustics, clipmap, mesh_job: None, ssr_job: None, alternate_ssr: None,
+            scene, reflection_tiles, foam, reduced,
             underwater_slot: None, rain_heights: None, spindrift: None, eye: [0.0; 2],
-            aerial: false, map_environment, sky_faces, external_sky: None, gerstner,
+            aerial: false, map_environment, sky_faces, external_sky: None, ninja, ninja_underwater: None,
             slots: std::array::from_fn(|_| None) }
     }
 }
@@ -699,6 +904,37 @@ pub(super) fn surface_camera(
     }
 }
 
+/// First screen row a horizontal water plane can cover from an eye above it: the sea
+/// horizon (roll-free, as `surface_camera`), less 3% of the height for crests and lens
+/// jitter. 0 when the view looks steeply down or the horizon is off the top.
+fn water_copy_top_row(camera: &crate::camera::Camera, width: u32, height: u32) -> u32 {
+    let (w, h) = (width.max(1) as f32, height.max(1) as f32);
+    let forward = camera.forward();
+    let level = Vec3::new(forward.x, 0.0, forward.z);
+    if level.length() < 1e-3 { return 0; }
+    let level = level.normalize();
+    let fov = camera.fov_y_for_viewport(width.max(1), height.max(1));
+    let view = glam::camera::rh::view::look_to_mat4(Vec3::ZERO, forward, Vec3::Y);
+    let projection = glam::camera::rh::proj::directx::perspective(fov, w / h, 1000.0, 1.0);
+    let half = ((fov * 0.5).tan() * w / h).atan() + 0.1;
+    let mut top = -1.0f32;
+    for yaw in [-half, 0.0, half] {
+        let d = glam::Quat::from_rotation_y(yaw) * level;
+        let clip = projection * view * d.extend(0.0);
+        if clip.w <= 1e-4 { return 0; }
+        top = top.max(clip.y / clip.w);
+    }
+    ((1.0 - top) * 0.5 * h - 0.03 * h).floor().clamp(0.0, h) as u32
+}
+
+/// How far (JKA units) the near plane's corners reach from the eye.
+pub(crate) fn near_plane_reach(camera: &crate::camera::Camera, width: u32, height: u32) -> f32 {
+    let (width, height) = (width.max(1), height.max(1));
+    let aspect = width as f32 / height as f32;
+    let tan_half_fov_y = (camera.fov_y_for_viewport(width, height) * 0.5).tan();
+    camera.near_distance() * (1.0 + tan_half_fov_y * (1.0 + aspect * aspect).sqrt())
+}
+
 impl OceanGpu {
     /// Prepare the native surface independently of the atmosphere. Until this
     /// returns true, the host must draw the authored water and its optics.
@@ -713,14 +949,32 @@ impl OceanGpu {
         use crate::pipeline_jobs::{hash_config, PipelineJobKey};
         if !matches!(self.settings.backend, 1 | 2) {
             jobs.cancel_slot("native-ocean-surface", 0);
+            jobs.cancel_slot("native-ocean-clipmap", 0);
+            jobs.cancel_slot("native-ocean-ssr", 0);
+            jobs.cancel_slot("coast-wave-clipmap", 0);
+            jobs.cancel_slot("coast-adaptive", 0);
+            jobs.cancel_slot("coast-late-fft", 0);
             return true;
         }
         let config = SurfaceConfig::new(target, self.settings);
         let Some(blue) = self.blue_water.as_mut() else { return false; };
-        if blue.original_surface.as_ref().is_some_and(|surface| surface.config == config) {
+        if let Some(surface) = blue.original_surface.as_mut().filter(|surface| surface.config.can_reuse_renderer(config)) {
+            surface.ensure_mesh(jobs, device, config.segments, config.levels);
+            surface.ensure_ssr_variant(jobs, device, config.cost_probe);
+            if self.settings.ninja_coast_deep_water > 0.0 && (self.settings.ninja_coast_adaptive
+                || self.settings.ninja_coast_wave_clipmap || self.settings.ninja_coast_fft_late)
+            {
+                surface.ensure_coast_variants(jobs, device, blue.surface_waves.layout(), self.settings);
+            }
             return true;
         }
-        blue.original_surface = None;
+        if blue.original_surface.take().is_some() {
+            jobs.cancel_slot("native-ocean-clipmap", 0);
+            jobs.cancel_slot("native-ocean-ssr", 0);
+            jobs.cancel_slot("coast-wave-clipmap", 0);
+            jobs.cancel_slot("coast-adaptive", 0);
+            jobs.cancel_slot("coast-late-fft", 0);
+        }
         // The layout handle also identifies the wave resource generation. A
         // late result from a recreated ocean cannot replace the new surface.
         let key = PipelineJobKey::new("native-ocean-surface", 0,
@@ -746,13 +1000,14 @@ impl OceanGpu {
     pub(crate) fn original_surface_ready(&self, target: (u32, u32, u32, wgpu::TextureFormat)) -> bool {
         !matches!(self.settings.backend, 1 | 2) || self.blue_water.as_ref()
             .and_then(|blue| blue.original_surface.as_ref())
-            .is_some_and(|surface| surface.config == SurfaceConfig::new(target, self.settings))
+            .is_some_and(|surface| surface.config.can_reuse_renderer(SurfaceConfig::new(target, self.settings)))
     }
 
     pub(crate) fn native_surface_available(&self) -> bool {
         !matches!(self.settings.backend, 1 | 2) || self.blue_water.as_ref()
             .and_then(|blue| blue.original_surface.as_ref())
-            .is_some_and(|surface| surface.config == SurfaceConfig::new(surface.key, self.settings))
+            .is_some_and(|surface| surface.config.can_reuse_renderer(SurfaceConfig::new(surface.key, self.settings))
+                && (surface.config.ninja_mode == 0 || surface.slots.iter().flatten().any(|slot|slot.ready)))
     }
     /// Godot's visible_tiles distinguishes unavailable mask data (None, keep
     /// conservative) from known water with zero tiles in this cluster (reject).
@@ -779,6 +1034,8 @@ impl OceanGpu {
         sky_faces: Option<[&wgpu::TextureView; 6]>,
         water_distance: &wgpu::TextureView,
         camera_water_surface: f32,
+        // Pool the camera stands clearly above (`CameraWater::Air`, renderer/environment/weather.rs).
+        air_slot: Option<usize>,
         sky_environment: Option<&::blue_water_sky::EnvironmentMap>,
         sky_light: Option<::blue_water_sky::CelestialLight>,
         sky_reflection_gains: [f32; 2], // [original, compact] (sky atlas only)
@@ -794,11 +1051,13 @@ impl OceanGpu {
         lake_planar: Option<(&wgpu::TextureView, &wgpu::Sampler, &[Option<[f32; 4]>; 4])>,
         lake_submerged: Option<(&wgpu::TextureView, &wgpu::TextureView)>,
         player_interaction: Option<&super::interaction::RenderResources>,
+        ninja_actors: &[jka_river::river_ninja::ActorSample],
+        ninja_load: impl FnOnce(bool) -> Result<super::NinjaOceanAssets,String>,
     ) {
         if self.settings.backend == 3 {
             self.prepare_lakes(device, queue, encoder, camera, key, jitter, dt, frame, pvs, sky_pvs_mask,
                 sky_faces, sky_environment, aerial, cloud, seconds, lake_planar,
-                lake_submerged, volumes, camera_water_surface);
+                lake_submerged, volumes, camera_water_surface, ninja_actors, ninja_load);
             return;
         }
         let Some(blue) = self.blue_water.as_mut() else {
@@ -812,7 +1071,9 @@ impl OceanGpu {
         // Only present while Godot caustics can reach a receiver; otherwise the
         // surface reads its own scene copy (identical when no caustic applies).
         let surface_color = godot_receiver_color.unwrap_or(&renderer.scene.color);
-        if show_wireframe {
+        if let Some(ninja) = &mut renderer.ninja {
+            ninja.begin(device, self.elapsed, ninja_actors, show_wireframe, ninja_load);
+        } else if show_wireframe && renderer.config.ninja_mode == 0 {
             renderer.pipeline.ensure_wireframe(device, key.3, key.2);
         }
         if show_waterline_marker {
@@ -836,6 +1097,13 @@ impl OceanGpu {
             f64::from(camera.position.x / OCEAN_UNITS_PER_METER),
             f64::from(camera.position.z / OCEAN_UNITS_PER_METER),
         ];
+        // Coast without SSR samples the copied scene only through its own water pixels
+        // (and their small refraction offsets): from above every pool, nothing above the horizon.
+        let highest = self.promoted_surfaces.iter().map(|s| s.descriptor.surface.plane_height).fold(f32::NEG_INFINITY, f32::max);
+        renderer.copy_top = if renderer.config.ninja_mode != 0 && renderer.config.ninja_preset != 0
+            && !renderer.config.ninja_ssr && camera.position.y - highest > 3.0 * OCEAN_UNITS_PER_METER {
+            water_copy_top_row(camera, key.0, key.1)
+        } else { 0 };
         renderer.aerial = aerial.is_some();
         renderer.caustics.write(
             queue,
@@ -846,6 +1114,7 @@ impl OceanGpu {
         );
         for slot in renderer.slots.iter_mut().flatten() {
             slot.ready = false;
+            slot.wave_clipmap_ready = false;
         }
         renderer.underwater_slot = None;
         let mut underwater_score = f32::INFINITY;
@@ -868,34 +1137,13 @@ impl OceanGpu {
         let mut wake_stepped = false;
         // Hybrid r_hybridUnderwaterMode 4 below the surface: every pool's mesh is
         // this clipmap with `submerged_mesh`'s sparse indices, shaded by Godot.
-        let hybrid_submerged = self.settings.backend == 2 && self.settings.blue_water_underwater_mode == 4
+        let hybrid_submerged = self.settings.uses_godot_submerged_mesh()
             && camera_water_surface > crate::renderer::NO_WATER_SURFACE;
         // Past this the water has absorbed everything (metres): the culling distance, as world geometry uses.
         let absorbed = match self.settings.underwater_cull_distance() {
             distance if distance > 0.0 => distance,
             _ => self.settings.optics.absorption_distance() * 2.0 * super::optics::MIN_CULL_MULTIPLE,
         } / OCEAN_UNITS_PER_METER;
-        // `r_oceanType 5`'s persistent foam: one capture around the camera, against the nearest pool's plane.
-        let gerstner_foam = renderer.gerstner.as_mut().map(|gerstner| {
-            let nearest = self.promoted_surfaces.iter()
-                .filter(|promoted| promoted.descriptor.index < OCEAN_MAX_SURFACES)
-                .min_by(|a, b| (camera.position.y - a.descriptor.surface.plane_height).abs()
-                    .total_cmp(&(camera.position.y - b.descriptor.surface.plane_height).abs()));
-            let plane = nearest.map(|promoted| promoted.descriptor.surface.plane_height);
-            let camera_xz = [camera.position.x / OCEAN_UNITS_PER_METER, camera.position.z / OCEAN_UNITS_PER_METER];
-            gerstner.select_contact(device, queue, self.gerstner_contact.as_ref(), plane, camera_xz);
-            gerstner.foam.update(queue, encoder, &blue_water_gpu::godot_water::FoamFrame {
-                camera_xz,
-                seconds: self.elapsed,
-                delta: dt,
-                scale: self.settings.gerstner_wave_scale,
-                enabled: [self.settings.gerstner_foam & 1 != 0, self.settings.gerstner_foam & 2 != 0],
-                rate: self.settings.gerstner_foam_rate,
-                plane_above_field: plane.zip(gerstner.contact_level)
-                    .map(|(plane, level)| (plane - level) / OCEAN_UNITS_PER_METER),
-            })
-        });
-        let gerstner_views = renderer.gerstner.as_ref().map(|gerstner| gerstner.foam.views());
         // The reflection tiles' floor (`reflection_tiles::ReflectionTiles::set_floor`): the first drawn pool's camera
         // (its ocean space the depth copy is read in), its plane, and the lowest plane less its trough bound (units).
         let mut tile_floor: Option<([[f32; 4]; 4], f32, f32)> = None;
@@ -942,7 +1190,15 @@ impl OceanGpu {
             } else {
                 distance
             };
-            let detail = renderer.clipmap.clipmap().detail(f64::from(standoff));
+            // r_ninjaCoastFarMeshLevels: past the Coast sim's reach, read the clipmap as if
+            // 2^n farther away (its finest rings dropped; the morph stays continuous).
+            let mesh_bias = renderer.ninja.as_ref().map_or(0, |ninja| ninja.far_mesh_levels(index));
+            // Ninja's mesh follows one value. Within the shore sim's reach the sim
+            // sets it (full mesh). Past it only the FFT moves vertices, so Wave
+            // height drives the ring detail, and at 0 the pool is one flat quad.
+            let ninja_far = self.settings.ninja_requested()
+                && renderer.ninja.as_ref().is_some_and(|ninja| !ninja.sim_displaces(index));
+            let detail = renderer.clipmap.clipmap().detail(f64::from(standoff) * f64::from(1u32 << mesh_bias));
             if !wake_stepped {
                 wake_stepped = true;
                 if let Some(wake) = blue.wake.as_mut().filter(|wake| wake.busy()) {
@@ -1033,9 +1289,12 @@ impl OceanGpu {
                     fill_step: 1,
                     pruned: None,
                     submerged: None,
+                    wave_clipmap: None,
+                    wave_clipmap_ready: false,
                     local_state: LocalTileState::default(),
                     ready: false,
                     horizon: false,
+                    absorbed: false,
                 }
             });
             if sky_changed || new_slot || external_sky_changed {
@@ -1087,7 +1346,6 @@ impl OceanGpu {
             );
             slot.bindings.set_player_interaction(device, &renderer.pipeline,
                 player_interaction.map(|field| (&field.view, &field.uniform)));
-            slot.bindings.set_godot_water(device, &renderer.pipeline, gerstner_views.as_ref());
             if slot.wake_generation != slot.bindings.wake_generation() {
                 slot.wake_generation = slot.bindings.wake_generation();
                 slot.underwater = UnderwaterBindings::new(
@@ -1197,9 +1455,8 @@ impl OceanGpu {
                 ((closest[0] - point[0]).powi(2) + (closest[1] - point[1]).powi(2)).sqrt();
             // Include the near plane's reach across an outline. The probe
             // still checks each ray against the exact GPU admission mask.
-            let near_reach = camera.near_distance()
-                * (1.0 + surface_view.tan_half_fov_y * (1.0 + surface_view.aspect.powi(2)).sqrt());
-            let analytic_height = f64::from(super::hybrid_analytic_height(&promoted.settings, self.elapsed));
+            let near_reach = near_plane_reach(camera, key.0, key.1);
+            let analytic_height = f64::from(super::hybrid_swell_uniform(&promoted.settings, self.elapsed)[0][3]);
             let crest_bound = (2.0 * blue.field.input_parameters().significant_height + analytic_height + 8.1) as f32;
             let trough = source.plane_height - crest_bound * OCEAN_UNITS_PER_METER;
             tile_floor = Some(match tile_floor {
@@ -1210,6 +1467,13 @@ impl OceanGpu {
                 && surface_view.position_time[1]
                 <= crest_bound + near_reach / OCEAN_UNITS_PER_METER
                 && (horizontal <= near_reach || extension.is_some_and(|sky| sky.contains(point)));
+            // `near_surface` bounds the water by the pool's tallest possible crest (2 Hs), so a tall sea kept
+            // the underwater pass (scene copy, water distance, full-screen composite: 1.9 ms at 10 m, 2.6 ms
+            // at 29 m on costadelsol) running over open air, where it changes no pixel. The renderer's
+            // camera classification rules the near plane out while it stands clearly above this pool.
+            let eye_clear = air_slot == Some(index);
+            slot.absorbed = camera_water_surface > crate::renderer::NO_WATER_SURFACE
+                && trough - camera.position.y > absorbed * OCEAN_UNITS_PER_METER;
             slot.probe_due = new_slot || near_surface || slot.probe_active;
             slot.probe_active = near_surface;
             slot.envelope = [
@@ -1219,7 +1483,7 @@ impl OceanGpu {
                 0.0,
             ];
             prefix[23][3] = if near_surface { 1.0 } else { 0.0 };
-            if promoted.settings.backend == 2 && (promoted.settings.hybrid_breaker > 0 || promoted.settings.gerstner_active()) {
+            if promoted.settings.backend == 2 && promoted.settings.hybrid_breaker > 0 {
                 // The original GPU probe inverts the unlimited field. Once
                 // the horizontal map changes, use Hybrid's native eye solve
                 // (the same classifier as tint/mesh choice) for the underside.
@@ -1241,16 +1505,19 @@ impl OceanGpu {
             slot.bindings.write_surface_prefix(queue, &prefix);
             slot.bindings.write_hybrid_swell(queue,
                 &super::hybrid_swell_uniform(&promoted.settings, self.elapsed));
+            let fast_foam = if renderer.config.ninja_open_sea {
+                self.settings.hybrid_fast_foam * self.settings.ninja_coast_deep_foam
+            } else {
+                self.settings.hybrid_fast_foam
+            };
             slot.bindings.write_breaker_mode(queue,
                 if promoted.settings.backend == 2 { promoted.settings.hybrid_breaker } else { 0 },
-                self.settings.hybrid_fast_foam, self.settings.hybrid_fast_foam_detail,
+                fast_foam, self.settings.hybrid_fast_foam_detail,
                 // Material 0 is the reference: do not alter its default night
                 // appearance. The compact GGX material needs a separate night
                 // correction for the overly broad environment reflection lobe.
                 sky_reflection_gains[usize::from(renderer.config.cost_probe
                     & blue_water_gpu::shader_composer::SURFACE_FAST_HYBRID != 0)]);
-            slot.bindings.write_godot_water(queue,
-                &super::gerstner_uniform(&promoted.settings, self.elapsed, gerstner_foam.unwrap_or([0.0; 4])));
             let sun = self.environment.sun_direction_intensity;
             let tint = self.environment.sun_color;
             let (direction, color) = sky_light.map_or(
@@ -1297,10 +1564,6 @@ impl OceanGpu {
             } else {
                 (camera.position.y - source.plane_height).abs() + 1.0
             };
-            if near_surface && score < underwater_score {
-                underwater_score = score;
-                renderer.underwater_slot = Some(index);
-            }
             if sky_environment.is_none() {
                 slot.bindings
                     .write_sun(queue, direction, color, self.environment.map_sun_intensity());
@@ -1317,12 +1580,15 @@ impl OceanGpu {
                 self.settings.screen_lod_pixels,
             );
             slot.fill_step = 1;
-            if self.settings.adaptive_mesh == 1 {
-                let analytic = super::hybrid_mesh_swell(&promoted.settings, self.elapsed);
+            if self.settings.adaptive_mesh == 1 || ninja_far {
+                let analytic = super::hybrid_swell_uniform(&promoted.settings, self.elapsed)[0];
                 let waves = self.settings.blue_water_waves;
                 // Only the FFT component can drive the FFT curvature bound;
-                // at a pure Gerstner blend use the analytic curvature instead.
-                let fft_weight = if self.settings.backend == 2 {
+                // at a pure analytic-swell blend use the analytic curvature instead.
+                // Ninja runs the full FFT exactly when Wave height > 0.
+                let fft_weight = if self.settings.ninja_requested() {
+                    if self.settings.ninja_fft() { 1.0 } else { 0.0 }
+                } else if self.settings.backend == 2 {
                     self.settings.hybrid_fft_blend.clamp(0.0, 1.0)
                 } else { 1.0 };
                 let (steps, fill_step) = curvature_mesh_steps(
@@ -1360,6 +1626,10 @@ impl OceanGpu {
                 [snap(frame[0]), snap(frame[1]), frame[2], frame[3]]
             });
             let view_focal = key_view_height_focal(key.1, camera.fov_y_for_viewport(key.0,key.1));
+            // Nothing displaces this pool: no FFT (Wave height 0), no sim share, no wake.
+            let flat = ninja_far && !self.settings.ninja_fft()
+                && !blue.wake.as_ref().is_some_and(|wake| wake.busy());
+            let coast_margin = coast_admission_margin(renderer.config.ninja_preset);
             let key = NativePruneKey {
                 centres: frames.map(|frame| [frame[0].to_bits(), frame[1].to_bits()]),
                 first: slot.first,
@@ -1371,6 +1641,8 @@ impl OceanGpu {
                 mesh_mode: self.settings.adaptive_mesh,
                 pvs: if extension.is_none() { pvs[index] } else { None },
                 far_split: renderer.config.far_variant != 0 && extension.is_some(),
+                margin: coast_margin.to_bits(),
+                flat,
             };
             let geometry = slot.pruned.get_or_insert_with(|| NativePrunedGeometry {
                 buffer: device.create_buffer(&wgpu::BufferDescriptor {
@@ -1395,8 +1667,8 @@ impl OceanGpu {
             // A finished background prune lands here, before deciding on a new one.
             if let Some(job) = geometry.prune_job.as_ref() {
                 match job.try_recv() {
-                    // r_oceanAdaptiveMesh 2 owns the buffers now; drop a stale pruned set.
-                    Ok(result) if self.settings.adaptive_mesh == 2 => {
+                    // r_oceanAdaptiveMesh 2 or the flat quad owns the buffers now; drop a stale pruned set.
+                    Ok(result) if self.settings.adaptive_mesh == 2 || flat => {
                         geometry.prune_job = None;
                         geometry.prune_cache = Some(result.cache);
                     }
@@ -1423,13 +1695,28 @@ impl OceanGpu {
                     }
                 }
             }
-            if self.settings.adaptive_mesh != 2 && geometry.key.as_ref() != Some(&key) && geometry.prune_job.is_none() {
+            if flat && geometry.key.as_ref() != Some(&key) {
+                let bounds = extension.is_none().then(|| [
+                    source.minimum[0] / OCEAN_UNITS_PER_METER,
+                    source.minimum[1] / OCEAN_UNITS_PER_METER,
+                    source.maximum[0] / OCEAN_UNITS_PER_METER,
+                    source.maximum[1] / OCEAN_UNITS_PER_METER,
+                ]);
+                let (vertices, indices) = renderer.clipmap.local_flat_mesh(
+                    &frames, bounds, slot.horizon, PRUNE_QUANTUM_METRES + coast_margin / OCEAN_UNITS_PER_METER);
+                geometry.upload_local(device, queue, &vertices, &indices);
+                geometry.local_counts = [0; 5];
+                geometry.baseline_count = None;
+                geometry.key = Some(key.clone());
+                geometry.upload_generation += 1;
+            }
+            if !flat && self.settings.adaptive_mesh != 2 && geometry.key.as_ref() != Some(&key) && geometry.prune_job.is_none() {
                 // Only levels whose snapped frame moved are re-pruned (`PruneSegmentCache`); the cell test
                 // itself is keyed by everything else it reads.
                 let context = {
                     use std::hash::{Hash, Hasher};
                     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    (index, key.pvs, key.far_split, key.sky_extension).hash(&mut hasher);
+                    (index, key.pvs, key.far_split, key.sky_extension, key.margin).hash(&mut hasher);
                     (std::sync::Arc::as_ptr(&self.masks) as usize).hash(&mut hasher);
                     format!("{source:?}{extension:?}").hash(&mut hasher);
                     hasher.finish()
@@ -1443,6 +1730,7 @@ impl OceanGpu {
                     extension,
                     frames,
                     extra_pad: PRUNE_QUANTUM_METRES,
+                    margin: coast_margin,
                     context,
                     key: key.clone(),
                 };
@@ -1480,7 +1768,7 @@ impl OceanGpu {
                     }
                 }
             }
-            if self.settings.adaptive_mesh == 2 &&
+            if !flat && self.settings.adaptive_mesh == 2 &&
                 (geometry.key.as_ref() != Some(&key)
                     || self.elapsed < geometry.last_local_upload
                     || self.elapsed - geometry.last_local_upload >= 1.0/60.0)
@@ -1490,7 +1778,7 @@ impl OceanGpu {
                 // LOD/morph weight. The exact same buffer is used for shaded,
                 // wireframe, reflections and low-res reconstruction passes.
                 let waves = self.settings.blue_water_waves;
-                let swell = super::hybrid_mesh_swell(&promoted.settings, self.elapsed);
+                let swell = super::hybrid_swell_uniform(&promoted.settings, self.elapsed)[0];
                 let fft_weight = if self.settings.backend == 2 {
                     self.settings.hybrid_fft_blend.clamp(0.0, 1.0)
                 } else { 1.0 };
@@ -1513,8 +1801,8 @@ impl OceanGpu {
                     slot.first, slot.outer, slot.horizon, &frames,
                     &slot.ring_steps, hint, &mut slot.local_state,
                     |lo, hi| {
-                        let lo = lo.map(|v| v * OCEAN_UNITS_PER_METER);
-                        let hi = hi.map(|v| v * OCEAN_UNITS_PER_METER);
+                        let lo = lo.map(|v| v * OCEAN_UNITS_PER_METER - coast_margin);
+                        let hi = hi.map(|v| v * OCEAN_UNITS_PER_METER + coast_margin);
                         super::promoted_ocean_cell_may_contain(
                             source, &self.masks, Some(index),
                             if extension.is_some() { None } else { pvs[index].as_ref() },
@@ -1531,37 +1819,10 @@ impl OceanGpu {
                         + vertices.len() * std::mem::size_of::<blue_water_gpu::geometry::OceanVertex>()) as u64;
                 }
                 let upload_started = profile_cpu.then(std::time::Instant::now);
-                if indices.len() > geometry.index_capacity {
-                    geometry.index_capacity = indices.len().next_power_of_two();
-                    geometry.buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("Blue Water local-tile indices"),
-                        size: (geometry.index_capacity * std::mem::size_of::<u32>()) as u64,
-                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
-                }
-                if vertices.len() > geometry.local_vertex_capacity {
-                    geometry.local_vertex_capacity = vertices.len().next_power_of_two();
-                    geometry.local_vertices = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("Blue Water adaptive tile vertices and morph weights"),
-                        size: (geometry.local_vertex_capacity * std::mem::size_of::<blue_water_gpu::geometry::OceanVertex>()) as u64,
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    }));
-                }
-                if !indices.is_empty() {
-                    queue.write_buffer(&geometry.buffer, 0, bytemuck::cast_slice(&indices));
-                }
-                if let Some(buffer) = geometry.local_vertices.as_ref() {
-                    if !vertices.is_empty() {
-                        queue.write_buffer(buffer, 0, bytemuck::cast_slice(&vertices));
-                    }
-                }
+                geometry.upload_local(device, queue, &vertices, &indices);
                 if let Some(started) = upload_started {
                     mesh_perf.upload_ms += started.elapsed().as_secs_f64() * 1000.0;
                 }
-                geometry.count = indices.len() as u32;
-                geometry.far_start = geometry.count;
                 geometry.local_counts = counts;
                 if geometry.key.as_ref() != Some(&key) {
                     geometry.baseline_count = None;
@@ -1578,8 +1839,8 @@ impl OceanGpu {
                     slot.first, slot.outer, &[1u8; 10], 1, slot.horizon,
                     &frames, PRUNE_QUANTUM_METRES,
                     |lo, hi| {
-                        let lo = lo.map(|v| v * OCEAN_UNITS_PER_METER);
-                        let hi = hi.map(|v| v * OCEAN_UNITS_PER_METER);
+                        let lo = lo.map(|v| v * OCEAN_UNITS_PER_METER - coast_margin);
+                        let hi = hi.map(|v| v * OCEAN_UNITS_PER_METER + coast_margin);
                         super::promoted_ocean_cell_may_contain(
                             source, &self.masks, Some(index),
                             if extension.is_some() { None } else { pvs[index].as_ref() },
@@ -1633,7 +1894,7 @@ impl OceanGpu {
                             source, &self.masks, Some(index),
                             if extension.is_some() { None } else { pvs[index].as_ref() },
                             extension.as_ref(),
-                            lo.map(|v| v * OCEAN_UNITS_PER_METER), hi.map(|v| v * OCEAN_UNITS_PER_METER),
+                            lo.map(|v| v * OCEAN_UNITS_PER_METER - coast_margin), hi.map(|v| v * OCEAN_UNITS_PER_METER + coast_margin),
                         ),
                     );
                     if indices.len() > submerged.capacity {
@@ -1673,11 +1934,54 @@ impl OceanGpu {
             } else if let Some(submerged) = slot.submerged.as_mut() {
                 submerged.key = None;
             }
-            slot.ready = true;
+            if let Some(ninja) = &mut renderer.ninja {
+                let waves = blue.shore_waves[index].as_ref().unwrap_or(&blue.surface_waves).group(&blue.field);
+                ninja.prepare(device, queue, encoder, index, waves,
+                    centre.map(|v| v as f32), source.plane_height,
+                    [surface_view.position_time[0],surface_view.position_time[1],surface_view.position_time[2]],
+                    self.elapsed, renderer.clipmap.clipmap().cell(slot.first) as f32, &self.masks);
+                let clipmap_enabled = self.settings.ninja_coast_wave_clipmap
+                    && self.settings.ninja_coast_deep_water > 0.0
+                    && self.settings.ninja_coast_debug == 0
+                    && self.settings.ninja_coast_shore_depth > 0.0
+                    && self.settings.ninja_coast_cost_probe & 16384 == 0
+                    && !slot.absorbed
+                    && ninja.group(index).is_some();
+                if let (true, super::ninja_ocean::Surface::Coast(coast)) = (clipmap_enabled, &*ninja) {
+                    if let Some(Ok(pipeline)) = coast.wave_clipmap.as_ref() {
+                        let clipmap = slot.wave_clipmap.get_or_insert_with(|| {
+                            super::ninja_coast_wave_clipmap::Slot::new(device, pipeline, slot.bindings.hybrid_swell_buffer())
+                        });
+                        clipmap.encode(queue, encoder, pipeline, waves, blue.wave_revision,
+                            [surface_view.position_time[0], surface_view.position_time[2]],
+                            (self.settings.ninja_coast_fft_detail, self.settings.ninja_coast_shore_clipmap));
+                        slot.wave_clipmap_ready = true;
+                    }
+                }
+                if slot.probe_due {
+                    ninja.encode_probe(device,queue,encoder,index,waves,&surface_view,
+                        renderer.clipmap.clipmap().cell(slot.first) as f32,near_surface,slot.bindings.boundary_buffer(),slot.bindings.underwater_probe());
+                }
+            }
+            slot.ready = renderer.config.ninja_mode == 0
+                || renderer.ninja.as_ref().and_then(|ninja| ninja.group(index)).is_some();
+            if slot.ready && near_surface && !eye_clear && score < underwater_score {
+                underwater_score = score;
+                renderer.underwater_slot = Some(index);
+            }
         }
         if let Some(reduced) = renderer.reduced.as_ref().filter(|reduced| reduced.adaptive.is_some()) {
             let contrast = self.settings.pixel_detail_contrast.clamp(0.001, 0.5);
             queue.write_buffer(&reduced.adaptive_params, 0, bytemuck::cast_slice(&[contrast, 0.0f32, 0.0, 0.0]));
+        }
+        if self.settings.ninja_coast_adaptive {
+            if let Some(super::ninja_ocean::Surface::Coast(coast)) = &renderer.ninja {
+                if let Some(Ok(adaptive)) = &coast.adaptive {
+                    let contrast = self.settings.pixel_detail_contrast.clamp(0.001, 0.5);
+                    let debug = f32::from(u8::from(self.settings.pixel_detail_debug));
+                    queue.write_buffer(&adaptive.target.adaptive_params, 0, bytemuck::cast_slice(&[contrast, 1.0, debug, 0.0]));
+                }
+            }
         }
         if let Some(tiles) = renderer.reflection_tiles.as_ref() {
             // Only while the eye is above the floor (see `reflection_tiles`); otherwise every surface is marked.
@@ -1697,8 +2001,7 @@ impl OceanGpu {
         let mut counted = 0u32;
         let mut missing = 0u32;
         for (index, slot) in renderer.slots.iter().enumerate() {
-            let Some(slot) = slot.as_ref().filter(|slot| slot.ready &&
-                (admitted >> index & 1 != 0 || slot.horizon)) else { continue; };
+            let Some(slot) = slot.as_ref().filter(|slot| slot.drawn(admitted, index)) else { continue; };
             let Some(mesh) = slot.pruned.as_ref() else { missing += 1; continue; };
             if let Some(full_count) = mesh.baseline_count {
                 baseline += u64::from(full_count) / 3;
@@ -1726,12 +2029,30 @@ impl OceanGpu {
         if out.is_empty() { "no ready native water pools".to_owned() } else { out }
     }
 
-    /// True once the native pipeline owns the surface draw, even if a pool
-    /// was rejected by this frame's PVS. `original_surface_triangles(None)`
-    /// must never trigger a fallback to the old Godot indices in that case.
+    /// Legacy native pipelines own eligible BSP water as soon as the surface
+    /// renderer is prepared. Ocean2 is different: shader setup does NOT imply
+    /// that its per-pool textures/field exist or have a drawable bind group.
     pub fn original_surface_prepared(&self) -> bool {
         if self.settings.backend == 3 { return self.lakes.is_some(); }
         self.blue_water.as_ref().is_some_and(|blue| blue.original_surface.is_some())
+    }
+
+    /// Pools with a prepared Ocean2 replacement for their authored water.
+    pub(crate) fn ninja_surface_owners(&self) -> u8 {
+        let Some(surface) = self.blue_water.as_ref()
+            .and_then(|blue| blue.original_surface.as_ref()) else { return 0; };
+        if surface.config.ninja_mode == 0 {
+            return 0;
+        }
+        surface.slots.iter().enumerate().fold(0, |owners, (index, slot)| {
+            if slot.as_ref().is_some_and(|slot| slot.ready
+                && slot.pruned.as_ref().is_some_and(|mesh| mesh.count != 0))
+            {
+                owners | (1u8 << index)
+            } else {
+                owners
+            }
+        })
     }
 
     pub fn original_surface_triangles(&self, index: usize) -> Option<u64> {
@@ -1750,7 +2071,16 @@ impl OceanGpu {
         self.blue_water.as_ref()
             .and_then(|blue| blue.original_surface.as_ref())
             .is_some_and(|renderer| renderer.slots.iter().flatten()
-                .any(|slot| slot.ready && slot.caustic_receiver.enabled))
+                .any(|slot| slot.ready && slot.caustic_receiver.enabled)
+                || Self::coast_wet_receiver(renderer).is_some_and(|(ninja, _)| renderer.slots.iter().enumerate()
+                    .any(|(i, slot)| slot.as_ref().is_some_and(|s| s.ready) && ninja.group(i).is_some() && ninja.wet_visible(i))))
+    }
+
+    /// The Fluid Ninja Coast landscape wet-map receiver, when Coast draws.
+    fn coast_wet_receiver(renderer: &SurfaceRenderer) -> Option<(&super::ninja_ocean::Surface, &wgpu::RenderPipeline)> {
+        if renderer.config.ninja_mode == 0 { return None; }
+        let ninja = renderer.ninja.as_ref()?;
+        ninja.wet().map(|pipeline| (ninja, pipeline))
     }
 
     pub fn apply_original_caustics(
@@ -1766,12 +2096,8 @@ impl OceanGpu {
             .and_then(|blue| blue.original_surface.as_ref())
         {
             let blue = self.blue_water.as_ref().expect("original ocean");
-            if renderer
-                .slots
-                .iter()
-                .flatten()
-                .any(|slot| slot.ready && slot.caustic_receiver.enabled)
-            {
+            let caustics = renderer.slots.iter().flatten().any(|slot| slot.ready && slot.caustic_receiver.enabled);
+            if caustics {
                 renderer.scene.capture(device, encoder, color, depth);
                 {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1794,6 +2120,34 @@ impl OceanGpu {
                             &slot.caustic_receiver,
                             blue.waves(index).group(&blue.field),
                         );
+                    }
+                }
+            }
+            // FNL Water_Dense_Sea landscape MF_WetMapFunction: wet sand darkens
+            // and turns glossy where the Coast sim's wet map has been.
+            if let Some((ninja, wet)) = Self::coast_wet_receiver(renderer) {
+                let ready: Vec<_> = renderer.slots.iter().enumerate()
+                    .filter_map(|(i, s)| s.as_ref().filter(|s| s.ready && ninja.wet_visible(i)).zip(ninja.group(i)).map(|(s, g)| (i, s, g)))
+                    .collect();
+                if !ready.is_empty() {
+                    if !caustics { renderer.scene.capture(device, encoder, color, depth); }
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Ninja coast wet-map receiver"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: color, depth_slice: None, resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                        })],
+                        ..Default::default()
+                    });
+                    crate::renderer::tile_probe_scissor_surface(&mut pass);
+                    pass.set_pipeline(wet);
+                    for (index, slot, group) in ready {
+                        pass.set_bind_group(0, &slot.bindings.camera_group, &[]);
+                        pass.set_bind_group(1, &slot.bindings.material_group, &[]);
+                        pass.set_bind_group(2, blue.waves(index).group(&blue.field), &[]);
+                        pass.set_bind_group(3, &slot.bindings.environment_group, &[]);
+                        pass.set_bind_group(4, group, &[]);
+                        pass.draw(0..3, 0..1);
                     }
                 }
             }
@@ -1919,11 +2273,8 @@ impl OceanGpu {
         depth: &wgpu::TextureView,
     ) {
         if let Some(lakes) = &self.lakes {
-            if self.settings.lake.needs_scene_color() {
-                lakes.scene.capture(device, encoder, color, depth);
-            } else {
-                lakes.scene.capture_depth(device, encoder, color, depth);
-            }
+            // Source lake water always refracts the scene color.
+            lakes.scene.capture(device, encoder, color, depth);
             return;
         }
         if let Some(renderer) = self
@@ -1931,7 +2282,11 @@ impl OceanGpu {
             .as_ref()
             .and_then(|blue| blue.original_surface.as_ref())
         {
-            renderer.scene.capture(device, encoder, color, depth);
+            if renderer.copy_top > 0 {
+                renderer.scene.capture_rows(device, encoder, color, depth, renderer.copy_top);
+            } else {
+                renderer.scene.capture(device, encoder, color, depth);
+            }
             if let Some(tiles) = renderer.reflection_tiles.as_ref() {
                 tiles.encode(encoder);
             }
@@ -1958,6 +2313,7 @@ impl OceanGpu {
     pub fn prepare_original_probe(&self, encoder: &mut wgpu::CommandEncoder) {
         if let Some(blue) = &self.blue_water {
             if let Some(renderer) = &blue.original_surface {
+                if renderer.config.ninja_mode != 0 {return;} // combined probe encoded with freshly published FNL output
                 for (index, slot) in renderer.slots.iter().enumerate()
                     .filter_map(|(i,s)|s.as_ref().filter(|s|s.ready && s.probe_due).map(|s|(i,s)))
                 {
@@ -1997,29 +2353,40 @@ impl OceanGpu {
             .map_or([0.0; 4], |slot| slot.envelope)
     }
 
+    /// `ninja`: underwater mode 5's river-host camera view and textures
+    /// (None keeps Blue Water's composite).
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_original_underwater(
-        &self,
+        &mut self,
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         color: &wgpu::TextureView,
         resolve: Option<&wgpu::TextureView>,
         depth: &wgpu::TextureView,
+        ninja: Option<(super::NinjaUnderwaterView, &super::NinjaUnderwaterTextures)>,
     ) {
         let Some(renderer) = self
             .blue_water
-            .as_ref()
-            .and_then(|blue| blue.original_surface.as_ref())
+            .as_mut()
+            .and_then(|blue| blue.original_surface.as_mut())
         else {
             return;
         };
-        let Some(slot) = renderer
-            .underwater_slot
-            .and_then(|index| renderer.slots[index].as_ref())
-        else {
+        let Some(index) = renderer.underwater_slot.filter(|&index| renderer.slots[index].is_some()) else {
             return;
         };
         // Refresh after water and transparency. No effect samples a live attachment.
         renderer.scene.capture(device, encoder, color, depth);
+        let ninja_group = ninja.map(|(view, textures)| {
+            let (format, samples) = (renderer.key.3, renderer.key.2);
+            let probe = renderer.slots[index].as_ref().expect("underwater slot").bindings.underwater_probe();
+            renderer.ninja_underwater.get_or_insert_with(|| super::ninja_underwater::NinjaUnderwater::new(device))
+                .prepare(device, queue, format, samples, textures, view, &renderer.scene,
+                    super::ninja_underwater::Mask::Probe(probe))
+        });
+        let renderer = &*renderer;
+        let slot = renderer.slots[index].as_ref().expect("underwater slot");
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Blue Water original underwater effects"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -2042,7 +2409,10 @@ impl OceanGpu {
             ..Default::default()
         });
         crate::renderer::tile_probe_scissor_surface(&mut pass);
-        slot.underwater.draw(&mut pass, &renderer.underwater, self.settings.blue_water_underwater_mode != 1);
+        match (ninja_group.as_ref(), renderer.ninja_underwater.as_ref()) {
+            (Some(group), Some(ninja)) => ninja.draw(&mut pass, group),
+            _ => slot.underwater.draw(&mut pass, &renderer.underwater, self.settings.blue_water_underwater_mode != 1),
+        }
     }
 
     /// Every native rendering pass uses the same *pruned* index buffer;
@@ -2097,15 +2467,20 @@ impl OceanGpu {
         }
         let Some(blue) = self.blue_water.as_ref() else { return; };
         let Some(renderer) = blue.original_surface.as_ref() else { return; };
-        let Some(pipeline) = renderer.pipeline.wireframe.as_ref() else { return; };
+        let selected = if renderer.config.ninja_mode != 0 { renderer.ninja.as_ref().and_then(|n|n.wire()) }
+            else { renderer.pipeline.wireframe.as_ref() };
+        let Some(pipeline) = selected else { return; };
         for (index, slot) in renderer.slots.iter().enumerate() {
-            let Some(slot) = slot.as_ref().filter(|slot|
-                slot.ready && (admitted >> index & 1 != 0 || slot.horizon)) else { continue; };
+            let Some(slot) = slot.as_ref().filter(|slot| slot.drawn(admitted, index)) else { continue; };
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &slot.bindings.camera_group, &[]);
             pass.set_bind_group(1, &slot.bindings.material_group, &[]);
             pass.set_bind_group(2, blue.waves(index).group(&blue.field), &[]);
             pass.set_bind_group(3, &slot.bindings.environment_group, &[]);
+            if renderer.config.ninja_mode != 0 {
+                let Some(group) = renderer.ninja.as_ref().and_then(|n|n.group(index)) else { continue; };
+                pass.set_bind_group(4, group, &[]);
+            }
             Self::draw_native_slot(renderer, pass, slot);
         }
     }
@@ -2135,9 +2510,10 @@ impl OceanGpu {
         let Some(blue) = self.blue_water.as_ref() else { return; };
         let Some(renderer) = blue.original_surface.as_ref() else { return; };
         let (Some(target), Some(pipeline)) = (renderer.reduced.as_ref(), renderer.pipeline.reduced_pipeline.as_ref()) else { return; };
+        let Some([mean, transfer]) = &target.glitter_views else { return; };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Blue Water original material / true reduced pixels"),
-            color_attachments: &[&target.color_view, &target.glitter_views[0], &target.glitter_views[1]].map(|view|
+            color_attachments: &[&target.color_view, mean, transfer].map(|view|
                 Some(wgpu::RenderPassColorAttachment {
                     view, depth_slice: None, resolve_target: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
@@ -2150,7 +2526,7 @@ impl OceanGpu {
             ..Default::default()
         });
         for (index, slot) in renderer.slots.iter().enumerate() {
-            let Some(slot) = slot.as_ref().filter(|s| s.ready && (admitted >> index & 1 != 0 || s.horizon)) else { continue; };
+            let Some(slot) = slot.as_ref().filter(|s| s.drawn(admitted, index)) else { continue; };
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &slot.bindings.camera_group, &[]);
             pass.set_bind_group(1, &slot.bindings.material_group, &[]);
@@ -2160,17 +2536,70 @@ impl OceanGpu {
         }
         drop(pass);
         // Mode 5: decide each 16x16 tile from the reduced shading before the full-resolution passes read it.
-        if let (Some((classify, _)), Some((group, tiles))) =
-            (renderer.pipeline.adaptive_classify.as_ref(), target.adaptive.as_ref())
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Blue Water adaptive tiles"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(classify);
-            pass.set_bind_group(0, group, &[]);
-            pass.dispatch_workgroups(tiles.0, tiles.1, 1);
+        if let Some((classify, _)) = &renderer.pipeline.adaptive_classify {
+            target.classify(encoder, classify);
         }
+    }
+
+    /// The reduced image represents one water plane. Multiple ready pools can
+    /// overlap in screen space, so use direct shading in those frames.
+    pub fn encode_coast_adaptive(&mut self, encoder: &mut wgpu::CommandEncoder, admitted: u8,
+        camera: &crate::camera::Camera,
+    ) -> Option<usize> {
+        if !self.settings.ninja_coast_adaptive || self.settings.ninja_coast_deep_water <= 0.0
+            || self.settings.ninja_coast_debug != 0 || self.settings.ninja_coast_cost_probe & 16384 != 0
+            || self.settings.ninja_coast_shore_depth <= 0.0
+        {
+            return None;
+        }
+        let blue = self.blue_water.as_mut()?;
+        let renderer = blue.original_surface.as_mut()?;
+        let super::ninja_ocean::Surface::Coast(coast) = renderer.ninja.as_mut()? else { return None; };
+        let mut ready = renderer.slots.iter().enumerate().filter_map(|(index, slot)| {
+            slot.as_ref().filter(|slot| slot.ready && !slot.absorbed).map(|slot| (index, slot))
+        });
+        let (index, slot) = ready.next()?;
+        // This mode saves deep-water material work. When visible shore
+        // simulation can contribute, the extra reduced draw and tile pass
+        // compete with the shore pass for very little eligible screen area.
+        if ready.next().is_some() || !slot.drawn(admitted, index) || coast.wet_visible(index) { return None; }
+        let adaptive = coast.adaptive.as_mut()?.as_mut().ok()?;
+        let work = adaptive.plan(camera, self.settings.ninja_coast_deep_foam,
+            self.settings.pixel_detail_contrast, self.settings.pixel_detail_debug);
+        if matches!(work, super::ninja_coast_adaptive::Work::Skip) { return None; }
+        let blue = self.blue_water.as_ref()?;
+        let renderer = blue.original_surface.as_ref()?;
+        let slot = renderer.slots[index].as_ref()?;
+        let super::ninja_ocean::Surface::Coast(coast) = renderer.ninja.as_ref()? else { return None; };
+        let adaptive = coast.adaptive.as_ref()?.as_ref().ok()?;
+        let group = coast.group(index)?;
+        let target = &adaptive.target;
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Coast adaptive deep-water material at 2x2 rate"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.color_view, depth_slice: None, resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &target.depth_view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+        pass.set_pipeline(&adaptive.coarse);
+        pass.set_bind_group(0, &slot.bindings.camera_group, &[]);
+        pass.set_bind_group(1, &slot.bindings.material_group, &[]);
+        pass.set_bind_group(2, blue.waves(index).group(&blue.field), &[]);
+        pass.set_bind_group(3, &slot.bindings.environment_group, &[]);
+        pass.set_bind_group(4, group, &[]);
+        Self::draw_native_slot(renderer, &mut pass, slot);
+        drop(pass);
+        target.classify(encoder, &adaptive.classify);
+        if let super::ninja_coast_adaptive::Work::Sample(sender) = work {
+            adaptive.sample(encoder, sender);
+        }
+        Some(index)
     }
 
     pub fn draw_original_near_detail<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, admitted: u8) {
@@ -2178,7 +2607,7 @@ impl OceanGpu {
         let Some(renderer) = blue.original_surface.as_ref() else { return; };
         let Some(pipeline) = renderer.pipeline.near_pipeline.as_ref() else { return; };
         for (index, slot) in renderer.slots.iter().enumerate() {
-            let Some(slot) = slot.as_ref().filter(|s| s.ready && (admitted >> index & 1 != 0 || s.horizon)) else { continue; };
+            let Some(slot) = slot.as_ref().filter(|s| s.drawn(admitted, index)) else { continue; };
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &slot.bindings.camera_group, &[]);
             pass.set_bind_group(1, &slot.bindings.material_group, &[]);
@@ -2198,6 +2627,7 @@ impl OceanGpu {
         &'a self,
         pass: &mut wgpu::RenderPass<'a>,
         admitted: u8,
+        coast_adaptive: Option<usize>,
     ) -> (u32, u32, u64) {
         if let Some(lakes) = &self.lakes { return lakes.draw(pass, admitted); }
         let Some(blue) = self.blue_water.as_ref() else {
@@ -2215,7 +2645,7 @@ impl OceanGpu {
             // when selecting this slot's sky contacts, before preparation.
             let Some(slot) = slot
                 .as_ref()
-                .filter(|slot| slot.ready && (admitted >> index & 1 != 0 || slot.horizon))
+                .filter(|slot| slot.drawn(admitted, index))
             else {
                 continue;
             };
@@ -2223,8 +2653,49 @@ impl OceanGpu {
                 horizon_only += 1;
                 horizon_triangles += slot.pruned.as_ref().map_or(0, |mesh| u64::from(mesh.count) / 3);
             }
-            pass.set_pipeline(renderer.pipeline.reconstruct_pipeline.as_ref()
-                .unwrap_or(&renderer.pipeline.pipeline));
+            let mut ninja_split = None;
+            if renderer.config.ninja_mode != 0 {
+                let Some(ninja) = renderer.ninja.as_ref() else { continue; };
+                let Some(group) = ninja.group(index) else { continue; };
+                // r_ninjaCoastDeepWater: the deep-water pass first, then the Coast pass blends
+                // the shore band over it (same mesh, same bind groups).
+                if let Some(deep) = ninja.deep().filter(|_| self.settings.ninja_coast_deep_water > 0.0) {
+                    ninja_split = Some(match ninja {
+                        super::ninja_ocean::Surface::Coast(coast) if self.settings.ninja_coast_fft_late =>
+                            coast.late_fft.as_ref().and_then(|pipeline| pipeline.as_ref().ok()).unwrap_or(ninja.pipeline()),
+                        _ => ninja.pipeline(),
+                    });
+                    let cached = match ninja {
+                        super::ninja_ocean::Surface::Coast(coast) if slot.wave_clipmap_ready => {
+                            coast.wave_clipmap.as_ref().and_then(|pipeline| pipeline.as_ref().ok()).zip(slot.wave_clipmap.as_ref())
+                        }
+                        _ => None,
+                    };
+                    let adaptive = match ninja {
+                        super::ninja_ocean::Surface::Coast(coast) if coast_adaptive == Some(index) => {
+                            coast.adaptive.as_ref().and_then(|pipeline| pipeline.as_ref().ok())
+                        }
+                        _ => None,
+                    };
+                    if let Some(adaptive) = adaptive {
+                        pass.set_pipeline(&adaptive.full);
+                        pass.set_bind_group(5, &adaptive.target.binding, &[]);
+                    } else if let Some((pipeline, clipmap)) = cached {
+                        pass.set_pipeline(&pipeline.draw);
+                        pass.set_bind_group(5, &clipmap.draw, &[]);
+                        if self.settings.ninja_coast_shore_clipmap {
+                            ninja_split = Some(&pipeline.shore);
+                        }
+                    } else {
+                        pass.set_pipeline(deep);
+                    }
+                } else {
+                    pass.set_pipeline(ninja.pipeline());
+                }
+                pass.set_bind_group(4, group, &[]);
+            } else {
+                pass.set_pipeline(renderer.pipeline.reconstruct_pipeline.as_ref().unwrap_or(&renderer.pipeline.pipeline));
+            }
             pass.set_bind_group(0, &slot.bindings.camera_group, &[]);
             pass.set_bind_group(1, &slot.bindings.material_group, &[]);
             pass.set_bind_group(2, blue.waves(index).group(&blue.field), &[]);
@@ -2235,6 +2706,17 @@ impl OceanGpu {
             // Full resolution shades here; the reduced modes shade in `encode_reduced_original_surface`.
             let far = renderer.pipeline.far_pipeline.as_ref().filter(|_| renderer.config.pixel_detail_mode == 0);
             Self::draw_native_slot_split(renderer, pass, slot, far);
+            if let Some(shore) = ninja_split.filter(|_| self.settings.ninja_coast_cost_probe & 32768 == 0) {
+                pass.set_pipeline(shore);
+                Self::draw_native_slot(renderer, pass, slot);
+            }
+            // Coast whitewater sprites over this pool's surface (same groups 0-3).
+            if let Some((pipeline, group, args)) = renderer.ninja.as_ref().filter(|_| renderer.config.ninja_mode != 0)
+                .and_then(|ninja| ninja.whitewater(index)) {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(4, group, &[]);
+                pass.draw_indirect(args, super::ninja_coast_whitewater::DRAW_ARGS);
+            }
             drawn += 1;
         }
         (drawn, horizon_only, horizon_triangles)
@@ -2252,7 +2734,6 @@ mod tests {
         let target = (1920, 1080, 1, wgpu::TextureFormat::Rgba16Float);
         let mut settings = super::super::OceanSettings::default();
         settings.backend = 2;
-        settings.gerstner_water = false;
         settings.hybrid_ssr = true;
         // Statistics are native-only and must not accidentally turn on the
         // adaptive flag in compact Hybrid's shared pipeline-key namespace.

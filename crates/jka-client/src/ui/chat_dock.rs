@@ -6,9 +6,11 @@
 //! Drawn inside `draw_placed(Chat)`, so HUD Edit moves and sizes the field
 //! together with the feed.
 use crate::palette::hud as pal;
+use crate::ui::chat::chat_display_cursor;
 use crate::ui::flex::{Container, Flex};
 use crate::ui::text::UiText;
-use crate::ui::{disc, rect, ChatMode, ProportionalFont, UiSnapshot, UiVertex, CHATBOX_CUTOFF, CHATBOX_Y};
+use crate::ui::{color_escape, disc, rect, ChatMode, ProportionalFont, UiSnapshot, UiVertex, CHATBOX_CUTOFF, CHATBOX_Y};
+use std::ops::Range;
 use taffy::prelude::AlignItems;
 
 /// Greedy word wrap measured with the text it will be drawn in. Colour codes
@@ -29,7 +31,7 @@ pub(super) fn wrap(txt: &UiText, value: &str, px: f32, max_width: f32) -> Vec<St
         let bytes = word.as_bytes();
         let mut at = 0;
         while at < bytes.len() {
-            if let Some((skip, _)) = crate::ui::color_escape(bytes, at, 1.0) {
+            if let Some((skip, _)) = color_escape(bytes, at, 1.0) {
                 colour = word[at..at + skip].to_owned();
                 at += skip;
             } else {
@@ -43,14 +45,41 @@ pub(super) fn wrap(txt: &UiText, value: &str, px: f32, max_width: f32) -> Vec<St
     lines
 }
 
-/// The typed text with its oldest characters dropped until it fits.
-fn tail_to_fit(txt: &UiText, value: &str, px: f32, max_width: f32) -> String {
-    let chars: Vec<char> = value.chars().collect();
+/// Fit the tail when possible, scrolling left when the caret would be hidden.
+fn visible_input(
+    txt: &UiText,
+    value: &str,
+    caret: usize,
+    px: f32,
+    max_width: f32,
+    mut color: [f32; 4],
+) -> (Range<usize>, [f32; 4]) {
+    let max_width = max_width.max(0.0);
+    let next_offset = |offset| {
+        color_escape(value.as_bytes(), offset, 1.0).map_or_else(
+            || offset + value[offset..].chars().next().unwrap().len_utf8(),
+            |(length, _)| offset + length,
+        )
+    };
     let mut start = 0;
-    while start < chars.len() && txt.width(&chars[start..].iter().collect::<String>(), px) > max_width {
-        start += 1;
+    while txt.width(&value[start..], px) > max_width {
+        if start == caret {
+            let mut end = start;
+            while end < value.len() {
+                let next = next_offset(end);
+                if txt.width(&value[start..next], px) > max_width {
+                    break;
+                }
+                end = next;
+            }
+            return (start..end, color);
+        }
+        if let Some((_, active)) = color_escape(value.as_bytes(), start, color[3]) {
+            color = active;
+        }
+        start = next_offset(start);
     }
-    chars[start..].iter().collect()
+    (start..value.len(), color)
 }
 
 /// How many of the three dots show, `idle_ms` into a pause: they appear one
@@ -206,27 +235,35 @@ pub(in crate::ui) fn build(out: &mut Vec<UiVertex>, ui: &UiSnapshot, small_font:
     let baseline = text_b[1] + (text_b[3] + txt.cap(px)) * 0.5;
     let reserve = 40.0 * s;
     let input_txt = txt.without_chat_emojis();
-    let shown = tail_to_fit(&input_txt, &ui.chat_input, px, text_b[2] - reserve);
+    let caret = chat_display_cursor(&ui.chat_input, ui.chat_cursor);
+    let (visible, color) = visible_input(
+        &input_txt, &ui.chat_input, caret, px, text_b[2] - reserve, pal::fade(pal::TEXT(), open),
+    );
+    let shown = &ui.chat_input[visible.clone()];
     if ui.chat_input_selected && !shown.is_empty() {
         // Only the visible part of a Ctrl+A selection is drawn in this
         // horizontally scrolling field; the complete message remains selected.
         rect(out, text_b[0], baseline - txt.cap(px) - 2.0 * s,
-            input_txt.width(&shown, px), txt.cap(px) + 5.0 * s,
+            input_txt.width(shown, px), txt.cap(px) + 5.0 * s,
             pal::fade([0.18, 0.42, 0.65, 0.80], open), w, h);
     }
-    if shown.is_empty() {
+    if ui.chat_input.is_empty() {
         // Clear of the caret, which rests at the start of the empty field.
         txt.draw(out, "Type a message", text_b[0] + 8.0 * s, baseline, px, pal::fade(pal::TEXT_FAINT(), 0.8 * open));
     } else {
-        input_txt.draw(out, &shown, text_b[0], baseline, px, pal::fade(pal::TEXT(), open));
+        input_txt.draw(out, shown, text_b[0], baseline, px, color);
     }
-    let end = text_b[0] + if shown.is_empty() { 0.0 } else { input_txt.width(&shown, px) } + 2.0 * s;
-    let dots = if shown.is_empty() { 0 } else { typing_dots(anim.idle_ms) };
+    let caret_x = text_b[0] + input_txt.width(&ui.chat_input[visible.start..caret], px);
+    let dots = if !shown.is_empty() && caret == ui.chat_input.len() {
+        typing_dots(anim.idle_ms)
+    } else {
+        0
+    };
     if dots == 0 && (anim.caret || anim.idle_ms < 500) {
-        rect(out, end, baseline - txt.cap(px) - 2.0 * s, (2.0 * s).max(1.0), txt.cap(px) + 5.0 * s, pal::fade(pal::ACCENT(), open), w, h);
+        rect(out, caret_x, baseline - txt.cap(px) - 2.0 * s, (2.0 * s).max(1.0), txt.cap(px) + 5.0 * s, pal::fade(pal::ACCENT(), open), w, h);
     }
     for i in 0..dots {
-        let cx = end + 8.0 * s + i as f32 * 9.0 * s;
+        let cx = caret_x + 10.0 * s + i as f32 * 9.0 * s;
         disc(out, cx, baseline - 3.0 * s, 2.6 * s, 10, pal::fade(pal::ACCENT(), 0.9 * open), w, h);
     }
 }

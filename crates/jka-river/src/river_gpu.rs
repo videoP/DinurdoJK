@@ -926,12 +926,18 @@ impl Simulation {
         self.discharge_active=true;
     }
 
+    /// Dense promoted domains use WaterInfo.xy for target/depth and z for signed
+    /// per-cell exchange (cm/s). Only this explicit flag activates the extension.
+    pub fn enable_promoted_boundaries(&mut self) {
+        self.boundary_template.flags[2] |= 2;
+    }
+
     /// Existing inlet-box storage stays bound in either mode; the native loop
     /// count and rise cap are copied with the next solver frame's parameters.
     pub fn set_height_source(&mut self, enabled: bool, rise_limit_cm: f32) {
         // Flag z bit 0 disables the native source boxes; the box count also
         // covers the drains that follow them.
-        self.boundary_template.flags[2] = u32::from(!enabled);
+        self.boundary_template.flags[2] = (self.boundary_template.flags[2] & !1) | u32::from(!enabled);
         self.boundary_template.origin[3] = rise_limit_cm;
     }
 

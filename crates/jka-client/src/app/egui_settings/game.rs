@@ -313,11 +313,11 @@ impl App {
                 );
                 if let Some(value) = segmented_row(
                     ui,
-                    "Gibs",
-                    "cg_blood. Gibbed players: off (a death voice plays instead), skull or brain only, or full gibs. Needs the jaPRO models/gibs assets; jaPRO itself defaults to off.",
+                    "Blood effects",
+                    "cg_blood: 0 off; 1 animated Ninja blood and a skull/brain on gib events; 2 the full TaystJK gib burst, bleeding into Ninja surface blood. The original MD3 models must be installed.",
                     theme::Reset::None,
                     self.audio.game.blood,
-                    &[(0, "Off"), (1, "Skull / brain"), (2, "Full")],
+                    &[(0, "Off"), (1, "Blood"), (2, "Blood + gibs")],
                 ) {
                     let _ = self.set_console_cvar("cg_blood", &value.to_string());
                 }

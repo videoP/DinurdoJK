@@ -6,11 +6,10 @@
 //! is right-aligned, so lines of different lengths share one right edge.
 use crate::palette::hud as pal;
 use crate::ui::flex::{Bounds, Container, Flex};
-use crate::ui::hud::movement::{ICON_TEXTURE_SOURCE, ICON_WEAPON_BASE};
 use crate::ui::text::UiText;
 use crate::ui::{
     rect, rect_gradient, rect_outline, textured_rect_with_source, ProportionalFont, UiSnapshot,
-    UiVertex,
+    UiVertex, ICON_TEXTURE_SOURCE, ICON_WEAPON_BASE,
 };
 use taffy::prelude::AlignItems;
 

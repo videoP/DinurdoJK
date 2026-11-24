@@ -125,8 +125,8 @@ mod transparency_order_tests {
 }
 
 impl Renderer {
-    /// DOF is drawn under this plan: `Off` never draws, underwater-only draws
-    /// only while the camera is below a water surface (`dof_plan_underwater`).
+    /// Underwater-only DOF prepares resources for submerged BSP/ocean eyes and
+    /// candidate river eyes. The river classifier controls the actual draw.
     pub(in crate::renderer) fn dof_draws_this_plan(&self) -> bool {
         self.depth_of_field_strength > 0.001
             && match self.dof_mode {
@@ -138,7 +138,7 @@ impl Renderer {
 
     pub(in crate::renderer) fn rebuild_frame_plan(&mut self) {
         let fog_enabled = self.weather.fog.volumetric_effective();
-        let legacy1_global_post = self.weather.fog.legacy1_global_post_active();
+        let legacy_global_fog = self.weather.fog.legacy_global_fog_active();
         // Legacy GL kept r_drawfog 2 smooth with framebuffer dithering. Our
         // equivalent uses a float scene plus one dithered presentation pass so
         // the fog blend is not irreversibly quantized before presentation.
@@ -169,7 +169,7 @@ impl Renderer {
             || self.temporal_resolve_active()
             || self.contact_shadows_enabled
             || fog_enabled
-            || legacy1_global_post
+            || legacy_global_fog
             || self.clouds_enabled
             || self.weather.snow.enabled
             || self.weather.atmosphere.active()
@@ -214,7 +214,7 @@ impl Renderer {
             || self.motion_vectors_wanted()
             || self.contact_shadows_enabled
             || fog_enabled
-            || legacy1_global_post
+            || legacy_global_fog
             || self.clouds_enabled
             || self.weather.snow.enabled
             || self.weather.atmosphere.active()
@@ -231,7 +231,7 @@ impl Renderer {
             self.motion_vectors_wanted(),
             self.contact_shadows_enabled,
             fog_enabled,
-            legacy1_global_post,
+            legacy_global_fog,
             self.clouds_enabled,
             self.weather.snow.enabled,
             self.weather.atmosphere.active(),

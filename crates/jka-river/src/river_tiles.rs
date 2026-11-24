@@ -1953,6 +1953,15 @@ impl SparseSimulation {
         encoder.copy_buffer_to_buffer(&upload, 0, &self.presentation, 0, 32);
     }
 
+    /// Read-only native collider input for the optional Ninja adapter.
+    /// Reborrow after pool growth; both buffers belong to this generation.
+    pub(crate) fn ninja_geometry(&self, window_origin: [i32; 2]) -> crate::river_ninja::Geometry<'_> {
+        crate::river_ninja::Geometry::Sparse {
+            geometry: &self.pool.geometry, slots: &self.table, window_origin,
+            lattice_cells: self.lattice.dimensions(), tiles: self.lattice.tiles(),
+            tile: self.lattice.tile(), generation: self.generation,
+        }
+    }
     /// Non-pristine tiles from the latest occupancy sample.
     pub fn wet_tiles(&self) -> &BTreeSet<[i32; 2]> {
         &self.wet_tiles

@@ -497,6 +497,165 @@ app_cvars! {
         ]
     }
 
+    APP_R_CLOTHSOLVER {
+        runtime: CvarDef::new(
+                "r_clothSolver",
+                "",
+                "0..1",
+                "Cloth solver: 0 CPU (XPBD worker), 1 GPU (gpu-cloth-sim compute port; needs r_ghoul2Skinning gpu, otherwise the CPU solver runs).",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app: &App| CvarValue::String(app.video.cloth_solver.to_string()),
+                |app, value| App::cvar_set_r_clothsolver(app, APP_R_CLOTHSOLVER.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_clothsolver, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Some(v) = value.trim().parse::<u8>().ok() {
+                        settings.cloth_solver = v.clamp(0, 1);
+                    }
+                }),
+                archive: Some((200, |state| state.video.cloth_solver.to_string())),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothsolver(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value
+                        .trim()
+                        .parse::<u8>()
+                        .ok()
+                        .ok_or_else(|| format!("{name}: expected an integer"))?;
+                    self.video.cloth_solver = amount.clamp(0, 1);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHSTIFFNESS {
+        runtime: CvarDef::new(
+                "r_clothStiffness",
+                "",
+                "0.1..100",
+                "Cloth bending stiffness. Low drapes (silk), high resists folding (canvas/leather); above 10 the solver adds iterations (more CPU). Rebuilds active cloth.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app: &App| CvarValue::String(app.video.cloth_stiffness.to_string()),
+                |app, value| App::cvar_set_r_clothstiffness(app, APP_R_CLOTHSTIFFNESS.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_clothstiffness, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Some(v) = value.trim().parse::<f32>().ok().filter(|v| v.is_finite()) {
+                        settings.cloth_stiffness = v.clamp(0.1, 100.0);
+                    }
+                }),
+                archive: Some((200, |state| format!("{:.3}", state.video.cloth_stiffness))),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothstiffness(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("{name}: expected a finite number"))?;
+                    self.video.cloth_stiffness = amount.clamp(0.1, 100.0);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHDAMPING {
+        runtime: CvarDef::new(
+                "r_clothDamping",
+                "",
+                "0..30 per second",
+                "Cloth velocity damping. Higher settles faster and feels heavier; lower swings longer. Rebuilds active cloth.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app: &App| CvarValue::String(app.video.cloth_damping.to_string()),
+                |app, value| App::cvar_set_r_clothdamping(app, APP_R_CLOTHDAMPING.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_clothdamping, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Some(v) = value.trim().parse::<f32>().ok().filter(|v| v.is_finite()) {
+                        settings.cloth_damping = v.clamp(0.0, 30.0);
+                    }
+                }),
+                archive: Some((200, |state| format!("{:.3}", state.video.cloth_damping))),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothdamping(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("{name}: expected a finite number"))?;
+                    self.video.cloth_damping = amount.clamp(0.0, 30.0);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHSTIFFENING {
+        runtime: CvarDef::new(
+                "r_clothStiffening",
+                "",
+                "0..10",
+                "How much cloth bending stiffens as a fold sharpens. 0 is linear; higher keeps gentle drape soft but resists hard creases and fold-overs. Rebuilds active cloth.",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app: &App| CvarValue::String(app.video.cloth_stiffening.to_string()),
+                |app, value| App::cvar_set_r_clothstiffening(app, APP_R_CLOTHSTIFFENING.entry.name, &value.to_string()),
+            )
+            .with_text_setter(App::cvar_set_r_clothstiffening, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Some(v) = value.trim().parse::<f32>().ok().filter(|v| v.is_finite()) {
+                        settings.cloth_stiffening = v.clamp(0.0, 10.0);
+                    }
+                }),
+                archive: Some((200, |state| format!("{:.3}", state.video.cloth_stiffening))),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothstiffening(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("{name}: expected a finite number"))?;
+                    self.video.cloth_stiffening = amount.clamp(0.0, 10.0);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_DISMEMBERLIFETIME {
         runtime: CvarDef::new(
                 "r_dismemberLifetime",

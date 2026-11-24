@@ -1,6 +1,8 @@
 //! Chat.
 use crate::app::{App, ChatMode, ChatPlayerCompletionCycle, Instant, OverlayMode};
 
+pub(super) const CHAT_INPUT_LIMIT: usize = 160;
+
 /// TaystJK `Message_Key` wire sanitization. JKA reliable commands are tokenized
 /// text, so a literal double quote cannot safely be embedded inside the quoted
 /// `say` argument. TaystJK replaces it with two apostrophes and replaces `%`
@@ -131,11 +133,34 @@ impl App {
             return;
         }
         self.chat_mode = mode;
-        self.chat_input.clear();
-        self.chat_input_selected = false;
+        self.clear_chat_input();
         self.chat_emoji_picker.open = false;
-        self.chat_player_completion = None;
         self.set_overlay(OverlayMode::Chat);
+    }
+
+    pub(super) fn clear_chat_input(&mut self) {
+        self.chat_input.clear();
+        self.chat_cursor = 0;
+        self.chat_input_selected = false;
+        self.chat_player_completion = None;
+    }
+
+    pub(super) fn chat_input_len_for_insert(&self) -> usize {
+        if self.chat_input_selected {
+            0
+        } else {
+            crate::cgame::unicode_input_wire_len(&self.chat_input)
+        }
+    }
+
+    /// Insert text already checked against the input limit and control keys.
+    pub(super) fn insert_chat_at_cursor(&mut self, text: &str) {
+        if self.chat_input_selected {
+            self.clear_chat_input();
+        }
+        self.chat_input.insert_str(self.chat_cursor, text);
+        self.chat_cursor += text.len();
+        self.chat_player_completion = None;
     }
 
     /// TaystJK Con_MessageMode3_f / CG_CrosshairPlayer: capture the recipient
@@ -235,44 +260,47 @@ impl App {
             if !cycle.candidates.is_empty() {
                 cycle.index = (cycle.index + 1) % cycle.candidates.len();
                 let word_start = cycle.word_start;
-                let name = cycle.candidates[cycle.index].clone();
-                self.chat_input.truncate(word_start);
-                self.chat_input.push_str(&name);
-                self.chat_input.push(' ');
-                self.chat_input_selected = false;
+                let replacement = &cycle.candidates[cycle.index];
+                self.chat_input.replace_range(word_start..self.chat_cursor, replacement);
+                self.chat_cursor = word_start + replacement.len();
                 self.publish_ui();
                 return;
             }
         }
 
-        let word_start = self
-            .chat_input
+        let input = &self.chat_input;
+        let word_start = input[..self.chat_cursor]
             .rfind(char::is_whitespace)
-            .map_or(0, |index| {
-                index
-                    + self.chat_input[index..]
-                        .chars()
-                        .next()
-                        .map_or(1, char::len_utf8)
-            });
-        let query = self.chat_input[word_start..].to_owned();
+            .map_or(0, |index| Self::console_next_boundary(input, index));
+        let query = &input[word_start..self.chat_cursor];
         let mut candidates =
-            match crate::console::complete_player_name(&query, &self.connected_player_names()) {
+            match crate::console::complete_player_name(query, &self.connected_player_names()) {
                 PlayerNameCompletion::None => return,
                 PlayerNameCompletion::One(name) => vec![name],
                 PlayerNameCompletion::Many(names) => names,
             };
 
-        // Chat input is capped at 160 bytes. Drop candidates that cannot replace
-        // this word without overflowing rather than truncating a name/color code.
-        candidates.retain(|name| word_start + name.len() + 1 <= 160);
-        let Some(name) = candidates.first().cloned() else {
+        let word_end = self.chat_cursor + input[self.chat_cursor..]
+            .find(char::is_whitespace)
+            .unwrap_or(input.len() - self.chat_cursor);
+        let retained = crate::cgame::unicode_input_wire_len(&input[..word_start])
+            + crate::cgame::unicode_input_wire_len(&input[word_end..]);
+        let append_space = word_end == input.len();
+        candidates.retain(|name| {
+            retained + crate::cgame::unicode_input_wire_len(name) + usize::from(append_space)
+                <= CHAT_INPUT_LIMIT
+        });
+        if append_space {
+            for name in &mut candidates {
+                name.push(' ');
+            }
+        }
+        let Some(replacement) = candidates.first() else {
             return;
         };
 
-        self.chat_input.truncate(word_start);
-        self.chat_input.push_str(&name);
-        self.chat_input.push(' ');
+        self.chat_input.replace_range(word_start..word_end, replacement);
+        self.chat_cursor = word_start + replacement.len();
         self.chat_input_selected = false;
         self.chat_player_completion = Some(ChatPlayerCompletionCycle {
             word_start,
@@ -286,14 +314,13 @@ impl App {
         // An input opened while connected cannot be submitted after a
         // disconnect or transition to a demo or in-process solo game.
         if self.chat_unavailable() {
-            self.chat_input.clear();
-            self.chat_input_selected = false;
-            self.chat_player_completion = None;
+            self.clear_chat_input();
             self.set_overlay(OverlayMode::None);
             return;
         }
         self.chat_player_completion = None;
         self.chat_input_selected = false;
+        self.chat_cursor = 0;
         let message = std::mem::take(&mut self.chat_input);
         if !message.is_empty() {
             // Port TaystJK Message_Key rather than feeding chat through the

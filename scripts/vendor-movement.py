@@ -1,7 +1,14 @@
-"""Vendor byte-identical stock OpenJK sources and their local include closure.
+"""Vendor byte-identical TaystJK sources and their local include closure.
 
-Input: target/openjk-stock.zip downloaded from the pinned codeload URL.
-No user-owned game assets are copied.
+TaystJK (an OpenJK fork) is the only JKA/Base movement and collision source.
+Input: the pinned codeload archive, default target/taystjk-client.zip, or the
+path given with --archive. No user-owned game assets are copied.
+
+    python scripts/vendor-movement.py [--archive PATH]   # import
+    python scripts/vendor-movement.py --check            # verify hashes
+
+Import overwrites files, including the local jaPRO sailing hunks in
+bg_pmove.c, so run it only to refresh the pin deliberately.
 """
 import hashlib
 import json
@@ -11,41 +18,25 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[1]
-REVISION = "1a6a643427aa347553e9073dac5570b33337c4d9"
-DEST = ROOT / "crates/jka-movement/vendor/openjk"
-REPOSITORY = "https://github.com/JACoders/OpenJK"
-ARCHIVE = ROOT / "target/openjk-stock.zip"
-PREFIX = "OpenJK-" + REVISION + "/"
+REVISION = "b35ed06fec41c53644352743c6b199a5d5d500f3"
+DEST = ROOT / "crates/jka-movement/vendor/japro"
+REPOSITORY = "https://github.com/taysta/TaystJK"
+ARCHIVE = ROOT / "target/taystjk-client.zip"
+if "--archive" in sys.argv:
+    ARCHIVE = Path(sys.argv[sys.argv.index("--archive") + 1])
+PREFIX = "TaystJK-" + REVISION + "/"
 SOURCES = [
-    "LICENSE.txt",
+    "LICENSE.txt", "codemp/cgame/cg_local.h", "codemp/cgame/animtable.h",
     "codemp/game/bg_pmove.c", "codemp/game/bg_slidemove.c",
     "codemp/game/bg_panimate.c", "codemp/game/bg_saber.c",
     "codemp/game/bg_misc.c", "codemp/game/bg_weapons.c",
-    "codemp/cgame/cg_local.h",
-    "codemp/qcommon/cm_load.cpp", "codemp/qcommon/cm_trace.cpp",
-    "codemp/qcommon/cm_test.cpp", "codemp/qcommon/cm_patch.cpp",
-    "codemp/qcommon/cm_polylib.cpp",
     "shared/qcommon/q_math.c", "codemp/qcommon/q_shared.c",
     "shared/qcommon/q_string.c",
-    "shared/sys/snapvector.cpp",
-    "codemp/game/g_xcvar.h", "codemp/game/w_force.c",
-    "codemp/game/g_client.c", "codemp/game/g_active.c",
+    # Clip-map collision (JKA maps) and the engine's Sys_SnapVector.
+    "codemp/qcommon/cm_load.cpp", "codemp/qcommon/cm_trace.cpp",
+    "codemp/qcommon/cm_test.cpp", "codemp/qcommon/cm_patch.cpp",
+    "codemp/qcommon/cm_polylib.cpp", "shared/sys/snapvector.cpp",
 ]
-
-if "--japro" in sys.argv:
-    REVISION = "b35ed06fec41c53644352743c6b199a5d5d500f3"
-    DEST = ROOT / "crates/jka-movement/vendor/japro"
-    REPOSITORY = "https://github.com/taysta/TaystJK"
-    ARCHIVE = ROOT / "target/taystjk-client.zip"
-    PREFIX = "TaystJK-" + REVISION + "/"
-    SOURCES = [
-        "LICENSE.txt", "codemp/cgame/cg_local.h", "codemp/cgame/animtable.h",
-        "codemp/game/bg_pmove.c", "codemp/game/bg_slidemove.c",
-        "codemp/game/bg_panimate.c", "codemp/game/bg_saber.c",
-        "codemp/game/bg_misc.c", "codemp/game/bg_weapons.c",
-        "shared/qcommon/q_math.c", "codemp/qcommon/q_shared.c",
-        "shared/qcommon/q_string.c",
-    ]
 
 
 def main():

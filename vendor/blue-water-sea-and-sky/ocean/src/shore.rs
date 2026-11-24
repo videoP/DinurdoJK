@@ -340,9 +340,17 @@ pub fn table_scale(table: &[f64; FETCH_TABLE], fetch: f64) -> f64 {
 }
 
 impl ShoreGrid<f32> {
-    /// The grid's value at chart point `at`, bilinear between its samples; none off it.
+    /// Bilinear height using known columns. A majority-unknown footprint or
+    /// a point outside the grid falls back to open water.
     pub fn sample(&self, at: [f64; 2]) -> Option<f64> {
-        self.sample_with(at, |k| self.values[k])
+        let weight = self.sample_with(at, |k| f32::from(self.values[k].is_finite()))?;
+        if weight < 0.5 {
+            return None;
+        }
+        self.sample_with(at, |k| {
+            let height = self.values[k];
+            if height.is_finite() { height } else { 0.0 }
+        }).map(|height| height / weight)
     }
 }
 
@@ -430,7 +438,7 @@ impl<T> ShoreGrid<T> {
     }
 }
 
-/// The GPU half: the map's two grids as textures (heights in metres, `R16Float`; the fetch in kilometres,
+/// The GPU half: the map's two grids as textures (height in metres and validity in `Rg16Float`; the fetch in kilometres,
 /// `Rg16Float`), or a calm placeholder of one texel each while there is no coast.
 pub struct ShoreTextures {
     pub heights: wgpu::TextureView,
@@ -459,7 +467,7 @@ impl ShoreTextures {
                 .create_view(&wgpu::TextureViewDescriptor::default())
         };
         Self {
-            heights: texture("ocean shore heights", wgpu::TextureFormat::R16Float),
+            heights: texture("ocean shore heights", wgpu::TextureFormat::Rg16Float),
             exposure: texture("ocean shore exposure", wgpu::TextureFormat::Rg16Float),
         }
     }
@@ -528,14 +536,18 @@ impl ShoreTextures {
             );
             texture.create_view(&wgpu::TextureViewDescriptor::default())
         };
-        let heights = halves(&mut heights.iter().copied());
+        // Filter the height numerator and valid weight together. Missing bed
+        // samples then contribute zero to both, without adding fake depth.
+        let heights = halves(&mut heights.iter().flat_map(|&h| {
+            if h.is_finite() { [h, 1.0] } else { [0.0, 0.0] }
+        }));
         let exposure = halves(&mut exposure.iter().flatten().copied());
         Self {
             heights: texture(
                 "ocean shore heights",
                 heights_size,
-                wgpu::TextureFormat::R16Float,
-                2,
+                wgpu::TextureFormat::Rg16Float,
+                4,
                 &heights,
             ),
             exposure: texture(
@@ -552,6 +564,20 @@ impl ShoreTextures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shore_height_filter_excludes_missing_columns() {
+        let heights = ShoreGrid {
+            origin: [0.0; 2],
+            cell: 1.0,
+            columns: 2,
+            rows: 2,
+            values: vec![-2.0, f32::NAN, 4.0, f32::NAN],
+        };
+        assert_eq!(heights.sample([0.25, 0.5]), Some(1.0));
+        assert_eq!(heights.sample([0.5, 0.0]), Some(-2.0));
+        assert_eq!(heights.sample([0.75, 0.5]), None);
+    }
 
     /// A straight coast along z at x ≤ `beach` (land), sea beyond, on a 101 × 41 grid of 100 m cells.
     fn coast(beach: usize) -> (Vec<bool>, usize, usize) {

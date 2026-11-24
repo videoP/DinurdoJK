@@ -206,9 +206,12 @@ impl Renderer {
     pub(in crate::renderer) fn hybrid_wave_surface_active(&self) -> bool {
         self.ocean_enabled
             && self.ocean_settings.backend == 2
-            && self.ocean_settings.blue_water_underwater_mode == 4
-            && self.ocean_settings.blue_water_adapter
             && self.ocean.as_ref().is_some_and(|gpu| gpu.backend() != 0)
+            && (self.ocean_settings.ninja_requested()
+                // Legacy Hybrid wave classification still requires the Godot
+                // submerged mesh and its mode-4 height probe.
+                || (self.ocean_settings.blue_water_underwater_mode == 4
+                    && self.ocean_settings.blue_water_adapter))
     }
 
     /// Promoted pool whose footprint (and outline) lies over `eye`; where several
@@ -270,6 +273,36 @@ impl Renderer {
         let sample = slot.and_then(|slot| self.ocean.as_ref()?.eye_wave_sample(slot));
         self.eye_wave_offset = sample.map_or(0.0, |s| s.offset());
         self.eye_wave_correction = sample.map(|s| s.correction());
+    }
+
+    /// One classification of the camera against the water for every consumer (`CameraWater`), from the same
+    /// eye solve `refresh_water_boxes` reads. Run after it, with the frame's render size.
+    pub(in crate::renderer) fn classify_camera_water(&mut self, camera: &Camera, width: u32, height: u32) {
+        self.camera_water = if self.camera_water_surface > NO_WATER_SURFACE {
+            crate::renderer::CameraWater::Submerged
+        } else {
+            self.camera_clear_of_water(camera, width, height)
+                .map_or(crate::renderer::CameraWater::Unknown, |clear| match clear {
+                    Some(slot) => crate::renderer::CameraWater::Air { slot },
+                    None => crate::renderer::CameraWater::Near,
+                })
+        };
+    }
+
+    /// None without a fresh eye solve; else the pool when the near plane clears its surface by the sea's
+    /// possible rise since the solve plus the camera's drift across slopes up to `eye_wave::MAX_SLOPE`.
+    fn camera_clear_of_water(&self, camera: &Camera, width: u32, height: u32) -> Option<Option<usize>> {
+        let slot = self.eye_wave_slot?;
+        let ocean = self.ocean.as_ref()?;
+        let sample = ocean.eye_wave_sample(slot)?;
+        let rise_m = ocean.eye_wave_rise_m(&sample)?;
+        let plane = self.world.as_ref()?.ocean_surfaces.get(slot)?.plane_height;
+        let eye = camera.position;
+        let drift = ((eye.x - sample.eye_xz[0]).powi(2) + (eye.z - sample.eye_xz[1]).powi(2)).sqrt();
+        let margin = crate::ocean::near_plane_reach(camera, width, height)
+            + rise_m * crate::ocean::OCEAN_UNITS_PER_METER
+            + crate::ocean::eye_wave::MAX_SLOPE * drift;
+        Some((eye.y - (plane + sample.offset()) > margin).then_some(slot))
     }
 
     /// Collects this frame's water volumes (authored oceans first, then promoted

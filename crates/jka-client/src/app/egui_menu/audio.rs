@@ -61,6 +61,12 @@ impl App {
             "s_volume"
         );
         audio_slider!(
+            "River ambience",
+            "s_riverVolume. Authored water loops driven by solved river flow. Scaled by effects volume; zero disables river ambience.",
+            river_volume,
+            "s_riverVolume"
+        );
+        audio_slider!(
             "Voice",
             "s_volumeVoice. OpenJK voice-channel level; stock default is 1.0.",
             voice_volume,
@@ -288,22 +294,22 @@ impl App {
 
         }
         if section == Some(SetupSection::AudioPositional) {
-        theme::section(ui, "MAP ACOUSTICS · EAL / OPENAL SOFT", "Map-authored .eal environmental effects. Independent of Steam Audio; changes are saved.");
+        theme::section(ui, "ECHOFIELD AUDIO", "Authored EAGLE acoustics and experimental static BSP acoustics.");
         theme::row(
             ui,
-            "EAL map audio",
-            "s_eal. Enable authored reverb, frequency filtering, diffraction and room directionality from the map's .eal data. Works independently of Steam Audio. Maps without EAL data keep their normal sound. No sound restart is required.",
+            "Echofield Audio",
+            "s_echoField. Enables the positional soundscape and map acoustics. Uses authored EAGLE reverb, filtering and diffraction on maps with .eal data, and geometry-based occlusion and reverb on other BSP maps. Changes apply live.",
             theme::Reset::None,
             |ui| {
-                if let Some(enabled) = theme::switch(ui, self.audio.eal_enabled) {
-                    let _ = self.set_console_cvar("s_eal", if enabled { "1" } else { "0" });
+                if let Some(enabled) = theme::switch(ui, self.audio.echofield) {
+                    let _ = self.set_console_cvar("s_echoField", if enabled { "1" } else { "0" });
                 }
             },
         );
         theme::row(
             ui,
             "OpenAL headphone HRTF",
-            "s_ealHrtf. Headphone binaural positioning for EAL/OpenAL sources. Independent of s_steamAudio and s_steamAudioBinaural; only applies when EAL map acoustics are active. Changing it live reconfigures OpenAL Soft.",
+            "s_ealHrtf. Headphone binaural positioning for Echofield sources. Changing it live reconfigures OpenAL Soft.",
             theme::Reset::None,
             |ui| {
                 if let Some(enabled) = theme::switch(ui, self.audio.eal_hrtf) {
@@ -318,20 +324,26 @@ impl App {
             .and_then(|sound| sound.info());
         theme::row(
             ui,
-            "EAL audio status",
-            "Shows whether the current map's authored acoustics is running, unavailable, or has no EAL data.",
+            "Map acoustics status",
+            "Shows which acoustics the current map is using.",
             theme::Reset::None,
             |ui| {
-                let (state, color) = if !self.audio.eal_enabled {
+                let (state, color) = if !self.audio.echofield {
                     ("Off".to_owned(), theme::TEXT_FAINT())
                 } else if let Some(info) = &info {
                     if let Some(error) = &info.eal_effects_error {
                         (format!("Unavailable: {error}"), theme::WARNING())
+                    } else if info.echo_field_selected {
+                        if info.eal_rooms > 0 {
+                            (format!("Static BSP · {} reverb sends", info.eal_rooms), theme::TEXT())
+                        } else {
+                            ("Static BSP · preparing acoustics".to_owned(), theme::TEXT_DIM())
+                        }
                     } else if let Some(path) = &info.eal_file {
                         (format!("{}: {} | {}", if info.eal_effects_active { "Active" } else { "Inactive" },
                             path, info.eal_environment.as_deref().unwrap_or("waiting for listener position")), theme::TEXT())
                     } else {
-                        ("No EAL data loaded for this map".to_owned(), theme::TEXT_DIM())
+                        ("Waiting for map acoustics".to_owned(), theme::TEXT_DIM())
                     }
                 } else {
                     ("Enabled: load a map to hear its acoustics".to_owned(), theme::TEXT_DIM())
@@ -343,11 +355,11 @@ impl App {
         theme::row(
             ui,
             "OpenAL HRTF status",
-            "Actual EAL HRTF processing state as reported by the OpenAL effects worker.",
+            "Actual headphone positioning state as reported by the OpenAL effects worker.",
             theme::Reset::None,
             |ui| {
-                let (state, color) = if !self.audio.eal_enabled {
-                    ("EAL disabled", theme::TEXT_FAINT())
+                let (state, color) = if !self.audio.echofield {
+                    ("Echofield disabled", theme::TEXT_FAINT())
                 } else if let Some(info) = &info {
                     if info.eal_effects_error.is_some() {
                         ("Unavailable", theme::WARNING())
@@ -357,8 +369,8 @@ impl App {
                         ("Off", theme::TEXT_DIM())
                     } else if info.eal_effects_active {
                         (match info.eal_hrtf_status { 2 => "Denied by device", 5 => "Unsupported output format", _ => "Requested; device HRTF is off" }, theme::WARNING())
-                    } else if info.eal_file.is_none() {
-                        ("No EAL map loaded", theme::TEXT_DIM())
+                    } else if info.eal_file.is_none() && !info.echo_field_selected {
+                        ("Waiting for map acoustics", theme::TEXT_DIM())
                     } else {
                         ("Requested · awaiting worker", theme::TEXT_DIM())
                     }
@@ -371,6 +383,7 @@ impl App {
             },
         );
 
+        self.egui_echofield_controls(ui);
         theme::section(
             ui,
             "STEAM AUDIO",
@@ -615,5 +628,74 @@ impl App {
             );
         }
         }
+    }
+    fn egui_echofield_controls(&mut self, ui: &mut egui::Ui) {
+        let settings = self.audio.echofield_settings;
+        egui::CollapsingHeader::new("Echofield controls").show(ui, |ui| {
+            for (label, description, cvar, enabled) in [
+                ("Enhancements", "Enable the soundscape and live acoustic supplements.", "s_echoFieldEnhancements", settings.enhancements),
+                ("World emitters", "Play sounds from nearby world features.", "s_echoFieldEmitters", settings.emitters),
+                ("Terrain audio", "Play sounds at terrain transitions, surfaces, and passages.", "s_echoFieldTerrain", settings.terrain),
+                ("Diffraction", "Allow sound to take paths around obstacles.", "s_echoFieldDiffraction", settings.diffraction),
+                ("Doppler effect", "Shift pitch according to listener and sound source motion.", "s_echoFieldDoppler", settings.doppler),
+                ("Material transmission", "Filter sound traveling through walls and movers.", "s_echoFieldTransmission", settings.transmission),
+                ("Air absorption", "Apply frequency-dependent atmospheric absorption.", "s_echoFieldAirAbsorption", settings.air_absorption),
+                ("Per-source reverb balance", "Use critical distance to adjust reverb for each source.", "s_echoFieldDirectReverb", settings.per_source_dr),
+                ("Update moving sounds", "Refresh acoustics as a sound source or the listener moves.", "s_echoFieldUpdateMoving", settings.resample_moving_sources),
+            ] {
+                theme::row(ui, label, description, theme::Reset::None, |ui| {
+                    if let Some(on) = theme::switch(ui, enabled) {
+                        let _ = self.set_console_cvar(cvar, if on { "1" } else { "0" });
+                    }
+                });
+            }
+            for (label, description, cvar, mut value, minimum) in [
+                ("Soundscape level", "Overall level of environmental sources.", "s_echoFieldVolume", settings.master_volume, 0.0),
+                ("Emitter density", "Number of emitters that can be heard at a distance.", "s_echoFieldEmitterDensity", settings.emitter_density, 0.25),
+                ("Excitation level", "Level of wind and other continuous environmental sound.", "s_echoFieldExcitationVolume", settings.excitation_volume, 0.0),
+                ("Terrain level", "Level of terrain sonification.", "s_echoFieldTerrainIntensity", settings.terrain_intensity, 0.0),
+                ("Early reflections", "Level of delayed reflections in the BSP headphone path.", "s_echoFieldEarlyReflections", settings.reflection_intensity, 0.0),
+            ] {
+                theme::row(ui, label, description, theme::Reset::None, |ui| {
+                    let readout = format!("{:.0}%", value * 100.0);
+                    if theme::slider(ui, &mut value, minimum..=1.0, &readout) {
+                        let _ = self.set_console_cvar(cvar, &value.to_string());
+                    }
+                });
+            }
+            theme::row(ui, "Relative humidity", "Choose a percentage, or set zero to use local weather.", theme::Reset::None, |ui| {
+                let mut humidity = settings.humidity;
+                let readout = if humidity == 0.0 { "Auto".to_owned() } else { format!("{humidity:.0}%") };
+                if theme::slider(ui, &mut humidity, 0.0..=100.0, &readout) {
+                    let _ = self.set_console_cvar("s_echoFieldHumidity", &humidity.to_string());
+                }
+            });
+            theme::row(ui, "Terrain scan radius", "Distance covered by terrain probes.", theme::Reset::None, |ui| {
+                let mut range = settings.terrain_range as f32;
+                let readout = format!("{range:.0} m");
+                if theme::slider(ui, &mut range, 8.0..=32.0, &readout) {
+                    let _ = self.set_console_cvar("s_echoFieldTerrainRange", &(range.round() as u32).to_string());
+                }
+            });
+            for (title, cvar, mut mask, labels) in [
+                ("Excitation types", "s_echoFieldExcitationMask", settings.excitation_mask,
+                    &[(0, "Wind"), (1, "Foliage"), (2, "Grass"), (3, "Water"), (4, "Lava")][..]),
+                ("Emitter types", "s_echoFieldEmitterMask", settings.emitter_mask,
+                    &[(4, "Leaf rustle"), (5, "Grass"), (6, "Wind whistle"),
+                    (7, "Flowing water"), (8, "Drips"), (9, "Rain"), (10, "Still water"), (11, "Lava"),
+                    (12, "Cave sounds"), (13, "Cave drone"), (14, "Mechanical")][..]),
+            ] {
+                egui::CollapsingHeader::new(title).show(ui, |ui| {
+                    for &(index, label) in labels {
+                        let bit = 1 << index;
+                        let mut checked = mask & bit != 0;
+                        if ui.checkbox(&mut checked, label).changed() {
+                            mask = if checked { mask | bit } else { mask & !bit };
+                            let _ = self.set_console_cvar(cvar, &mask.to_string());
+                        }
+                    }
+                });
+            }
+        });
     }
 }

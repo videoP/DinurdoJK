@@ -1,13 +1,14 @@
 //! Authored river material controls; native defaults, generation unchanged.
 use super::cvar_prelude::*;
+use crate::river_settings::FLUID_NINJA_UNDERWATER;
 app_cvars! {
     APP_R_RIVERUNDERWATEROPTICS {
-        runtime: CvarDef::new("r_riverUnderwaterOptics", "1", "0..1",
-            "River underwater A/B: 0 original appearance, 1 shared Blue Water optics with subtle waterline tint (default). Visual only; s_underwater audio is independent.",
-            CvarType::Int {min:0,max:1}, CvarFlags::ARCHIVE, LatchScope::None,
+        runtime: CvarDef::new("r_riverUnderwaterOptics", if jka_river::river_ninja::FLUID_NINJA_INCLUDED { "2" } else { "1" }, "0..2",
+            "Underwater appearance for new rivers: 0 original, 1 shared Blue Water optics, 2 Fluid Ninja Green Murky (default when Fluid Ninja is built in).",
+            CvarType::Int {min:0,max:2}, CvarFlags::ARCHIVE, LatchScope::None,
             |app:&App|CvarValue::Int(i32::from(app.video.river_settings.underwater_optics)),
-            |app,value|{let CvarValue::Int(v)=value else {unreachable!()};app.video.river_settings.underwater_optics=v.clamp(0,1) as u8;app.commit_river_settings();Ok(())}),
-        config: CvarBinding {load_video:Some(|s,_,v,_|{if let Ok(v)=v.parse::<u8>(){s.river_settings.underwater_optics=v.min(1);}}),
+            |app,value|{let CvarValue::Int(v)=value else {unreachable!()};app.video.river_settings.underwater_optics=v.clamp(0,i32::from(FLUID_NINJA_UNDERWATER)) as u8;app.commit_river_settings();Ok(())}),
+        config: CvarBinding {load_video:Some(|s,_,v,_|{if let Ok(v)=v.parse::<u8>(){s.river_settings.underwater_optics=v.min(FLUID_NINJA_UNDERWATER);}}),
             archive:Some((29134,|s|s.video.river_settings.underwater_optics.to_string())),..CvarBinding::NONE}, implementations: []
     }
     APP_R_RIVERFOAMMINIMUMDEPTH {

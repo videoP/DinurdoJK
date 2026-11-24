@@ -90,6 +90,14 @@ fn specular_alpha(draw: SkinDraw, world: vec3<f32>, world_normal: vec3<f32>) -> 
 // Source 1 `$bumpmap`, linear. A flat (128, 128, 255) 1x1 texture is bound
 // wherever a surface has none, so this is always a legal read.
 @group(1) @binding(3) var normal_texture: texture_2d<f32>;
+// Only the separately-specialized SkinGore pipeline has group 3. Stock JKA
+// pipelines never bind or sample these textures.
+@group(3) @binding(0) var gore_damage: texture_2d<f32>;
+@group(3) @binding(1) var gore_detail: texture_2d<f32>;
+@group(3) @binding(2) var gore_metallic: texture_2d<f32>;
+@group(3) @binding(3) var gore_sampler: sampler;
+@group(3) @binding(10) var gore_reflection_probe: texture_cube<f32>;
+@group(3) @binding(11) var gore_clamp_sampler: sampler;
 
 struct EntityLightingSettings {
     values: vec4<u32>,
@@ -705,8 +713,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     );
 }
 
-@fragment
-fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
+fn masked_color(input: VertexOut, authored_stage: bool) -> vec4<f32> {
     let tex = textureSample(base_texture, base_sampler, input.uv);
     if (is_disintegration(input.color.a)) {
         if (tex.a < 0.5) { discard; }
@@ -716,7 +723,8 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
         return disintegration_body_color(lit, input.color.a,
             input.world_position, input.predator_local);
     }
-    if tex.a < 0.5 {
+    let coverage = select(tex.a, tex.a * input.color.a, authored_stage);
+    if coverage < 0.5 {
         discard;
     }
     return fogged(
@@ -724,6 +732,191 @@ fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
         input.world_position,
         false
     );
+}
+
+// zulubo/SkinGore (MIT), SkinGore.shader and SkinGoreBase.mat.
+fn gore_overlay(a: f32, b: f32) -> f32 {
+    if (a < 0.5) { return 2.0 * a * b; }
+    return 1.0 - 2.0 * (1.0 - a) * (1.0 - b);
+}
+
+// Recover the tangent and its handedness from the skinned mesh and its UVs.
+// Ghoul2's packed vertices have no tangents. Match the orthonormal frame
+// used by Standard, including mirrored UV islands.
+fn gore_world_normal(
+    geometric: vec3<f32>, normal_ts: vec3<f32>,
+    dp_x: vec3<f32>, dp_y: vec3<f32>, duv_x: vec2<f32>, duv_y: vec2<f32>,
+) -> vec3<f32> {
+    let uv_winding = duv_x.x * duv_y.y - duv_x.y * duv_y.x;
+    let tangent_raw = (dp_x * duv_y.y - dp_y * duv_x.y) * sign(uv_winding);
+    let tangent_plane = tangent_raw - geometric * dot(geometric, tangent_raw);
+    let tangent_len_sq = dot(tangent_plane, tangent_plane);
+    if (tangent_len_sq <= 1.0e-16) { return geometric; }
+    let tangent = tangent_plane * inverseSqrt(tangent_len_sq);
+    let bitangent_raw = (dp_y * duv_x.x - dp_x * duv_y.x) * sign(uv_winding);
+    let bitangent = cross(geometric, tangent);
+    let handedness = select(-1.0, 1.0, dot(bitangent, bitangent_raw) >= 0.0);
+    return normalize(tangent * normal_ts.x + bitangent * (normal_ts.y * handedness)
+        + geometric * normal_ts.z);
+}
+
+struct SkinGoreMaterial {
+    diffuse: vec3<f32>,
+    reflectance: vec3<f32>,
+    perceptual_roughness: f32,
+    roughness: f32,
+    grazing: f32,
+};
+
+fn gore_pow5(x: f32) -> f32 {
+    let x2 = x * x;
+    return x2 * x2 * x;
+}
+
+// Unity Standard's direct BRDF: Disney diffuse, GGX distribution, joint
+// Smith visibility and Schlick Fresnel. The pi in Standard's specular scale
+// cancels the reciprocal pi in the GGX distribution.
+fn gore_direct(
+    material: SkinGoreMaterial, n: vec3<f32>, v: vec3<f32>, nv: f32,
+    toward_light: vec3<f32>, radiance: vec3<f32>,
+) -> vec3<f32> {
+    let length_sq = dot(toward_light, toward_light);
+    if (length_sq <= 1.0e-8 || !any(radiance > vec3<f32>(0.0))) {
+        return vec3<f32>(0.0);
+    }
+    let l = toward_light * inverseSqrt(length_sq);
+    let nl = clamp(dot(n, l), 0.0, 1.0);
+    let half_vector = l + v;
+    let h = half_vector * inverseSqrt(max(dot(half_vector, half_vector), 1.0e-8));
+    let nh = clamp(dot(n, h), 0.0, 1.0);
+    let lh = clamp(dot(l, h), 0.0, 1.0);
+    let roughness = material.roughness;
+    let fd90 = 0.5 + 2.0 * lh * lh * material.perceptual_roughness;
+    let diffuse = (1.0 + (fd90 - 1.0) * gore_pow5(1.0 - nl))
+        * (1.0 + (fd90 - 1.0) * gore_pow5(1.0 - nv));
+    let visibility = 0.5 / (nl * mix(nv, 1.0, roughness) + nv * mix(nl, 1.0, roughness) + 1.0e-5);
+    let roughness_sq = roughness * roughness;
+    let d = 1.0 + nh * nh * (roughness_sq - 1.0);
+    let distribution = roughness_sq / (d * d + 1.0e-7);
+    let fresnel = mix(material.reflectance, vec3<f32>(1.0), gore_pow5(1.0 - lh));
+    return radiance * nl * (material.diffuse * diffuse + fresnel * (visibility * distribution));
+}
+
+fn gore_lighting(
+    input: VertexOut, material: SkinGoreMaterial, n: vec3<f32>,
+) -> vec3<f32> {
+    let draw = skin_draws[input.draw_index];
+    let p = input.world_position;
+    let v = normalize(camera.camera_pos_time.xyz - p);
+    let nv = clamp(abs(dot(n, v)), 0.0, 1.0);
+    let studio = entity_lighting.values.w != 0u;
+    let has_light_grid = (draw.params.y & 1u) != 0u;
+    var ambient = vec3<f32>(1.0);
+    var direct = vec3<f32>(0.0);
+    var probe_light = vec3<f32>(0.0);
+    if (studio) {
+        ambient = entity_lighting.studio_ambient.rgb * entity_lighting.studio_ambient.a;
+        direct = gore_direct(material, n, v, nv, entity_lighting.studio_sun_direction.xyz,
+            entity_lighting.studio_sun.rgb * entity_lighting.studio_sun.a);
+    } else if (has_light_grid) {
+        ambient = draw.classic_ambient.rgb / 255.0;
+        probe_light = max(draw.classic_directed.rgb, draw.classic_sun_directed.rgb) / 255.0;
+        direct = gore_direct(material, n, v, nv, draw.classic_direction.xyz, draw.classic_directed.rgb / 255.0)
+            + gore_direct(material, n, v, nv, draw.classic_sun_direction.xyz, draw.classic_sun_directed.rgb / 255.0);
+    } else if (entity_lighting.values.x == 2u) {
+        ambient = model_irradiance_volume_light(p, n);
+    }
+    for (var i = 0u; i < min(entity_lighting.values.z, 32u); i += 1u) {
+        let ci = entity_lighting.studio_lights[i * 4u + 1u];
+        let light = studio_light_sample(i, p);
+        direct += gore_direct(material, n, v, nv, light.xyz, ci.rgb * ci.a * light.w);
+    }
+
+    let reflected = reflect(-v, n);
+    let luma = vec3<f32>(0.2126, 0.7152, 0.0722);
+    // SkinGoreDemo.unity's indirect specular color stands in for its sky
+    // reflection when the map has no captured probe. Diffuse irradiance can
+    // scale that fallback but shouldn't itself become a mirror reflection.
+    let demo_indirect_specular = vec3<f32>(0.16788375, 0.21073635, 0.28994125);
+    var environment = demo_indirect_specular * clamp(dot(ambient, luma), 0.0, 1.0);
+    if (draw.axis2.w > 0.5 && !studio) {
+        let direction_jka = vec3<f32>(reflected.x, -reflected.z, reflected.y);
+        let roughness = material.perceptual_roughness;
+        let probe_roughness = roughness * (1.7 - 0.7 * roughness);
+        let mip = probe_roughness * f32(textureNumLevels(gore_reflection_probe) - 1u);
+        let probe = textureSampleLevel(gore_reflection_probe, gore_clamp_sampler, direction_jka, mip);
+        // The cube's alpha stores the capture location's light-grid luminance.
+        // Use the same attenuation as Rend2 surfaces moving into darker light.
+        let local_luma = max(dot(ambient, luma), dot(probe_light, luma));
+        environment = probe.rgb * clamp(local_luma / max(probe.a, 0.0001), 0.0, 1.0);
+    } else if (!studio && entity_lighting.values.x == 2u && entity_irradiance_info.volume_enabled_pad.x > 0.5) {
+        let irradiance = model_irradiance_volume_light(p, reflected);
+        environment = demo_indirect_specular * clamp(dot(irradiance, luma), 0.0, 1.0);
+    }
+    let grazing = 1.0 - nv;
+    let grazing_sq = grazing * grazing;
+    let env_fresnel = mix(material.reflectance, vec3<f32>(material.grazing), grazing_sq * grazing_sq);
+    let env_specular = environment * env_fresnel / (1.0 + material.roughness * material.roughness);
+    let sky_gain = select(sky_world_model_gain(n, p), vec3<f32>(1.0), studio);
+    return (ambient * material.diffuse + direct) * sky_gain + env_specular;
+}
+
+@fragment
+fn fs_skin_gore(input: VertexOut) -> @location(0) vec4<f32> {
+    let uv = input.uv;
+    let art_uv = uv * 3.0;
+    let damage = textureSample(gore_damage, gore_clamp_sampler, uv).r;
+    let detail = textureSample(gore_detail, gore_sampler, uv * 4.0).r;
+    let mask = gore_overlay(gore_overlay(damage, detail), detail);
+    let hardness = 1.0 - 0.504;
+    let coverage = clamp((mask - (0.5 - hardness / 2.0)) / hardness, 0.0, 1.0);
+    let edge = clamp(((1.0 - mask) - (0.5 - hardness / 2.0 - 0.124)) / (hardness / 2.0), 0.0, 1.0);
+    let uv_dx = dpdx(uv);
+    let uv_dy = dpdy(uv);
+    let position_dx = dpdx(input.world_position);
+    let position_dy = dpdy(input.world_position);
+    // The original material's alpha is the damage coverage alone. Keep the
+    // uncut mesh out of the full material shading and retain explicit gradients.
+    if (mask < 0.1 || coverage < 0.5) { discard; }
+    let art_dx = uv_dx * 3.0;
+    let art_dy = uv_dy * 3.0;
+    let albedo = textureSampleGrad(base_texture, base_sampler, art_uv, art_dx, art_dy).rgb;
+    let metallic_smoothness = textureSampleGrad(gore_metallic, gore_sampler, art_uv, art_dx, art_dy).ra;
+    let packed_normal = textureSampleGrad(normal_texture, base_sampler, art_uv, art_dx, art_dy).rg;
+    // Unity's normal art is Y+ with v increasing upward; GLM textures have
+    // v increasing down their image rows. Preserve the texture-space relief.
+    let xy = (packed_normal * 2.0 - 1.0) * vec2<f32>(1.0, -1.0);
+    let z = sqrt(1.0 - min(dot(xy, xy), 1.0));
+    let n = gore_world_normal(normalize(input.normal), vec3<f32>(xy * mix(1.0, -3.0, edge), z),
+        position_dx, position_dy, uv_dx, uv_dy);
+
+    // SkinGoreBase runs in a linear-color project. ShaderLab Color properties
+    // reach surf() as linear values, while metallic map alpha stays linear.
+    let tint = vec3<f32>(0.60703, 0.22044, 0.22044);
+    let edge_color = vec3<f32>(0.23192, 0.0, 0.0);
+    let rgb = albedo * tint * mix(vec3<f32>(1.0), edge_color, edge);
+    let smoothness = metallic_smoothness.y * mix(1.0, 0.446, edge);
+    let perceptual_roughness = 1.0 - smoothness;
+    let one_minus_reflectivity = 0.96 * (1.0 - metallic_smoothness.x);
+    let material = SkinGoreMaterial(
+        rgb * one_minus_reflectivity * model_brightness(),
+        mix(vec3<f32>(0.04), rgb, metallic_smoothness.x),
+        perceptual_roughness,
+        max(perceptual_roughness * perceptual_roughness, 0.002),
+        clamp(smoothness + 1.0 - one_minus_reflectivity, 0.0, 1.0),
+    );
+    let lit = vec4<f32>(gore_lighting(input, material, n), coverage);
+    return fogged(lit, input.world_position, false);
+}
+
+@fragment
+fn fs_mask(input: VertexOut) -> @location(0) vec4<f32> {
+    return masked_color(input, false);
+}
+
+@fragment
+fn fs_stage_mask_blend(input: VertexOut) -> @location(0) vec4<f32> {
+    return legacy_effect_output(masked_color(input, true));
 }
 
 @fragment

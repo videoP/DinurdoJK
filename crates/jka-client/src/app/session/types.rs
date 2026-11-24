@@ -111,8 +111,12 @@ pub(in crate::app) struct GameSession {
     /// Dedupes snapshot/prediction damage transitions.
     pub(in crate::app) extension_last_damage: Option<(i32, i32, i32)>,
     pub(in crate::app) player_position: Option<glam::Vec3>,
+    pub(super) ninja_fire_river_wet: Option<(u64, i32, crate::river_runtime::RiverAudioContact)>,
     pub(in crate::app) ocean_actors: Arc<Vec<crate::ocean::interaction::ActorSample>>,
+    // Non-player native collider sources exclusively for the Ninja painter.
+    pub(in crate::app) ninja_entities: Option<Arc<Vec<jka_river::river_ninja::ActorSample>>>,
     pub(in crate::app) ocean_interaction_enabled: bool,
+    pub(in crate::app) ocean_ninja_enabled: bool,
     pub(in crate::app) lake_wakes_enabled: bool,
     pub(in crate::app) water_wake_mode: u8,
     pub(in crate::app) water_wake: super::water_wake::WaterWakeTracker,

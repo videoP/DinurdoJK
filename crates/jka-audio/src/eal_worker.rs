@@ -106,6 +106,16 @@ pub struct WorkerStatus {
     pub callback_dropped_samples: AtomicU64,
     pub transport: AtomicU64,
     pub hrtf_status: AtomicU64,
+    pub(crate) ambience: Mutex<crate::echo_runtime::AmbienceScene>,
+    pub(crate) weather: Mutex<jka_echofield::soundscape::Weather>,
+    pub(crate) ambience_paused: AtomicBool,
+    pub(crate) movers: Mutex<Option<Vec<crate::EchoMover>>>,
+    pub(crate) river_contacts: Mutex<Option<(Instant, Vec<jka_echofield::world::Contact>)>>,
+    /// VFS reader for Echofield recordings; the geometry worker takes it once.
+    pub(crate) ambience_assets: Mutex<Option<jka_assets::pk3::AssetSearchPath>>,
+    pub(crate) software_underwater: AtomicBool,
+    pub(crate) echo_settings: Mutex<crate::EchoSettings>,
+    pub(crate) doppler: Mutex<Option<std::collections::HashMap<u64, f32>>>,
     error: Mutex<Option<String>>,
 }
 impl WorkerStatus {
@@ -129,8 +139,30 @@ pub struct EalWorker {
 }
 impl EalWorker {
     pub fn new(rate: u32, map: Arc<EalMap>) -> Result<Self, String> {
+        Self::new_authored(rate, map, None, false)
+    }
+    pub fn new_authored(
+        rate: u32,
+        map: Arc<EalMap>,
+        bsp: Option<crate::EchoGeometryInput>,
+        offline: bool,
+    ) -> Result<Self, String> {
+        Self::new_inner(rate, Some(map), bsp, offline)
+    }
+    pub fn new_echo(rate: u32, bsp: crate::EchoGeometryInput, offline: bool) -> Result<Self, String> {
+        Self::new_inner(rate, None, Some(bsp), offline)
+    }
+    fn new_inner(rate:u32,map:Option<Arc<EalMap>>,bsp:Option<crate::EchoGeometryInput>,offline:bool)->Result<Self,String>{
         Self::spawn_with_status(move |status| {
-            let mut scene = NativeScene::new(rate, &map)?;
+            let static_reverb = map.is_none();
+            let mut scene = if let Some(map) = map {
+                NativeScene::new(rate, &map)?
+            } else {
+                NativeScene::new_echo(rate)?
+            };
+            let mut echo = bsp.map(|bsp| {
+                crate::echo_runtime::EchoRuntime::new(rate, bsp, static_reverb, offline, Arc::clone(&status))
+            }).transpose()?;
             let mut previous_sequence: Option<u64> = None;
             Ok(
                 move |job: InputBlock| -> Result<[f32; BLOCK_FRAMES * 2], String> {
@@ -153,7 +185,11 @@ impl EalWorker {
                             voice.pcm.fill(0.0);
                         }
                         for _ in 0..missing {
-                            scene.render(&silent, &mut output)?;
+                            if let Some(echo) = echo.as_ref() {
+                                scene.render_echo(&silent, echo.latest(), &mut output)?;
+                            } else {
+                                scene.render(&silent, &mut output)?;
+                            }
                         }
                     }
                     previous_sequence = Some(job.sequence);
@@ -161,7 +197,7 @@ impl EalWorker {
                     // the EAL per-source sample clocks, worker queue and
                     // Rodio playback/crossfade entirely unchanged. Test this
                     // before changing EAX or audio-device buffering.
-                    let stats = if frame.debug_mode == 1 {
+                    let mut stats = if frame.debug_mode == 1 {
                         let mut stats = crate::eal_native::SceneStats::default();
                         for voice in &frame.voices {
                             if voice.active == 0 {
@@ -175,11 +211,38 @@ impl EalWorker {
                         }
                         stats
                     } else {
-                        scene.render(&frame, &mut output)?
+                        let mut snapshot = None;
+                        let mut geometry_failed = false;
+                        if let Some(runtime) = &mut echo {
+                            if job.enabled && !status.ambience_paused.load(Ordering::Relaxed) {
+                                match runtime.update(job.sequence, &frame, status.hrtf.load(Ordering::Relaxed)) {
+                                    Ok(result) => snapshot = Some(result),
+                                    Err(error) if static_reverb => return Err(error),
+                                    Err(error) => {
+                                        eprintln!("ECHOFIELD AMBIENCE: {error}");
+                                        geometry_failed = true;
+                                    }
+                                }
+                            } else {
+                                snapshot = Some(runtime.latest());
+                            }
+                        }
+                        let stats = if let Some(snapshot) = snapshot {
+                            scene.render_echo(&frame, snapshot, &mut output)?
+                        } else {
+                            scene.render(&frame, &mut output)?
+                        };
+                        if geometry_failed {
+                            echo = None;
+                        }
+                        stats
                     };
                     status
                         .sources
                         .store(stats.sources as u64, Ordering::Relaxed);
+                    if static_reverb && echo.as_ref().is_some_and(|echo| !echo.is_ready()) {
+                        stats.rooms = 0;
+                    }
                     status.rooms.store(stats.rooms as u64, Ordering::Relaxed);
                     status
                         .filtered_sources

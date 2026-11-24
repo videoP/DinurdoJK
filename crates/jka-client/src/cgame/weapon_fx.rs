@@ -491,6 +491,7 @@ fn interpolate_fx_particles(
 }
 
 fn fx_worker_loop(rx: mpsc::Receiver<FxWorkerCommand>, assets: AssetSearchPath) {
+    crate::ninja_fire_debug::clear_effect_geometry();
     let mut worker = FxWorker {
         fx: FxSystem::new(), assets, ids: HashMap::new(),
         missing: HashSet::new(), last_sample_time: None,
@@ -584,6 +585,7 @@ fn fx_worker_loop(rx: mpsc::Receiver<FxWorkerCommand>, assets: AssetSearchPath) 
                         // VFS, including names that previously resolved missing.
                         worker.ids.clear();
                         worker.missing.clear();
+                        // Keep geometry for FxSystem templates that survive VFS refresh.
                         retried
                     })
                     .map_err(|error| format!("FX ASSET REFRESH ERROR: {error}"));
@@ -1153,11 +1155,15 @@ struct SaberWallMark {
 #[derive(Clone, Debug)]
 struct FootMark {
     end_time: i32,
+    /// Blood marks reuse the original foot projection/UVs, but carry
+    /// transferred pigment and a shorter, step-dependent fade.
+    blood_strength: Option<f32>,
     positions: Vec<[f32; 3]>,
     uvs: Vec<[f32; 2]>,
     indices: Vec<u32>,
     /// `footstep_heavy_*` (a run step) rather than `footstep_*`.
     heavy: bool,
+    snow: bool,
 }
 
 /// The prints kept at once; the oldest give way.
@@ -1239,6 +1245,11 @@ struct Chunk {
     axis: [[f32; 3]; 3],
     last_time: i32,
     stationary: bool,
+    /// Survives Rapier fallback, which clears physics_candidate on rejection.
+    is_gib: bool,
+    next_blood_ms: i32,
+    next_smear_ms: i32,
+    last_smear_origin: Option<([f32; 3], i32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1432,6 +1443,8 @@ fn saber_wall_contact_sound(origin: [f32; 3], variant: i32) -> FxSound {
 }
 
 pub struct WeaponFx {
+    ninja_blood: crate::ninja_blood::BloodEvents,
+    ninja_blood_velocities: HashMap<u16, [f32; 3]>,
     saber_definitions: SaberDefinitions,
     vehicle_definitions: VehicleDefinitions,
     /// Lazily populated `g_vehWeaponInfo` indices, 1-based; tied to the map's
@@ -1496,12 +1509,15 @@ pub struct WeaponFx {
     /// EV_DEBRIS spawn specifications queued for the shared Rapier world.
     pending_debris: Vec<ChunkSpec>,
     pending_gibs: Vec<ChunkSpec>,
+    /// Local-only /testgib requests wait for the next FX frame, so the
+    /// standard EV_GIB_PLAYER fallback / Rapier promotion runs unchanged.
+    test_gib_spawns: Vec<ChunkSpec>,
+    test_gib_seed: u32,
     pending_glass: Vec<ShardSpec>,
     plums: Vec<Plum>,
     last_plum_z: f32,
     score_plums: bool,
-    /// jaPRO `cg_blood` (0 none, 1 skull/brain, 2 full gibs).
-    gib_level: u8,
+    blood_mode: u8,
     shards: Vec<Shard>,
     /// `(mins, maxs)` per inline model, for glass tessellation.
     inline_model_bounds: std::sync::Arc<[([f32; 3], [f32; 3])]>,
@@ -1580,6 +1596,8 @@ impl WeaponFx {
         let (worker_tx, rx) = mpsc::channel();
         let worker = thread::Builder::new().name("jka-fx".to_owned()).spawn(move || fx_worker_loop(rx, assets)).expect("failed to start JKA FX worker");
         Self {
+            ninja_blood: Default::default(),
+            ninja_blood_velocities: HashMap::new(),
             saber_definitions,
             vehicle_definitions,
             vehicle_weapon_names: Vec::new(),
@@ -1626,11 +1644,13 @@ impl WeaponFx {
             chunks: Vec::new(),
             pending_debris: Vec::new(),
             pending_gibs: Vec::new(),
+            test_gib_spawns: Vec::new(),
+            test_gib_seed: 0,
             pending_glass: Vec::new(),
             plums: Vec::new(),
             last_plum_z: 0.0,
             score_plums: true,
-            gib_level: 0,
+            blood_mode: 0,
             shards: Vec::new(),
             inline_model_bounds: std::sync::Arc::from(Vec::new()),
             inline_model_glass_faces: std::sync::Arc::from(Vec::new()),
@@ -1745,7 +1765,13 @@ impl WeaponFx {
     }
 
     pub fn set_mark_surfaces(&mut self, surfaces: Option<std::sync::Arc<jka_assets::bsp::MarkSurfaces>>) {
+        let changed = match (&self.mark_surfaces, &surfaces) {
+            (Some(a), Some(b)) => !std::sync::Arc::ptr_eq(a, b),
+            (None, None) => false,
+            _ => true,
+        };
         self.mark_surfaces = surfaces;
+        if changed { self.ninja_blood.clear(); }
         self.saber_wall_marks.clear();
         self.foot_marks.clear();
         self.efx_world_marks.clear();
@@ -1818,6 +1844,16 @@ impl WeaponFx {
             self.fx_lod = value;
             let _ = self.worker_tx.send(FxWorkerCommand::SetLod { mode: value.0, count_scale: value.1, lod_scale: value.2 });
         }
+    }
+
+    /// `r_fxSmokeDurationScale` controls the persistence of promoted EFX smoke.
+    /// Authored EFX smoke, including the stock smoke kept beside promoted
+    /// fires, always keeps its authored lifetime.
+    pub fn set_fx_smoke_duration_scale(&mut self, scale: f32) {
+        let scale = if scale.is_finite() {
+            scale.clamp(crate::fx::SMOKE_DURATION_SCALE_MIN, crate::fx::SMOKE_DURATION_SCALE_MAX)
+        } else { crate::fx::SMOKE_DURATION_SCALE_DEFAULT };
+        crate::ninja_fire_debug::set_smoke_lifetime(scale);
     }
 
     /// Final render view for LOD (`px_per_unit` = viewport height / (2 tan(fov_y / 2))).
@@ -1894,9 +1930,105 @@ impl WeaponFx {
         }
     }
 
+    pub(crate) fn ninja_blood_scene(&self) -> Option<crate::ninja_blood::BloodScene> {
+        self.ninja_blood.scene()
+    }
+
+    pub(crate) fn reload_blood_assets(&mut self, base: &std::path::Path, game: Option<&std::path::Path>) -> Result<(), String> {
+        if self.jk2_assets || !crate::ninja_blood::enabled() {
+            self.ninja_blood.disable();
+            self.ninja_blood_velocities.clear();
+            self.foot_marks.retain(|mark| mark.blood_strength.is_none());
+            return Ok(());
+        }
+        self.ninja_blood.load_spurt(base, game)
+    }
+
+    pub(crate) fn stop_local_ninja_blood(&mut self) -> bool {
+        self.ninja_blood.local_started_ms = None;
+        self.ninja_blood.local_emit_ms.take().is_some()
+    }
+
+    pub(crate) fn start_local_ninja_blood(&mut self, _origin: [f32; 3], style: crate::ninja_blood::BleedStyle) {
+        self.ninja_blood.begin_frame(self.time);
+        // Keep the emitter independent from ground deposits; an airborne
+        // droplet must trace a real surface before injecting Ninja density.
+        self.ninja_blood.local_style = style;
+        self.ninja_blood.local_started_ms = Some(self.time);
+        self.ninja_blood.local_emit_ms = Some(self.time);
+    }
+
+    pub(crate) fn update_local_ninja_blood(&mut self, actor: Option<&PresentedEntity>) {
+        let Some(next) = self.ninja_blood.local_emit_ms else { return; };
+        if self.time < next { return; }
+        if let Some(actor) = actor.filter(|actor| actor.entity_type == super::ET_PLAYER
+            && actor.state.field_i32("eFlags").unwrap_or(0) & super::EF_DEAD == 0)
+        {
+            let mut position = actor.origin;
+            // Spawn from above the feet, not on the floor or inside the BSP.
+            position[2] += 12.0;
+            let velocity = super::entity_vec3(&actor.state, "pos.trDelta").unwrap_or([0.0; 3]);
+            let yaw = actor.angles[1].to_radians();
+            let forward = [yaw.cos(), yaw.sin(), 0.0];
+            let catchup = (self.time.saturating_sub(next) / crate::ninja_blood::EMIT_INTERVAL_MS + 1).clamp(1,4);
+            for sample in 0..catchup {
+                let scheduled = next.saturating_add(sample * crate::ninja_blood::EMIT_INTERVAL_MS);
+                let pulse = if self.ninja_blood.local_style == crate::ninja_blood::BleedStyle::Gush {
+                    crate::ninja_blood::gush_heartbeat(scheduled.saturating_sub(
+                        self.ninja_blood.local_started_ms.unwrap_or(scheduled)))
+                } else { 1.0 };
+                self.ninja_blood.bleed_pulsed(position, velocity, forward, self.ninja_blood.local_style, pulse);
+            }
+            self.ninja_blood.local_emit_ms = Some(self.time.saturating_add(crate::ninja_blood::EMIT_INTERVAL_MS));
+        }
+    }
+
+    pub(crate) fn test_ninja_blood_surface(&mut self, origin: [f32; 3], direction: [f32; 3]) -> bool {
+        if self.jk2_assets || !crate::ninja_blood::enabled() || !crate::fx::simulation_enabled() { return false; }
+        let (Some(world), Some(surfaces)) = (self.collision_world.as_mut(), self.mark_surfaces.as_deref()) else { return false; };
+        let Some(dir) = glam::Vec3::from_array(direction).try_normalize() else { return false; };
+        let end = (glam::Vec3::from_array(origin) + dir * 2048.0).to_array();
+        let hit = world.trace(TraceQuery { start: origin, end, mins: [0.0;3], maxs: [0.0;3], pass_entity: -1, mask: CONTENTS_SOLID });
+        self.ninja_blood.impact(hit, dir * 100.0, crate::ninja_blood::POINT_SIZE_CM, true,
+            crate::ninja_blood::SplatKind::Ordinary, surfaces, self.time)
+    }
+
+    pub(crate) fn test_ninja_blood_spurt(&mut self, eye: [f32; 3], direction: [f32; 3]) -> bool {
+        let Some(world) = self.collision_world.as_mut() else { return false; };
+        let Some(direction) = glam::Vec3::from_array(direction).try_normalize() else { return false; };
+        let eye_pos = glam::Vec3::from_array(eye);
+        let clearance = world.trace(TraceQuery { start: eye, end: (eye_pos + direction * 48.0).to_array(),
+            mins: [0.0; 3], maxs: [0.0; 3], pass_entity: -1, mask: CONTENTS_SOLID });
+        if clearance.start_solid != 0 || self.mark_surfaces.is_none() { return false; }
+        let distance = if clearance.fraction < 1.0 { (48.0 * clearance.fraction - 2.0).max(0.0) } else { 48.0 };
+        self.ninja_blood.preview_spurt(eye_pos + direction * distance, direction, self.time)
+    }
+
+    /// Grounded movement drives fluid displacement. Animated footfalls also
+    /// transfer pigment onto the soles for the footprint pass.
+    pub(crate) fn disturb_ninja_blood<'a>(&mut self, players: impl Iterator<Item = &'a PresentedEntity>) {
+        self.ninja_blood_velocities.clear();
+        if !self.ninja_blood.has_pools() { return; }
+        for player in players {
+            if player.entity_type != super::ET_PLAYER
+                || player.state.field_i32("groundEntityNum") != Some(ENTITY_WORLD)
+                || player.state.field_i32("eFlags").unwrap_or(0) & super::EF_DEAD != 0
+                || player.state.field_i32("m_iVehicleNum").unwrap_or(0) != 0
+            { continue; }
+            if let Some(velocity) = super::entity_vec3(&player.state, "pos.trDelta") {
+                self.ninja_blood_velocities.insert(player.number, velocity);
+                let [x, y, z] = player.origin;
+                // DEFAULT_MINS_2 is the bottom of the stock JKA player hull.
+                self.ninja_blood.disturb([x, y, z - 24.0], velocity);
+            }
+        }
+    }
+
     /// Clear time-dependent presentation while retaining registered effect assets.
     /// Used by demo seeking so replayed events do not leak across the seek boundary.
     pub fn reset_for_seek(&mut self, time: i32) {
+        self.ninja_blood.clear();
+        self.ninja_blood_velocities.clear();
         // Discard completed and in-flight frames. Old replies have their own
         // receivers and cannot be mistaken for post-seek output.
         self.pending_fx_tick = None;
@@ -1921,6 +2053,7 @@ impl WeaponFx {
         self.chunks.clear();
         self.pending_debris.clear();
         self.pending_gibs.clear();
+        self.test_gib_spawns.clear();
         self.pending_glass.clear();
         self.foot_marks.clear();
         self.efx_world_marks.clear();
@@ -1945,6 +2078,7 @@ impl WeaponFx {
 
     /// FX_AdjustTime for this presentation frame (`cg.time`).
     pub fn begin_frame(&mut self, time: i32) {
+        self.ninja_blood.begin_frame(time);
         let disabled = !crate::fx::simulation_enabled();
         if disabled != self.fx_was_disabled {
             // Clear worker and local transient state once at each transition.
@@ -1979,6 +2113,7 @@ impl WeaponFx {
             self.chunks.clear();
             self.pending_debris.clear();
             self.pending_gibs.clear();
+            self.test_gib_spawns.clear();
             self.pending_glass.clear();
             self.entity_fx.clear();
             self.missile_fx.clear();
@@ -2003,6 +2138,19 @@ impl WeaponFx {
         self.repeated_time = time == self.time && !self.fresh_time;
         self.fresh_time = false;
         self.time = time;
+        if crate::ninja_blood::enabled() {
+            if let (Some(world), Some(surfaces)) = (self.collision_world.as_mut(), self.mark_surfaces.as_deref()) {
+                self.ninja_blood.update(time, world, surfaces);
+            }
+        }
+        // Execute local /testgib only after the presentation time has been
+        // advanced. This shares exactly the event-owned chunk and Rapier paths
+        // without introducing a networked EV_GIB_PLAYER or changing the avatar.
+        if !self.test_gib_spawns.is_empty() {
+            let specs = std::mem::take(&mut self.test_gib_spawns);
+            self.pending_gibs.extend(specs.iter().cloned());
+            self.add_chunks_with_kind(&specs, Some(ChunkPhysicsKind::Gib));
+        }
         let _ = self.worker_tx.send(FxWorkerCommand::AdjustTime(time));
     }
 
@@ -2154,8 +2302,55 @@ impl WeaponFx {
         }
     }
 
-    pub fn set_gib_level(&mut self, level: u8) {
-        self.gib_level = level.min(2);
+    pub fn set_blood_mode(&mut self, mode: u8) {
+        self.blood_mode = mode.min(2);
+    }
+
+    pub(crate) fn blood_mode_enabled(&self) -> bool {
+        self.blood_mode != 0 && !self.jk2_assets
+            && crate::ninja_blood::enabled() && crate::fx::simulation_enabled()
+    }
+
+    pub(crate) fn blood_gibs_enabled(&self) -> bool {
+        self.blood_mode == 2 && !self.jk2_assets
+            && crate::ninja_blood::enabled() && crate::fx::simulation_enabled()
+    }
+
+    /// Rapier gibs supply occasional fresh Ninja ink *and* the original
+    /// fluid-displacement contact brush. Existing aerial leaks remain intact.
+    pub(crate) fn smear_physics_gibs(&mut self, samples: &[crate::ninja_blood::BloodDragSample]) {
+        if !self.blood_gibs_enabled() { return; }
+        let Some(world) = self.collision_world.as_mut() else { return; };
+        let surfaces = self.mark_surfaces.as_deref();
+        for &(start, end, elapsed_ms, deposit_cm) in samples {
+            self.ninja_blood.disturb_ground_motion(
+                start, end, elapsed_ms, deposit_cm, world, surfaces, self.time,
+            );
+        }
+    }
+
+    /// Only *dead* ragdoll contacts supply blood; living Force Grip bodies
+    /// are excluded at the physics sampler. Works with cg_blood 1 and 2.
+    pub(crate) fn smear_physics_corpses(&mut self, samples: &[crate::ninja_blood::BloodDragSample]) {
+        if !self.blood_mode_enabled() { return; }
+        let Some(world) = self.collision_world.as_mut() else { return; };
+        let surfaces = self.mark_surfaces.as_deref();
+        for &(start, end, elapsed_ms, deposit_cm) in samples {
+            self.ninja_blood.disturb_ground_motion(
+                start, end, elapsed_ms, deposit_cm, world, surfaces, self.time,
+            );
+        }
+    }
+
+    /// Rapier-owned gib particles use the same fluid blood emitter as the
+    /// legacy (non-promoted) chunks; no stock bloodTrail/bloodMark shaders.
+    pub(crate) fn bleed_physics_gibs(&mut self, sources: &[([f32; 3], [f32; 3])]) {
+        if self.blood_mode != 2 || self.jk2_assets
+            || !crate::ninja_blood::enabled() || !crate::fx::simulation_enabled()
+        { return; }
+        for &(origin, velocity) in sources {
+            self.ninja_blood.bleed(origin, velocity, [0.0; 3], crate::ninja_blood::BleedStyle::Leak);
+        }
     }
 
     fn add_chunks(&mut self, specs: &[ChunkSpec]) {
@@ -2177,6 +2372,10 @@ impl WeaponFx {
                 axis: scale_axis(angles_to_axis(spec.angles), spec.scale),
                 last_time: self.time,
                 stationary: false,
+                is_gib: kind == Some(ChunkPhysicsKind::Gib),
+                next_blood_ms: self.time,
+                next_smear_ms: self.time,
+                last_smear_origin: None,
                 physics_candidate: kind,
                 spec: spec.clone(),
             });
@@ -2187,6 +2386,19 @@ impl WeaponFx {
     /// the shared Rapier world explicitly accepts the corresponding event.
     pub(crate) fn take_debris_spawns(&mut self) -> Vec<ChunkSpec> {
         std::mem::take(&mut self.pending_debris)
+    }
+
+    /// Stage a full TaystJK gib burst at the local player, without changing
+    /// health, animation, entity state, or the server. The app owns VFS lookup;
+    /// return the requested paths so it can diagnose missing assets.
+    pub(crate) fn queue_test_gib_burst(&mut self, origin: [f32; 3]) -> (usize, Vec<String>) {
+        self.test_gib_seed = self.test_gib_seed.wrapping_add(1);
+        let seed = (self.time as u32).rotate_left(11) ^ self.test_gib_seed;
+        let specs = gib_specs(origin, seed, 2);
+        let paths = specs.iter().map(|spec| spec.qpath.clone()).collect();
+        let count = specs.len();
+        self.test_gib_spawns.extend(specs);
+        (count, paths)
     }
 
     pub(crate) fn take_gib_spawns(&mut self) -> Vec<ChunkSpec> {
@@ -2227,6 +2439,10 @@ impl WeaponFx {
 
     pub fn set_inline_model_bounds(&mut self, bounds: std::sync::Arc<[([f32; 3], [f32; 3])]>) {
         self.inline_model_bounds = bounds;
+    }
+
+    pub(crate) fn inline_model_bounds(&self, model: usize) -> Option<([f32; 3], [f32; 3])> {
+        self.inline_model_bounds.get(model).copied()
     }
 
     pub fn set_inline_model_glass_faces(&mut self, faces: std::sync::Arc<[Option<[[f32; 3]; 4]>]>) {
@@ -2304,6 +2520,9 @@ impl WeaponFx {
         self.chunks.retain(|chunk| time < chunk.end_time && time >= chunk.start_time);
         let mut models = Vec::with_capacity(self.chunks.len());
         let mut world = self.collision_world.take();
+        let use_ninja_gib_blood = self.blood_mode == 2 && !self.jk2_assets
+            && crate::ninja_blood::enabled() && crate::fx::simulation_enabled();
+        let surfaces = self.mark_surfaces.as_deref();
         for chunk in &mut self.chunks {
             if chunk.stationary {
                 let remaining = chunk.end_time - time;
@@ -2338,10 +2557,20 @@ impl WeaponFx {
                     chunk.axis = scale_axis(angles_to_axis(angles), chunk.spec.scale);
                 }
                 Some(trace) if trace.start_solid == 0 => {
-                    // CG_ReflectVelocity.
                     let hit_time = chunk.last_time as f32 + frame_ms * trace.fraction;
                     let mut velocity = chunk.velocity;
                     velocity[2] -= DEFAULT_GRAVITY * (hit_time - chunk.trajectory_time as f32) * 0.001;
+                    // CG_ReflectVelocity. Replace TaystJK's LEMT_BLOOD with
+                    // the existing Ninja surface mark using impact velocity.
+                    if use_ninja_gib_blood && chunk.is_gib {
+                        if let Some(surfaces) = surfaces {
+                            self.ninja_blood.impact(
+                                trace, glam::Vec3::from_array(velocity),
+                                crate::ninja_blood::POINT_SIZE_CM * 0.5, true,
+                                crate::ninja_blood::SplatKind::Ordinary, surfaces, time,
+                            );
+                        }
+                    }
                     let dot = velocity[0] * trace.normal[0] + velocity[1] * trace.normal[1] + velocity[2] * trace.normal[2];
                     chunk.velocity = std::array::from_fn(|i| (velocity[i] - 2.0 * dot * trace.normal[i]) * chunk.spec.bounce_factor);
                     chunk.base = trace.end;
@@ -2356,6 +2585,24 @@ impl WeaponFx {
                 Some(_) => {} // starts inside a solid: leave it where it is
             }
             chunk.last_time = time;
+            if use_ninja_gib_blood && chunk.is_gib && time >= chunk.next_smear_ms {
+                chunk.next_smear_ms = time.saturating_add(GIB_SMEAR_INTERVAL_MS);
+                let old = chunk.last_smear_origin.replace((chunk.origin, time));
+                if let (Some((start, sampled_at)), Some(world)) = (old, world.as_mut()) {
+                    let age = time.saturating_sub(chunk.start_time);
+                    let width_cm = ground_deposit_size_cm(age, GIB_GROUND_BLEED_DURATION_MS, GIB_SMEAR_WIDTH_CM);
+                    self.ninja_blood.disturb_ground_motion(
+                        start, chunk.origin, time.saturating_sub(sampled_at), width_cm,
+                        world, surfaces, time,
+                    );
+                }
+            }
+            if use_ninja_gib_blood && chunk.is_gib && time >= chunk.next_blood_ms
+                && time < chunk.start_time.saturating_add(GIB_BLEED_DURATION_MS)
+            {
+                chunk.next_blood_ms = time.saturating_add(GIB_BLEED_INTERVAL_MS);
+                self.ninja_blood.bleed(chunk.origin, chunk.velocity, [0.0; 3], crate::ninja_blood::BleedStyle::Leak);
+            }
             models.push(ChunkModel { qpath: chunk.spec.qpath.clone(), origin: chunk.origin, axis: chunk.axis, alpha: 1.0 });
         }
         self.collision_world = world;
@@ -2569,6 +2816,11 @@ impl WeaponFx {
         self.append_saber_wall_marks(&mut frame);
         self.append_foot_marks(&mut frame);
         self.append_glass_shards(&mut frame);
+        // Airborne presentation consumes the existing event and droplet state.
+        if crate::ninja_blood::enabled() && crate::fx::simulation_enabled() {
+            self.ninja_blood.emit_hits();
+            self.ninja_blood.append_air(&mut frame, time);
+        }
         self.append_score_plums(&mut frame);
         if matches!(self.saber_marks, SaberMarkMode::Enhanced) {
             self.append_enhanced_melt(&mut frame);
@@ -2661,6 +2913,8 @@ impl WeaponFx {
             self.footprints = mode;
             if mode == FootprintMode::Off {
                 self.foot_marks.clear();
+            } else if mode == FootprintMode::NinjaComposite {
+                self.foot_marks.retain(|mark| !mark.snow);
             }
         }
     }
@@ -2670,6 +2924,12 @@ impl WeaponFx {
     /// Snowflow field deforms in 3D mode, where a flat print would hover over
     /// the dent.
     pub fn footstep(&mut self, impact: &FootstepImpact, stages: FootstepStages, snowflow_owner: bool) {
+        // Reuse the exact foot bolt, projection and mirrored foot UVs. Blood
+        // transfer is an FX feature, independent of terrain r_footprints.
+        let blood = if !self.repeated_time && crate::fx::simulation_enabled() {
+            let velocity = self.ninja_blood_velocities.get(&impact.entity).copied().unwrap_or([0.0; 3]);
+            self.ninja_blood.footfall(impact.entity, impact.foot.right_foot(), impact.position, impact.normal, velocity, self.time)
+        } else { None };
         let step = footsteps::material_step(impact.material);
         if stages.effects {
             if let Some(effect) = step.effect {
@@ -2677,20 +2937,26 @@ impl WeaponFx {
                 self.play(effect, impact.position, normalize_or_up(impact.normal));
             }
         }
+        if let Some(strength) = blood {
+            // A stained sole leaves a sequence of progressively fainter prints
+            // even on concrete; drawing a normal footprint beneath it is wrong.
+            self.push_footprint(impact, Some(strength));
+            return;
+        }
         if !stages.marks || !step.mark || self.footprints == FootprintMode::Off || self.repeated_time {
             return;
         }
         let snow = impact.material & 0x1f == footsteps::MATERIAL_SNOW;
-        if snow && snowflow_owner && self.footprints == FootprintMode::ThreeD {
+        if snow && (self.footprints == FootprintMode::NinjaComposite || (snowflow_owner && self.footprints == FootprintMode::ThreeD)) {
             return;
         }
-        self.push_footprint(impact);
+        self.push_footprint(impact, None);
     }
 
     /// CG_ImpactMark(footMarkShader, pos, normal, yaw, 1, 1, 1, 1, qfalse, 6, qfalse):
     /// a 12 unit square around the step, its `footstep_*` image turned to the
     /// legs' yaw and projected onto the drawn world surfaces below it.
-    fn push_footprint(&mut self, impact: &FootstepImpact) -> bool {
+    fn push_footprint(&mut self, impact: &FootstepImpact, blood_strength: Option<f32>) -> bool {
         let axis0 = normalize3(impact.normal);
         if impact.normal.iter().all(|&c| c == 0.0) {
             return false;
@@ -2735,11 +3001,13 @@ impl WeaponFx {
             indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
         }
         self.foot_marks.push(FootMark {
-            end_time: self.time + SABER_MARK_LIFETIME_MS,
+            end_time: self.time + if blood_strength.is_some() { 5_000 } else { SABER_MARK_LIFETIME_MS },
+            blood_strength,
             positions,
             uvs,
             indices,
             heavy: impact.foot.heavy(),
+            snow: impact.material & 0x1f == footsteps::MATERIAL_SNOW,
         });
         if self.foot_marks.len() > FOOT_MARK_MAX {
             let excess = self.foot_marks.len() - FOOT_MARK_MAX;
@@ -2762,6 +3030,8 @@ impl WeaponFx {
         let time = self.time;
         let mut light = Batch::default();
         let mut heavy = Batch::default();
+        let mut blood_light = Batch::default();
+        let mut blood_heavy = Batch::default();
         self.foot_marks.retain(|mark| {
             if time >= mark.end_time {
                 return false;
@@ -2773,15 +3043,31 @@ impl WeaponFx {
                 1.0
             };
             let channel = (255.0 * fade.clamp(0.0, 1.0)).round() as u8;
-            let batch = if mark.heavy { &mut heavy } else { &mut light };
+            let (batch, rgba) = if let Some(strength) = mark.blood_strength {
+                // Distinct concepts: pigment fades over successive FOOTFALLS,
+                // while an individual print holds its color until the final
+                // second of its 5 s life. The old code applied both an age
+                // ramp and the last-second fade, washing out fresh tracks.
+                let pigment = |c: f32| (c * strength * fade.clamp(0.0, 1.0)).round() as u8;
+                (if mark.heavy { &mut blood_heavy } else { &mut blood_light },
+                    // Keep the user's stock footstep texture/UV, but remove
+                    // the grey/pink channels from the blood tint entirely.
+                    // The alpha comes from the authored footprint material.
+                    [pigment(185.0), 0, 0, 255])
+            } else {
+                (if mark.heavy { &mut heavy } else { &mut light }, [channel, channel, channel, 255])
+            };
             let base = batch.positions.len() as u32;
             batch.positions.extend_from_slice(&mark.positions);
             batch.uvs.extend_from_slice(&mark.uvs);
-            batch.rgba.resize(batch.positions.len(), [channel, channel, channel, 255]);
+            batch.rgba.resize(batch.positions.len(), rgba);
             batch.indices.extend(mark.indices.iter().map(|index| base + index));
             true
         });
-        for (batch, shader) in [(light, "footstep_r"), (heavy, "footstep_heavy_r")] {
+        for (batch, shader) in [
+            (light, "footstep_r"), (heavy, "footstep_heavy_r"),
+            (blood_light, "$blood_footstep_r"), (blood_heavy, "$blood_footstep_heavy_r"),
+        ] {
             if !batch.indices.is_empty() {
                 frame.draws.push(FxDraw::Mesh {
                     positions: batch.positions,
@@ -2823,9 +3109,23 @@ impl WeaponFx {
     pub fn entity_fx(&mut self, entity: &PresentedEntity, game: &ClientGameState) {
         let state = &entity.state;
         let fx_state = state.field_i32("modelindex2").unwrap_or(FX_STATE_OFF);
-        // During a paused demo, the same snapshot is presented repeatedly.
-        // Never replay ET_FX births without advancing the game clock.
-        if fx_state == FX_STATE_OFF || self.repeated_time { return; }
+        if fx_state == FX_STATE_OFF { return; }
+        // Keep this orientation identical to the FX worker PlayDirClass,
+        // which constructs [forward, right, up] via make_normal_vectors.
+        let mut dir = crate::fx::system::angles_to_axis(
+            super::entity_vec3(state, "angles").unwrap_or([0.0; 3]))[0];
+        if dir == [0.0; 3] { dir[1] = 1.0; }
+        let (right, up) = crate::fx::system::make_normal_vectors(dir);
+        if state.field_i32("pos.trType").unwrap_or(TR_STATIONARY) == TR_STATIONARY {
+            let effect_index = state.field_i32("modelindex").unwrap_or(0);
+            if let Some(name) = game.effect_qpath(effect_index) {
+                crate::ninja_fire_debug::observe_runner(
+                    entity.number, &name, entity.origin, [dir, right, up], self.time,
+                    fx_state >= FX_STATE_ONE_SHOT_LIMIT);
+            }
+        }
+        // During a paused demo, never replay the authored EFX births.
+        if self.repeated_time { return; }
         {
             let runtime = self.entity_fx.entry(entity.number).or_default();
             if runtime.next_time > self.time { return; }
@@ -2845,8 +3145,6 @@ impl WeaponFx {
         self.entity_fx.entry(entity.number).or_default().next_time = self.time.saturating_add(cadence).saturating_add(jitter);
         let effect_index = state.field_i32("modelindex").unwrap_or(0);
         let Some(name) = game.effect_qpath(effect_index) else { return; };
-        let mut dir = angles_to_axis(super::entity_vec3(state, "angles").unwrap_or([0.0; 3]))[0];
-        if dir == [0.0; 3] { dir[1] = 1.0; }
         if state.field_i32("pos.trType").unwrap_or(TR_STATIONARY) == TR_STATIONARY {
             let _ = self.worker_tx.send(FxWorkerCommand::PlayDirClass {
                 name, origin: entity.origin, dir, class: FxClass::MapRunner(entity.number),
@@ -3007,6 +3305,16 @@ impl WeaponFx {
     /// Force-power visuals requested by CG_Player.
     pub fn player_fx(&mut self, request: &PlayerFxRequest) {
         match request {
+            PlayerFxRequest::RagdollBlood { calves } => {
+                if crate::ninja_blood::enabled()
+                    && self.ninja_blood.ragdoll_emit_ms.is_none_or(|next| self.time >= next)
+                {
+                    self.ninja_blood.ragdoll_emit_ms = Some(self.time.saturating_add(crate::ninja_blood::RAGDOLL_INTERVAL_MS));
+                    for [x, y, z] in calves.iter().copied().flatten() {
+                        self.ninja_blood.bleed([x, y, z + 4.0], [0.0; 3], [0.0; 3], crate::ninja_blood::BleedStyle::Leak);
+                    }
+                }
+            }
             PlayerFxRequest::PowerupLight { origin, rgb } => {
                 // jaPRO CG_PlayerPowerups: 200 + (rand() & 31).
                 let radius = 200.0 + self.runner_rng.irand(0, 31) as f32;
@@ -4352,14 +4660,46 @@ impl WeaponFx {
         self.entity_event_prepared(event, &prepared)
     }
 
+    fn note_blood_hit(&mut self, event: &PresentationEvent, prepared: &PreparedFxEvent) {
+        let victim = || event.state.field_i32("otherEntityNum")
+            .filter(|number| (0..ENTITY_WORLD).contains(number)).map(|number| number as u16);
+        let time = event.server_time;
+        if let PreparedFxEvent::SaberHit { count, origin, dir, person: true, .. } = prepared {
+            self.ninja_blood.note_hit(victim(), time, *origin, *dir, (*count).clamp(1, 3) as i32);
+            return;
+        }
+        match event.event {
+            EntityEvent::EV_MISSILE_HIT if !event.event_only_entity => {
+                self.ninja_blood.note_hit(victim(), time, event.position, jka_movement::byte_to_dir(event.parm), 1);
+            }
+            // Direct hitscan events use weapon as a flesh flag and may omit the victim.
+            EntityEvent::EV_MISSILE_HIT | EntityEvent::EV_DISRUPTOR_HIT
+                if event.state.field_i32("weapon").unwrap_or(0) != 0 =>
+            {
+                self.ninja_blood.note_hit(None, time, event.position, jka_movement::byte_to_dir(event.parm), 1);
+            }
+            EntityEvent::EV_PAIN if matches!(event.state.field_i32("eType"), Some(super::ET_PLAYER | super::ET_NPC)) => {
+                self.ninja_blood.note_pain(event.entity_num, time, event.position, event.parm);
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn entity_event_prepared(
         &mut self,
         event: &PresentationEvent,
         prepared: &PreparedFxEvent,
     ) -> Option<EventDispatchResult> {
+        if self.blood_mode > 0 && !self.jk2_assets && crate::ninja_blood::enabled() && crate::fx::simulation_enabled() {
+            self.note_blood_hit(event, prepared);
+        }
         match prepared {
             PreparedFxEvent::None => None,
-            PreparedFxEvent::SaberHit { effect, count, origin, dir } => {
+            PreparedFxEvent::SaberHit { effect, count, origin, dir, person } => {
+                let stock_blood = *person && crate::ninja_blood::is_stock_saber_effect(effect);
+                if stock_blood && self.blood_mode == 0 {
+                    return Some(EventDispatchResult::Handled("FX_SABER_HIT_BLOOD_DISABLED"));
+                }
                 let mut played = false;
                 for _ in 0..*count {
                     played |= self.play_saber_impact(effect, *origin, *dir);
@@ -4465,7 +4805,7 @@ impl WeaponFx {
                 Some(EventDispatchResult::Handled("FX_GLASS_SHARDS"))
             }
             PreparedFxEvent::Gibs { origin, seed } => {
-                let specs = gib_specs(*origin, *seed, self.gib_level);
+                let specs = gib_specs(*origin, *seed, self.blood_mode);
                 if specs.is_empty() || self.repeated_time {
                     return Some(EventDispatchResult::Handled("FX_GIBS"));
                 }
@@ -4492,6 +4832,10 @@ impl WeaponFx {
                         axis: scale_axis(angles_to_axis(spec.angles), spec.scale),
                         last_time: self.time,
                         stationary: false,
+                        is_gib: false,
+                        next_blood_ms: self.time,
+                        next_smear_ms: self.time,
+                        last_smear_origin: None,
                         physics_candidate: Some(ChunkPhysicsKind::Debris),
                         spec: spec.clone(),
                     });
@@ -4553,6 +4897,7 @@ impl WeaponFx {
 pub(crate) enum PreparedFxEvent {
     None,
     SaberHit {
+        person: bool,
         effect: String,
         count: usize,
         origin: [f32; 3],
@@ -4589,7 +4934,7 @@ pub(crate) enum PreparedFxEvent {
     },
     /// `CG_Chunks` fragments (EV_DEBRIS).
     Chunks(Vec<ChunkSpec>),
-    /// `CG_GibPlayer` at `origin`; the gib count depends on `cg_blood` at dispatch.
+    /// `CG_GibPlayer` at `origin`, gated by `cg_blood` at dispatch.
     Gibs { origin: [f32; 3], seed: u32 },
     /// `CG_GlassShatter` (EV_GLASS_SHATTER). `model` is the glass entity's inline
     /// model when its state is still known; shards are built on dispatch, where
@@ -4704,7 +5049,13 @@ pub(crate) fn prepare_entity_event(
                 value if value != 0 => (hit_person, 3),
                 _ => (hit_other, 1),
             };
-            PreparedFxEvent::SaberHit { effect, count, origin, dir }
+            PreparedFxEvent::SaberHit {
+                effect,
+                count,
+                origin,
+                dir,
+                person: event.parm != 0,
+            }
         }
         EntityEvent::EV_SABER_BLOCK => {
             // OpenJK: eventParm != 0 is saber-on-saber; zero is a projectile deflect.
@@ -4926,15 +5277,40 @@ pub(crate) fn prepare_entity_event(
     }
 }
 
-/// `CG_GibPlayer`: skull or brain at level 1, plus nine body parts at level 2.
-fn gib_specs(origin: [f32; 3], seed: u32, level: u8) -> Vec<ChunkSpec> {
-    if level == 0 {
-        return Vec::new();
-    }
+// TaystJK codemp/cgame/cg_effects.c CG_GibPlayer/CG_LaunchGib:
+// mode 1: one skull or brain; mode 2: that first part plus the following
+// *ordered* nine parts (the second leg is intentional). Only the blood
+// rendering differs: fragments use Ninja droplets and surface ink, not Q3
+// bloodTrail/bloodMark. MD3 paths are inherited, not synthesized assets.
+/// Same contact cadence as player fluid displacement; each grounded sample
+/// lays one smear stroke and feeds the original movement brush.
+pub(super) const GIB_SMEAR_INTERVAL_MS: i32 = 33;
+pub(super) const GIB_BLEED_INTERVAL_MS: i32 = 400;
+pub(super) const GIB_BLEED_DURATION_MS: i32 = 1600;
+pub(super) const GIB_GROUND_BLEED_DURATION_MS: i32 = 10_000;
+pub(super) const CORPSE_GROUND_BLEED_DURATION_MS: i32 = 18_000;
+/// Fresh smear stroke widths; they narrow to a quarter as the part dries.
+pub(super) const GIB_SMEAR_WIDTH_CM: f32 = 28.0;
+pub(super) const CORPSE_SMEAR_WIDTH_CM: f32 = 22.0;
+
+/// Finite contact pigment supply: smaller marks as the fragment/corpse ages.
+/// Fluid displacement continues even after it runs dry.
+pub(super) fn ground_deposit_size_cm(age_ms: i32, duration_ms: i32, fresh_cm: f32) -> f32 {
+    if age_ms >= duration_ms || duration_ms <= 0 { return 0.0; }
+    let remaining = 1.0 - age_ms.max(0) as f32 / duration_ms as f32;
+    fresh_cm * (0.25 + 0.75 * remaining)
+}
+fn gib_specs(origin: [f32; 3], seed: u32, mode: u8) -> Vec<ChunkSpec> {
+    if mode == 0 { return Vec::new(); }
     const GIB_VELOCITY: f32 = 250.0;
     const GIB_JUMP: f32 = 250.0;
     let mut rng = SmallRng::new(seed);
-    let gib = |model: &str, rng: &mut SmallRng| ChunkSpec {
+    let first = if rng.irand(0, 1) != 0 { "skull" } else { "brain" };
+    let mut models = vec![first];
+    if mode >= 2 {
+        models.extend(["abdomen", "arm", "chest", "fist", "foot", "forearm", "intestine", "leg", "leg"]);
+    }
+    models.into_iter().map(|model| ChunkSpec {
         qpath: format!("models/gibs/{model}.md3"),
         origin,
         velocity: [
@@ -4944,17 +5320,12 @@ fn gib_specs(origin: [f32; 3], seed: u32, level: u8) -> Vec<ChunkSpec> {
         ],
         angles: [0.0; 3],
         angle_velocity: [0.0; 3],
-        life_ms: 5000 + (rng.range(0.0, 1.0) * 3000.0) as i32,
+        // Double the original TaystJK 5–8 s lifetime: 10–16 s, in both
+        // legacy trajectories and Rapier-promoted gib bodies.
+        life_ms: 2 * (5000 + (rng.range(0.0, 1.0) * 3000.0) as i32),
         bounce_factor: 0.6,
         scale: 1.0,
-    };
-    let mut specs = vec![gib(if rng.irand(0, 1) != 0 { "skull" } else { "brain" }, &mut rng)];
-    if level >= 2 {
-        for part in ["abdomen", "arm", "chest", "fist", "foot", "forearm", "intestine", "leg", "leg"] {
-            specs.push(gib(part, &mut rng));
-        }
-    }
-    specs
+    }).collect()
 }
 
 /// CG_Chunks: the LE_FRAGMENT spray for a broken brush/model (material_t in
@@ -5741,6 +6112,28 @@ mod tests {
     }
 
     #[test]
+    fn blood_tracks_reuse_the_stock_foot_uv_and_fade() {
+        use jka_assets::animevents::FootstepType;
+        let mut fx = footprint_fx();
+        fx.set_footprint_mode(FootprintMode::Off);
+        fx.begin_frame(1000);
+        let concrete = FootstepImpact { material: 11, ..footprint_at(60.0, FootstepType::Right) };
+        assert!(fx.push_footprint(&concrete, Some(0.5)));
+        let (positions, uvs, rgba) = mesh_of(&fx.end_frame(), "$blood_footstep_r").unwrap();
+        assert_eq!(positions.len(), 4);
+        assert_eq!(uvs.len(), 4);
+        assert!(rgba.iter().all(|&v| v == [93, 0, 0, 255]), "{rgba:?}");
+        fx.begin_frame(1000 + 2000);
+        let (_, _, still_red) = mesh_of(&fx.end_frame(), "$blood_footstep_r").unwrap();
+        assert_eq!(rgba, still_red, "blood prints retain pigment until the final second");
+        fx.begin_frame(1000 + 4900);
+        let (_, _, faded) = mesh_of(&fx.end_frame(), "$blood_footstep_r").unwrap();
+        assert!(faded[0][0] < rgba[0][0]);
+        fx.begin_frame(1000 + 5000);
+        assert!(mesh_of(&fx.end_frame(), "$blood_footstep_r").is_none());
+    }
+
+    #[test]
     fn rotating_about_the_up_axis_turns_counterclockwise() {
         let forward = rotate_about3([1.0, 0.0, 0.0], [0.0, 0.0, 1.0], 90.0);
         assert!((forward[1] - 1.0).abs() < 1e-5 && forward[0].abs() < 1e-5);
@@ -6349,7 +6742,7 @@ mod event_beam_tests {
     fn gib_and_breakable_promotion_are_independent() {
         let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
         let mut fx = WeaponFx::new(assets);
-        fx.set_gib_level(2);
+        fx.set_blood_mode(1);
         fx.begin_frame(2000);
         let debris = event(EntityEvent::EV_DEBRIS, 0, &[]);
         let chunk = ChunkSpec {
@@ -6364,11 +6757,11 @@ mod event_beam_tests {
             origin: [0.0, 0.0, 30.0], seed: 12345,
         });
         assert_eq!(fx.take_debris_spawns().len(), 1);
-        assert_eq!(fx.take_gib_spawns().len(), 10);
+        assert_eq!(fx.take_gib_spawns().len(), 1);
         fx.resolve_debris_promotion(true);
-        assert_eq!(fx.chunks.len(), 10);
+        assert_eq!(fx.chunks.len(), 1);
         fx.resolve_gib_promotion(false);
-        assert_eq!(fx.chunk_models().len(), 10);
+        assert_eq!(fx.chunk_models().len(), 1);
     }
 
     #[test]
@@ -6440,15 +6833,30 @@ mod event_beam_tests {
         let skull_or_brain = gib_specs([0.0; 3], 1, 1);
         assert_eq!(skull_or_brain.len(), 1);
         assert!(skull_or_brain[0].qpath.ends_with("skull.md3") || skull_or_brain[0].qpath.ends_with("brain.md3"));
-        let full = gib_specs([0.0; 3], 1, 2);
-        assert_eq!(full.len(), 10);
-        assert!(full.iter().all(|gib| gib.velocity[2] >= 0.0 && gib.bounce_factor == 0.6));
+        assert!(skull_or_brain[0].velocity[2] >= 0.0 && skull_or_brain[0].bounce_factor == 0.6);
         let mut fx = WeaponFx::new(AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap());
-        fx.set_gib_level(2);
+        fx.set_blood_mode(1);
         fx.begin_frame(1_000);
         let gib = event(EntityEvent::EV_GIB_PLAYER, 0, &[]);
         fx.entity_event_prepared(&gib, &prepare(&gib));
-        assert_eq!(fx.chunk_models().len(), 10);
+        assert_eq!(fx.take_gib_spawns().len(), 1);
+        assert_eq!(fx.chunk_models().len(), 1);
+        let full = gib_specs([0.0; 3], 1, 2);
+        assert_eq!(full.len(), 10);
+        assert_eq!(full[0].qpath, skull_or_brain[0].qpath);
+        assert_eq!(full[1..].iter().map(|part| part.qpath.as_str()).collect::<Vec<_>>(), vec![
+            "models/gibs/abdomen.md3", "models/gibs/arm.md3", "models/gibs/chest.md3",
+            "models/gibs/fist.md3", "models/gibs/foot.md3", "models/gibs/forearm.md3",
+            "models/gibs/intestine.md3", "models/gibs/leg.md3", "models/gibs/leg.md3",
+        ]);
+        assert!(full.iter().all(|part| (10_000..=16_000).contains(&part.life_ms)
+            && part.bounce_factor == 0.6 && (0.0..=500.0).contains(&part.velocity[2])));
+        assert_eq!(full[0].life_ms, skull_or_brain[0].life_ms);
+        fx.set_blood_mode(2);
+        fx.begin_frame(2_000);
+        fx.entity_event_prepared(&gib, &prepare(&gib));
+        assert_eq!(fx.take_gib_spawns().len(), 10);
+        assert_eq!(fx.chunk_models().len(), 11, "old mode-1 chunk remains until expiry");
     }
 }
 

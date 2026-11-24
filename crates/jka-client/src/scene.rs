@@ -28,6 +28,7 @@ mod lightmaps;
 use lightmaps::{overbright_rgb, shift_lightmap_rgba};
 mod material_batches;
 mod prepare;
+pub(crate) mod river_promotion;
 mod reflections;
 mod shader_remap;
 mod source;
@@ -46,6 +47,7 @@ use cache::{map_content_hash, static_bsp_ao_cache_info, StageFingerprint};
 pub use cache::{PrepStageKeys, StaticBspAoCacheInfo};
 use collision::bsp_physics_collision_mesh;
 pub use collision::{prepare_collision_render_mesh, prepare_physics_collision, river_collision_triangles};
+pub(crate) use collision::ninja_fire_world_brushes;
 pub use jka_render_core::coordinates::{jka_position, render_position};
 pub use entities::SkyPortal;
 pub(crate) use entities::{append_authored_ocean_planes, bsp_brush_entities};
@@ -989,6 +991,7 @@ pub struct MapPrepareOptions {
     pub grass: bool,
     pub voxel_probe_gi: bool,
     pub ocean: bool,
+    pub river_promotion: u8,
     /// Build Rapier's static visual-physics world on the map-prep worker.
     pub client_physics: bool,
     pub gen_normal_maps: bool,
@@ -1032,6 +1035,7 @@ pub struct MapPrepareOptions {
     /// offline probe/reflection/pathing bake. When false there is no acoustic
     /// geometry work during map preparation.
     pub steam_audio: bool,
+    pub echo_acoustics: bool,
     /// Apply the built-in main-menu presentation edits (see `scene::menu_look`):
     /// prepare-time material substitution and synthesized water. Only the
     /// frontend background sets this; gameplay loads of the same map stay stock.
@@ -1052,6 +1056,7 @@ impl Default for MapPrepareOptions {
             grass: true,
             voxel_probe_gi: true,
             ocean: true,
+            river_promotion: 0,
             client_physics: false,
             gen_normal_maps: false,
             float_lightmap: false,
@@ -1065,6 +1070,7 @@ impl Default for MapPrepareOptions {
             glass_promotion: false,
             allow_asset_overrides: true,
             steam_audio: false,
+            echo_acoustics: false,
             menu_look: false,
             menu_props: false,
         }
@@ -1646,6 +1652,8 @@ impl PreparedRemapPlan {
     pub fn into_full_map(self) -> PreparedMap {
         let mut map = (*self.base).clone();
         self.apply_remap_diagnostics(&mut map.material_debug);
+        map.river_plans = Arc::default();
+        map.river_promotion_mode = 0;
         map.batches = self.batches;
         map.pvs_batches = self.pvs_batches;
         map.inline_batches = self.inline_batches;
@@ -1702,6 +1710,8 @@ mod thermal_liquid_tests {
 
 #[derive(Clone)]
 pub struct PreparedMap {
+    pub river_plans: Arc<Vec<jka_river::river_promotion::Plan>>,
+    pub river_promotion_mode: u8,
     pub patch_draws: Vec<PreparedPatchDraw>,
     pub inline_patch_draws: Vec<PreparedPatchDraw>,
     /// Background static coastal geometry; never waited on by map loading or rendering.
@@ -1790,6 +1800,7 @@ pub struct PreparedMap {
     /// enabled. This is deliberately brush-derived instead of renderer-derived
     /// so nodraw/caulk walls remain acoustically solid.
     pub steam_audio_acoustic_mesh: Option<Arc<jka_assets::bsp::AcousticMesh>>,
+    pub echo_geometry: Option<jka_audio::EchoGeometryInput>,
     /// Validated serialized Steam Audio scene + probe batch, when this map has
     /// already been baked and cached.
     pub steam_audio_bake: Option<Arc<crate::steam_audio::SteamAudioBakeData>>,

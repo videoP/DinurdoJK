@@ -11,7 +11,6 @@ use std::time::Instant;
 mod cache;
 mod bands;
 mod upstream_shore;
-mod contact_band;
 mod promotion;
 mod report;
 pub use cache::fingerprint;
@@ -925,10 +924,10 @@ impl Geometry {
     }
 
     fn column(&self, p: [f32; 2], level: f32, solids: &[usize], triangles: &[usize]) -> Column {
-        self.column_with_sky(p, level, solids, triangles, false)
+        self.classify_column(p, level, solids, triangles, false)
     }
 
-    fn column_with_sky(&self, p: [f32; 2], level: f32, solids: &[usize], triangles: &[usize], open_sky: bool) -> Column {
+    fn classify_column(&self, p: [f32; 2], level: f32, solids: &[usize], triangles: &[usize], render_shore: bool) -> Column {
         let mut spans: Vec<_> = solids
             .iter()
             .filter_map(|&s| {
@@ -937,7 +936,7 @@ impl Geometry {
                 // The BSP's sky shell closes collision/visibility. Its vertical sky face
                 // at the water level is an opening to the extended sea, not a coastal bank.
                 // Retain real seabed below the water and the existing solver's geometry.
-                let sky_boundary = open_sky && span.0 <= f64::from(level) && span.1 >= f64::from(level)
+                let sky_boundary = render_shore && span.0 <= f64::from(level) && span.1 >= f64::from(level)
                     && solid.sky.iter().zip(&solid.planes).any(|(sky,plane)| *sky && f64::from(plane.normal[2]).abs() < EPS);
                 (!sky_boundary).then_some(span)
             })
@@ -1003,7 +1002,13 @@ impl Geometry {
             .min_by(f64::total_cmp);
         let stacked = merged
             .iter()
-            .filter(|s| s.1 < level - EPS && liquid_bottom.is_none_or(|bottom| s.1 > bottom + EPS))
+            .filter(|s| {
+                // The visual shore uses the upper bed. A shell floor from below
+                // the authored water volume can protrude into it (Costadelsol),
+                // while two submerged layers inside that volume are ambiguous.
+                let layer_start = if render_shore { s.0 } else { s.1 };
+                s.1 < level - EPS && liquid_bottom.is_none_or(|bottom| layer_start > bottom + EPS)
+            })
             .count()
             > 1;
         // An overhead bridge is supported above this water layer: retain its

@@ -2,17 +2,18 @@
 
 ## Ownership and sources
 
-Physics remains C-owned. The build links two isolated implementations:
-
-- Existing stock OpenJK for offline play and ordinary Base JKA prediction.
-- TaystJK's shared client movement for JA+, jaPRO, and Base/other servers that
-  explicitly advertise `taystJKinfo` movement capabilities.
+Physics remains C-owned. There is one native implementation for JKA: the pinned
+TaystJK shared client movement (TaystJK is an OpenJK fork). It serves offline
+play, Base, JA+, jaPRO and any server that advertises `taystJKinfo`. The former
+stock OpenJK copy and its backend switch were removed; the OpenJK clip-map
+collision sources now come from the same pinned TaystJK tree.
 
 Rust reads current configstrings and passes settings, commands, and entity inputs
-through the bridge. `native/mod_dispatch.c` owns native backend selection and
-player allocation. It converts between backends through the existing wire-field
-contract, never by casting one backend's `playerState_t` to the other's layout.
-Both backends use the existing recursive native lock.
+through the bridge. `native/movement.c` owns player allocation and sets `cgs`
+(`serverMod`, `baseGame`, `taystJKinfo`, ...) from `jka_predict_settings`, so the
+shared source's own `cgs.serverMod`/`cgs.baseGame` branches select Base, JA+ or
+jaPRO behavior at runtime. The native layer uses the existing recursive lock.
+`jka_player_new` starts from OpenJK-style settings (non-fixed, Base identity).
 
 The JAPRO source is pinned to TaystJK revision
 [`b35ed06fec41c53644352743c6b199a5d5d500f3`](https://github.com/taysta/TaystJK/tree/b35ed06fec41c53644352743c6b199a5d5d500f3).
@@ -43,12 +44,10 @@ local `D:/Code/Japro` fork. Relevant recent fixes include
 and [JA+ DFA flag selection](https://github.com/taysta/TaystJK/commit/0b7350b908c0d7f53e48cca82ec0460bf0aedc15).
 Those changes are present in the imported source. JA+ now selects the shared
 TaystJK backend and supplies `jp_cinfo`, while jaPRO supplies `jcinfo`/`jcinfo2`.
-Server identity is kept separate from backend selection so the shared source's
-`cgs.serverMod` branches execute exactly for Base, JA+, or jaPRO. Base servers
-that advertise `taystJKinfo` also use the shared backend with `cgs.baseGame`
-preserved, rather than parsing capability bits and then running stock Pmove.
+The shared source's `cgs.serverMod` branches execute exactly for Base, JA+, or
+jaPRO, and Base servers that advertise `taystJKinfo` keep `cgs.baseGame` set.
 
-Both C builds use `/fp:precise` on MSVC, disable strict aliasing where supported,
+The C build uses `/fp:precise` on MSVC, disable strict aliasing where supported,
 and disable floating-point contraction where supported. They use the same
 `Sys_SnapVector` implementation. No fast-math flag is introduced. This preserves
 the existing build policy; it is not a claim of bit parity with every compiler,
@@ -131,9 +130,11 @@ test fails at its fast-stance assertion in both the pre-change baseline and this
 implementation. It is recorded as an existing failure, not modified or hidden.
 
 To reproduce the source import, place the pinned GitHub codeload archive at
-`target/taystjk-client.zip` and run `python scripts/vendor-movement.py --japro`.
-Run `python scripts/vendor-movement.py --japro --check` and the stock
-`python scripts/vendor-movement.py --check` after changes. If adding a native
-translation unit, update `build.rs` and `native/japro_namespace.h` to isolate its
-external symbols. The tiny generated-engine-version substitute is under
+`target/taystjk-client.zip` (or pass `--archive PATH`) and run
+`python scripts/vendor-movement.py`. It overwrites files, including the local
+sailing hunks in `bg_pmove.c`, so use it only to refresh the pin deliberately.
+`python scripts/vendor-movement.py --check` verifies the manifest hashes. If
+adding a native translation unit, add it to `build.rs`; `native/host_prelude.h`
+is force-included and supplies the jump-trace declarations the vendored BG
+sources expect. The tiny generated-engine-version substitute is under
 `native/japro/qcommon/q_version.h`, outside the verified vendor tree.

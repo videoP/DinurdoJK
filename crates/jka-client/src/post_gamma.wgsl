@@ -112,7 +112,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if (settings.flags.z > 0.5 && !jk2_sdr) {
         corrected *= 2.0;
     }
-    if (settings.flags.x < 0.5) {
+    // Dither every SDR presentation; a float scene still quantizes at the
+    // 8-bit swapchain. Only native HDR output (flags.y) skips it.
+    if (settings.flags.y < 0.5) {
         corrected = output_dither_srgb8(corrected, input.position.xy);
     }
     return vec4<f32>(corrected, 1.0);

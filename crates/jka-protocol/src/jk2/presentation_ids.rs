@@ -2540,7 +2540,7 @@ pub const EVENTS: &[i32] = &[
     -1, // EV_TAUNT_GETFLAG
     -1, // EV_TAUNT_GUARDBASE
     -1, // EV_TAUNT_PATROL
-    -1, // EV_BODY_QUEUE_COPY
+    crate::entity_event::EntityEvent::EV_JK2_BODY_QUEUE_COPY as i32, // EV_BODY_QUEUE_COPY
 ];
 
 pub const ENTITY_TYPES: &[i32] = &[

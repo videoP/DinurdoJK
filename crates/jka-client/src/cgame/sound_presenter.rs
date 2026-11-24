@@ -4,6 +4,8 @@ use crate::audio::{
     SoundDecodeResult, SoundOrigin, SoundRequest,
 };
 use crate::steam_audio::SteamAudioBakeData;
+#[path = "river_ambience.rs"]
+mod river_ambience;
 use jka_protocol::entity_event::EntityEvent;
 use jka_assets::{
     bsp::AcousticMesh,
@@ -322,11 +324,14 @@ pub struct SoundPresenter {
     eal_map: Option<Arc<crate::eal::EalMap>>,
     eal_file: Option<String>,
     eal_enabled: bool,
+    echo_bsp: Option<jka_audio::EchoGeometryInput>,
+    echofield_settings: jka_audio::EchoSettings,
     eal_hrtf_enabled: bool,
     eal_debug_mode: u8,
     underwater_mode: u8,
     listener_submerged: bool,
     river_foot_contact: RiverFootContact,
+    river_ambience: river_ambience::RiverAmbience,
     /// Authored BSP/server oceans; ordinary waterbrush contents are queried
     /// from the authoritative collision world by the session.
     underwater_oceans: Vec<([f32; 3], [f32; 3], f32)>,
@@ -427,11 +432,14 @@ impl SoundPresenter {
             eal_map: None,
             eal_file: None,
             eal_enabled: false,
+            echo_bsp: None,
+            echofield_settings: jka_audio::EchoSettings::default(),
             eal_hrtf_enabled: false,
             eal_debug_mode: 0,
             underwater_mode: 2,
             listener_submerged: false,
             river_foot_contact: RiverFootContact::default(),
+            river_ambience: river_ambience::RiverAmbience::default(),
             underwater_oceans: Vec::new(),
             offline_restore_backend: None,
             offline_capture_active: false,
@@ -582,6 +590,7 @@ impl SoundPresenter {
 
     pub fn retry_failed_assets(&mut self) -> Result<usize, String> {
         let retried = self.assets.retry_failed_assets()?;
+        self.river_ambience.retry_assets();
         self.warnings.clear();
         self.custom_sound_profiles.clear();
         self.prep.ambient_sets = load_ambient_sets(&mut self.assets);
@@ -1042,6 +1051,11 @@ impl SoundPresenter {
         self.dispatch_prepared(event,game,siege_classes,event.server_time,prepared);
     }
 
+    /// Set the independent river ambience level without restarting audio.
+    pub fn set_river_volume(&mut self, volume: f32) {
+        self.river_ambience.set_volume(volume, self.backend.as_mut());
+    }
+
     /// Set the archived listener-only preset live. No backend restart.
     pub fn set_underwater_mode(&mut self, mode: u8) {
         self.underwater_mode = mode.min(3);
@@ -1050,7 +1064,20 @@ impl SoundPresenter {
         }
     }
 
-    pub fn underwater_enabled(&self) -> bool { self.underwater_mode != 0 }
+    pub fn underwater_enabled(&self) -> bool { self.underwater_mode != 0 || self.eal_enabled }
+
+    pub fn set_echofield_weather(&mut self, hour: f32, rains: bool, storm: bool, wind: f32, temperature: f32) {
+        if let Some(backend) = &mut self.backend {
+            backend.set_echofield_weather(hour, rains, storm, wind, temperature);
+        }
+    }
+
+    pub fn set_echofield_settings(&mut self, settings: jka_audio::EchoSettings) {
+        self.echofield_settings = settings;
+        if let Some(backend) = &mut self.backend {
+            backend.set_echofield_settings(settings);
+        }
+    }
 
     /// Client-only counterpart of JKA EV_WATER_TOUCH / EV_WATER_LEAVE.
     /// BSP-liquid events remain server-authoritative; never double-play when
@@ -1083,13 +1110,13 @@ impl SoundPresenter {
     ) {
         // The waterHeight plane is in JKA Z, unlike renderer Y. Unlike an
         // infinite ocean plane, check the authored map brush bounds too.
-        self.listener_submerged = self.underwater_mode != 0 && (bsp_submerged ||
+        self.listener_submerged = bsp_submerged ||
             self.underwater_oceans.iter().any(|(mins, maxs, height)| {
                 let p = listener.origin;
                 p[0] >= mins[0] && p[0] <= maxs[0] &&
                 p[1] >= mins[1] && p[1] <= maxs[1] &&
                 p[2] >= mins[2] && p[2] <= *height
-            }));
+            });
         // Offline sessions have no connection ID; first-person presentation may
         self.poll_emote_warmup();
         for result in crate::emotes::poll_prepared_audio() { let _ = self.assets.cache_emote_decode(result); }
@@ -1130,6 +1157,19 @@ impl SoundPresenter {
         }
         if let Some(backend) = &mut self.backend {
             backend.set_underwater(self.underwater_mode, self.listener_submerged);
+            self.river_ambience.update(&mut self.assets, backend, listener.origin);
+            backend.set_echofield_movers(audio_entities(entities, followed_entity).filter_map(|entity| {
+                if entity.state.field_i32("solid") != Some(SOLID_BMODEL) {
+                    return None;
+                }
+                let model = usize::try_from(entity.state.field_i32("modelindex")?).ok()?;
+                (model > 0).then(|| jka_audio::EchoMover {
+                    entity: entity.number,
+                    model,
+                    origin: entity.origin,
+                    axis: crate::cgame::weapon_fx::angles_to_axis(entity.angles),
+                })
+            }));
             backend.frame(
                 listener,
                 audio_entities(entities, followed_entity)
@@ -1292,6 +1332,17 @@ impl SoundPresenter {
         if let Some(backend) = &mut self.backend {
             backend.set_jk2_mode(jka_assets::pk3::active_jk2().is_some());
             backend.set_underwater(self.underwater_mode, self.listener_submerged);
+            if self.offline_restore_backend.is_none() {
+                backend.set_eal_hrtf_enabled(self.eal_hrtf_enabled);
+                backend.set_echofield_settings(self.echofield_settings);
+                backend.set_echo_ambience_assets(self.assets.echo_ambience_reader());
+                backend.set_acoustic_map_enabled(
+                    self.eal_file.clone(),
+                    self.eal_map.clone(),
+                    self.echo_bsp.clone(),
+                    self.eal_enabled,
+                );
+            }
         }
         self.map_music = None;
         self.start_map_music(game, true);
@@ -1309,6 +1360,9 @@ impl SoundPresenter {
             offline.clear();
         }
         self.backend = self.offline_restore_backend.take();
+        if let Some(backend) = &mut self.backend {
+            backend.set_echofield_settings(self.echofield_settings);
+        }
         self.map_music = None;
         if self.backend.is_some() {
             self.start_map_music(game, true);
@@ -1321,8 +1375,13 @@ impl SoundPresenter {
     pub fn resume_after_video_restart(&mut self, game: &ClientGameState) {
         if let Some(backend) = self.backend.as_mut() {
             backend.set_eal_hrtf_enabled(self.eal_hrtf_enabled);
-            backend.set_eal_map(self.eal_file.clone(), self.eal_map.clone());
-            backend.set_eal_enabled(self.eal_enabled);
+            backend.set_echo_ambience_assets(self.assets.echo_ambience_reader());
+            backend.set_acoustic_map_enabled(
+                self.eal_file.clone(),
+                self.eal_map.clone(),
+                self.echo_bsp.clone(),
+                self.eal_enabled,
+            );
             backend.set_eal_debug_mode(self.eal_debug_mode);
         }
         self.restart_map_music(game);
@@ -1336,6 +1395,8 @@ impl SoundPresenter {
         self.item_pickup_until.clear();
         self.last_local_equipped_weapon = None;
         self.river_foot_contact = RiverFootContact::default();
+        jka_river::river_ambience::invalidate();
+        self.river_ambience.clear(self.backend.as_mut());
         self.announcer = Announcer::default();
         self.map_music = None;
         self.music_mult = 1.0;
@@ -1403,8 +1464,25 @@ impl SoundPresenter {
         }
     }
 
-    /// Load authored EAGLE map zones and configure the optional wet renderer.
     pub fn set_eal_map(&mut self, name: &str) {
+        self.set_prepared_eal_map(name, None);
+    }
+
+    pub fn matches_echo_vfs(
+        &self,
+        token: &jka_assets::pk3::VfsIndexToken,
+        variant: Option<u8>,
+        overrides: bool,
+    ) -> bool {
+        self.assets.matches_echo_vfs(token, variant, overrides)
+    }
+
+    /// Attach authored EAGLE data and a deferred static BSP fallback.
+    pub fn set_prepared_eal_map(
+        &mut self,
+        name: &str,
+        prepared: Option<jka_audio::EchoGeometryInput>,
+    ) {
         self.eal_file = None;
         self.eal_map = None;
         match self.assets.read_eal_map(name) {
@@ -1417,10 +1495,16 @@ impl SoundPresenter {
             Ok(None) => (),
             Err(error) => eprintln!("EAL ZONES: {error}; disabled for this map"),
         }
+        self.echo_bsp = prepared.or_else(|| self.assets.echo_geometry_input(name));
         if let Some(backend) = &mut self.backend {
             backend.set_eal_hrtf_enabled(self.eal_hrtf_enabled);
-            backend.set_eal_map(self.eal_file.clone(), self.eal_map.clone());
-            backend.set_eal_enabled(self.eal_enabled);
+            backend.set_echo_ambience_assets(self.assets.echo_ambience_reader());
+            backend.set_acoustic_map_enabled(
+                self.eal_file.clone(),
+                self.eal_map.clone(),
+                self.echo_bsp.clone(),
+                self.eal_enabled,
+            );
             backend.set_eal_debug_mode(self.eal_debug_mode);
         }
     }
@@ -1475,8 +1559,14 @@ impl SoundPresenter {
         backend.set_underwater(self.underwater_mode, self.listener_submerged);
         backend.set_steam_audio_map(acoustic_mesh, bake);
         backend.set_eal_hrtf_enabled(self.eal_hrtf_enabled);
-        backend.set_eal_map(self.eal_file.clone(), self.eal_map.clone());
-        backend.set_eal_enabled(self.eal_enabled);
+        backend.set_echofield_settings(self.echofield_settings);
+        backend.set_echo_ambience_assets(self.assets.echo_ambience_reader());
+        backend.set_acoustic_map_enabled(
+            self.eal_file.clone(),
+            self.eal_map.clone(),
+            self.echo_bsp.clone(),
+            self.eal_enabled,
+        );
         backend.set_eal_debug_mode(self.eal_debug_mode);
         let info = backend.info();
         self.backend = Some(backend);

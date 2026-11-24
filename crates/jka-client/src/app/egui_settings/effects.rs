@@ -1,6 +1,6 @@
 //! Effects.
 use crate::app::egui_settings::{
-    index_of, segmented_row, theme, ui, App, Ghoul2SkinningMode,
+    index_of, segmented_row, theme, ui, App, FootprintMode, Ghoul2SkinningMode,
 };
 
 impl App {
@@ -72,18 +72,21 @@ impl App {
 
         });
 
-        ui.add_enabled_ui(self.video.ghoul2_skinning == Ghoul2SkinningMode::Gpu, |ui| {
-        if let Some(value) = segmented_row(
-            ui,
-            "Burn marks",
-            "cg_ghoul2Marks. Scorch marks left on player models by blaster, rocket and thermal hits, kept per model (jaPRO defaults to 16). They follow the animation and fade after 10-20 seconds. Needs GPU Ghoul2 skinning (Video > Models).",
-            theme::Reset::None,
-            self.audio.game.g2_marks,
-            &[(0, "Off"), (4, "4"), (16, "16"), (32, "32")],
-        ) {
-            let _ = self.set_console_cvar("cg_ghoul2Marks", &value.to_string());
-        }
-        });
+        ui.add_enabled_ui(
+            self.video.ghoul2_skinning == Ghoul2SkinningMode::Gpu && self.audio.game.blood == 0,
+            |ui| {
+                if let Some(value) = segmented_row(
+                    ui,
+                    "Legacy burn marks",
+                    "cg_ghoul2Marks limits the legacy scorch marks kept per model when Blood effects are off. Requires GPU Ghoul2 skinning (Video > Models).",
+                    theme::Reset::None,
+                    self.audio.game.g2_marks,
+                    &[(0, "Off"), (4, "4"), (16, "16"), (32, "32")],
+                ) {
+                    let _ = self.set_console_cvar("cg_ghoul2Marks", &value.to_string());
+                }
+            },
+        );
 
         const FX_PHYSICS: [(u32, &str); 3] = [
             (crate::fx::FX_PHYSICS_OFF, "Off"),
@@ -314,5 +317,231 @@ impl App {
             self.video_selected = ui::VIDEO_ROW_SABER_MARKS;
             self.change_video_setting(next as i32 - current as i32);
         }
+        self.egui_water_wake(ui);
+        self.egui_ninja_effects(ui);
+    }
+
+    fn egui_water_wake(&mut self, ui: &mut egui::Ui) {
+        // Global player wake, independent of the water renderer: one setting
+        // for stock JKA water, promoted oceans, lakes and the shared Fluid
+        // Ninja river/ocean wake.
+        theme::section(ui, "WATER WAKE", "Player wakes on every water type. Console: cg_waterwake.");
+        theme::row(ui, "Water wake",
+            "Off disables all player wakes, including the Fluid Ninja river and Ninja ocean wake. Regular uses the original JKA wake on unpromoted water and the shared Fluid Ninja wake on Ninja rivers and the Ninja ocean. Enhanced also animates the JKA wake and enables the promoted-water deformation below (Godot, Blue Water, Hybrid and lakes). This does not change ship wakes or ambient wave foam.",
+            theme::Reset::None, |ui| {
+                for (mode, label) in [(0u8, "Off"), (1, "Regular"), (2, "Enhanced")] {
+                    if theme::chip(ui, label, self.video.water_wake == mode).clicked()
+                        && self.video.water_wake != mode
+                    {
+                        let _ = self.set_console_cvar("cg_waterwake", &mode.to_string());
+                    }
+                    ui.add_space(3.0);
+                }
+            });
+
+        let mut interaction = self.video.ocean_settings.interaction;
+        let mut strength = self.video.ocean_settings.interaction_strength;
+        let mut splash_mode = self.video.ocean_settings.interaction_splash_mode;
+        let toggled = ui.checkbox(&mut interaction, "Player water deformation").on_hover_text(
+            "Global player displacement for Godot, Blue Water, Hybrid and supported lake surfaces. Requires Enhanced wake.").changed();
+        let adjusted = ui.horizontal(|ui| {
+            ui.label("Deformation strength (all water renderers)");
+            ui.add(egui::DragValue::new(&mut strength).speed(0.5).range(0.0..=f32::MAX)).changed()
+        }).inner;
+        let mut splash_changed = false;
+        ui.horizontal(|ui| {
+            ui.label("Interaction FX A/B");
+            egui::ComboBox::from_id_salt("ocean_interaction_splash_mode")
+                .selected_text(match splash_mode {
+                    0 => "Off",
+                    1 => "A: Entry droplets",
+                    2 => "B: Wake spray",
+                    3 => "A + B",
+                    4 => "Entry jets",
+                    _ => "All FX",
+                })
+                .show_ui(ui, |ui| {
+                    splash_changed |= ui.selectable_value(&mut splash_mode, 0, "Off").changed();
+                    splash_changed |= ui.selectable_value(&mut splash_mode, 1, "A: Entry droplets").changed();
+                    splash_changed |= ui.selectable_value(&mut splash_mode, 2, "B: Wake spray").changed();
+                    splash_changed |= ui.selectable_value(&mut splash_mode, 3, "A + B").changed();
+                    splash_changed |= ui.selectable_value(&mut splash_mode, 4, "Entry jets").changed();
+                    splash_changed |= ui.selectable_value(&mut splash_mode, 5, "All FX").changed();
+                });
+        }).response.on_hover_text(
+            "Compare entry droplets with spray emitted along the moving wake. Count and size follow speed and deformation strength; Entry jets and All FX add upward jets.");
+        if toggled || adjusted || splash_changed {
+            self.video.ocean_settings.interaction = interaction;
+            self.video.ocean_settings.interaction_strength = strength;
+            self.video.ocean_settings.interaction_splash_mode = splash_mode;
+            self.commit_ocean_settings();
+        }
+    }
+
+    fn egui_ninja_effects(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, "FLUID NINJA", "Fire, ground fog, blood, and snow presentation. These use the existing Fluid Ninja implementation and its console commands, not a second solver. Diagnostic emitters are local to the current map/session.");
+        if !jka_ninja::INCLUDED {
+            theme::hint(ui, "The private Fluid Ninja crate is not included in this build. Fire, fog and blood diagnostics require that implementation.", theme::TEXT_FAINT());
+        }
+        ui.add_enabled_ui(jka_ninja::INCLUDED, |ui| {
+            theme::section(ui, "FIRE", "Place bonfires, candles, torches or log fires along your view, or ignite the player for the Burning Man effect.");
+            {
+                self.ninja_toggle(ui, "r_ninjaFirePromote", crate::ninja_fire_debug::promote(),
+                    "Promote authored fire effects",
+                    "Replace supported stationary ET_FX flames with Ninja fire and Burning Man sparks. The closest four eligible flames are simulated.");
+                self.ninja_toggle(ui, "r_ninjaSmokePromote", crate::ninja_fire_debug::promote_smoke(),
+                    "Promote authored smoke effects",
+                    "Replace upright particle smoke and steam from the two nearest eligible continuous map emitters with Ninja smoke once their volumes are ready.");
+                theme::row(
+                    ui,
+                    "Smoke lifetime",
+                    "How long promoted EFX smoke lingers (0.25x–8x, default 1x).",
+                    theme::Reset::None,
+                    |ui| {
+                        let mut scale = self.video.fx_smoke_duration_scale;
+                        let readout = format!("{scale:.2}x");
+                        let changed = theme::slider(ui, &mut scale, crate::fx::SMOKE_DURATION_SCALE_MIN..=crate::fx::SMOKE_DURATION_SCALE_MAX, &readout);
+                        // Double-click the label or the slider: the cvar's default (1x).
+                        let reset = theme::row_label_double_clicked(ui)
+                            || ui.ctx().input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary))
+                                && ui.min_rect().contains(ui.ctx().input(|i| i.pointer.interact_pos()).unwrap_or_default());
+                        if reset {
+                            let default = crate::app::commands::registry::cvar_registry().find("r_fxSmokeDurationScale")
+                                .map_or_else(|| "1".to_owned(), |def| def.entry.default.to_string());
+                            let _ = self.set_console_cvar("r_fxSmokeDurationScale", &default);
+                        } else if changed {
+                            let _ = self.set_console_cvar("r_fxSmokeDurationScale", &format!("{scale:.2}"));
+                        }
+                    },
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Spawn at view:");
+                    for (name, command) in [
+                        ("Bonfire", "ninjafire bonfire"), ("Candle", "ninjafire candle"),
+                        ("Torch", "ninjafire torch"), ("Log fire", "ninjafire logfire"),
+                    ] {
+                        if ui.button(name).on_hover_text(format!("Run /{command} (96 units in front of the view)")).clicked() {
+                            self.execute_command_line(command);
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Burning Man ON").on_hover_text("Run /ninjafireon on the presented player").clicked() {
+                        self.execute_command_line("ninjafireon");
+                    }
+                    if ui.button("Smoking Man ON").on_hover_text("Run /ninjafireon smokingman: the Fire Smoke demo's key-2 pawn (volume smoke)").clicked() {
+                        self.execute_command_line("ninjafireon smokingman");
+                    }
+                    if ui.button("Smoking Man (always) ON").on_hover_text("Run /ninjafireon smokingman2: Smoking Man that keeps smoking while you stand still").clicked() {
+                        self.execute_command_line("ninjafireon smokingman2");
+                    }
+                    if ui.button("Burning + Smoking Man ON").on_hover_text("Run /ninjafireon burningman3: the Fire Smoke demo's key-3 pawn (flame plus volume smoke)").clicked() {
+                        self.execute_command_line("ninjafireon burningman3");
+                    }
+                    if ui.button("Burning + Smoking Man (always) ON").on_hover_text("Run /ninjafireon burningman3b: Burning + Smoking Man whose smoke keeps going while you stand still").clicked() {
+                        self.execute_command_line("ninjafireon burningman3b");
+                    }
+                    if ui.button("Blue Fist ON").on_hover_text("Run /ninjafireon fist: Stage 11 Flaming Fist B (blue smoke from the left hand)").clicked() {
+                        self.execute_command_line("ninjafireon fist");
+                    }
+                    if ui.button("Player effect OFF").clicked() { self.execute_command_line("ninjafireoff"); }
+                    if ui.button("Clear flames").clicked() { self.execute_command_line("ninjafireclear"); }
+                });
+                self.ninja_toggle(ui, "r_ninjaFireFlicker", crate::ninja_fire_debug::flicker(), "Flickering fire light", "Animate the existing Burning Man light's intensity; off restores steady intensity.");
+                self.ninja_toggle(ui, "r_ninjaFireAirflow", crate::ninja_fire_debug::airflow_response(), "Airflow response", "Thin the outer flame in fast air and flare as the airflow subsides.");
+                self.ninja_toggle(ui, "r_ninjaFireCollision", crate::ninja_fire_debug::collision(), "Brush collision", "Use Fluid Ninja MeshField collision against solid map brushes.");
+                self.ninja_toggle(ui, "r_ninjaFireEmbers", crate::ninja_fire_debug::embers(), "Fire embers", "Fire Smoke flamethrower-turret embers from every Ninja fire source: bright streaks and soft glowing dots that fall, bounce and settle on the floor.");
+            }
+
+            theme::section(ui, "FOG", "Fog Mist follows the player and reacts to movement.");
+            self.ninja_toggle(ui, "r_ninjaFog", crate::ninja_fog_debug::enabled(), "Fluid Ninja fog", "Enable test fog. Disabling removes the active volume.");
+            ui.add_enabled_ui(crate::ninja_fog_debug::enabled(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Fog Mist (follows player)").on_hover_text("Run /ninjafog mist").clicked() {
+                        self.execute_command_line("ninjafog mist");
+                    }
+                    if ui.button("Clear fog").clicked() { self.execute_command_line("ninjafogclear"); }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Fixed test volumes");
+                    for (name, command) in [
+                        ("Low lying", "ninjafog lowlying"), ("Plastic", "ninjafog plastic"),
+                        ("Scattered", "ninjafog scattered"),
+                    ] {
+                        if ui.button(name).on_hover_text(format!("Run /{command}")).clicked() {
+                            self.execute_command_line(command);
+                        }
+                    }
+                });
+            });
+
+            theme::section(ui, "BLOOD", "Animated saber spurts and interactive surface blood.");
+            if let Some(mode) = segmented_row(
+                ui, "Blood effects",
+                "cg_blood 1: animated Ninja blood, surface pools, SkinGore and a skull/brain gib. cg_blood 2: full TaystJK gib models with Ninja blood droplets/marks instead of legacy bloodTrail/bloodMark. SkinGore requires GPU Ghoul2 skinning; gib MD3 assets must be available.",
+                theme::Reset::None, self.audio.game.blood,
+                &[(0, "Off"), (1, "Blood"), (2, "Blood + gibs")],
+            ) {
+                let _ = self.set_console_cvar("cg_blood", &mode.to_string());
+            }
+            ui.add_enabled_ui(crate::ninja_blood::enabled(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Test:");
+                    for (label, command) in [
+                        ("Spurt", "ninjablood spurt"), ("Leak", "ninjablood leak"),
+                        ("Gush", "ninjablood gush"), ("Impact", "ninjablood hit"),
+                    ] {
+                        if ui.button(label).on_hover_text(format!("Run /{command}")).clicked() {
+                            self.execute_command_line(command);
+                        }
+                    }
+                    if ui.button("Stop bleeding").on_hover_text("Stop the local leak or gush").clicked() {
+                        self.execute_command_line("ninjablood");
+                    }
+                });
+            });
+        });
+        theme::section(ui, "SNOW", "The existing footprint modes; Ninja composite selects the Fluid Ninja painter and composite presentation when available.");
+        const FOOTPRINTS: [(FootprintMode, &str); 5] = [
+            (FootprintMode::Off, "Off"), (FootprintMode::TwoD, "2D"),
+            (FootprintMode::ThreeD, "3D"), (FootprintMode::Ninja, "Ninja"),
+            (FootprintMode::NinjaComposite, "Ninja composite"),
+        ];
+        if let Some(mode) = segmented_row(ui, "Snow footprints", "r_footprints: same choice as the surface settings page. Controls snow and other footprint media using the existing renderer modes.", theme::Reset::None, self.video.footprints, &FOOTPRINTS) {
+            let _ = self.set_console_cvar("r_footprints", mode.config_value());
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Reset Ninja diagnostics")
+                .on_hover_text("Restore the registered session defaults for Ninja fire and fog")
+                .clicked()
+            {
+                for name in NINJA_CVARS {
+                    if let Some(def) = crate::app::commands::registry::cvar_registry().find(name) {
+                        let default = def.entry.default.to_owned();
+                        let _ = self.set_console_cvar(name, &default);
+                    }
+                }
+            }
+        });
+    }
+
+    fn ninja_toggle(&mut self, ui: &mut egui::Ui, name: &str, current: bool, label: &str, tip: &str) {
+        let value = theme::row(ui, label, tip, theme::Reset::None, |ui| {
+            let mut value = current;
+            let response = ui.checkbox(&mut value, "Enabled");
+            if theme::row_label_double_clicked(ui) {
+                crate::app::commands::registry::cvar_registry().find(name)
+                    .map(|def| def.entry.default == "1")
+            } else if response.changed() { Some(value) } else { None }
+        });
+        if let Some(value) = value {
+            let _ = self.set_console_cvar(name, if value { "1" } else { "0" });
+        }
     }
 }
+
+const NINJA_CVARS: &[&str] = &[
+    "r_ninjaFirePromote", "r_ninjaSmokePromote", "r_ninjaFireFlicker", "r_ninjaFireAirflow",
+    "r_ninjaFireCollision", "r_ninjaFireEmbers",
+    "r_ninjaFog",
+];

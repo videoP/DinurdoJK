@@ -157,7 +157,20 @@ impl SceneCopy {
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
     ) {
-        self.capture_impl(device, encoder, color, depth, false, None);
+        self.capture_impl(device, encoder, color, depth, false, None, 0);
+    }
+
+    /// `capture` limited to rows `top..` (the caller knows nothing above samples it).
+    /// Rows above stay cleared: black color and reversed-Z far depth (no receiver).
+    pub fn capture_rows(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        color: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        top: u32,
+    ) {
+        self.capture_impl(device, encoder, color, depth, false, None, top);
     }
 
     /// Resolve reversed depth without reading or writing scene color. The color
@@ -170,7 +183,7 @@ impl SceneCopy {
         color: &wgpu::TextureView,
         depth: &wgpu::TextureView,
     ) {
-        self.capture_impl(device, encoder, color, depth, true, None);
+        self.capture_impl(device, encoder, color, depth, true, None, 0);
     }
 
     /// GPU-authored DrawIndirect arguments: zero vertices when no copy is
@@ -183,7 +196,7 @@ impl SceneCopy {
         depth: &wgpu::TextureView,
         args: &wgpu::Buffer,
     ) {
-        self.capture_impl(device, encoder, color, depth, false, Some(args));
+        self.capture_impl(device, encoder, color, depth, false, Some(args), 0);
     }
 
     fn capture_impl(
@@ -194,6 +207,7 @@ impl SceneCopy {
         depth: &wgpu::TextureView,
         depth_only: bool,
         indirect: Option<&wgpu::Buffer>,
+        top: u32,
     ) {
         let input = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Blue Water scene copy input"),
@@ -246,6 +260,10 @@ impl SceneCopy {
             &self.pipeline
         });
         pass.set_bind_group(0, &input, &[]);
+        if top > 0 {
+            if top >= self.key.1 { return; }
+            pass.set_scissor_rect(0, top, self.key.0, self.key.1 - top);
+        }
         if let Some(args) = indirect {
             pass.draw_indirect(args, 0);
         } else {
