@@ -179,6 +179,7 @@ impl BloodField {
     pub fn encode(&mut self, _queue: &wgpu::Queue, _encoder: &mut wgpu::CommandEncoder, _game_delta: f64, _motions: &[crate::BloodMotion], _ink: Option<crate::BloodInk<'_>>, _skip_seed: bool) -> Result<bool, String> { match self.0 {} }
     pub fn restart(&mut self, _device: &wgpu::Device, _encoder: &mut wgpu::CommandEncoder, _seed: BloodSeed) -> Result<(), String> { match self.0 {} }
     pub fn outputs(&self) -> BloodOutputs<'_> { match self.0 {} }
+    pub fn high_quality(&self) -> bool { match self.0 {} }
 }
 
 // Public-only builds never create the private Ocean2 solver.
@@ -208,6 +209,7 @@ pub const COAST_SEA_FOOTPRINT_SLOPE: f32 = 0.040;
 pub struct CoastField(std::convert::Infallible);
 impl CoastField {
     pub fn set_landscape_normal_gain(&mut self, _gain: f32) { match self.0 {} }
+    pub fn set_host_waves(&mut self, _travel: [f32; 2], _exposure: f32, _speed: f32) { match self.0 {} }
     pub fn new(_device: &wgpu::Device, _queue: &wgpu::Queue, _desc: &crate::CoastDesc, _images: [&wgpu::TextureView; 4], _terrain: &wgpu::TextureView) -> Result<Self, String> { Err(NOT_INCLUDED.into()) }
     pub fn capture_resolution(&self) -> [u32; 2] { match self.0 {} }
     pub fn shift(&mut self, _cells: [i32; 2]) { match self.0 {} }
