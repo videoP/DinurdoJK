@@ -341,6 +341,7 @@ struct DetachedLimbBody {
 /// world. No server entity or gameplay collision is created.
 #[derive(Debug)]
 struct DebrisBody {
+    dynamic_gib: Option<super::player_presenter::DynamicGib>,
     body: RigidBodyHandle,
     qpath: String,
     scale: f32,
@@ -2035,15 +2036,19 @@ impl RagdollWorld {
             // geometry remains visual-only. GIB and enhanced breakable bodies
             // accept the GROUP_3 kinematic player hull, but ordinary debris
             // keeps its world/debris-only collision behavior.
-            let gib = !breakable && spec.qpath.starts_with("models/gibs/");
+            let gib = !breakable && (spec.dynamic_gib.is_some() || spec.qpath.starts_with("models/gibs/"));
             let radius = (3.0 * spec.scale).clamp(0.5, 12.0) * JKA_TO_RAPIER;
             let groups = InteractionGroups::new(
                 Group::GROUP_2, Group::GROUP_1 | Group::GROUP_2
                     | (if breakable || gib { Group::GROUP_3 } else { Group::empty() }),
                 InteractionTestMode::default(),
             );
+            let collider = if let Some(piece) = &spec.dynamic_gib {
+                let [x, y, z] = piece.half_extents().map(|v| v * JKA_TO_RAPIER);
+                ColliderBuilder::cuboid(x, y, z)
+            } else { ColliderBuilder::ball(radius) };
             self.colliders.insert_with_parent(
-                ColliderBuilder::ball(radius)
+                collider
                     .user_data(if breakable { BREAKABLE_FRAGMENT_TAG } else { 0 })
                     .mass(0.3)
                     .friction(0.8)
@@ -2060,6 +2065,7 @@ impl RagdollWorld {
                 (self.config.debris_lifetime_seconds * 1000.0) as i32
             };
             self.debris.push(DebrisBody {
+                dynamic_gib: spec.dynamic_gib.clone(),
                 body,
                 qpath: spec.qpath.clone(),
                 scale: spec.scale,
@@ -2362,7 +2368,13 @@ impl RagdollWorld {
             }
             let body = bodies.get(fragment.body)?;
             let p = body.translation() * RAPIER_TO_JKA;
-            let point = [p.x, p.y, p.z - fragment.radius_jka];
+            let bottom = if let Some(piece) = &fragment.dynamic_gib {
+                let half = piece.half_extents();
+                let rotation = body.position().rotation;
+                [Vector::X, Vector::Y, Vector::Z].into_iter().zip(half)
+                    .map(|(axis, extent)| (rotation * axis).z.abs() * extent).sum()
+            } else { fragment.radius_jka };
+            let point = [p.x, p.y, p.z - bottom];
             fragment.next_smear_ms = now.saturating_add(super::weapon_fx::GIB_SMEAR_INTERVAL_MS);
             let old = fragment.last_smear_origin.replace((point, now))?;
             // Every grounded sample lays a continuous smear stroke.
@@ -2418,6 +2430,7 @@ impl RagdollWorld {
             });
             let p = display.translation * RAPIER_TO_JKA;
             Some(ChunkModel {
+                dynamic_gib: fragment.dynamic_gib.clone(),
                 qpath: fragment.qpath.clone(),
                 origin: [p.x, p.y, p.z],
                 axis: basis,
@@ -3065,6 +3078,7 @@ mod tests {
     fn debris_uses_existing_rapier_world_and_respects_budgets_and_expiry() {
         let mut world = RagdollWorld::new();
         let spec = ChunkSpec {
+            dynamic_gib: None,
             qpath: "models/chunks/rock/rock1_1.md3".into(),
             origin: [0.0, 0.0, 48.0], velocity: [24.0, 0.0, 20.0],
             angles: [0.0; 3], angle_velocity: [180.0, 30.0, 0.0],
@@ -3151,6 +3165,7 @@ mod tests {
         ).unwrap();
         world.set_map_mesh(&mesh).unwrap();
         let chunk = ChunkSpec {
+            dynamic_gib: None,
             qpath: "models/chunks/rock/rock1_1.md3".into(),
             origin: [0., 0., 48.], velocity: [0.; 3],
             angles: [0.; 3], angle_velocity: [0.; 3],
@@ -3195,6 +3210,7 @@ mod tests {
         world.set_map_mesh(&mesh).unwrap();
         assert!(!world.wants_player_contacts());
         let gib = ChunkSpec {
+            dynamic_gib: None,
             qpath: "models/gibs/chest.md3".into(),
             origin: [28., 0., 24.], velocity: [0.; 3],
             angles: [0.; 3], angle_velocity: [0.; 3],
@@ -3237,6 +3253,7 @@ mod tests {
         ).unwrap();
         world.set_map_mesh(&mesh).unwrap();
         let chunk = ChunkSpec {
+            dynamic_gib: None,
             qpath: "models/chunks/rock/rock1_1.md3".into(),
             origin: [36., 0., 24.], velocity: [0.; 3],
             angles: [0.; 3], angle_velocity: [0.; 3],

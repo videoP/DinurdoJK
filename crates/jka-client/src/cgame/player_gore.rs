@@ -194,6 +194,7 @@ pub(crate) fn impact_position(
 /// With `trace`, `hit` is only the start of a segment towards `hit + dir` (the
 /// "special trace" of `EV_GHOUL2_MARK`'s eventParm) and the nearest surface hit
 /// becomes the mark centre; no hit means no mark.
+#[cfg(test)]
 pub(crate) fn build_gore(
     snaps: &[GpuSnap],
     id: u32,

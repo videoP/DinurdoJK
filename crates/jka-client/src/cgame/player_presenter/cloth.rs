@@ -55,6 +55,45 @@ impl PlayerPresenter {
         built
     }
 
+    /// Body proxies for promoted GLM hair springs (cg_hairPhysics 2), the same
+    /// capsules cloth uses, fitted at LOD 0 without the hair surfaces. Imported
+    /// Source rigs get none: their jigglebones are not necessarily hair.
+    pub(in crate::cgame::player_presenter) fn hair_spring_colliders(
+        templates: &mut HashMap<(String, usize, Vec<usize>), Vec<(usize, ClothCapsule)>>,
+        model: &crate::cgame::player_presenter::PlayerModelAsset,
+        pose: &[Matrix3x4],
+    ) -> Vec<jka_assets::source1_jiggle::SpringCollider> {
+        if model.source_imported {
+            return Vec::new();
+        }
+        let visible = model
+            .surfaces
+            .iter()
+            .map(|asset| asset.surface_index)
+            .filter(|&index| {
+                !model.glm.hierarchy.get(index).is_some_and(|entry| {
+                    entry.name.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("hair"))
+                })
+            })
+            .collect::<Vec<_>>();
+        let key = (format!("{}#hair_springs", model.key), 0, visible);
+        let templates = templates.entry(key.clone()).or_insert_with(|| {
+            crate::cgame::cloth_body::build_body_templates(&model.glm, &model.gla, &key.2, 0)
+        });
+        crate::cgame::cloth_body::pose_body_capsules(templates, &model.gla, pose)
+            .into_iter()
+            .map(|capsule| jka_assets::source1_jiggle::SpringCollider {
+                a: capsule.a,
+                b: capsule.b,
+                basis: capsule.basis.unwrap_or([
+                    [capsule.radius, 0.0, 0.0],
+                    [0.0, capsule.radius, 0.0],
+                    [0.0, 0.0, capsule.radius],
+                ]),
+            })
+            .collect()
+    }
+
     pub(in crate::cgame::player_presenter) fn cloth_surface_name<'a>(
         glm: &'a GlmModel,
         surface: &GlmSurface,
@@ -73,9 +112,19 @@ impl PlayerPresenter {
         gla: &GlaAnimation,
         pose: &[Matrix3x4],
     ) -> Vec<ClothCapsule> {
+        // Simulated hair is not part of the body: left in, its scalp vertices
+        // grow the cranium proxy to the hair volume, and the bind-pose overlap
+        // allowance then lets the hair sink into the head.
+        let hair_cloth = self.hair_cloth_active();
         let visible = surface_assets
             .iter()
             .map(|asset| asset.surface_index)
+            .filter(|&index| {
+                !hair_cloth
+                    || !glm.hierarchy.get(index).is_some_and(|entry| {
+                        ClothSystem::is_hair_surface_name(&entry.name)
+                    })
+            })
             .collect::<Vec<_>>();
         let key = (model_label.to_owned(), lod_index, visible);
         let templates = self
@@ -86,16 +135,30 @@ impl PlayerPresenter {
             });
         crate::cgame::cloth_body::pose_body_capsules(templates, gla, pose)
     }
+    /// Garment surface, or a `hair*` surface while `hair_cloth` (see
+    /// `hair_cloth_active`) is on.
+    pub(in crate::cgame::player_presenter) fn is_cloth_surface(
+        glm: &GlmModel,
+        surface: &GlmSurface,
+        hair_cloth: bool,
+    ) -> bool {
+        Self::cloth_surface_name(glm, surface).is_some_and(|name| {
+            ClothSystem::is_cloth_surface_name(name)
+                || (hair_cloth && ClothSystem::is_hair_surface_name(name))
+        })
+    }
+
     pub(in crate::cgame::player_presenter) fn cloth_surface_frame(
         glm: &GlmModel,
         surface: &GlmSurface,
         skinned: &Ghoul2SkinnedSurface,
         pose: &[Matrix3x4],
+        hair_cloth: bool,
     ) -> Option<ClothSurfaceFrame> {
-        let surface_name = Self::cloth_surface_name(glm, surface)?;
-        if !ClothSystem::is_cloth_surface_name(surface_name) {
+        if !Self::is_cloth_surface(glm, surface, hair_cloth) {
             return None;
         }
+        let surface_name = Self::cloth_surface_name(glm, surface)?;
         // These transforms let the garment solver derive attachment motion
         // from the actual skin weights. No bone names or animation IDs enter
         // the rule for how hanging fabric follows those attachments.
@@ -250,7 +313,7 @@ impl PlayerPresenter {
                         pose,
                     )
                     .ok()
-                    .and_then(|skinned| Self::cloth_surface_frame(glm, source, &skinned, pose));
+                    .and_then(|skinned| Self::cloth_surface_frame(glm, source, &skinned, pose, false));
                     let gpu_vertices = (0..source.vertices.len())
                         .map(|index| {
                             crate::cgame::player_presenter::submission::mesh::gpu_vertex_from_glm(

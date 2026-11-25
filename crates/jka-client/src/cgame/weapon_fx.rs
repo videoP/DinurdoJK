@@ -1219,6 +1219,7 @@ struct Beam {
 #[derive(Clone, Debug)]
 pub(crate) struct ChunkSpec {
     pub(crate) qpath: String,
+    pub(crate) dynamic_gib: Option<super::player_presenter::DynamicGib>,
     pub(crate) origin: [f32; 3],
     pub(crate) velocity: [f32; 3],
     pub(crate) angles: [f32; 3],
@@ -1259,6 +1260,7 @@ enum ChunkPhysicsKind { Debris, Gib }
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChunkModel {
     pub qpath: String,
+    pub(crate) dynamic_gib: Option<super::player_presenter::DynamicGib>,
     pub origin: [f32; 3],
     /// Axis rows already multiplied by the fragment's scale (ScaleModelAxis).
     pub axis: [[f32; 3]; 3],
@@ -1509,6 +1511,7 @@ pub struct WeaponFx {
     /// EV_DEBRIS spawn specifications queued for the shared Rapier world.
     pending_debris: Vec<ChunkSpec>,
     pending_gibs: Vec<ChunkSpec>,
+    dynamic_gib_requests: Vec<DynamicGibRequest>,
     /// Local-only /testgib requests wait for the next FX frame, so the
     /// standard EV_GIB_PLAYER fallback / Rapier promotion runs unchanged.
     test_gib_spawns: Vec<ChunkSpec>,
@@ -1644,6 +1647,7 @@ impl WeaponFx {
             chunks: Vec::new(),
             pending_debris: Vec::new(),
             pending_gibs: Vec::new(),
+            dynamic_gib_requests: Vec::new(),
             test_gib_spawns: Vec::new(),
             test_gib_seed: 0,
             pending_glass: Vec::new(),
@@ -2053,6 +2057,7 @@ impl WeaponFx {
         self.chunks.clear();
         self.pending_debris.clear();
         self.pending_gibs.clear();
+        self.dynamic_gib_requests.clear();
         self.test_gib_spawns.clear();
         self.pending_glass.clear();
         self.foot_marks.clear();
@@ -2113,6 +2118,7 @@ impl WeaponFx {
             self.chunks.clear();
             self.pending_debris.clear();
             self.pending_gibs.clear();
+            self.dynamic_gib_requests.clear();
             self.test_gib_spawns.clear();
             self.pending_glass.clear();
             self.entity_fx.clear();
@@ -2303,7 +2309,8 @@ impl WeaponFx {
     }
 
     pub fn set_blood_mode(&mut self, mode: u8) {
-        self.blood_mode = mode.min(2);
+        self.blood_mode = mode.min(3);
+        if self.blood_mode != 3 { self.dynamic_gib_requests.clear(); }
     }
 
     pub(crate) fn blood_mode_enabled(&self) -> bool {
@@ -2312,7 +2319,7 @@ impl WeaponFx {
     }
 
     pub(crate) fn blood_gibs_enabled(&self) -> bool {
-        self.blood_mode == 2 && !self.jk2_assets
+        self.blood_mode >= 2 && !self.jk2_assets
             && crate::ninja_blood::enabled() && crate::fx::simulation_enabled()
     }
 
@@ -2345,7 +2352,7 @@ impl WeaponFx {
     /// Rapier-owned gib particles use the same fluid blood emitter as the
     /// legacy (non-promoted) chunks; no stock bloodTrail/bloodMark shaders.
     pub(crate) fn bleed_physics_gibs(&mut self, sources: &[([f32; 3], [f32; 3])]) {
-        if self.blood_mode != 2 || self.jk2_assets
+        if self.blood_mode < 2 || self.jk2_assets
             || !crate::ninja_blood::enabled() || !crate::fx::simulation_enabled()
         { return; }
         for &(origin, velocity) in sources {
@@ -2399,6 +2406,25 @@ impl WeaponFx {
         let count = specs.len();
         self.test_gib_spawns.extend(specs);
         (count, paths)
+    }
+
+    pub(crate) fn queue_test_dynamic_gib(&mut self, entity: u16, origin: [f32; 3]) {
+        self.test_gib_seed = self.test_gib_seed.wrapping_add(1);
+        let seed = (self.time as u32).rotate_left(11) ^ self.test_gib_seed;
+        self.dynamic_gib_requests.push(DynamicGibRequest { entity, origin, seed, time: self.time });
+    }
+
+    pub(crate) fn take_dynamic_gib_requests(&mut self) -> Vec<DynamicGibRequest> {
+        std::mem::take(&mut self.dynamic_gib_requests)
+    }
+
+    pub(crate) fn retry_dynamic_gib(&mut self, request: DynamicGibRequest) {
+        self.dynamic_gib_requests.push(request);
+    }
+
+    pub(crate) fn add_dynamic_gibs(&mut self, specs: Vec<ChunkSpec>) {
+        self.pending_gibs.extend(specs.iter().cloned());
+        self.add_chunks_with_kind(&specs, Some(ChunkPhysicsKind::Gib));
     }
 
     pub(crate) fn take_gib_spawns(&mut self) -> Vec<ChunkSpec> {
@@ -2520,7 +2546,7 @@ impl WeaponFx {
         self.chunks.retain(|chunk| time < chunk.end_time && time >= chunk.start_time);
         let mut models = Vec::with_capacity(self.chunks.len());
         let mut world = self.collision_world.take();
-        let use_ninja_gib_blood = self.blood_mode == 2 && !self.jk2_assets
+        let use_ninja_gib_blood = self.blood_mode >= 2 && !self.jk2_assets
             && crate::ninja_blood::enabled() && crate::fx::simulation_enabled();
         let surfaces = self.mark_surfaces.as_deref();
         for chunk in &mut self.chunks {
@@ -2531,7 +2557,7 @@ impl WeaponFx {
                 } else {
                     1.0
                 };
-                models.push(ChunkModel { qpath: chunk.spec.qpath.clone(), origin: chunk.origin, axis: chunk.axis, alpha });
+                models.push(ChunkModel { dynamic_gib: chunk.spec.dynamic_gib.clone(), qpath: chunk.spec.qpath.clone(), origin: chunk.origin, axis: chunk.axis, alpha });
                 continue;
             }
             let dt = (time - chunk.trajectory_time) as f32 * 0.001;
@@ -2603,7 +2629,7 @@ impl WeaponFx {
                 chunk.next_blood_ms = time.saturating_add(GIB_BLEED_INTERVAL_MS);
                 self.ninja_blood.bleed(chunk.origin, chunk.velocity, [0.0; 3], crate::ninja_blood::BleedStyle::Leak);
             }
-            models.push(ChunkModel { qpath: chunk.spec.qpath.clone(), origin: chunk.origin, axis: chunk.axis, alpha: 1.0 });
+            models.push(ChunkModel { dynamic_gib: chunk.spec.dynamic_gib.clone(), qpath: chunk.spec.qpath.clone(), origin: chunk.origin, axis: chunk.axis, alpha: 1.0 });
         }
         self.collision_world = world;
         models
@@ -4695,11 +4721,9 @@ impl WeaponFx {
         }
         match prepared {
             PreparedFxEvent::None => None,
-            PreparedFxEvent::SaberHit { effect, count, origin, dir, person } => {
-                let stock_blood = *person && crate::ninja_blood::is_stock_saber_effect(effect);
-                if stock_blood && self.blood_mode == 0 {
-                    return Some(EventDispatchResult::Handled("FX_SABER_HIT_BLOOD_DISABLED"));
-                }
+            PreparedFxEvent::SaberHit { effect, count, origin, dir, .. } => {
+                // jaPRO EV_SABER_HIT never consults cg_blood: the stock flesh
+                // effect (sparks and its Ghoul2 wound decals) plays at 0 too.
                 let mut played = false;
                 for _ in 0..*count {
                     played |= self.play_saber_impact(effect, *origin, *dir);
@@ -4805,6 +4829,14 @@ impl WeaponFx {
                 Some(EventDispatchResult::Handled("FX_GLASS_SHARDS"))
             }
             PreparedFxEvent::Gibs { origin, seed } => {
+                if self.blood_mode == 3 {
+                    if !self.repeated_time && !self.jk2_assets && crate::fx::simulation_enabled() {
+                        self.dynamic_gib_requests.push(DynamicGibRequest {
+                            entity: event.entity_num, origin: *origin, seed: *seed, time: self.time,
+                        });
+                    }
+                    return Some(EventDispatchResult::Handled("FX_DYNAMIC_GIBS"));
+                }
                 let specs = gib_specs(*origin, *seed, self.blood_mode);
                 if specs.is_empty() || self.repeated_time {
                     return Some(EventDispatchResult::Handled("FX_GIBS"));
@@ -5301,7 +5333,7 @@ pub(super) fn ground_deposit_size_cm(age_ms: i32, duration_ms: i32, fresh_cm: f3
     fresh_cm * (0.25 + 0.75 * remaining)
 }
 fn gib_specs(origin: [f32; 3], seed: u32, mode: u8) -> Vec<ChunkSpec> {
-    if mode == 0 { return Vec::new(); }
+    if mode == 0 || mode == 3 { return Vec::new(); }
     const GIB_VELOCITY: f32 = 250.0;
     const GIB_JUMP: f32 = 250.0;
     let mut rng = SmallRng::new(seed);
@@ -5311,6 +5343,7 @@ fn gib_specs(origin: [f32; 3], seed: u32, mode: u8) -> Vec<ChunkSpec> {
         models.extend(["abdomen", "arm", "chest", "fist", "foot", "forearm", "intestine", "leg", "leg"]);
     }
     models.into_iter().map(|model| ChunkSpec {
+        dynamic_gib: None,
         qpath: format!("models/gibs/{model}.md3"),
         origin,
         velocity: [
@@ -5322,6 +5355,31 @@ fn gib_specs(origin: [f32; 3], seed: u32, mode: u8) -> Vec<ChunkSpec> {
         angle_velocity: [0.0; 3],
         // Double the original TaystJK 5–8 s lifetime: 10–16 s, in both
         // legacy trajectories and Rapier-promoted gib bodies.
+        life_ms: 2 * (5000 + (rng.range(0.0, 1.0) * 3000.0) as i32),
+        bounce_factor: 0.6,
+        scale: 1.0,
+    }).collect()
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DynamicGibRequest {
+    pub entity: u16,
+    pub origin: [f32; 3],
+    pub seed: u32,
+    pub time: i32,
+}
+
+pub(crate) fn dynamic_gib_specs(
+    pieces: Vec<([f32; 3], super::player_presenter::DynamicGib)>, seed: u32,
+) -> Vec<ChunkSpec> {
+    let mut rng = SmallRng::new(seed);
+    pieces.into_iter().map(|(origin, piece)| ChunkSpec {
+        qpath: String::new(), // typed Ghoul2 payload; never looked up in the VFS
+        dynamic_gib: Some(piece),
+        origin,
+        velocity: [rng.range(-250.0, 250.0), rng.range(-250.0, 250.0), 250.0 + rng.range(-250.0, 250.0)],
+        angles: [0.0; 3],
+        angle_velocity: [rng.range(-180.0, 180.0), rng.range(-180.0, 180.0), rng.range(-180.0, 180.0)],
         life_ms: 2 * (5000 + (rng.range(0.0, 1.0) * 3000.0) as i32),
         bounce_factor: 0.6,
         scale: 1.0,
@@ -5380,6 +5438,7 @@ fn prepare_chunks(event: &PresentationEvent, game: &ClientGameState) -> Prepared
         let angles = [rng.range(0.0, 360.0), rng.range(0.0, 360.0), rng.range(0.0, 360.0)];
         let spin = rng.range(0.0, 1.0) * 600.0 + 200.0;
         specs.push(ChunkSpec {
+            dynamic_gib: None,
             qpath,
             origin: spot,
             velocity: dir.map(|c| c * chunk_speed),
@@ -6709,6 +6768,7 @@ mod event_beam_tests {
         let assets = AssetSearchPath::open_search_dirs(Vec::<std::path::PathBuf>::new()).unwrap();
         let mut fx = WeaponFx::new(assets);
         let specs = vec![ChunkSpec {
+            dynamic_gib: None,
             qpath: "models/chunks/rock/rock1_1.md3".into(),
             origin: [0.0, 0.0, 32.0], velocity: [50.0, 0.0, 0.0],
             angles: [0.0; 3], angle_velocity: [0.0; 3],
@@ -6730,6 +6790,7 @@ mod event_beam_tests {
         assert!(fx.chunks.iter().all(|chunk| chunk.physics_candidate.is_none()));
 
         fx.add_chunks(&[ChunkSpec {
+            dynamic_gib: None,
             qpath: "models/chunks/gib.md3".into(),
             origin: [0.0; 3], velocity: [0.0; 3],
             angles: [0.0; 3], angle_velocity: [0.0; 3],
@@ -6746,6 +6807,7 @@ mod event_beam_tests {
         fx.begin_frame(2000);
         let debris = event(EntityEvent::EV_DEBRIS, 0, &[]);
         let chunk = ChunkSpec {
+            dynamic_gib: None,
             qpath: "models/chunks/rock/rock1_1.md3".into(),
             origin: [0.0, 0.0, 30.0], velocity: [1.0, 2.0, 3.0],
             angles: [0.0; 3], angle_velocity: [0.0; 3], life_ms: 1500,
@@ -6830,6 +6892,7 @@ mod event_beam_tests {
     #[test]
     fn gib_counts_follow_cg_blood_and_launch_upwards() {
         assert!(gib_specs([0.0; 3], 1, 0).is_empty());
+        assert!(gib_specs([0.0; 3], 1, 3).is_empty(), "mode 3 must never load stock gibs");
         let skull_or_brain = gib_specs([0.0; 3], 1, 1);
         assert_eq!(skull_or_brain.len(), 1);
         assert!(skull_or_brain[0].qpath.ends_with("skull.md3") || skull_or_brain[0].qpath.ends_with("brain.md3"));
@@ -6857,6 +6920,14 @@ mod event_beam_tests {
         fx.entity_event_prepared(&gib, &prepare(&gib));
         assert_eq!(fx.take_gib_spawns().len(), 10);
         assert_eq!(fx.chunk_models().len(), 11, "old mode-1 chunk remains until expiry");
+        fx.set_blood_mode(3);
+        fx.begin_frame(3_000);
+        fx.entity_event_prepared(&gib, &prepare(&gib));
+        assert!(fx.take_gib_spawns().is_empty());
+        let requests = fx.take_dynamic_gib_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].entity, gib.entity_num);
+        assert_eq!(fx.chunk_models().len(), 11, "mode 3 creates no stock chunks");
     }
 }
 

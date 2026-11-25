@@ -168,6 +168,7 @@ impl PlayerPresenter {
             custom_material,
             apply_alpha_blend,
             None,
+            false,
         )
     }
 
@@ -188,6 +189,7 @@ impl PlayerPresenter {
         custom_material: Option<(Option<Arc<TextureData>>, DynamicModelAlphaMode, bool)>,
         apply_alpha_blend: bool,
         surface_selection: Option<&HashSet<usize>>,
+        rigid_piece: bool,
     ) -> Result<Vec<DynamicModelSurface>, String> {
         let tinted = entity_rgb != [1.0; 3] && custom_material.is_none();
         let stage_seconds = self.stage_time_ms as f32 * 0.001;
@@ -249,7 +251,7 @@ impl PlayerPresenter {
             // r_clothSolver 1: the renderer's GPU cloth (gpu-cloth-sim port)
             // replaces the CPU solver. A cloth surface that also carries jiggle
             // deformation keeps the whole garment on the CPU path.
-            let gpu_cloth = self.cloth.gpu_tuning().filter(|_| {
+            let gpu_cloth = self.cloth.gpu_tuning().filter(|_| !rigid_piece).filter(|_| {
                 !jobs.iter().any(|(_, surface, _)| {
                     Self::cloth_surface_name(glm, surface)
                         .is_some_and(ClothSystem::is_cloth_surface_name)
@@ -271,11 +273,11 @@ impl PlayerPresenter {
             let mut deformed_skinned = HashMap::<usize, Ghoul2SkinnedSurface>::new();
             let mut cloth_frames = Vec::<ClothSurfaceFrame>::new();
             let mut cloth_remeshes = HashMap::<usize, Arc<ClothRemesh>>::new();
+            let hair_cloth = self.hair_cloth_active();
             for (_, surface, gpu_mesh) in &jobs {
-                let cloth_candidate = self.cloth.enabled()
+                let cloth_candidate = !rigid_piece && self.cloth.enabled()
                     && gpu_cloth.is_none()
-                    && Self::cloth_surface_name(glm, surface)
-                        .is_some_and(ClothSystem::is_cloth_surface_name);
+                    && Self::is_cloth_surface(glm, surface, hair_cloth);
                 let jiggle_candidate = jiggle_profile.is_some_and(|profile| {
                     profile.affects_surface(lod_index, surface.surface_index)
                 });
@@ -306,7 +308,8 @@ impl PlayerPresenter {
                     }
                 }
                 if cloth_candidate {
-                    if let Some(frame) = Self::cloth_surface_frame(glm, skin_source, &skinned, pose)
+                    if let Some(frame) =
+                        Self::cloth_surface_frame(glm, skin_source, &skinned, pose, hair_cloth)
                     {
                         cloth_frames.push(frame);
                     }
@@ -532,12 +535,12 @@ impl PlayerPresenter {
 
         let preview_remesh = self.preview_cpu_remesh && self.jiggle_remesh != Default::default();
         // Densified cloth topology; jiggle surfaces keep their authored vertices.
+        let hair_cloth = self.hair_cloth_active();
         let cloth_remeshes = jobs
             .iter()
             .map(|(_, surface, gpu_mesh)| {
-                let cloth = self.cloth.enabled()
-                    && Self::cloth_surface_name(glm, surface)
-                        .is_some_and(ClothSystem::is_cloth_surface_name)
+                let cloth = !rigid_piece && self.cloth.enabled()
+                    && Self::is_cloth_surface(glm, surface, hair_cloth)
                     && !jiggle_profile.is_some_and(|profile| {
                         profile.affects_surface(lod_index, surface.surface_index)
                     });
@@ -598,13 +601,13 @@ impl PlayerPresenter {
             }
         }
 
-        let cloth_frames = if self.cloth.enabled() {
+        let cloth_frames = if !rigid_piece && self.cloth.enabled() {
             skin_sources
                 .iter()
                 .zip(skinned.iter())
                 .filter_map(|(surface, skinned)| {
                     let skinned = skinned.as_ref().ok()?;
-                    Self::cloth_surface_frame(glm, surface, skinned, pose)
+                    Self::cloth_surface_frame(glm, surface, skinned, pose, hair_cloth)
                 })
                 .collect::<Vec<_>>()
         } else {

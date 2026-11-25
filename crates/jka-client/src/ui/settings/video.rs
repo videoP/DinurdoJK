@@ -250,8 +250,11 @@ pub struct VideoSettings {
     /// Profile-driven post-Ghoul2 soft-tissue secondary motion.
     /// 0 off, 1 female, 2 male, 3 both (reported player sex).
     pub jiggle_physics: u8,
-    /// 0 = off; 1 = authored Source jigglebones only; 2 = authored plus native GLM hair* springs.
+    /// 0 = off; 1 = authored Source jigglebones only; 2 = authored plus native GLM hair* springs;
+    /// 3 = authored springs plus native GLM hair* as CPU cloth (falls back to 2 without it).
     pub hair_physics: u8,
+    /// cg_hairSelfCollision: cg_hairPhysics 3 hair strands/cards collide with each other.
+    pub hair_self_collision: bool,
     /// 0 = KawaiiPhysics-derived point solver, 1 = naelstrof/JigglePhysics Verlet solver.
     pub jiggle_solver: u8,
     pub jiggle_strength: f32,
@@ -313,6 +316,8 @@ pub struct VideoSettings {
     /// Experimental Ghoul2 cape/cloak/robe presentation cloth.
     pub cloth_physics: bool,
     pub cloth_body_collision: bool,
+    /// r_clothSelfCollision: CPU solver garment self contacts.
+    pub cloth_self_collision: bool,
     pub cloth_body_clearance: f32,
     pub cloth_air_resistance: f32,
     pub cloth_turn_response: f32,
@@ -324,9 +329,9 @@ pub struct VideoSettings {
     pub cloth_damping: f32,
     /// Bend stiffening with fold size (r_clothStiffening).
     pub cloth_stiffening: f32,
-    /// r_clothSolver: 0 CPU XPBD worker, 1 GPU (gpu-cloth-sim port). Both
-    /// solvers use the same r_cloth* settings.
+    /// r_clothSolver: 0 CPU XPBD, 1 Godot GPU PBD, 2 Unified GPU XPBD.
     pub cloth_solver: u8,
+    pub cloth_unified: crate::renderer::UnifiedClothSettings,
     pub physics_props: bool,
     pub physics_prop_max: u32,
     pub physics_debris: bool,
@@ -947,6 +952,7 @@ impl Default for VideoSettings {
             ragdoll_joint_model: 0,
             jiggle_physics: 0,
             hair_physics: 2,
+            hair_self_collision: false,
             jiggle_solver: 0,
             jiggle_strength: 1.0,
             jiggle_breast_strength: 1.0,
@@ -993,6 +999,7 @@ impl Default for VideoSettings {
             dismember_lifetime: 16.0,
             cloth_physics: false,
             cloth_body_collision: true,
+            cloth_self_collision: false,
             cloth_body_clearance: 1.0,
             cloth_air_resistance: 1.0,
             cloth_turn_response: 1.8,
@@ -1002,6 +1009,7 @@ impl Default for VideoSettings {
             cloth_damping: 8.0,
             cloth_stiffening: 3.0,
             cloth_solver: 0,
+            cloth_unified: Default::default(),
             physics_props: true,
             physics_prop_max: 96,
             physics_debris: true,

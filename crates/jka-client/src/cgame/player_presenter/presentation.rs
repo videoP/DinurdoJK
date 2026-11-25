@@ -162,29 +162,39 @@ pub(crate) fn collision_world_equipment_texture() -> Arc<crate::materials::Textu
     })))
 }
 
-/// Convert the JK2 Ghoul2 `lower_lumbar` bolt into the exact trace ray used by
-/// MVSDK `CG_FootstepForSurface`: bolt origin and its NEGATIVE_Y direction.
-/// The caller supplies the same model-to-world transform as visible players.
+/// MVSDK CG_FootstepForSurface + JK2MV G2API_GetBoltMatrix (MP path).
+/// This ports the public matrix conversion, not the NoReconstruct cache lifetime.
 fn jk2_lumbar_footstep_ray(
     bolt: Matrix3x4,
-    render_axis: [[f32; 3]; 3],
-    render_origin: [f32; 3],
+    lerp_angles: [f32; 3],
+    lerp_origin: [f32; 3],
+    model_scale: [f32; 3],
 ) -> ([f32; 3], [f32; 3]) {
-    let local = [-bolt[0][1], -bolt[1][1], -bolt[2][1]];
+    let world_axis = angles_to_axis([0.0, lerp_angles[1], lerp_angles[2]]);
+    // The MP API scales only translation; zero scale components mean unchanged.
+    let mut point = [bolt[0][3], bolt[1][3], bolt[2][3]];
+    for (component, scale) in point.iter_mut().zip(model_scale) {
+        if scale != 0.0 {
+            *component *= scale;
+        }
+    }
+    // G2API_GetBoltMatrix postmultiplies world*bolt by Create_Matrix(0,270,0).
+    // Only its negative Y column is needed; the postrotation leaves origin alone.
+    let post_y = angles_to_axis([0.0, 270.0, 0.0])[1];
+    let mut local = [0.0; 3];
+    for (j, out) in local.iter_mut().enumerate() {
+        *out = -(bolt[j][0] * post_y[0]
+            + bolt[j][1] * post_y[1]
+            + bolt[j][2] * post_y[2]);
+    }
     let mut down = [0.0; 3];
     for (j, out) in down.iter_mut().enumerate() {
-        *out = render_axis[0][j] * local[0]
-            + render_axis[1][j] * local[1]
-            + render_axis[2][j] * local[2];
+        *out = world_axis[0][j] * local[0]
+            + world_axis[1][j] * local[1]
+            + world_axis[2][j] * local[2];
     }
-    let length = (down[0] * down[0] + down[1] * down[1] + down[2] * down[2]).sqrt();
-    let down = if length > f32::EPSILON {
-        [down[0] / length, down[1] / length, down[2] / length]
-    } else {
-        [0.0, 0.0, -1.0]
-    };
-    let point = [bolt[0][3], bolt[1][3], bolt[2][3]];
-    (transform_jka_model_point(point, render_axis, render_origin), down)
+    // The multiplayer bolt API does not normalize this direction.
+    (transform_jka_model_point(point, world_axis, lerp_origin), down)
 }
 
 /// TaystJK `CG_Player` (`cg_players.c`): `EF_NODRAW` and
@@ -254,6 +264,7 @@ impl PlayerPresenter {
         forced_models: Option<&ForcedPlayerModels>,
     ) -> Vec<DynamicModelSurface> {
         self.stage_time_ms = current_time;
+        self.retain_dynamic_gib_sources(current_time);
         self.ninja_fire_pose = None;
         if jka_river::river_ninja::wake_joints_requested() || crate::ninja_fog_debug::wants_actors() {
             self.river_ninja_bones.get_or_insert_with(HashMap::new).clear();
@@ -347,6 +358,7 @@ impl PlayerPresenter {
         let mut live_entities = HashSet::new();
         let mut live_ragdolls = HashSet::new();
         let mut live_detached_limbs = HashSet::new();
+        let mut limb_diagnostics = HashSet::new();
         let mut detached_entities = Vec::new();
         if let Some(entity_num) = preserve_entity {
             // The local/followed player is presented separately just like
@@ -389,12 +401,30 @@ impl PlayerPresenter {
                 ) else {
                     continue;
                 };
+                limb_diagnostics.insert(entity.number);
                 if !part.allowed_at_level(dismemberment_level) {
+                    self.report_player_status(entity.number, format!(
+                        "dismember owner={source} part={part:?} blocked by cg_dismember={dismemberment_level}"
+                    ));
+                    continue;
+                }
+                // CG_General checks the owner/death pose only when creating
+                // the Ghoul2 copy. Existing limbs survive the owner's removal
+                // or respawn and must not sever the new living instance.
+                let generation = super::bodies::dismemberment::dismember_generation(entity, source, part);
+                if self.detached_limb_visuals.get(&entity.number)
+                    .is_some_and(|visual| visual.generation == generation)
+                {
+                    live_detached_limbs.insert(entity.number);
+                    detached_entities.push(entity);
                     continue;
                 }
                 let Some(source_entity) =
                     entities.iter().find(|candidate| candidate.number == source)
                 else {
+                    self.report_player_status(entity.number, format!(
+                        "dismember owner={source} part={part:?} waiting for source entity"
+                    ));
                     continue;
                 };
                 // Match CG_General's creation gate before mutating the source
@@ -406,6 +436,12 @@ impl PlayerPresenter {
                     .get(&source)
                     .map(|runtime| runtime.animation.torso.animation_number);
                 if !dismember_source_ready(source_entity, presented_torso_anim) {
+                    self.report_player_status(entity.number, format!(
+                        "dismember owner={source} type={} part={part:?} waiting for death pose flags={:#x} torso={} presented={presented_torso_anim:?}",
+                        source_entity.entity_type,
+                        source_entity.state.field_i32("eFlags").unwrap_or(0),
+                        source_entity.state.field_i32("torsoAnim").unwrap_or(0),
+                    ));
                     continue;
                 }
                 self.dismembered.entry(source).or_default().insert(part);
@@ -668,7 +704,13 @@ impl PlayerPresenter {
             let source = source_num
                 .and_then(|source| entities.iter().find(|entity| entity.number == source));
             match self.present_detached_limb(limb, source, current_time, view) {
-                Ok(mut limb_draws) => draws.append(&mut limb_draws),
+                Ok(mut limb_draws) => {
+                    self.report_player_status(limb.number, format!(
+                        "dismember owner={source_num:?} submitted={} surfaces={}",
+                        usize::from(!limb_draws.is_empty()), limb_draws.len(),
+                    ));
+                    draws.append(&mut limb_draws);
+                }
                 Err(error) => self.report_player_status(
                     limb.number,
                     format!("dismember submitted=0 reason={error}"),
@@ -712,7 +754,7 @@ impl PlayerPresenter {
         self.thrown_sabers
             .retain(|entity_num, _| live_entities.contains(entity_num));
         self.player_diagnostics
-            .retain(|entity_num, _| live_entities.contains(entity_num));
+            .retain(|entity_num, _| live_entities.contains(entity_num) || limb_diagnostics.contains(entity_num));
         self.mind_trick_fades
             .retain(|entity_num, _| live_entities.contains(entity_num));
         self.cloak_states
@@ -1149,6 +1191,7 @@ impl PlayerPresenter {
         let swim_bank_strength = self.swim_turn_bank;
         let move_lean_strength = self.move_lean;
         let jk2_lean_fix = self.jk2_lean_fix;
+        let hair_spring_mode = self.hair_spring_mode();
         let runtime = self
             .entities
             .get_mut(&entity.number)
@@ -1184,6 +1227,12 @@ impl PlayerPresenter {
                 time_rewound,
             ));
         if reset_player_entity {
+            if jk2_version.is_some() && entity.entity_type != ET_BODY {
+                self.jk2_footstep_diag.line(current_time, || format!(
+                    "ent={} RESET recreate={} force_reset={} rewind={} prev_client={} client={} old_flags={:#x} flags={:#x}",
+                    entity.number, recreate, force_reset, time_rewound, runtime.last_client_num, client_num, previous_e_flags, e_flags,
+                ));
+            }
             // OpenJK CG_TransitionEntity -> CG_ResetEntity ->
             // CG_ResetPlayerEntity when interpolation is broken.  This resets
             // the lerp frames and the persistent torso/legs angle swing state.
@@ -1821,7 +1870,6 @@ impl PlayerPresenter {
                             // (plus ancestors), and only on an actual footfall:
                             // never force a full Ghoul2 pose at raster FPS.
                             if jk2_step {
-                                let (render_axis, render_origin) = ghoul2_render_transform(entity, axis);
                                 let lumbar = if Arc::ptr_eq(&model.animation_gla, &model.gla)
                                     && local_emote.is_none()
                                 {
@@ -1847,7 +1895,7 @@ impl PlayerPresenter {
                                 let bolt_found = lumbar.is_some();
                                 let (origin, down) = lumbar.map_or(
                                     (entity.origin, [0.0, 0.0, -1.0]),
-                                    |bolt| jk2_lumbar_footstep_ray(bolt, render_axis, render_origin),
+                                    |bolt| jk2_lumbar_footstep_ray(bolt, entity.angles, entity.origin, [ghoul2_model_scale(entity); 3]),
                                 );
                                 if let Some(world) = self.collision_world.as_mut() {
                                     footsteps::jk2_probe_step(
@@ -2061,8 +2109,10 @@ impl PlayerPresenter {
         // pose and attachments stay untouched; only weighted Source jiggle
         // and hair vertices receive secondary motion. Simulate in world space so
         // footsteps and character turns transfer inertia naturally.
-        if model.procedural_jiggles_enabled(self.hair_physics_mode) {
+        if model.procedural_jiggles_enabled(hair_spring_mode) {
             if let Some(bindings) = model.source_jiggles.as_deref() {
+                let colliders =
+                    Self::hair_spring_colliders(&mut self.cloth_body_templates, &model, &pose);
                 runtime.source_jiggle_sim.get_or_insert_with(Default::default).update(
                     bindings,
                     model.gla.skeleton.len(),
@@ -2070,6 +2120,7 @@ impl PlayerPresenter {
                     render_axis,
                     render_origin,
                     current_time,
+                    &colliders,
                 );
             }
         } else {
@@ -2162,7 +2213,7 @@ impl PlayerPresenter {
                 let bolt_found = lumbar.is_some();
                 let (origin, down) = lumbar.map_or(
                     (entity.origin, [0.0, 0.0, -1.0]),
-                    |bolt| jk2_lumbar_footstep_ray(bolt, render_axis, render_origin),
+                    |bolt| jk2_lumbar_footstep_ray(bolt, entity.angles, entity.origin, [ghoul2_model_scale(entity); 3]),
                 );
                 footsteps::jk2_probe_step(
                     world, &self.presentation_solids, self.viewer_client,
@@ -2246,6 +2297,13 @@ impl PlayerPresenter {
         )?;
 
         let cloak = self.cloak_visual(entity, current_time);
+        if self.dynamic_gibs_enabled && matches!(entity.entity_type, ET_PLAYER | ET_NPC | ET_BODY) {
+            let rgb = info.team_color_override.map_or_else(
+                || player_entity_rgb(entity), |rgb| rgb.map(|v| f32::from(v) / 255.0),
+            );
+            self.capture_dynamic_gib_source(entity.number, current_time, entity.origin,
+                Arc::clone(&model), &pose, render_axis, render_origin, rgb);
+        }
         if !submit_geometry && !self.rt_shadow_casters_enabled {
             // OpenJK still runs CG_Player for the local player in first person
             // and marks the refEntity RF_THIRD_PERSON.  Keep all animation and
@@ -2364,6 +2422,7 @@ impl PlayerPresenter {
             body_custom,
             true,
             dismember_selection.as_ref(),
+            false,
         )?;
 
         // TaystJK CG_Disintegration: submit precisely the body, twice, with
@@ -2833,17 +2892,38 @@ mod mindtrick_fade_tests {
 mod jk2_footstep_ray_tests {
     use super::jk2_lumbar_footstep_ray;
 
+    fn assert_vec_close(actual: [f32; 3], expected: [f32; 3]) {
+        for (a, e) in actual.into_iter().zip(expected) {
+            assert!((a - e).abs() < 1.0e-4, "actual={actual:?}, expected={expected:?}");
+        }
+    }
+
     #[test]
-    fn traces_from_the_bolt_along_negative_y_even_if_model_is_offscreen() {
+    fn public_negative_y_uses_internal_negative_x_and_translation_only_scale() {
         let bolt = [
-            [1.0, 0.0, 0.0, 10.0],
+            [0.0, 1.0, 0.0, 10.0],
             [0.0, 0.0, 1.0, 20.0],
-            [0.0, 1.0, 0.0, 30.0],
+            [1.0, 0.0, 0.0, 30.0],
         ];
-        let axis = [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]];
-        let (origin, down) = jk2_lumbar_footstep_ray(bolt, axis, [1.0, 2.0, 3.0]);
-        assert_eq!(origin, [21.0, 42.0, 63.0]);
-        assert_eq!(down, [0.0, 0.0, -1.0]);
+        let (origin, down) = jk2_lumbar_footstep_ray(
+            bolt, [35.0, 0.0, 0.0], [1.0, 2.0, 3.0], [2.0, 2.0, 2.0],
+        );
+        assert_vec_close(origin, [21.0, 42.0, 63.0]);
+        assert_vec_close(down, [0.0, 0.0, -1.0]);
+    }
+
+    #[test]
+    fn preserves_raw_direction_length_and_applies_yaw_to_scaled_origin() {
+        let bolt = [
+            [0.5, 0.0, 0.0, 10.0],
+            [0.0, 1.0, 0.0, 20.0],
+            [0.0, 0.0, 1.0, 30.0],
+        ];
+        let (origin, down) = jk2_lumbar_footstep_ray(
+            bolt, [40.0, 90.0, 0.0], [1.0, 2.0, 3.0], [2.0, 0.0, 0.5],
+        );
+        assert_vec_close(origin, [-19.0, 22.0, 18.0]);
+        assert_vec_close(down, [0.0, -0.5, 0.0]);
     }
 }
 

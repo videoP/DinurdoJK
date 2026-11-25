@@ -70,7 +70,8 @@ pub(crate) struct AsyncClothSystem {
     config: ClothConfig,
     /// r_clothSolver 1: the renderer's gpu-cloth-sim port replaces this
     /// worker for GPU-skinned players.
-    gpu_solver: bool,
+    gpu_solver: u8,
+    unified: crate::renderer::UnifiedClothSettings,
     wind: [f32; 3],
     epoch: u64,
     generation: Arc<AtomicU64>,
@@ -86,7 +87,8 @@ impl Default for AsyncClothSystem {
             tx: None,
             rx: None,
             config: ClothConfig::default(),
-            gpu_solver: false,
+            gpu_solver: 0,
+            unified: Default::default(),
             wind: [0.0; 3],
             epoch: 0,
             generation: Arc::new(AtomicU64::new(0)),
@@ -234,15 +236,19 @@ impl AsyncClothSystem {
         self.wind = velocity;
     }
 
-    pub(crate) fn set_gpu_solver(&mut self, enabled: bool) {
-        self.gpu_solver = enabled;
+    pub(crate) fn set_gpu_solver(&mut self, solver: u8, unified: crate::renderer::UnifiedClothSettings) {
+        if self.gpu_solver != solver {
+            self.invalidate();
+        }
+        self.gpu_solver = solver;
+        self.unified = unified;
     }
 
     /// GPU solver tuning (from the shared cloth settings) while cloth is on
     /// and r_clothSolver selects it.
     pub(crate) fn gpu_tuning(&self) -> Option<crate::renderer::ClothGpuTuning> {
-        (self.gpu_solver && self.config.enabled)
-            .then(|| super::cloth_gpu::tuning(&self.config))
+        (self.gpu_solver != 0 && self.config.enabled)
+            .then(|| super::cloth_gpu::tuning(&self.config, self.gpu_solver, self.unified))
     }
 
     pub(crate) fn config(&self) -> ClothConfig {

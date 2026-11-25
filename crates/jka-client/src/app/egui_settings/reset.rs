@@ -697,6 +697,8 @@ impl App {
                 self.video.cloth_body_collision = defaults.cloth_body_collision
             }
             PHYS_CLOTH_WIND => self.video.cloth_wind = defaults.cloth_wind,
+            super::PHYS_CLOTH_SELF_COLLISION => self.video.cloth_self_collision = defaults.cloth_self_collision,
+            super::PHYS_HAIR_SELF_COLLISION => self.video.hair_self_collision = defaults.hair_self_collision,
             PHYS_CLOTH_AIR => self.video.cloth_air_resistance = defaults.cloth_air_resistance,
             PHYS_CLOTH_TURN => self.video.cloth_turn_response = defaults.cloth_turn_response,
             PHYS_CLOTH_ANIMATION => {
@@ -707,6 +709,16 @@ impl App {
             PHYS_CLOTH_DAMPING => self.video.cloth_damping = defaults.cloth_damping,
             PHYS_CLOTH_STIFFENING => self.video.cloth_stiffening = defaults.cloth_stiffening,
             PHYS_CLOTH_GPU => self.video.cloth_solver = defaults.cloth_solver,
+            super::PHYS_CLOTH_UNIFIED_SUBSTEPS => self.video.cloth_unified.substeps = defaults.cloth_unified.substeps,
+            super::PHYS_CLOTH_UNIFIED_COMPLIANCE => self.video.cloth_unified.compliance = defaults.cloth_unified.compliance,
+            super::PHYS_CLOTH_UNIFIED_CONSTRAINT_DAMPING => self.video.cloth_unified.constraint_damping = defaults.cloth_unified.constraint_damping,
+            super::PHYS_CLOTH_UNIFIED_RADIUS => self.video.cloth_unified.particle_radius = defaults.cloth_unified.particle_radius,
+            super::PHYS_CLOTH_UNIFIED_SOR => self.video.cloth_unified.sor = defaults.cloth_unified.sor,
+            super::PHYS_CLOTH_UNIFIED_FRICTION_STATIC => self.video.cloth_unified.friction_static = defaults.cloth_unified.friction_static,
+            super::PHYS_CLOTH_UNIFIED_FRICTION_KINETIC => self.video.cloth_unified.friction_kinetic = defaults.cloth_unified.friction_kinetic,
+            super::PHYS_CLOTH_UNIFIED_DEPENETRATION => self.video.cloth_unified.max_depenetration_speed = defaults.cloth_unified.max_depenetration_speed,
+            super::PHYS_CLOTH_UNIFIED_SELF_COLLISION => self.video.cloth_unified.self_collision = defaults.cloth_unified.self_collision,
+            super::PHYS_CLOTH_UNIFIED_PARTICLE_COLLISION => self.video.cloth_unified.particle_collision = defaults.cloth_unified.particle_collision,
             PHYS_PROPS => self.video.physics_props = defaults.physics_props,
             PHYS_PROP_MAX => self.video.physics_prop_max = defaults.physics_prop_max,
             PHYS_DEBRIS => self.video.physics_debris = defaults.physics_debris,

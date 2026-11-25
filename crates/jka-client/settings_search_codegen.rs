@@ -54,7 +54,7 @@ const FUNCTIONS: &[&str] = &[
     "ocean_slider", "ocean_slider_d", "ocean_slider_dd", "ocean_slider_metres_d",
     "linked_ocean_slider", "audio_slider!", "camera_number!",
     "self.egui_physics_toggle", "self.egui_physics_slider", "self.egui_physics_number",
-    "self.egui_toggle_row", "self.egui_environment_toggle", "self.audio_choice_row",
+    "self.egui_toggle_row", "self.egui_style_toggle", "self.egui_environment_toggle", "self.audio_choice_row",
     "self.cvar_choice_row", "self.cvar_switch_row", "self.baked_slider",
     "sky_slider", "locked_slider", "slider", "slider_with", "choice",
 ];
@@ -71,7 +71,8 @@ fn subsection_for(path: &str, source: &str, pos: usize) -> &'static str {
     };
     if path.ends_with("egui_settings/game.rs") {
         if pos < source.find("\"WEAPONS\"").unwrap() { "Some(SetupSection::GameSystem)" }
-        else if pos < source.find("\"SPECTATING & DEMOS\"").unwrap() { "Some(SetupSection::GameGameplay)" }
+        else if pos < source.find("\"PRIVATE DUELS\"").unwrap() { "Some(SetupSection::GameGameplay)" }
+        else if pos < source.find("\"SPECTATING & DEMOS\"").unwrap() { "Some(SetupSection::GamePlayerVisibility)" }
         else { "Some(SetupSection::GamePresentation)" }
     } else if path.ends_with("egui_menu/audio.rs") {
         if pos < source.find("if section == Some(SetupSection::AudioPositional)").unwrap() { "Some(SetupSection::AudioGeneral)" }

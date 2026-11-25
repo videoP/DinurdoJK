@@ -1,6 +1,7 @@
 //! Game.
 use crate::app::egui_settings::{segmented_row, theme, App};
 use crate::app::egui_menu::{selected_setup_section, SetupSection, SETUP_TAB_GAME};
+use crate::japro_cg::style;
 
 #[cfg(windows)]
 #[derive(Clone)]
@@ -93,7 +94,8 @@ impl App {
         let (title, description) = match section {
             Some(SetupSection::GameSystem) => ("GAME / LAUNCH & UPDATES", "Launch behavior, updates and server links."),
             Some(SetupSection::GameGameplay) => ("GAME / GAMEPLAY & ANIMATIONS", "Weapon preferences and client-side player presentation."),
-            _ => ("GAME / SPECTATING & EFFECTS", "Spectator presentation and gameplay view effects."),
+            Some(SetupSection::GamePlayerVisibility) => ("GAME / PLAYER VISIBILITY & EFFECTS", "Client-side player visibility and presentation preferences across mods."),
+            _ => ("GAME / SPECTATING", "Spectator and demo presentation."),
         };
         theme::page_title(ui, title, description);
 
@@ -251,6 +253,40 @@ impl App {
                     },
                 );
 
+                theme::section(ui, "VIEW EFFECTS", "Gameplay feedback and camera effects.");
+                theme::row(
+                    ui,
+                    "Score numbers",
+                    "cg_scorePlums. Floating score numbers where you score.",
+                    theme::Reset::None,
+                    |ui| {
+                        if let Some(value) = theme::switch(ui, self.audio.game.score_plums) {
+                            let _ = self.set_console_cvar("cg_scorePlums", if value { "1" } else { "0" });
+                        }
+                    },
+                );
+                if let Some(value) = segmented_row(
+                    ui,
+                    "Screen shake",
+                    "cg_screenShake. Effects: shake from explosions and creature stomps. Effects + weapons: also the kick of firing rockets, alt repeater, flechette and charged shots, plus shake while charging bryar/bowcaster/demp2. Server-triggered shake events (rancors, scripted quakes) are unaffected, as in OpenJK.",
+                    theme::Reset::None,
+                    self.screen_shake,
+                    &[(0, "Off"), (1, "Effects"), (2, "Effects + weapons")],
+                ) {
+                    let _ = self.set_console_cvar("cg_screenShake", &value.to_string());
+                }
+
+                }
+                if section == Some(SetupSection::GamePlayerVisibility) {
+                    theme::section(ui, "PRIVATE DUELS", "Client-side presentation of private duels. Server-specific duel rules still apply.");
+                    self.egui_style_toggle(ui, "Hide duelers", "cg_stylePlayer. Do not draw other players who are in a private duel.", style::HIDE_DUELERS, false);
+                    self.egui_style_toggle(ui, "Translucent duelers", "cg_stylePlayer. Draw players in a private duel as blue translucent ghosts instead of dark models inside a bubble.", style::VFX_DUELERS, false);
+                    self.egui_style_toggle(ui, "Duel glow shell", "cg_stylePlayer. While you duel, wrap you and your opponent in a glow that fades with distance.", style::SHELL, false);
+                    self.egui_style_toggle(ui, "Hide non-duelers while dueling", "cg_stylePlayer. Hide bystanders during your own private duel on stock servers. JA+ uses its duel visibility rules; jaPRO already hides bystanders.", style::HIDE_NONDUELERS, false);
+
+                    theme::section(ui, "PLAYER EFFECTS", "Optional visual effects on player models.");
+                    self.egui_style_toggle(ui, "Disable breathing effects", "cg_stylePlayer. Hide cold breath and underwater bubbles on player models.", style::DISABLE_BREATHING, false);
+                    self.egui_style_toggle(ui, "Hide cosmetics", "cg_stylePlayer. Hide player cosmetics, including hats and capes.", style::HIDE_COSMETICS, false);
                 }
                 if section == Some(SetupSection::GamePresentation) {
                 theme::section(
@@ -299,38 +335,17 @@ impl App {
                     },
                 );
 
-                theme::section(ui, "VIEW EFFECTS", "Camera effects driven by the game.");
                 theme::row(
                     ui,
-                    "Score numbers",
-                    "cg_scorePlums. Floating score numbers where you score.",
+                    "Follow the fastest player",
+                    "cg_specFollowFastest. While spectating on a server, keep following whoever is moving fastest. It only cuts to someone clearly faster who stays ahead for a moment, and never more than once every couple of seconds.",
                     theme::Reset::None,
                     |ui| {
-                        if let Some(value) = theme::switch(ui, self.audio.game.score_plums) {
-                            let _ = self.set_console_cvar("cg_scorePlums", if value { "1" } else { "0" });
+                        if let Some(on) = theme::switch(ui, self.japro_cg.follow_fastest) {
+                            let _ = self.set_console_cvar("cg_specFollowFastest", if on { "1" } else { "0" });
                         }
                     },
                 );
-                if let Some(value) = segmented_row(
-                    ui,
-                    "Blood effects",
-                    "cg_blood: 0 off; 1 animated Ninja blood and a skull/brain on gib events; 2 the full TaystJK gib burst, bleeding into Ninja surface blood. The original MD3 models must be installed.",
-                    theme::Reset::None,
-                    self.audio.game.blood,
-                    &[(0, "Off"), (1, "Blood"), (2, "Blood + gibs")],
-                ) {
-                    let _ = self.set_console_cvar("cg_blood", &value.to_string());
-                }
-                if let Some(value) = segmented_row(
-                    ui,
-                    "Screen shake",
-                    "cg_screenShake. Effects: shake from explosions and creature stomps. Effects + weapons: also the kick of firing rockets, alt repeater, flechette and charged shots, plus shake while charging bryar/bowcaster/demp2. Server-triggered shake events (rancors, scripted quakes) are unaffected, as in OpenJK.",
-                    theme::Reset::None,
-                    self.screen_shake,
-                    &[(0, "Off"), (1, "Effects"), (2, "Effects + weapons")],
-                ) {
-                    let _ = self.set_console_cvar("cg_screenShake", &value.to_string());
-                }
                 }
             });
     }

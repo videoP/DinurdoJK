@@ -343,11 +343,39 @@ pub struct Ghoul2GpuSkinning {
     pub source_material: Option<SourceMaterialParams>,
 }
 
+/// Native settings from Unified Solver's SolverManager / ClothGenerator.
+/// Separate from Godot PBD stiffness and CPU bending stiffness.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UnifiedClothSettings {
+    pub substeps: u32,
+    pub compliance: f32,
+    pub constraint_damping: f32,
+    pub particle_radius: f32,
+    pub self_collision: bool,
+    pub particle_collision: bool,
+    pub sor: f32,
+    pub friction_static: f32,
+    pub friction_kinetic: f32,
+    pub max_depenetration_speed: f32,
+}
+impl UnifiedClothSettings {
+    pub const DEFAULT: Self = Self {
+        substeps: 30, compliance: 0.0, constraint_damping: 0.0,
+        particle_radius: 0.1, self_collision: false, particle_collision: true, sor: 1.5,
+        friction_static: 0.4, friction_kinetic: 0.2, max_depenetration_speed: 5.0,
+    };
+}
+impl Default for UnifiedClothSettings {
+    fn default() -> Self { Self::DEFAULT }
+}
+
 /// Parameters of the GPU cloth solver (port of gpu-cloth-sim's
 /// `GPUClothSolver` exports), derived from the shared r_cloth* settings.
 /// Units are the reference's: metres, seconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClothGpuTuning {
+    pub solver: u8,
+    pub unified: UnifiedClothSettings,
     pub hz: u32,
     /// Fixed ticks allowed per rendered frame before excess time is dropped.
     pub max_ticks: u32,

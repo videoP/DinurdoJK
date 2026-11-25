@@ -158,6 +158,7 @@ impl PlayerPresenter {
         self.body_queue_copies.clear();
         self.dismembered.clear();
         self.dismember_source_snaps.clear();
+        self.dynamic_gib_sources.clear();
         self.detached_limb_visuals.clear();
         self.saber_blade_lengths.clear();
         self.blob_shadow_instances.clear();
@@ -386,6 +387,8 @@ impl PlayerPresenter {
             body_queue_copies: HashMap::new(),
             dismembered: HashMap::new(),
             dismember_source_snaps: HashMap::new(),
+            dynamic_gibs_enabled: false,
+            dynamic_gib_sources: HashMap::new(),
             detached_limb_visuals: HashMap::new(),
             saber_blade_lengths: HashMap::new(),
             failed_models: HashMap::new(),

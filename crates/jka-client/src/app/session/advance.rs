@@ -853,6 +853,16 @@ impl GameSession {
                 .spawn_breakable_debris(&new_debris, target_server_time);
             self.weapon_fx.resolve_debris_promotion(promoted);
         }
+        for request in self.weapon_fx.take_dynamic_gib_requests() {
+            if let Some(specs) = self.player_presenter.build_dynamic_gibs(request, target_server_time) {
+                self.weapon_fx.add_dynamic_gibs(specs);
+            } else if target_server_time.saturating_sub(request.time) < 250 {
+                // A first-seen victim may not have a posed Ghoul2 instance yet.
+                self.weapon_fx.retry_dynamic_gib(request);
+            } else {
+                devprintln!(1, "DYNAMIC GIB: no recent posed model for entity {}", request.entity);
+            }
+        }
         let new_gibs = self.weapon_fx.take_gib_spawns();
         if !new_gibs.is_empty() {
             let promoted = self.player_presenter
@@ -887,7 +897,7 @@ impl GameSession {
         self.player_presenter
             .begin_physics_frame(target_server_time);
         // Rapier and legacy fallback gibs feed the same cg_blood 1 fluid
-        // emitter. Only mode 2 opts in; mode 1 retains its original effects.
+        // emitter. Modes 2 and 3 opt in; mode 1 retains its original effects.
         if self.weapon_fx.blood_gibs_enabled() {
             let blood = self.player_presenter.physics_gib_blood_samples(target_server_time);
             self.weapon_fx.bleed_physics_gibs(&blood);
@@ -1447,7 +1457,9 @@ impl GameSession {
         // A Decal{} with ghoul2decals may also mark an animated character.
         // This is a model-space projection, not an extra billboard in the FX pass.
         if crate::fx::render_enabled() {
-            self.player_presenter.add_authored_ghoul2_decals(&fx_frame.ghoul2_decals, target_server_time);
+            self.player_presenter.add_authored_ghoul2_decals(
+                &fx_frame.ghoul2_decals, &self.presented_entities, target_server_time,
+            );
         }
 
         let (emote_draws, emote_lights) = self.player_presenter.drain_emote_fx();

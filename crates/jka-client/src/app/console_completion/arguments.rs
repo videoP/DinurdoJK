@@ -79,7 +79,7 @@ pub(super) fn source_for(command: &str, index: usize, previous: Option<&str>) ->
         ("loadtrail", 1) => Source::LoadTrailSlots,
         ("model" | "cg_forcemodel", 0) => Source::Models,
         ("saber1" | "saber2", 0) => Source::Sabers,
-        ("set" | "seta" | "sets" | "setu" | "toggle" | "vstr", 0) => Source::Cvars,
+        ("set" | "seta" | "sets" | "setu" | "toggle" | "reset" | "vstr", 0) => Source::Cvars,
         ("help", 0) => Source::Registered,
         ("bind" | "bindspec" | "binddemo" | "unbind" | "unbindspec" | "unbinddemo", 0) => Source::Keys,
         ("bind" | "bindspec" | "binddemo", 1) => Source::Commands,
@@ -125,6 +125,9 @@ mod tests {
         check("/remapShader old textures/", Source::Shaders, "textures/");
         check("/tell 3", Source::Players, "3");
         check("/execq auto", Source::Configs, "auto");
+        check("/reset r_gam", Source::Cvars, "r_gam");
+        check("/RESET ", Source::Cvars, "");
+        assert!(context("/reset r_gamma extra", 20).is_none());
         check("/loadTrail mytrail 2", Source::LoadTrailSlots, "2");
         assert!(context("/set r_gamma 1", 14).is_none());
         assert!(context("/mapname test", 13).is_none());

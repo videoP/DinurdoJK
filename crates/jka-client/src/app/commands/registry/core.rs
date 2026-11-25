@@ -605,6 +605,32 @@ commands! {
         return CommandResult::Handled;
     }
 
+    // TaystJK Cvar_Reset_f -> Cvar_Reset -> Cvar_SetSafe: use the
+    // registered reset value through the ordinary (non-forced) setter.
+    cmd_reset ["reset", ] ("reset <variable>", "Reset a cvar to default", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        let [_, name] = words.as_slice() else {
+            self.push_console_line("^3usage:^7 reset <variable>");
+            return CommandResult::Handled;
+        };
+        let name = name.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(name);
+        let default = if let Some(def) = super::cvar_registry().find(name) {
+            def.entry.default.to_owned()
+        } else if let Some(cvar) = self.network.user_cvar(name) {
+            cvar.reset_value.clone()
+        } else {
+            // Upstream does not create or forward a missing cvar on reset.
+            return CommandResult::Handled;
+        };
+        match self.set_console_cvar_from_console(name, &default) {
+            Ok(ConsoleCvarSetResult::Latched) => self.push_console_line(format!(
+                "^7{name} will be changed upon restarting.")),
+            Ok(_) => {},
+            Err(error) => self.push_console_error(format!("^1{error}")),
+        }
+        CommandResult::Handled
+    }
+
     cmd_set ["set", "seta", "sets", "setu"] ("set[u|a|s] <variable> <value>", "Create or set a cvar; setu marks userinfo, seta archives, and sets marks serverinfo.", CommandScope::Always) |self, command| {
         let (verb, rest) = command.split_once(char::is_whitespace)
             .map(|(verb, rest)| (verb, rest.trim())).unwrap_or((command, ""));

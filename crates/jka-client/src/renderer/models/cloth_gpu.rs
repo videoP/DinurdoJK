@@ -15,6 +15,9 @@ use crate::renderer::{
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
+#[path = "cloth_unified.rs"]
+mod unified;
+
 const WORKGROUP: u32 = 64;
 const METRES_PER_JKA_UNIT: f32 = 0.0254;
 /// Slot 0 carries the per-frame passes; ticks use 1..=MAX_TICKS.
@@ -358,6 +361,10 @@ struct InstanceGpu {
     pass_bind_groups: Vec<Option<wgpu::BindGroup>>,
     output_bind_group: Option<(wgpu::Buffer, wgpu::BindGroup)>,
     needs_warm_start: bool,
+    backend: u8,
+    unified_pose: Option<unified::Pose>,
+    unified_state: Option<unified::InstanceState>,
+    last_unified_frame: Option<u64>,
     accumulator: f32,
     last_time_ms: Option<i32>,
     /// Model origin at the previous simulated tick (reference `_prev_mesh_world_pos`).
@@ -447,6 +454,10 @@ impl InstanceGpu {
             pass_bind_groups: vec![None; PASSES.len()],
             output_bind_group: None,
             needs_warm_start: true,
+            backend: 0,
+            unified_pose: None,
+            unified_state: None,
+            last_unified_frame: None,
             accumulator: 0.0,
             last_time_ms: None,
             tick_origin: [0.0; 3],
@@ -527,6 +538,7 @@ struct PendingDraw {
 struct Dispatch {
     key: (u16, Arc<str>),
     warm_start: bool,
+    unified: bool,
     ticks: u32,
     drivers: bool,
     /// (draw slot, vertex count) of each output dispatch.
@@ -536,6 +548,8 @@ struct Dispatch {
 #[derive(Default)]
 pub(in crate::renderer) struct ClothGpuRenderer {
     pipelines: Option<ClothGpuPipelines>,
+    unified: unified::UnifiedGpu,
+    frame_serial: u64,
     garments: HashMap<Arc<str>, GarmentGpu>,
     instances: HashMap<(u16, Arc<str>), InstanceGpu>,
     pending: Vec<PendingDraw>,
@@ -546,6 +560,8 @@ impl ClothGpuRenderer {
     pub(in crate::renderer) fn begin_frame(&mut self) {
         self.pending.clear();
         self.dispatches.clear();
+        self.unified.begin_frame();
+        self.frame_serial = self.frame_serial.wrapping_add(1);
     }
 
     /// GPU work was scheduled this frame (the vertex buffer must be STORAGE).
@@ -581,6 +597,7 @@ impl ClothGpuRenderer {
         vertices: &mut [DynamicModelVertex],
     ) {
         if self.pending.is_empty() {
+            self.unified.reset_clock();
             self.evict();
             return;
         }
@@ -602,6 +619,23 @@ impl ClothGpuRenderer {
             self.pending.clear();
             return;
         };
+        // Both GPU modes share the existing skin/normal/output pipelines.
+        // Only mode 2 requests its additional global compute pipelines.
+        let unified_frame = pending.iter().find(|draw| {
+            let sim = &draw.surface.frame;
+            sim.tuning.solver == 2 && unified::Pose::from_frame(sim).is_some()
+        });
+        let unified_timing = if let Some(draw) = unified_frame {
+            if self.unified.ready(jobs, device) {
+                Some(self.unified.timing(&draw.surface.frame))
+            } else {
+                self.unified.reset_clock();
+                None
+            }
+        } else {
+            self.unified.reset_clock();
+            None
+        };
         let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment);
         let param_stride = align(std::mem::size_of::<Params>() as u64, alignment);
         let draw_stride = align(std::mem::size_of::<DrawUniform>() as u64, alignment);
@@ -611,6 +645,14 @@ impl ClothGpuRenderer {
         let mut draw_bytes = HashMap::<(u16, Arc<str>), Vec<u8>>::new();
         for draw in &pending {
             let sim = &draw.surface.frame;
+            let pose = if sim.tuning.solver == 2 {
+                let pose = unified::Pose::from_frame(sim);
+                if unified_timing.is_none() || pose.is_none() {
+                    cpu_skinned_fill(draw, vertices);
+                    continue;
+                }
+                pose
+            } else { None };
             let garment_key = Arc::clone(&sim.garment.key);
             let key = (sim.entity_num, Arc::clone(&garment_key));
             let stiffness = sim.tuning.stiffness;
@@ -638,7 +680,23 @@ impl ClothGpuRenderer {
 
             // First draw of this instance this frame schedules the simulation.
             if !self.dispatches.iter().any(|dispatch| dispatch.key == key) {
-                self.dispatches.push(schedule(instance, sim, device, queue, param_stride));
+                if instance.backend != sim.tuning.solver {
+                    instance.needs_warm_start = true;
+                    instance.unified_pose = None;
+                    instance.unified_state = None;
+                    instance.backend = sim.tuning.solver;
+                }
+                let timing = if let Some(pose) = pose {
+                    // Culled/absent garments missed the global world's ticks.
+                    // Restart from current skin, never inject old detached cloth.
+                    if instance.last_unified_frame != Some(self.frame_serial.wrapping_sub(1))
+                        || instance.unified_pose.is_none_or(|old| pose.changed_scale(old)) {
+                        instance.needs_warm_start = true;
+                    }
+                    instance.last_unified_frame = Some(self.frame_serial);
+                    unified_timing
+                } else { None };
+                self.dispatches.push(schedule(instance, sim, device, queue, param_stride, timing));
             }
 
             let slot = draw_slots.entry(key.clone()).or_insert(0);
@@ -686,6 +744,23 @@ impl ClothGpuRenderer {
                 self.instances.get_mut(&dispatch.key).unwrap().pass_bind_groups = groups;
             }
         }
+        if let Some(timing) = unified_timing {
+            if !self.unified.prepare(device, queue, &pending, &self.dispatches, &mut self.instances, timing) {
+                // No partial/truncated solver world, and no empty vertex ranges.
+                for draw in &pending {
+                    if draw.surface.frame.tuning.solver == 2 {
+                        cpu_skinned_fill(draw, vertices);
+                    }
+                }
+                for dispatch in self.dispatches.iter().filter(|d| d.unified) {
+                    if let Some(instance) = self.instances.get_mut(&dispatch.key) {
+                        instance.needs_warm_start = true;
+                    }
+                }
+                self.dispatches.retain(|d| !d.unified);
+                self.unified.reset_clock();
+            }
+        }
         self.pending = pending;
         self.pending.clear();
         self.evict();
@@ -717,7 +792,9 @@ impl ClothGpuRenderer {
         let Some(pipelines) = self.pipelines.as_ref() else {
             return;
         };
+        self.encode_unified(encoder);
         for dispatch in &self.dispatches {
+            if dispatch.unified { continue; }
             let (Some(instance), Some(garment)) = (
                 self.instances.get(&dispatch.key),
                 self.garments.get(&dispatch.key.1),
@@ -848,6 +925,7 @@ fn schedule(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     param_stride: u64,
+    unified_timing: Option<unified::Timing>,
 ) -> Dispatch {
     let tuning = frame.tuning;
     let hz = tuning.hz.clamp(15, 240);
@@ -884,6 +962,12 @@ fn schedule(
         instance.accumulator = 0.0;
         instance.tick_origin = frame.origin;
         ticks = 0;
+    }
+    if let Some(timing) = unified_timing {
+        warm_start |= timing.reset;
+        ticks = timing.ticks as usize;
+        instance.accumulator = timing.blend * h;
+        if warm_start { instance.tick_origin = frame.origin; }
     }
     instance.last_time_ms = Some(frame.time_ms);
     instance.needs_warm_start = false;
@@ -933,18 +1017,21 @@ fn schedule(
         tri_count: garment.triangles.len() as u32,
         bone_count,
         flip: NORMAL_FLIP,
-        blend: if warm_start { 1.0 } else { (instance.accumulator / h).clamp(0.0, 1.0) },
+        blend: if warm_start && (unified_timing.is_none() || ticks == 0) {
+            1.0
+        } else { (instance.accumulator / h).clamp(0.0, 1.0) },
         substeps,
         iterations,
         group_count: garment.constraint_groups.len() as u32,
         driver_count: garment.driver_particles.len() as u32,
-        influence: tuning.animation_influence,
+        influence: if unified_timing.is_some() { 1.0 } else { tuning.animation_influence },
         pad: [0.0; 3],
     };
-    let mut bytes = vec![0u8; (param_stride as usize) * (ticks + 1)];
+    let legacy_ticks = if unified_timing.is_some() { 0 } else { ticks };
+    let mut bytes = vec![0u8; (param_stride as usize) * (legacy_ticks + 1)];
     bytes[..std::mem::size_of::<Params>()].copy_from_slice(bytemuck::bytes_of(&base));
     let wind = Vec3::from_array(frame.wind);
-    for tick in 1..=ticks {
+    for tick in 1..=legacy_ticks {
         // Reference gust: Time.get_ticks_msec() / 1000 * wind_frequency, sampled
         // at this tick's simulated time.
         let tick_time = frame.time_ms as f32 * 0.001
@@ -980,7 +1067,7 @@ fn schedule(
     if !frame.bones.is_empty() {
         queue.write_buffer(&instance.bones, 0, bytemuck::cast_slice(frame.bones.as_slice()));
     }
-    if collider_count > 0 {
+    if unified_timing.is_none() && collider_count > 0 {
         queue.write_buffer(
             &instance.colliders,
             0,
@@ -990,8 +1077,9 @@ fn schedule(
     Dispatch {
         key: (frame.entity_num, Arc::clone(&garment.key)),
         warm_start,
+        unified: unified_timing.is_some(),
         ticks: ticks as u32,
-        drivers: !garment.driver_particles.is_empty(),
+        drivers: unified_timing.is_none() && !garment.driver_particles.is_empty(),
         outputs: Vec::new(),
     }
 }

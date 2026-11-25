@@ -15,8 +15,10 @@ const METRES_PER_JKA_UNIT: f32 = 0.0254;
 /// The GPU solver's settings come from the same r_cloth* / r_physics*
 /// settings as the CPU solver; only exports with no shared equivalent keep the
 /// `GPUClothSolver` defaults (substeps, gravity, inertia scale, gusts).
-pub(crate) fn tuning(config: &ClothConfig) -> ClothGpuTuning {
+pub(crate) fn tuning(config: &ClothConfig, solver: u8, unified: crate::renderer::UnifiedClothSettings) -> ClothGpuTuning {
     ClothGpuTuning {
+        solver,
+        unified,
         hz: config.hz,
         max_ticks: config.max_substeps,
         solver_iterations: super::cloth::solver_iterations(config.stiffness) as u32,
@@ -29,6 +31,8 @@ pub(crate) fn tuning(config: &ClothConfig) -> ClothGpuTuning {
 }
 
 const REFERENCE_TUNING: ClothGpuTuning = ClothGpuTuning {
+    solver: 1,
+    unified: crate::renderer::UnifiedClothSettings::DEFAULT,
     hz: 60,
     max_ticks: 4,
     solver_iterations: 8,

@@ -515,13 +515,13 @@ impl PlayerPresenter {
         } else {
             model.bind_animation_pose(animation_pose)?
         };
-        if presentation && model.procedural_jiggles_enabled(self.hair_physics_mode) {
+        if presentation && model.procedural_jiggles_enabled(self.hair_spring_mode()) {
             if let Some(bindings) = model.source_jiggles.as_deref() {
                 self.preview_source_jiggles
                     .entry(model.key.clone())
                     .or_default()
                     .update(bindings, model.gla.skeleton.len(), &mut pose,
-                            axis, origin, current_time);
+                            axis, origin, current_time, &[]);
             }
         }
         if let Some(active)=emote_preview.as_ref(){model.correct_emote_ground(active,&mut pose)?;}

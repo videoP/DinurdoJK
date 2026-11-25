@@ -134,6 +134,9 @@ pub(crate) fn digest(text: &str) -> String {
         .replace(", footstep_trace: false", "")
         .replace(", cloth_stiffness: 2.0, cloth_damping: 8.0, cloth_stiffening: 3.0", "")
         .replace(", cloth_solver: 0", "")
+        .replace(", cloth_self_collision: false", "")
+        .replace(", hair_self_collision: false", "")
+        .replace(", cloth_unified: UnifiedClothSettings { substeps: 30, compliance: 0.0, constraint_damping: 0.0, particle_radius: 0.1, self_collision: false, particle_collision: true, sor: 1.5, friction_static: 0.4, friction_kinetic: 0.2, max_depenetration_speed: 5.0 }", "")
         .replace(", chat_translate: Settings { mode: Off, target: \"\", display: Translated, provider: MyMemory, libre_url: \"\", team: false, demos: false, codepage: Auto, max_chars: 300 }", "")
         .replace(", chat_llm: Settings { translate_url: \"\", translate_prompt: \"\", censor: false, censor_hold: true, censor_severity: 3, censor_action: Cleanse, censor_ragebait: false, assist_url: \"\", censor_prompt: \"\", summary_prompt: \"\", threads: 0, translate_ignore_self: true }", "");
     for byte in projected.bytes() {
@@ -238,6 +241,9 @@ pub(crate) fn assert_snapshot(name: &str, actual: &str) {
                     && !line.starts_with("seta cg_fxFPSGame ")
                     && !line.starts_with("seta r_clothStiffness ")
                     && !line.starts_with("seta r_clothSolver ")
+                    && !line.starts_with("seta r_clothUnified")
+                    && !line.starts_with("seta r_clothSelfCollision ")
+                    && !line.starts_with("seta cg_hairSelfCollision ")
                     && !line.starts_with("seta r_clothDamping ")
                     && !line.starts_with("seta r_clothStiffening ")
                     && !line.starts_with("seta cg_chatTranslate")
@@ -288,6 +294,11 @@ fn cvar_compatibility_config_input_matrix() {
     {
         actual.push_str(name);
         for value in INPUTS {
+            // cg_blood 3 intentionally extends the frozen 0..=2 domain.
+            // Keep old-domain compatibility hashes; assert the new domain below.
+            let value = if name == "cg_blood" && value.trim().parse::<f32>().is_ok_and(|v| v.is_finite() && v >= 3.0) {
+                "2"
+            } else { *value };
             fs::write(
                 &path,
                 format!("seta {} \"{value}\"\n", name.to_ascii_uppercase()),
@@ -302,6 +313,10 @@ fn cvar_compatibility_config_input_matrix() {
         actual.push('\n');
     }
     assert_snapshot("config-matrix.txt", &actual);
+    for value in ["3", "7", "256", "10000000000"] {
+        fs::write(&path, format!("seta cg_blood \"{value}\"\n")).unwrap();
+        assert_eq!(config::load_audio_settings(&path).game.blood, 3);
+    }
 }
 #[test]
 fn cvar_compatibility_network_and_japro_setters() {

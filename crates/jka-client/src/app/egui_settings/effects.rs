@@ -1,6 +1,7 @@
 //! Effects.
 use crate::app::egui_settings::{
     index_of, segmented_row, theme, ui, App, FootprintMode, Ghoul2SkinningMode,
+    PHYS_DISMEMBERMENT,
 };
 
 impl App {
@@ -71,22 +72,6 @@ impl App {
         }
 
         });
-
-        ui.add_enabled_ui(
-            self.video.ghoul2_skinning == Ghoul2SkinningMode::Gpu && self.audio.game.blood == 0,
-            |ui| {
-                if let Some(value) = segmented_row(
-                    ui,
-                    "Legacy burn marks",
-                    "cg_ghoul2Marks limits the legacy scorch marks kept per model when Blood effects are off. Requires GPU Ghoul2 skinning (Video > Models).",
-                    theme::Reset::None,
-                    self.audio.game.g2_marks,
-                    &[(0, "Off"), (4, "4"), (16, "16"), (32, "32")],
-                ) {
-                    let _ = self.set_console_cvar("cg_ghoul2Marks", &value.to_string());
-                }
-            },
-        );
 
         const FX_PHYSICS: [(u32, &str); 3] = [
             (crate::fx::FX_PHYSICS_OFF, "Off"),
@@ -318,6 +303,64 @@ impl App {
             self.change_video_setting(next as i32 - current as i32);
         }
         self.egui_water_wake(ui);
+        theme::section(ui, "BLOOD & GORE", "Blood, gibs and server-authored dismemberment. Physical debris and detached-limb limits are under Video > Physics.");
+        if let Some(mode) = segmented_row(
+            ui, "Blood effects",
+            "cg_blood 1: animated Ninja blood, surface pools, SkinGore and a skull/brain gib. cg_blood 2: full TaystJK gib models with Ninja blood droplets/marks instead of legacy bloodTrail/bloodMark. SkinGore requires GPU Ghoul2 skinning; mode 2 requires gib MD3 assets. Mode 3 uses the actual player model.",
+            theme::Reset::None, self.audio.game.blood,
+            &[(0, "Off"), (1, "Blood"), (2, "Blood + gibs"), (3, "Dynamic gibs")],
+        ) {
+            let _ = self.set_console_cvar("cg_blood", &mode.to_string());
+        }
+        const DISMEMBERMENT: [(u8, &str); 3] = [(0, "Off"), (1, "Limbs"), (2, "Full")];
+        if let Some(mode) = segmented_row(
+            ui,
+            "Dismemberment",
+            "OpenJK cg_dismember semantics. Limbs hides head/waist severing; Full permits every server-authored part. \
+             This never invents a client-side saber hit or changes gameplay.",
+            theme::Reset::Physics(PHYS_DISMEMBERMENT),
+            self.video.dismemberment,
+            &DISMEMBERMENT,
+        ) {
+            self.video.dismemberment = mode;
+            self.physics_menu_changed();
+        }
+        ui.add_enabled_ui(
+            self.video.ghoul2_skinning == Ghoul2SkinningMode::Gpu && self.audio.game.blood == 0,
+            |ui| {
+                if let Some(value) = segmented_row(
+                    ui,
+                    "Legacy burn marks",
+                    "cg_ghoul2Marks limits the legacy scorch marks kept per model when Blood effects are off. Requires GPU Ghoul2 skinning (Video > Models).",
+                    theme::Reset::None,
+                    self.audio.game.g2_marks,
+                    &[(0, "Off"), (4, "4"), (16, "16"), (32, "32")],
+                ) {
+                    let _ = self.set_console_cvar("cg_ghoul2Marks", &value.to_string());
+                }
+            },
+        );
+
+        if !jka_ninja::INCLUDED {
+            theme::hint(ui, "Ninja blood simulation and its diagnostic emitters require the private Fluid Ninja implementation.", theme::TEXT_FAINT());
+        }
+        ui.add_enabled_ui(jka_ninja::INCLUDED && crate::ninja_blood::enabled(), |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Test:");
+                for (label, command) in [
+                    ("Spurt", "ninjablood spurt"), ("Leak", "ninjablood leak"),
+                    ("Gush", "ninjablood gush"), ("Impact", "ninjablood hit"),
+                ] {
+                    if ui.button(label).on_hover_text(format!("Run /{command}")).clicked() {
+                        self.execute_command_line(command);
+                    }
+                }
+                if ui.button("Stop bleeding").on_hover_text("Stop the local leak or gush").clicked() {
+                    self.execute_command_line("ninjablood");
+                }
+            });
+        });
+
         self.egui_ninja_effects(ui);
     }
 
@@ -379,9 +422,9 @@ impl App {
     }
 
     fn egui_ninja_effects(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, "FLUID NINJA", "Fire, ground fog, blood, and snow presentation. These use the existing Fluid Ninja implementation and its console commands, not a second solver. Diagnostic emitters are local to the current map/session.");
+        theme::section(ui, "FLUID NINJA", "Fire, ground fog, and snow presentation. These use the existing Fluid Ninja implementation and its console commands, not a second solver. Diagnostic emitters are local to the current map/session.");
         if !jka_ninja::INCLUDED {
-            theme::hint(ui, "The private Fluid Ninja crate is not included in this build. Fire, fog and blood diagnostics require that implementation.", theme::TEXT_FAINT());
+            theme::hint(ui, "The private Fluid Ninja crate is not included in this build. Fire and fog diagnostics require that implementation.", theme::TEXT_FAINT());
         }
         ui.add_enabled_ui(jka_ninja::INCLUDED, |ui| {
             theme::section(ui, "FIRE", "Place bonfires, candles, torches or log fires along your view, or ignite the player for the Burning Man effect.");
@@ -471,32 +514,6 @@ impl App {
                         if ui.button(name).on_hover_text(format!("Run /{command}")).clicked() {
                             self.execute_command_line(command);
                         }
-                    }
-                });
-            });
-
-            theme::section(ui, "BLOOD", "Animated saber spurts and interactive surface blood.");
-            if let Some(mode) = segmented_row(
-                ui, "Blood effects",
-                "cg_blood 1: animated Ninja blood, surface pools, SkinGore and a skull/brain gib. cg_blood 2: full TaystJK gib models with Ninja blood droplets/marks instead of legacy bloodTrail/bloodMark. SkinGore requires GPU Ghoul2 skinning; gib MD3 assets must be available.",
-                theme::Reset::None, self.audio.game.blood,
-                &[(0, "Off"), (1, "Blood"), (2, "Blood + gibs")],
-            ) {
-                let _ = self.set_console_cvar("cg_blood", &mode.to_string());
-            }
-            ui.add_enabled_ui(crate::ninja_blood::enabled(), |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Test:");
-                    for (label, command) in [
-                        ("Spurt", "ninjablood spurt"), ("Leak", "ninjablood leak"),
-                        ("Gush", "ninjablood gush"), ("Impact", "ninjablood hit"),
-                    ] {
-                        if ui.button(label).on_hover_text(format!("Run /{command}")).clicked() {
-                            self.execute_command_line(command);
-                        }
-                    }
-                    if ui.button("Stop bleeding").on_hover_text("Stop the local leak or gush").clicked() {
-                        self.execute_command_line("ninjablood");
                     }
                 });
             });

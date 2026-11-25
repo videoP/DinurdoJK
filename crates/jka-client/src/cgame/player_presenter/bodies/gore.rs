@@ -8,7 +8,7 @@ use crate::cgame::player_presenter::{
 };
 use crate::cgame::player_gore::{impact_position, project_gore, GpuSnap, PendingGore};
 use crate::ninja_blood::{pain_hit_scale, SMALL_HIT_SCALE};
-use jka_movement::{TraceQuery, TraceWorld, ENTITY_NONE, ENTITY_WORLD};
+use jka_movement::{TraceQuery, TraceResult, TraceWorld, ENTITY_NONE, ENTITY_WORLD};
 
 const SABER_COMPENSATION_MS: i32 = 400;
 
@@ -48,6 +48,7 @@ impl PlayerPresenter {
         if attacker == target {
             return;
         }
+        devprintln!(2, "SABER GORE: hit attacker={attacker} target={target} parm={}", event.parm);
         let time = now.max(event.server_time);
         let flesh_hit_time = (event.parm != 0).then_some(event.server_time);
         let hit = self.saber_gore_hits.entry(attacker).or_insert(SaberGoreHit {
@@ -141,9 +142,13 @@ impl PlayerPresenter {
         for blade in self.saber_gore_blades.drain(..) {
             let Some(hit) = self.saber_gore_hits.get(&blade.attacker) else { continue; };
             if !draws.iter().any(|draw| draw.entity_num == hit.target && draw.ghoul2_gpu.is_some()) {
+                devprintln!(2, "SABER GORE: target {} has no GPU-skinned draw this frame", hit.target);
                 continue;
             }
-            let Some(snaps) = self.last_gpu.get(&hit.target) else { continue; };
+            let Some(snaps) = self.last_gpu.get(&hit.target) else {
+                devprintln!(2, "SABER GORE: target {} has no GPU snapshot", hit.target);
+                continue;
+            };
             // CG_AddSaberBlade truncates the blade at solid architecture.
             let blade_trace = trace.trace(TraceQuery {
                 start: blade.base, end: blade.tip, mins: [0.0; 3], maxs: [0.0; 3],
@@ -154,35 +159,48 @@ impl PlayerPresenter {
             if blade_trace.fraction != 1.0 {
                 tip += (tip - base).normalize_or_zero() * 0.1;
             }
-            // CG_SaberCompWork tests forward and backward, so both sides of
-            // the victim follow the swing. Confirm the authoritative target
-            // against its posed triangles before queuing either mark mode.
-            for (reverse, (start, end)) in [(base, tip), (tip, base)].into_iter().enumerate() {
-                let contact = trace.trace(TraceQuery {
-                    start: start.to_array(), end: end.to_array(), mins: [0.0; 3], maxs: [0.0; 3],
-                    pass_entity: i32::from(blade.attacker), mask: MASK_PLAYERSOLID,
-                });
-                if contact.entity != i32::from(hit.target) { continue; }
-                let Some(position) = impact_position(snaps, start.to_array(), end.to_array()) else {
-                    continue;
-                };
-                let center = Vec3::from_array(position);
-                let direction = (end - center).normalize_or_zero();
-                if direction == Vec3::ZERO { continue; }
-                let seed = blade.seed ^ ((reverse as u64) << 32);
-                let random = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                let size = 3.0 + (random >> 40) as f32 / 16_777_216.0;
-                if self.skin_gore_enabled {
-                    self.skin_gore.add_damage(hit.target, snaps, position, size * hit.skin_scale, 1.0);
-                    continue;
-                }
-                self.pending_gore.push(PendingGore {
-                    entity: hit.target, start: position, end: (center + direction * 4.0).to_array(),
-                    trace: false, size, skin_scale: 1.0,
-                    life_ms: 5_000 + (random % 5_001) as i32, shader: blade.shader.clone(),
-                    time: now, sequence: seed,
-                });
+            // CG_SaberCompWork traces base -> tip only: jaPRO leaves the
+            // backward pass disabled ("sometimes it just makes too many
+            // effects"). Confirm the authoritative target against its posed
+            // triangles before queuing either mark mode.
+            let (start, end) = (base, tip);
+            let contact = trace.trace(TraceQuery {
+                start: start.to_array(), end: end.to_array(), mins: [0.0; 3], maxs: [0.0; 3],
+                pass_entity: i32::from(blade.attacker), mask: MASK_PLAYERSOLID,
+            });
+            if contact.entity != i32::from(hit.target) {
+                let target_solid = self.presentation_solids.iter()
+                    .find(|solid| solid.number == i32::from(hit.target))
+                    .map(|solid| format!("{:?}", solid.clip));
+                devprintln!(
+                    2,
+                    "SABER GORE: contact trace hit entity {} not target {} (solids={} target_clip={:?} seg={:?}->{:?})",
+                    contact.entity, hit.target, self.presentation_solids.len(), target_solid,
+                    start.to_array(), end.to_array(),
+                );
+                continue;
             }
+            let Some(position) = impact_position(snaps, start.to_array(), end.to_array()) else {
+                devprintln!(2, "SABER GORE: blade segment misses the posed mesh of {}", hit.target);
+                continue;
+            };
+            devprintln!(2, "SABER GORE: mark queued on {} skin_gore={}", hit.target, self.skin_gore_enabled);
+            let center = Vec3::from_array(position);
+            let direction = (end - center).normalize_or_zero();
+            if direction == Vec3::ZERO { continue; }
+            let seed = blade.seed;
+            let random = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let size = 3.0 + (random >> 40) as f32 / 16_777_216.0;
+            if self.skin_gore_enabled {
+                self.skin_gore.add_damage(hit.target, snaps, position, size * hit.skin_scale, 1.0);
+                continue;
+            }
+            self.pending_gore.push(PendingGore {
+                entity: hit.target, start: position, end: (center + direction * 4.0).to_array(),
+                trace: false, size, skin_scale: 1.0,
+                life_ms: 5_000 + (random % 5_001) as i32, shader: blade.shader.clone(),
+                time: now, sequence: seed,
+            });
         }
         let excess = self.pending_gore.len().saturating_sub(256);
         self.pending_gore.drain(..excess);
@@ -281,71 +299,78 @@ impl PlayerPresenter {
         if self.pending_gore.len() > 256 { self.pending_gore.remove(0); }
     }
 
+    /// CG_G2Trace: world trace, then CG_ClipMoveToEntities with g2Check over
+    /// `presentation_solids`. `None` only without a collision world.
+    fn cg_g2_trace(&mut self, query: TraceQuery) -> Option<TraceResult> {
+        let world = self.collision_world.as_mut()?;
+        let mut result = world.trace(query);
+        result.entity = if result.fraction < 1.0 { ENTITY_WORLD } else { ENTITY_NONE };
+        for solid in &self.presentation_solids {
+            if solid.number == query.pass_entity || solid.skip_movement
+                || (solid.number > MAX_CLIENTS as i32
+                    && solid.generic_enemy_index - (ENTITY_NONE + 1) == self.viewer_client)
+            {
+                continue;
+            }
+            let candidate = world.trace_entity(query, solid.clip);
+            let previous = result;
+            if candidate.all_solid != 0 || candidate.fraction < result.fraction {
+                result = candidate;
+                result.entity = solid.number;
+            } else if candidate.start_solid != 0 {
+                result.start_solid = 1;
+                result.entity = solid.number;
+            }
+            if result.all_solid != 0 {
+                break;
+            }
+            // CG_ClipMoveToEntities keeps the selected hull result when
+            // CG_G2TraceCollide succeeds. A mesh miss restores the previous
+            // result and lets the remaining solids compete for the trace.
+            if candidate.fraction < 1.0 || candidate.start_solid != 0 {
+                if let Some(snaps) = u16::try_from(solid.number).ok()
+                    .and_then(|entity| self.last_gpu.get(&entity))
+                    .filter(|snaps| !snaps.is_empty())
+                {
+                    if impact_position(snaps, query.start, query.end).is_none() {
+                        result = previous;
+                    }
+                }
+            }
+        }
+        Some(result)
+    }
+
     fn gore_projection_start(&mut self, hit: &PendingGore) -> Option<[f32; 3]> {
         if !hit.trace {
             return Some(hit.start);
         }
-        let Some(world) = self.collision_world.as_mut() else {
+        if self.collision_world.is_none() {
             return impact_position(self.last_gpu.get(&hit.entity)?, hit.start, hit.end);
-        };
+        }
         let mut query = TraceQuery {
             start: hit.start, end: hit.end, mins: [0.0; 3], maxs: [0.0; 3],
             mask: MASK_PLAYERSOLID, pass_entity: ENTITY_NONE,
         };
-        let mut trace = |query: TraceQuery| {
-            let mut result = world.trace(query);
-            result.entity = if result.fraction < 1.0 { ENTITY_WORLD } else { ENTITY_NONE };
-            for solid in &self.presentation_solids {
-                if solid.number == query.pass_entity || solid.skip_movement
-                    || (solid.number > MAX_CLIENTS as i32
-                        && solid.generic_enemy_index - (ENTITY_NONE + 1) == self.viewer_client)
-                {
-                    continue;
-                }
-                let candidate = world.trace_entity(query, solid.clip);
-                let previous = result;
-                if candidate.all_solid != 0 || candidate.fraction < result.fraction {
-                    result = candidate;
-                    result.entity = solid.number;
-                } else if candidate.start_solid != 0 {
-                    result.start_solid = 1;
-                    result.entity = solid.number;
-                }
-                if result.all_solid != 0 {
-                    break;
-                }
-                // CG_ClipMoveToEntities keeps the selected hull result when
-                // CG_G2TraceCollide succeeds. A mesh miss restores the previous
-                // result and lets the remaining solids compete for the trace.
-                if candidate.fraction < 1.0 || candidate.start_solid != 0 {
-                    if let Some(snaps) = u16::try_from(solid.number).ok()
-                        .and_then(|entity| self.last_gpu.get(&entity))
-                        .filter(|snaps| !snaps.is_empty())
-                    {
-                        if impact_position(snaps, query.start, query.end).is_none() {
-                            result = previous;
-                        }
-                    }
-                }
-            }
-            result
-        };
         let target = i32::from(hit.entity);
-        let first = trace(query);
+        let first = self.cg_g2_trace(query)?;
         if first.entity == target || first.entity >= ENTITY_WORLD {
             return Some(first.end);
         }
         query.pass_entity = first.entity;
-        let second = trace(query);
+        let second = self.cg_g2_trace(query)?;
         (second.entity == target).then_some(second.end)
     }
 
-    /// FX_GHOUL2_DECALS / SFxHelper::AddGhoul2Decal: project the authored
-    /// impact shader onto a nearby player's actual GPU-skinned triangles.
-    /// The short ray must hit skinned geometry: mere proximity to a player
-    /// must never paint them through BSP walls.
-    pub(crate) fn add_authored_ghoul2_decals(&mut self, decals: &[crate::fx::system::FxDecalSpawn], now: i32) {
-        if !self.gore_marks_enabled() { return; }
+    /// FX_GHOUL2_DECALS / SFxHelper::AddGhoul2Decal. Legacy marks follow
+    /// jaPRO C_G2Mark; SkinGore keeps its posed-surface stamp.
+    pub(crate) fn add_authored_ghoul2_decals(
+        &mut self,
+        decals: &[crate::fx::system::FxDecalSpawn],
+        entities: &[crate::cgame::PresentedEntity],
+        now: i32,
+    ) {
+        if decals.is_empty() || !self.gore_marks_enabled() { return; }
         if self.skin_gore_enabled {
             for decal in decals {
                 let start = std::array::from_fn(|i| decal.origin[i] + decal.normal[i] * 8.0);
@@ -365,36 +390,31 @@ impl PlayerPresenter {
             }
             return;
         }
-        for decal in decals {
-            let normal = decal.normal;
-            let start = std::array::from_fn(|i| decal.origin[i] + normal[i] * 8.0);
-            let end = std::array::from_fn(|i| decal.origin[i] - normal[i] * 16.0);
-            let mut nearest: Option<(u16, f32, Vec<crate::cgame::player_gore::GoreSurface>)> = None;
-            for (&entity, snaps) in &self.last_gpu {
-                if snaps.is_empty() { continue; }
-                // Cheap coarse rejection before per-triangle skinning; model
-                // origins are typically at the feet, so leave headroom.
-                if !snaps[0].origin.iter().zip(decal.origin.iter()).all(|(a,b)| (a-b).abs() < 150.0) { continue; }
-                let id = self.gore_next_id;
-                let surfaces = crate::cgame::player_gore::build_gore(snaps, id, start, end, true, decal.radius);
-                if surfaces.is_empty() { continue; }
-                let sq = snaps[0].origin.iter().zip(decal.origin.iter()).map(|(a,b)| (a-b)*(a-b)).sum::<f32>();
-                if nearest.as_ref().is_none_or(|(_, dist, _)| sq < *dist) {
-                    nearest = Some((entity, sq, surfaces));
-                }
-            }
-            if let Some((entity, _, surfaces)) = nearest {
-                self.gore_next_id = self.gore_next_id.wrapping_add(1);
-                while self.gore.iter().filter(|g| g.entity == entity).count() >= self.gore_limit {
-                    if let Some(i) = self.gore.iter().position(|g| g.entity == entity) { self.gore.remove(i); } else { break; }
-                }
-                self.gore.push(crate::cgame::player_gore::Gore {
-                    entity, start_time: now, life_ms: decal.life_ms,
-                    fade_out_ms: 1000,
-                    shader: decal.shader.clone(), surfaces,
-                });
-            }
+        // C_G2Mark (cg_main.c): CG_G2Trace from the decal origin 64 units
+        // along the effect's forward axis, from ENTITYNUM_NONE with
+        // MASK_PLAYERSOLID. World geometry blocks it. The first Ghoul2 entity
+        // it reaches gets CG_AddGhoul2Mark(size, tr.endpos -> end,
+        // Q_irand(2000, 4000)), sharing the cg_ghoul2Marks limit in append_gore.
+        crate::net::solid_entities_into(entities, now, &mut self.presentation_solids);
+        for (index, decal) in decals.iter().enumerate() {
+            let end: [f32; 3] = std::array::from_fn(|i| decal.origin[i] + decal.normal[i] * 64.0);
+            let Some(trace) = self.cg_g2_trace(TraceQuery {
+                start: decal.origin, end, mins: [0.0; 3], maxs: [0.0; 3],
+                pass_entity: ENTITY_NONE, mask: MASK_PLAYERSOLID,
+            }) else { return; };
+            if !(0..ENTITY_WORLD).contains(&trace.entity) { continue; }
+            let entity = trace.entity as u16;
+            if !self.last_gpu.get(&entity).is_some_and(|snaps| !snaps.is_empty()) { continue; }
+            let sequence = (u64::from(now as u32) << 24) ^ (u64::from(entity) << 12) ^ index as u64;
+            let random = sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 33;
+            self.pending_gore.push(PendingGore {
+                entity, start: trace.end, end, trace: false, size: decal.radius, skin_scale: 1.0,
+                life_ms: 2_000 + (random % 2_001) as i32, shader: decal.shader.clone(),
+                time: now, sequence,
+            });
         }
+        let excess = self.pending_gore.len().saturating_sub(256);
+        self.pending_gore.drain(..excess);
     }
 
     /// Draw this entity's burn marks through the same GPU skinning as its body.
@@ -504,12 +524,18 @@ impl PlayerPresenter {
                     .flat_map(|g| &g.surfaces)
                     .filter(|surface| snaps.iter().any(|snap| snap.mesh_key == surface.base_key))
                     .count();
-                if active_records >= self.gore_limit { break; }
+                if active_records >= self.gore_limit {
+                    devprintln!(2, "GORE: entity {entity} at cg_ghoul2Marks limit {}", self.gore_limit);
+                    break;
+                }
                 let id = self.gore_next_id;
                 self.gore_next_id = self.gore_next_id.wrapping_add(1);
                 let mut surfaces = project_gore(snaps, id, start, hit.end, hit.size, hit.sequence);
                 surfaces.extend(project_gore(&alternate_lods, id, start, hit.end, hit.size, hit.sequence));
-                if surfaces.is_empty() { continue; }
+                if surfaces.is_empty() {
+                    devprintln!(2, "GORE: projection of {} onto entity {entity} produced no triangles", hit.shader);
+                    continue;
+                }
                 self.gore.push(crate::cgame::player_gore::Gore {
                     entity, start_time: now,
                     life_ms: hit.life_ms,

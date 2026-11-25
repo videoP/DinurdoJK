@@ -128,7 +128,7 @@ jobs:
         shell: bash
         env:
           DINURDOJK_NINJA_TOKEN: ${{ secrets.DINURDOJK_NINJA_TOKEN }}
-          DINURDOJK_NINJA_REPO: ${{ vars.DINURDOJK_NINJA_REPO || secrets.DINURDOJK_NINJA_REPO }}
+          DINURDOJK_NINJA_REPO: ${{ vars.DINURDOJK_NINJA_REPO }}
         run: |
           set -euo pipefail
           dest="$GITHUB_WORKSPACE/../DinurdoJK-ninja"
@@ -615,7 +615,7 @@ jobs:
         shell: bash
         env:
           DINURDOJK_NINJA_TOKEN: ${{ secrets.DINURDOJK_NINJA_TOKEN }}
-          DINURDOJK_NINJA_REPO: ${{ vars.DINURDOJK_NINJA_REPO || secrets.DINURDOJK_NINJA_REPO }}
+          DINURDOJK_NINJA_REPO: ${{ vars.DINURDOJK_NINJA_REPO }}
         run: |
           set -euo pipefail
           dest="$GITHUB_WORKSPACE/../DinurdoJK-ninja"
@@ -838,7 +838,7 @@ jobs:
         shell: bash
         env:
           DINURDOJK_NINJA_TOKEN: ${{ secrets.DINURDOJK_NINJA_TOKEN }}
-          DINURDOJK_NINJA_REPO: ${{ vars.DINURDOJK_NINJA_REPO || secrets.DINURDOJK_NINJA_REPO }}
+          DINURDOJK_NINJA_REPO: ${{ vars.DINURDOJK_NINJA_REPO }}
         run: |
           set -euo pipefail
           dest="$GITHUB_WORKSPACE/../DinurdoJK-ninja"

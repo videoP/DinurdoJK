@@ -264,10 +264,10 @@ app_cvars! {
     }
 
     APP_CG_BLOOD {
-        runtime: CvarDef::new("cg_blood", "0", "0|1|2", "0: no blood (legacy marks); 1: Ninja blood, SkinGore, skull/brain on gib events; 2: same blood and complete TaystJK gib models, with Ninja blood instead of legacy gib decals.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_blood(app)), |app, value| App::cvar_set_cg_blood(app, APP_CG_BLOOD.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_blood, None),
+        runtime: CvarDef::new("cg_blood", "0", "0|1|2|3", "0: no blood (legacy marks); 1: Ninja blood, SkinGore, skull/brain on gib events; 2: same blood and complete TaystJK gib models, with Ninja blood instead of legacy gib decals; 3: dynamic gibs from the actual Ghoul2 player model.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_blood(app)), |app, value| App::cvar_set_cg_blood(app, APP_CG_BLOOD.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_blood, None),
         config: CvarBinding {
                 load_audio: Some(|settings, _name, value| {
-                    settings.game.blood = int_in(value, 2).unwrap_or(settings.game.blood)
+                    settings.game.blood = int_in(value, 3).unwrap_or(settings.game.blood)
                 }),
                 archive: Some((405, |state| {
                     let audio = state.audio;
@@ -281,7 +281,7 @@ app_cvars! {
                     self.audio.game.blood.to_string()
                 }
                 fn cvar_set_cg_blood(&mut self, name: &str, value: &str) -> Result<(), String> {
-                    let blood = Self::parse_cvar_finite(name, value)?.clamp(0.0, 2.0) as u8;
+                    let blood = Self::parse_cvar_finite(name, value)?.clamp(0.0, 3.0) as u8;
                     if self.audio.game.blood != blood {
                         self.audio.game.blood = blood;
                         crate::ninja_blood::set_enabled(blood != 0);

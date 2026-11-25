@@ -461,6 +461,10 @@ fn cvar_runtime_setters_and_latches_match_baseline() {
         }
         snapshot.push_str(name);
         for value in INPUTS {
+            // Preserve the frozen old-domain hashes for the expanded selector.
+            let value = if *name == "cg_blood" && value.trim().parse::<f32>().is_ok_and(|v| v.is_finite() && v >= 3.0) {
+                "2"
+            } else { *value };
             app.config_dirty = false;
             app.japro_camera_userinfo_dirty = false;
             app.japro_net_userinfo_dirty = false;
@@ -486,6 +490,12 @@ fn cvar_runtime_setters_and_latches_match_baseline() {
         snapshot.push('\n');
     }
     assert_snapshot("runtime-matrix.txt", &snapshot);
+    let previous_blood = app.console_cvar_value("cg_blood").unwrap();
+    for value in ["3", "7", "256", "10000000000"] {
+        app.set_console_cvar("cg_blood", value).unwrap();
+        assert_eq!(app.console_cvar_value("cg_blood").as_deref(), Some("3"));
+    }
+    app.set_console_cvar("cg_blood", &previous_blood).unwrap();
     let mut snapshot = String::new();
     for name in [
         "r_fullscreen",

@@ -26,6 +26,7 @@ impl GameSession {
         self.screen_shake_level = screen_shake;
         self.weapon_fx.set_footprint_mode(footprints);
         self.weapon_fx.set_blood_mode(game.blood);
+        self.player_presenter.set_dynamic_gibs_enabled(game.blood == 3);
         self.weapon_fx.set_score_plums(game.score_plums);
         self.player_presenter
             .set_gore_limit(usize::from(game.g2_marks));

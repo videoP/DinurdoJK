@@ -61,7 +61,7 @@ fn category(item: SearchItem) -> &'static str {
             SETUP_TAB_EXTENSIONS => "Extensions",
             SETUP_TAB_STREAMER => "Streamer mode",
             SETUP_TAB_PK3 => "Package Manager",
-            SETUP_TAB_MOD => "Mod",
+            SETUP_TAB_MOD => "JAPRO",
             _ => "Video",
         }
     }
@@ -144,7 +144,7 @@ impl App {
         if tokens.is_empty() { return; }
         let mut results: Vec<(i32, SearchItem)> = SEARCH_ITEMS.iter().copied()
             .filter_map(|item| score(item, &tokens, &joined).map(|score| (score, item)))
-            .filter(|(_, item)| item.tab != SETUP_TAB_MOD || self.ui_mod().is_some())
+            .filter(|(_, item)| item.tab != SETUP_TAB_MOD || self.ui_mod() == Some(crate::net::mod_support::ServerMod::Japro))
             .collect();
         // Inside Render Studio the search runs in the Studio graphics window,
         // which shows graphics pages only: other matches can't be opened there.
@@ -215,6 +215,28 @@ mod tests {
             && item.subsection == Some(SetupSection::AudioPositional)));
         assert!(items.iter().any(|item| item.label == "Steam binaural HRTF"
             && item.subsection == Some(SetupSection::AudioPositional)));
+        for label in ["Hide duelers", "Translucent duelers", "Duel glow shell", "Hide non-duelers while dueling", "Disable breathing effects", "Hide cosmetics"] {
+            assert!(items.iter().any(|item| item.label == label
+                && item.tab == SETUP_TAB_GAME && item.subsection == Some(SetupSection::GamePlayerVisibility)));
+            assert!(!items.iter().any(|item| item.label == label && item.tab == SETUP_TAB_MOD));
+        }
+        assert!(items.iter().any(|item| item.label == "Follow the fastest player"
+            && item.subsection == Some(SetupSection::GamePresentation)));
+        for label in ["Blood effects", "Dismemberment", "Legacy burn marks"] {
+            let matches: Vec<_> = items.iter().filter(|item| item.label == label).collect();
+            assert_eq!(matches.len(), 1, "{label} should have a single search destination");
+            assert_eq!(matches[0].tab, SETUP_TAB_VIDEO);
+            assert!(matches[0].section == Some(VideoSection::Effects));
+        }
+        for label in ["Detached limb budget", "Detached limb lifetime"] {
+            assert!(items.iter().any(|item| item.label == label
+                && item.section == Some(VideoSection::Physics)));
+        }
+        for label in ["Score numbers", "Screen shake"] {
+            assert!(items.iter().any(|item| item.label == label
+                && item.subsection == Some(SetupSection::GameGameplay)));
+        }
+        assert!(items.iter().any(|item| item.label == "Hide racers in FFA" && item.tab == SETUP_TAB_MOD));
         assert!(items.iter().any(|item| item.label == "Simulate projectiles"
             && item.subsection == Some(SetupSection::GameGameplay)));
         assert!(items.iter().any(|item| {

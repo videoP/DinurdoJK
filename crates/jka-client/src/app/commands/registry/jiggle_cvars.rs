@@ -811,15 +811,15 @@ app_cvars! {
 
     APP_CG_HAIRPHYSICS {
         runtime: CvarDef::new(
-            "cg_hairPhysics", "", "0|1|2",
-            "Procedural hair: 0 Off; 1 authored Source jigglebones; 2 authored + auto hair* on native GLMs.",
+            "cg_hairPhysics", "", "0|1|2|3",
+            "Procedural hair: 0 Off; 1 authored Source jigglebones; 2 authored + auto hair* springs on native GLMs; 3 authored + native hair* as remeshed CPU cloth (needs r_clothPhysics 1, r_clothSolver 0; else as 2).",
             CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app: &App| CvarValue::String(app.video.hair_physics.to_string()),
             |app, value| App::cvar_set_cg_hairphysics(app, APP_CG_HAIRPHYSICS.entry.name, &value.to_string()),
         ).with_text_setter(App::cvar_set_cg_hairphysics, None),
         config: CvarBinding {
             load_video: Some(|settings, _name, value, _context| {
-                if let Some(mode) = value.trim().parse::<u8>().ok().filter(|&mode| mode <= 2) {
+                if let Some(mode) = value.trim().parse::<u8>().ok().filter(|&mode| mode <= 3) {
                     settings.hair_physics = mode;
                 }
             }),
@@ -830,13 +830,41 @@ app_cvars! {
             impl App {
                 fn cvar_set_cg_hairphysics(&mut self, name: &str, value: &str) -> Result<(), String> {
                     let mode = value.trim().parse::<u8>()
-                        .ok().filter(|&mode| mode <= 2)
-                        .ok_or_else(|| format!("{name}: expected 0 Off, 1 Authored, or 2 Authored + GLM Hair"))?;
+                        .ok().filter(|&mode| mode <= 3)
+                        .ok_or_else(|| format!("{name}: expected 0 Off, 1 Authored, 2 Authored + GLM Hair, or 3 Hair Cloth"))?;
                     if self.video.hair_physics != mode {
                         self.video.hair_physics = mode;
                         self.mark_config_dirty();
                         self.publish_ui();
                     }
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_CG_HAIRSELFCOLLISION {
+        runtime: CvarDef::new(
+            "cg_hairSelfCollision", "", "0..1",
+            "cg_hairPhysics 3 (CPU cloth hair): keep hair strands and layers from passing through each other, and through garment fabric when r_clothSelfCollision is also on.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.hair_self_collision)),
+            |app, value| App::cvar_set_cg_hairselfcollision(app, APP_CG_HAIRSELFCOLLISION.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_cg_hairselfcollision, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.hair_self_collision =
+                    parse_bool(value).unwrap_or(settings.hair_self_collision);
+            }),
+            archive: Some((28101, |state| format!("{}", u8::from(state.video.hair_self_collision)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_cg_hairselfcollision(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.hair_self_collision = Self::parse_cvar_bool(name, value)?;
+                    self.mark_config_dirty();
+                    self.publish_ui();
                     Ok(())
                 }
             }

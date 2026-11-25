@@ -116,6 +116,7 @@ pub(in crate::cgame::player_presenter) enum ModelResolution {
 /// synchronous path and the asset workers implement this differently, but
 /// share exactly the same OpenJK registration logic in `build_*`.
 pub(in crate::cgame::player_presenter) trait ModelSource {
+    fn is_jk2(&self) -> bool;
     fn read_model(&mut self, qpath: &str) -> Result<Vec<u8>, String>;
     fn read_optional(&mut self, qpath: &str, max_bytes: usize) -> Result<Option<Vec<u8>>, String>;
     fn load_gla(&mut self, qpath: &str) -> Result<Arc<GlaAnimation>, String>;
@@ -130,6 +131,10 @@ pub(in crate::cgame::player_presenter) struct SyncModelSource<'a> {
 }
 
 impl ModelSource for SyncModelSource<'_> {
+    fn is_jk2(&self) -> bool {
+        self.presenter.assets.jk2_version().is_some()
+    }
+
     fn read_model(&mut self, qpath: &str) -> Result<Vec<u8>, String> {
         Ok(self
             .presenter
@@ -193,6 +198,10 @@ pub(in crate::cgame::player_presenter) struct WorkerModelSource<'a> {
 }
 
 impl ModelSource for WorkerModelSource<'_> {
+    fn is_jk2(&self) -> bool {
+        self.vfs.jk2_version().is_some()
+    }
+
     fn read_model(&mut self, qpath: &str) -> Result<Vec<u8>, String> {
         Ok(self
             .vfs
@@ -896,6 +905,23 @@ pub(in crate::cgame::player_presenter) fn mesh_skeleton_binding(
     }
 }
 
+/// TaystJK R_LoadMDXM lowercases hierarchy names and strips a trailing
+/// `_off` without changing the surface flags. Skin registration performs the
+/// same name rewrite. Keep original JK2 names: e.g. head and head_off are
+/// distinct surfaces in that game. Normalize once on character registration
+/// so both the skin lookup and runtime G2 surface overrides use the same names.
+fn normalize_character_surface_names(glm: &mut jka_assets::ghoul2::GlmModel, jk2: bool) {
+    if jk2 {
+        return;
+    }
+    for surface in &mut glm.hierarchy {
+        surface.name.make_ascii_lowercase();
+        if surface.name.ends_with("_off") {
+            surface.name.truncate(surface.name.len() - 4);
+        }
+    }
+}
+
 fn build_character_model(
     source: &mut dyn ModelSource,
     model_qpath: String,
@@ -907,7 +933,9 @@ fn build_character_model(
     jiggle_remesh: JiggleRemeshTuning,
 ) -> Result<PlayerModelAsset, String> {
     let model_bytes = source.read_model(&model_qpath)?;
-    let glm = Arc::new(jka_assets::ghoul2::parse_glm_native(&model_bytes)?);
+    let mut glm = jka_assets::ghoul2::parse_glm_native(&model_bytes)?;
+    normalize_character_surface_names(&mut glm, source.is_jk2());
+    let glm = Arc::new(glm);
 
     let gla_qpath = if glm.anim_name.to_ascii_lowercase().ends_with(".gla") {
         glm.anim_name.clone()

@@ -5,7 +5,7 @@ use super::egui_menu::jka_colored_text;
 use super::egui_theme as theme;
 use super::session_tools::FlagCarrier;
 use super::*;
-use crate::japro_cg;
+use crate::japro_cg::style;
 
 /// Third-person settings as they were when the editor opened, so CANCEL (or
 /// ESC) can put every value back.
@@ -706,6 +706,22 @@ impl App {
         let _ = self.set_console_cvar("cg_stylePlayer", &style.to_string());
     }
 
+    /// Shared cg_stylePlayer row; inverted bits disable the named effect.
+    pub(in crate::app) fn egui_style_toggle(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        tip: &str,
+        bit: u32,
+        inverted: bool,
+    ) {
+        theme::row(ui, label, tip, theme::Reset::None, |ui| {
+            if let Some(on) = theme::switch(ui, self.japro_cg.style_bit(bit) != inverted) {
+                self.set_style_bit(bit, on != inverted);
+            }
+        });
+    }
+
     // --------------------------------------------------------- HUD options --
 
     /// jaPRO HUD controls live with the rest of Setup -> Interface / HUD.
@@ -789,41 +805,14 @@ impl App {
 
     // ------------------------------------------------------- game options --
 
-    /// jaPRO player visibility and spectating rows on Setup -> JAPRO.
+    /// Race-specific player visibility on Setup -> JAPRO.
     pub(super) fn egui_japro_game_settings(&mut self, ui: &mut egui::Ui) {
-        theme::section(
-            ui,
-            "PLAYER VISIBILITY",
-            "How other players in duels and race mode are drawn (jaPRO cg_stylePlayer).",
-        );
-        for &(bit, label, tip) in japro_cg::STYLE_TOGGLES {
-            theme::row(ui, label, tip, theme::Reset::None, |ui| {
-                if let Some(on) = theme::switch(ui, self.japro_cg.style_bit(bit)) {
-                    self.set_style_bit(bit, on);
-                }
-            });
-        }
-        for &(bit, inverted, label, tip) in japro_cg::GHOST_TOGGLES {
-            theme::row(ui, label, tip, theme::Reset::None, |ui| {
-                let set = self.japro_cg.style_bit(bit);
-                if let Some(on) = theme::switch(ui, set != inverted) {
-                    self.set_style_bit(bit, on != inverted);
-                }
-            });
-        }
-
-        theme::section(ui, "SPECTATING", "Options while you watch other players.");
-        theme::row(
-            ui,
-            "Follow the fastest player",
-            "cg_specFollowFastest. While spectating on a server, keep following whoever is moving fastest. It only cuts to someone clearly faster who stays ahead for a moment, and never more than once every couple of seconds.",
-            theme::Reset::None,
-            |ui| {
-                if let Some(on) = theme::switch(ui, self.japro_cg.follow_fastest) {
-                    let _ = self.set_console_cvar("cg_specFollowFastest", if on { "1" } else { "0" });
-                }
-            },
-        );
+        theme::section(ui, "RACE VISIBILITY", "How jaPRO racers and FFA players are drawn (cg_stylePlayer).");
+        self.egui_style_toggle(ui, "Hide racers in FFA", "cg_stylePlayer. While you are not racing, do not draw players who are in race mode.", style::HIDE_RACERS_FFA, false);
+        self.egui_style_toggle(ui, "Hide non-racers while racing", "cg_stylePlayer. While you race, do not draw anyone who is not racing.", style::HIDE_NONRACERS_IF_RACER, false);
+        self.egui_style_toggle(ui, "Hide other racers while racing", "cg_stylePlayer. While you race, do not draw the other racers.", style::HIDE_RACERS_IF_RACER, false);
+        self.egui_style_toggle(ui, "Translucent racers", "cg_stylePlayer. While you race (or watch from FFA), draw racers as translucent ghosts so they never block your view.", style::RACER_VFX_DISABLE, true);
+        self.egui_style_toggle(ui, "Translucent FFA players while racing", "cg_stylePlayer. While you race, draw players who are not racing as translucent ghosts.", style::NONRACER_VFX_DISABLE, true);
     }
 
     /// Companion window selector on the Join page. This is the single control

@@ -1805,6 +1805,8 @@ impl App {
                 hz: self.video.client_physics_hz,
                 max_substeps: self.video.client_physics_max_substeps,
                 body_collision: self.video.cloth_body_collision,
+                self_collision: self.video.cloth_self_collision,
+                hair_self_collision: self.video.hair_self_collision,
                 body_clearance: self.video.cloth_body_clearance,
                 air_resistance: self.video.cloth_air_resistance,
                 turn_response: self.video.cloth_turn_response,
@@ -1814,7 +1816,7 @@ impl App {
                 stiffening: self.video.cloth_stiffening,
                 wind_velocity: [0.0; 3],
             });
-            playback.player_presenter.set_cloth_gpu_solver(self.video.cloth_solver == 1);
+            playback.player_presenter.set_cloth_gpu_solver(self.video.cloth_solver, self.video.cloth_unified);
             playback.player_presenter.set_cloth_wind(
                 self.video
                     .cloth_wind
@@ -1833,7 +1835,8 @@ impl App {
                 debris_lifetime_seconds: self.video.physics_debris_lifetime,
                 max_ragdolls: self.video.ragdoll_max,
                 lifetime_seconds: self.video.ragdoll_lifetime,
-                dismemberment: if self.video.client_physics { self.video.dismemberment } else { 0 },
+                // cg_dismember controls presentation, not the optional Rapier world.
+                dismemberment: self.video.dismemberment,
                 max_detached_limbs: self.video.dismember_max,
                 detached_limb_lifetime_seconds: self.video.dismember_lifetime,
                 self_collision: self.video.ragdoll_self_collision,

@@ -572,13 +572,13 @@ commands! {
         }
     }
 
-    cmd_testgib ["testgib"] ("testgib", "Spawn a visual-only ten-part TaystJK gib burst at your living local player, with cg_blood 2 Ninja blood and MD3 availability diagnostics. The player is unaffected.", CommandScope::Always) |self, command| {
+    cmd_testgib ["testgib"] ("testgib", "Spawn a visual-only gib burst at your living local player: stock MD3s in cg_blood 2, actual posed model fragments in cg_blood 3. The player is unaffected.", CommandScope::Always) |self, command| {
         if command.split_whitespace().count() != 1 {
             self.push_console_line("usage: testgib");
             return CommandResult::Handled;
         }
-        if self.audio.game.blood != 2 {
-            self.push_console_line("^3[TESTGIB]^7 Set cg_blood 2 first");
+        if !matches!(self.audio.game.blood, 2 | 3) {
+            self.push_console_line("^3[TESTGIB]^7 Set cg_blood 2 or 3 first");
             return CommandResult::Handled;
         }
         if self.live_input.is_jk2() {
@@ -609,6 +609,17 @@ commands! {
         // player_position is in renderer coordinates; gib_specs and the
         // shared fragment physics expect the original JKA coordinate system.
         let origin = crate::scene::jka_position(position.to_array());
+        if self.audio.game.blood == 3 {
+            let Some(entity) = session.presented_player_state()
+                .and_then(|ps| ps.field_i32("clientNum"))
+                .and_then(|n| u16::try_from(n).ok()) else {
+                self.push_console_line("^3[TESTGIB]^7 Local client identity unavailable");
+                return CommandResult::Handled;
+            };
+            session.weapon_fx.queue_test_dynamic_gib(entity, origin);
+            self.push_console_line("^3[TESTGIB]^7 Queued actual player-model gibs (visual only)");
+            return CommandResult::Handled;
+        }
         let (count, paths) = session.weapon_fx.queue_test_gib_burst(origin);
         // AssetSearchPath belongs to the app/VFS, not WeaponFx. Reopening it
         // here checks the current fs_game and mounted PK3s on explicit command

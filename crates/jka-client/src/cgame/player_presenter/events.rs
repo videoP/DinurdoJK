@@ -125,6 +125,7 @@ impl PlayerPresenter {
                 self.disintegration_smoke_last.remove(&entity);
                 self.dismembered.remove(&entity);
                 self.dismember_source_snaps.remove(&entity);
+                self.dynamic_gib_sources.remove(&entity);
                 self.detached_limb_visuals.remove(&entity);
                 self.thrown_sabers.remove(&entity);
                 self.team_power.remove(&entity);

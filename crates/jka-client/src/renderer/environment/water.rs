@@ -644,8 +644,8 @@ impl OceanVisibility {
 }
 
 /// HL2 water normals for Source lake water, as one array: the canal
-/// `dev/water_normal` frames (29 at 30 fps), then `water_coast01_normal` as
-/// the last layer. Either missing: the other stands in for it. Both missing:
+/// `water_normal.vtf` frames (29 at 30 fps), then the `water_lake_normal`
+/// image (png/tga/jpg) as the last layer. Either missing: the other stands in for it. Both missing:
 /// Source water keeps the `textures/japro/water_normal` fallback normal map.
 fn load_source_water_normal(
     device: &wgpu::Device,
@@ -653,8 +653,8 @@ fn load_source_water_normal(
     base: &std::path::Path,
     game: Option<&std::path::Path>,
 ) -> Option<wgpu::TextureView> {
-    const CANAL: &str = "materials/dev/water_normal.vtf";
-    const COAST: &str = "materials/nature/water_coast01_normal.vtf";
+    const CANAL: &str = "textures/japro/water_normal.vtf";
+    const COAST: &str = "textures/japro/water_lake_normal";
     let mut assets = match crate::renderer::AssetSearchPath::open_game(base, game) {
         Ok(assets) => assets,
         Err(error) => {
@@ -680,7 +680,12 @@ fn load_source_water_normal(
             .filter(|frames| !frames.is_empty())
     };
     let canal = load(CANAL);
-    let coast = load(COAST);
+    // Single frame: an ordinary linear image (png/tga/jpg) with a generated mip
+    // chain, so a 256x256 map matches the canal frames' shape.
+    let coast = crate::renderer::textures::try_load_texture_asset_from_search_path(
+        &mut assets, COAST, false, true, false, "Source water normal",
+    )
+    .map(|frame| vec![frame]);
     let (canal, coast) = match (canal, coast) {
         (Some(canal), Some(mut coast)) => {
             let shape = |t: &crate::materials::TextureData| (t.width, t.height, t.mip_level_count);

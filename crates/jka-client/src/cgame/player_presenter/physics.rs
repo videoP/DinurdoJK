@@ -173,8 +173,25 @@ impl PlayerPresenter {
         self.skin_gore_enabled || self.gore_limit > 0
     }
 
+    /// cg_hairPhysics 3 simulates native `hair*` surfaces in the CPU cloth
+    /// garment. Without CPU cloth it falls back to mode 2's springs.
+    pub(in crate::cgame::player_presenter) fn hair_cloth_active(&self) -> bool {
+        self.hair_physics_mode == 3 && self.cloth.enabled() && self.cloth.gpu_tuning().is_none()
+    }
+
+    /// Spring mode for `procedural_jiggles_enabled`: mode 3 keeps authored
+    /// Source jigglebones but drops the promoted GLM hair springs while cloth
+    /// owns those surfaces (their extra palette then follows the head).
+    pub(in crate::cgame::player_presenter) fn hair_spring_mode(&self) -> u8 {
+        match self.hair_physics_mode {
+            3 if self.hair_cloth_active() => 1,
+            3 => 2,
+            mode => mode,
+        }
+    }
+
     pub(crate) fn set_hair_physics_mode(&mut self, mode: u8) {
-        let mode = mode.min(2);
+        let mode = mode.min(3);
         if self.hair_physics_mode == mode { return; }
         self.hair_physics_mode = mode;
         // Avoid carrying spring velocity across an Off/Authored/GLM transition.
@@ -240,9 +257,9 @@ impl PlayerPresenter {
         self.cloth.set_config(config);
     }
 
-    /// r_clothSolver 1: the GPU cloth solver (same r_cloth* settings).
-    pub(crate) fn set_cloth_gpu_solver(&mut self, enabled: bool) {
-        self.cloth.set_gpu_solver(enabled);
+    /// r_clothSolver: 0 CPU, 1 Godot PBD, 2 Unified XPBD.
+    pub(crate) fn set_cloth_gpu_solver(&mut self, solver: u8, unified: crate::renderer::UnifiedClothSettings) {
+        self.cloth.set_gpu_solver(solver, unified);
     }
 
     pub(crate) fn set_cloth_wind(&mut self, wind: Option<crate::ocean::AtmosphericWind>) {

@@ -3,7 +3,7 @@ use crate::app::egui_settings::{
     quality_table_row, segmented_row, theme, App, PHYS_CCD, PHYS_CLIENT_ENABLED,
     PHYS_CLOTH, PHYS_CLOTH_AIR, PHYS_CLOTH_ANIMATION, PHYS_CLOTH_BODY_COLLISION,
     PHYS_CLOTH_CLEARANCE, PHYS_CLOTH_DAMPING, PHYS_CLOTH_GPU, PHYS_CLOTH_STIFFENING, PHYS_CLOTH_STIFFNESS, PHYS_CLOTH_TURN, PHYS_CLOTH_WIND, PHYS_BREAKABLES, PHYS_DEBRIS, PHYS_DEBRIS_LIFETIME,
-    PHYS_DEBRIS_MAX, PHYS_DEBUG_DRAW, PHYS_DISMEMBERMENT, PHYS_DISMEMBER_LIFETIME,
+    PHYS_DEBRIS_MAX, PHYS_DEBUG_DRAW, PHYS_DISMEMBER_LIFETIME,
     PHYS_DISMEMBER_MAX, PHYS_EXPLOSION_IMPULSES, PHYS_FORCE_IMPULSES, PHYS_JIGGLE,
     PHYS_JIGGLE_BREAST, PHYS_JIGGLE_BREAST_REMESH_BOTTOM_Z, PHYS_JIGGLE_BREAST_REMESH_TOP_Z, PHYS_HAIR,
     PHYS_JIGGLE_DAMPING, PHYS_JIGGLE_GLUTE, PHYS_JIGGLE_GLUTE_JIGGLE_BOTTOM_Z,
@@ -204,19 +204,6 @@ impl App {
         ) {
             let _ = self.set_console_cvar("r_jigglePhysics", &mode.to_string());
         }
-        const HAIR_MODES: [(u8, &str); 3] = [
-            (0, "Off"), (1, "Authored"), (2, "Authored + GLM"),
-        ];
-        if let Some(mode) = segmented_row(
-            ui,
-            "Hair physics",
-            "0 disables procedural hair motion. 1 uses authored jigglebones on imported Source models. 2 also simulates native JKA GLM surfaces beginning with hair (case-insensitive). Does not use cloth or body jiggle settings.",
-            theme::Reset::Physics(PHYS_HAIR),
-            self.video.hair_physics,
-            &HAIR_MODES,
-        ) {
-            let _ = self.set_console_cvar("cg_hairPhysics", &mode.to_string());
-        }
         const JIGGLE_SOLVER: [(u8, &str); 2] = [(0, "KawaiiPhysics"), (1, "JigglePhysics")];
         if let Some(mode) = segmented_row(
             ui,
@@ -317,22 +304,9 @@ impl App {
 
         theme::section(
             ui,
-            "DISMEMBERMENT",
-            "OpenJK server-authored severing with Ghoul2 stump caps and one Rapier body per detached part.",
+            "DETACHED LIMBS",
+            "Local physics budget and lifetime for severed parts. Set Dismemberment under Video > Effects.",
         );
-        const DISMEMBERMENT: [(u8, &str); 3] = [(0, "Off"), (1, "Limbs"), (2, "Full")];
-        if let Some(mode) = segmented_row(
-            ui,
-            "Dismemberment",
-            "OpenJK cg_dismember semantics. Limbs hides head/waist severing; Full permits every server-authored part. \
-             This never invents a client-side saber hit or changes gameplay.",
-            theme::Reset::Physics(PHYS_DISMEMBERMENT),
-            self.video.dismemberment,
-            &DISMEMBERMENT,
-        ) {
-            self.video.dismemberment = mode;
-            self.physics_menu_changed();
-        }
         const DISMEMBER_MAX: [(u32, &str); 5] =
             [(8, "8"), (16, "16"), (24, "24"), (48, "48"), (96, "96")];
         if let Some(index) = quality_table_row(
@@ -389,15 +363,47 @@ impl App {
             PHYS_CLOTH_BODY_COLLISION,
             self.video.cloth_body_collision,
         );
-        self.egui_physics_toggle(
+        if let Some(solver) = segmented_row(
+            ui, "Cloth solver",
+            "CPU XPBD / Godot GPU PBD / Unified GPU XPBD (shared world particle pool). GPU modes need GPU Ghoul2 skinning.",
+            theme::Reset::Physics(PHYS_CLOTH_GPU), self.video.cloth_solver,
+            &[(0u8, "CPU"), (1, "Godot GPU"), (2, "Unified GPU")],
+        ) {
+            self.video.cloth_solver = solver;
+            self.physics_menu_changed();
+        }
+        if self.video.cloth_solver == 0 {
+            self.egui_physics_toggle(
+                ui,
+                "Cloth self collision",
+                "CPU solver: keep folds and layers of the same garment (cape over robe) from \
+                 passing through each other. Costs extra CPU per garment.",
+                super::PHYS_CLOTH_SELF_COLLISION,
+                self.video.cloth_self_collision,
+            );
+        }
+        const HAIR_MODES: [(u8, &str); 4] = [
+            (0, "Off"), (1, "Authored"), (2, "Authored + GLM"), (3, "Cloth"),
+        ];
+        if let Some(mode) = segmented_row(
             ui,
-            "GPU cloth solver",
-            "Simulate cloth with the gpu-cloth-sim compute solver on the graphics card instead of \
-             the CPU worker, using the same cloth settings below. Needs GPU Ghoul2 skinning; \
-             otherwise the CPU solver runs.",
-            PHYS_CLOTH_GPU,
-            self.video.cloth_solver == 1,
-        );
+            "Hair physics",
+            "0 disables procedural hair motion. 1 uses authored jigglebones on imported Source models. 2 also springs native JKA GLM surfaces beginning with hair (case-insensitive). Cloth remeshes those hair surfaces and simulates them in the CPU cloth solver with body collision; it needs Cloth physics on with the CPU solver and otherwise behaves like Authored + GLM.",
+            theme::Reset::Physics(PHYS_HAIR),
+            self.video.hair_physics,
+            &HAIR_MODES,
+        ) {
+            let _ = self.set_console_cvar("cg_hairPhysics", &mode.to_string());
+        }
+        if self.video.hair_physics == 3 {
+            self.egui_physics_toggle(
+                ui,
+                "Hair self collision",
+                "Cloth hair: keep strands and layers of hair from passing through each other (and through garment fabric when Cloth self collision is also on). Costs extra CPU.",
+                super::PHYS_HAIR_SELF_COLLISION,
+                self.video.hair_self_collision,
+            );
+        }
 
         for (label, tip, field, current, maximum, cvar) in [
             ("Body clearance", "Additional gap between the fabric and the body, in JKA units.",
@@ -415,6 +421,10 @@ impl App {
             ("Fold stiffening", "How much stiffer fabric gets as a fold sharpens. Gentle drape stays soft; hard creases and fold-overs resist. Changing it restarts active cloth.",
                 PHYS_CLOTH_STIFFENING, self.video.cloth_stiffening, 10.0, "r_clothStiffening"),
         ] {
+            if self.video.cloth_solver == 2 && matches!(field,
+                PHYS_CLOTH_TURN | PHYS_CLOTH_ANIMATION | PHYS_CLOTH_STIFFNESS | PHYS_CLOTH_STIFFENING) {
+                continue;
+            }
             theme::row(ui, label, tip, theme::Reset::Physics(field), |ui| {
                 let mut value = current;
                 let readout = format!("{value:.2}");
@@ -422,6 +432,43 @@ impl App {
                     let _ = self.set_console_cvar(cvar, &value.to_string());
                 }
             });
+        }
+        if self.video.cloth_solver == 2 {
+            let tuning = self.video.cloth_unified;
+            theme::row(ui, "Particle collision", "Enable upstream spatial hash and particle contact solving.",
+                theme::Reset::Physics(super::PHYS_CLOTH_UNIFIED_PARTICLE_COLLISION), |ui| {
+                if let Some(value) = theme::switch(ui, tuning.particle_collision) {
+                    let _ = self.set_console_cvar("r_clothUnifiedParticleCollision", if value { "1" } else { "0" });
+                }
+            });
+            theme::row(ui, "Self collision", "Use upstream phase zero; adjacent particles also collide. Off by default, as in ClothGenerator.",
+                theme::Reset::Physics(super::PHYS_CLOTH_UNIFIED_SELF_COLLISION), |ui| {
+                if let Some(value) = theme::switch(ui, tuning.self_collision) {
+                    let _ = self.set_console_cvar("r_clothUnifiedSelfCollision", if value { "1" } else { "0" });
+                }
+            });
+            // Text entry permits exact XPBD compliance values without quantizing
+            // them to a legacy stiffness slider's range.
+            for (label, tip, field, value, cvar) in [
+                ("Substeps", "Number of Small Steps substeps per fixed physics tick; one Jacobi solve per substep.", super::PHYS_CLOTH_UNIFIED_SUBSTEPS, tuning.substeps.to_string(), "r_clothUnifiedSubsteps"),
+                ("Compliance", "XPBD distance compliance alpha; zero is rigid, not the legacy cloth stiffness.", super::PHYS_CLOTH_UNIFIED_COMPLIANCE, tuning.compliance.to_string(), "r_clothUnifiedCompliance"),
+                ("ConstraintDamping", "XPBD distance damping beta (independent of global velocity damping).", super::PHYS_CLOTH_UNIFIED_CONSTRAINT_DAMPING, tuning.constraint_damping.to_string(), "r_clothUnifiedConstraintDamping"),
+                ("Radius", "Particle radius in metres. Hash cell size is twice this radius.", super::PHYS_CLOTH_UNIFIED_RADIUS, tuning.particle_radius.to_string(), "r_clothUnifiedRadius"),
+                ("SOR", "Successive over-relaxation factor (upstream range 1..2).", super::PHYS_CLOTH_UNIFIED_SOR, tuning.sor.to_string(), "r_clothUnifiedSOR"),
+                ("FrictionStatic", "Coulomb static friction coefficient (upstream range 0..2).", super::PHYS_CLOTH_UNIFIED_FRICTION_STATIC, tuning.friction_static.to_string(), "r_clothUnifiedFrictionStatic"),
+                ("FrictionKinetic", "Coulomb kinetic friction coefficient; keep it at or below static friction, as upstream recommends.", super::PHYS_CLOTH_UNIFIED_FRICTION_KINETIC, tuning.friction_kinetic.to_string(), "r_clothUnifiedFrictionKinetic"),
+                ("MaxDepenetrationSpeed", "Maximum particle-contact depenetration speed in metres/second.", super::PHYS_CLOTH_UNIFIED_DEPENETRATION, tuning.max_depenetration_speed.to_string(), "r_clothUnifiedMaxDepenetrationSpeed"),
+            ] {
+                theme::row(ui, label, tip, theme::Reset::Physics(field), |ui| {
+                    // DragValue is local; commit via the same cvar setter as console.
+                    let mut numeric = value.parse::<f64>().unwrap_or(0.0);
+                    let response = ui.add(egui::DragValue::new(&mut numeric).speed(if field == super::PHYS_CLOTH_UNIFIED_SUBSTEPS { 1.0 } else if field == super::PHYS_CLOTH_UNIFIED_COMPLIANCE { 0.000001 } else { 0.01 }).max_decimals(8));
+                    if response.changed() {
+                        let text = if field == super::PHYS_CLOTH_UNIFIED_SUBSTEPS { format!("{:.0}", numeric) } else { numeric.to_string() };
+                        let _ = self.set_console_cvar(cvar, &text);
+                    }
+                });
+            }
         }
         self.egui_physics_toggle(
             ui,
@@ -587,7 +634,8 @@ impl App {
             PHYS_CLOTH => self.video.cloth_physics = value,
             PHYS_CLOTH_BODY_COLLISION => self.video.cloth_body_collision = value,
             PHYS_CLOTH_WIND => self.video.cloth_wind = value,
-            PHYS_CLOTH_GPU => self.video.cloth_solver = u8::from(value),
+            super::PHYS_CLOTH_SELF_COLLISION => self.video.cloth_self_collision = value,
+            super::PHYS_HAIR_SELF_COLLISION => self.video.hair_self_collision = value,
             PHYS_PROPS => self.video.physics_props = value,
             PHYS_DEBRIS => self.video.physics_debris = value,
             PHYS_PLAYER_PUSH => self.video.physics_player_push = value,

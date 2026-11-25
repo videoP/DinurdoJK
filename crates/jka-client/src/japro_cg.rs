@@ -150,63 +150,6 @@ pub mod style {
     pub const SEASONAL_COSMETICS: u32 = 1 << 20;
 }
 
-/// Bit, menu label, tooltip for the `cg_stylePlayer` switches DinurdoJK acts on.
-pub const STYLE_TOGGLES: &[(u32, &str, &str)] = &[
-    (
-        style::DISABLE_BREATHING,
-        "Disable breathing effects",
-        "Hide cold breath and underwater bubbles on player models.",
-    ),
-    (
-        style::SHELL,
-        "Duel glow shell",
-        "While you duel, wrap you and your opponent in a glow that fades with distance.",
-    ),
-    (
-        style::HIDE_DUELERS,
-        "Hide duelers",
-        "Do not draw other players who are in a private duel.",
-    ),
-    (
-        style::HIDE_RACERS_FFA,
-        "Hide racers in FFA",
-        "While you are not racing, do not draw players who are in race mode.",
-    ),
-    (
-        style::HIDE_NONRACERS_IF_RACER,
-        "Hide non-racers while racing",
-        "While you race, do not draw anyone who is not racing.",
-    ),
-    (
-        style::HIDE_RACERS_IF_RACER,
-        "Hide other racers while racing",
-        "While you race, do not draw the other racers.",
-    ),
-];
-
-/// Translucent-ghost switches. `invert` means the bit *disables* the ghost look,
-/// so the menu shows it as "on" when the bit is clear.
-pub const GHOST_TOGGLES: &[(u32, bool, &str, &str)] = &[
-    (
-        style::VFX_DUELERS,
-        false,
-        "Translucent duelers",
-        "Draw players in a private duel as blue translucent ghosts instead of dark models inside a bubble.",
-    ),
-    (
-        style::RACER_VFX_DISABLE,
-        true,
-        "Translucent racers",
-        "While you race (or watch from FFA), draw racers as translucent ghosts so they never block your view.",
-    ),
-    (
-        style::NONRACER_VFX_DISABLE,
-        true,
-        "Translucent FFA players while racing",
-        "While you race, draw players who are not racing as translucent ghosts.",
-    ),
-];
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct JaproCgame {
     /// TaystJK `cg_remaps`: 0 blocks server shader remaps, 1 blocks only
@@ -482,7 +425,7 @@ pub fn classify(viewer: &StyleViewer, target_number: i32, bolt1: i32, dead: bool
     if bit(style::HIDE_DUELERS) && bolt1 == 1 {
         return Appearance::HIDDEN;
     }
-    if bit(style::HIDE_RACERS_FFA) && bolt1 == 2 {
+    if viewer.japro && bit(style::HIDE_RACERS_FFA) && bolt1 == 2 {
         return Appearance::HIDDEN;
     }
     if bolt1 == 1 && !dead {
@@ -890,6 +833,20 @@ mod tests {
         assert!(!classify(&v, 3, 1, false).visible);
         assert!(!classify(&v, 4, 2, false).visible);
         assert!(classify(&v, 5, 0, false).visible);
+    }
+
+    #[test]
+    fn stock_viewer_ignores_saved_race_bits_but_honors_duel_bits() {
+        let v = StyleViewer {
+            japro: false,
+            style_player: style::HIDE_DUELERS | style::HIDE_RACERS_FFA
+                | style::HIDE_NONRACERS_IF_RACER | style::HIDE_RACERS_IF_RACER
+                | style::RACER_VFX_DISABLE | style::NONRACER_VFX_DISABLE,
+            ..viewer()
+        };
+        assert_eq!(classify(&v, 4, 2, false), Appearance::NORMAL);
+        assert_eq!(classify(&v, 5, 0, false), Appearance::NORMAL);
+        assert!(!classify(&v, 3, 1, false).visible);
     }
 
     #[test]

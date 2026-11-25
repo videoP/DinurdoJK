@@ -125,9 +125,14 @@ impl App {
             return Err(format!("{name} is already a registered command or cvar"));
         }
         let previous = self.network.user_cvar(name);
+        let newly_created = previous.is_none();
         let was_archived = previous.is_some_and(|cv| cv.flags.contains(crate::net::UserCvarFlags::ARCHIVE));
         let had_userinfo = previous.is_some_and(|cv| cv.flags.contains(crate::net::UserCvarFlags::USERINFO));
         let changed = self.network.set_user_cvar(name, value, flags)?;
+        if newly_created {
+            // Cvar argument completion includes dynamic names.
+            self.console_arg_suggest_cache.get_mut().take();
+        }
         let Some(updated) = self.network.user_cvar(name) else { unreachable!() };
         let archived = updated.flags.contains(crate::net::UserCvarFlags::ARCHIVE);
         let userinfo = updated.flags.contains(crate::net::UserCvarFlags::USERINFO);

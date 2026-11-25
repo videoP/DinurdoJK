@@ -43,6 +43,8 @@ const CONTENTS_WATER: i32 = 0x4;
 const MASK_WATER: i32 = CONTENTS_WATER | CONTENTS_LAVA;
 /// `MASK_PLAYERSOLID`: solid, player clip, body and terrain.
 const MASK_PLAYERSOLID: i32 = 0x1 | 0x10 | 0x100 | 0x1000;
+/// MVSDK MASK_PLAYERSOLID excludes JKA CONTENTS_TERRAIN.
+const JK2_MASK_PLAYERSOLID: i32 = 0x1 | 0x10 | 0x100;
 /// `FOOTSTEP_DISTANCE`: how far below the foot a surface still counts.
 const FOOTSTEP_DISTANCE: f32 = 32.0;
 /// `CG_PlayerFootsteps` lifts the bolt "a bit for coplanar".
@@ -273,7 +275,7 @@ impl<'a> FootstepEntityTrace<'a> {
 
 impl TraceWorld for FootstepEntityTrace<'_> {
     fn trace(&mut self, mut query: TraceQuery) -> TraceResult {
-        if query.mask != MASK_PLAYERSOLID {
+        if query.mask != MASK_PLAYERSOLID && query.mask != JK2_MASK_PLAYERSOLID {
             return self.world.trace(query);
         }
         query.pass_entity = self.skip_entity;
@@ -428,7 +430,7 @@ pub fn jk2_probe_footstep(
         maxs: JK2_HULL_MAXS,
         end,
         pass_entity: i32::from(entity),
-        mask: MASK_PLAYERSOLID,
+        mask: JK2_MASK_PLAYERSOLID,
     });
     let step = (hit.fraction < 1.0 && hit.surface_flags & JK2_SURF_NOSTEPS == 0).then_some(Jk2Footstep {
         entity,
@@ -904,7 +906,7 @@ BOTH_STAND1 400 30 0 20
             assert_eq!(query.mins, JK2_HULL_MINS);
             assert_eq!(query.maxs, JK2_HULL_MAXS);
             assert_eq!(query.pass_entity, 7);
-            assert_eq!(query.mask, MASK_PLAYERSOLID);
+            assert_eq!(query.mask, JK2_MASK_PLAYERSOLID);
             let mut hit = TraceResult::clear(query.end);
             hit.fraction = self.fraction;
             hit.surface_flags = self.flags;

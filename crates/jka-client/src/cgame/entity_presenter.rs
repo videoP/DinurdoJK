@@ -1336,6 +1336,17 @@ impl EntityPresenter {
 
         // CG_AddLocalEntities: LE_FRAGMENT debris from EV_DEBRIS.
         for chunk in weapon_fx.chunk_models().into_iter().chain(ghoul2.physics_debris_models(time)) {
+            if let Some(piece) = &chunk.dynamic_gib {
+                match ghoul2.present_dynamic_gib(piece, &chunk) {
+                    Ok(mut surfaces) => draws.append(&mut surfaces),
+                    Err(error) => {
+                        if self.logged_unsupported.insert(format!("dynamic-gib:{error}")) {
+                            println!("DYNAMIC GIB: {error}");
+                        }
+                    }
+                }
+                continue;
+            }
             let submission = ItemDraw {
                 model: chunk.qpath.clone(),
                 origin: chunk.origin,

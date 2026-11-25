@@ -68,23 +68,35 @@ const STOP_FADE_SECONDS: f32 = 0.004;
 const MAX_LOOP_VOICES: usize = 32;
 // Dedicated dry river budget: never displace a legacy loop or one-shot.
 pub const MAX_RIVER_LOOP_VOICES: usize = 16;
-/// River recordings live beside the other japro sounds: `sound/japro/<name>.wav`
-/// and `<name>_2.wav`, `<name>_3.wav` variants. Six required layers, then three
-/// optional specialist textures.
-pub const RIVER_LOOP_ROOT: &str = "sound/japro/";
-pub const RIVER_LOOP_NAMES: [&str; 9] = [
-    "still", "calm", "slow", "fast", "rapids", "waterfall", "riffles", "eddies", "hydraulics",
+/// EchoField's CC0 recordings, grouped by hydraulic role (not filename order).
+/// Each loop belongs to exactly one layer: the mixer keys a river voice by
+/// (emitter, qpath), so overlapping layer banks would collapse two voices.
+pub const RIVER_LOOP_BANKS: [&[&str]; 6] = [
+    // Quiet broad water: small waves (upstream still_01..03).
+    &["sound/japro/still/still_01.ogg", "sound/japro/still/still_02.ogg", "sound/japro/still/still_03.ogg"],
+    // Gentle current: small streams.
+    &["sound/japro/flow/flow_01.ogg", "sound/japro/flow/flow_02.ogg"],
+    // Riffles / moderate flow: brooklet.
+    &["sound/japro/flow/flow_04.ogg"],
+    // Fast / turbulent current: louder watercourse recordings.
+    &["sound/japro/flow/flow_07.ogg", "sound/japro/flow/flow_08.ogg"],
+    // Drop arrivals: small cascade and the quieter waterfall recordings.
+    &["sound/japro/flow/flow_03.ogg", "sound/japro/flow/flow_05.ogg", "sound/japro/flow/flow_06.ogg"],
+    // Aeration / eddies: original still_06 and still_07, renumbered in PK3.
+    &["sound/japro/still/still_04.ogg", "sound/japro/still/still_05.ogg"],
 ];
-/// The shared folder also holds rain, thunder and other loops, so a river loop
-/// is identified by its file name, not its folder.
+pub const RIVER_DRIP_PATHS: [&str; 8] = [
+    "sound/japro/drip/drip_01.ogg", "sound/japro/drip/drip_02.ogg",
+    "sound/japro/drip/drip_03.ogg", "sound/japro/drip/drip_04.ogg",
+    "sound/japro/drip/drip_05.ogg", "sound/japro/drip/drip_06.ogg",
+    "sound/japro/drip/drip_07.ogg", "sound/japro/drip/drip_08.ogg",
+];
 fn is_river_loop_qpath(qpath: &str) -> bool {
-    let Some(file) = qpath.strip_prefix(RIVER_LOOP_ROOT) else { return false };
-    let Some(stem) = file.strip_suffix(".wav") else { return false };
-    let base = match stem.rsplit_once('_') {
-        Some((base, variant)) if variant.parse::<u8>().is_ok() => base,
-        _ => stem,
-    };
-    RIVER_LOOP_NAMES.contains(&base)
+    RIVER_LOOP_BANKS.iter().any(|bank| bank.contains(&qpath))
+}
+const RIVER_DRIP_ENTITY: u16 = u16::MAX;
+fn is_river_drip(request: &SoundRequest) -> bool {
+    request.entity == RIVER_DRIP_ENTITY && RIVER_DRIP_PATHS.contains(&request.qpath.as_str())
 }
 const RIVER_LOOP_PREFIX: &str = "\u{1e}river:";
 const CHAN_AUTO: i32 = 0;
@@ -160,6 +172,13 @@ impl RegisteredSound {
         if samples.is_empty() { return None; }
         Some(Self { samples: samples.into(), sample_rate: rodio::SampleRate::new(rate)? })
     }
+    /// RMS of the decoded mono recording, evaluated once when a river clip
+    /// enters its bank. Keep source PCM shared with the normal SFX cache.
+    pub fn rms(&self) -> f32 {
+        if self.samples.is_empty() { return 0.0; }
+        (self.samples.iter().map(|&sample| f64::from(sample).powi(2)).sum::<f64>()
+            / self.samples.len() as f64).sqrt() as f32
+    }
     /// Scale to the given absolute peak; silent input is returned unchanged.
     pub(crate) fn normalized(self, peak: f32) -> Self {
         let max = self.samples.iter().fold(0.0f32, |max, sample| max.max(sample.abs()));
@@ -187,10 +206,8 @@ impl SoundDecodeJob {
     pub fn from_emote(key: String, bytes: Vec<u8>) -> Self { Self { key: key.to_ascii_lowercase(), bytes } }
     pub fn byte_len(&self) -> usize { self.bytes.len() }
     pub fn decode(self) -> SoundDecodeResult {
-        SoundDecodeResult {
-            key: self.key,
-            decoded: decode_sound(self.bytes),
-        }
+        let decoded = decode_asset(&self.key, self.bytes);
+        SoundDecodeResult { key: self.key, decoded }
     }
 }
 
@@ -244,20 +261,8 @@ impl SoundAssets {
     /// Long ambience needs MP3 padding removed and a short overlap at its seam.
     /// Keep legacy one-shot decoding unchanged: some JKA clips have bad tags.
     pub fn register_ambient_loop(&mut self, qpath: &str) -> Result<Arc<RegisteredSound>, String> {
-        let mut sound = decode_sound_with_gapless(self.load_bytes(qpath)?, true)?;
-        let overlap = (sound.sample_rate.get() as usize / 20).min(sound.samples.len() / 4);
-        if overlap > 1 {
-            let mut samples = sound.samples[overlap..].to_vec();
-            let tail = samples.len() - overlap;
-            for i in 0..overlap {
-                let t = i as f32 / (overlap - 1) as f32;
-                // Equal-power overlap keeps steady rain from dipping at the seam.
-                let angle = t * std::f32::consts::FRAC_PI_2;
-                samples[tail + i] = samples[tail + i] * angle.cos() + sound.samples[i] * angle.sin();
-            }
-            sound.samples = samples.into();
-        }
-        Ok(Arc::new(sound))
+        let sound = decode_sound_with_gapless(self.load_bytes(qpath)?, true)?;
+        Ok(Arc::new(prepare_ambient_loop(sound)))
     }
 
     pub fn register(&mut self, qpath: &str) -> Result<Arc<RegisteredSound>, String> {
@@ -486,7 +491,11 @@ impl SoundAssets {
         }
         // JKA commonly requests a .wav whose shipped asset is an .mp3.
         let stem = qpath.strip_suffix(".wav").or_else(|| qpath.strip_suffix(".mp3")).unwrap_or(qpath);
-        let candidates = if qpath.ends_with(".wav") || qpath.ends_with(".mp3") {
+        let candidates = if qpath.ends_with(".ogg") {
+            // Explicit compressed recordings must be read verbatim; do not
+            // append .wav/.mp3 or silently substitute a different asset.
+            vec![qpath.to_owned()]
+        } else if qpath.ends_with(".wav") || qpath.ends_with(".mp3") {
             vec![qpath.to_owned(), format!("{stem}.wav"), format!("{stem}.mp3")]
         } else { vec![format!("{stem}.wav"), format!("{stem}.mp3")] };
         for candidate in candidates {
@@ -498,7 +507,8 @@ impl SoundAssets {
     }
 
     fn load(&mut self, qpath: &str) -> Result<RegisteredSound, String> {
-        let sound = decode_sound(self.load_bytes(qpath)?)?;
+        let bytes = self.load_bytes(qpath)?;
+        let sound = decode_asset(qpath, bytes)?;
         self.reserve_sound_cache(sound.samples.len())?;
         if self.cached_samples + sound.samples.len() > MAX_CACHE_SAMPLES {
             return Err("SFX cache limit reached (128 MiB)".into());
@@ -527,6 +537,29 @@ impl SoundAssets {
         if self.cached_samples + incoming > MAX_CACHE_SAMPLES { return Err("SFX cache limit reached (128 MiB)".into()); }
         Ok(())
     }
+}
+
+/// Apply the existing menu ambience seam treatment to real river recordings
+/// once, before they enter the shared PCM cache. This is identical for the
+/// software, Steam Audio and native acoustic playback routes.
+fn prepare_ambient_loop(mut sound: RegisteredSound) -> RegisteredSound {
+    let overlap = (sound.sample_rate.get() as usize / 20).min(sound.samples.len() / 4);
+    if overlap > 1 {
+        let mut samples = sound.samples[overlap..].to_vec();
+        let tail = samples.len() - overlap;
+        for i in 0..overlap {
+            let t = i as f32 / (overlap - 1) as f32;
+            let angle = t * std::f32::consts::FRAC_PI_2;
+            samples[tail + i] = samples[tail + i] * angle.cos() + sound.samples[i] * angle.sin();
+        }
+        sound.samples = samples.into();
+    }
+    sound
+}
+
+fn decode_asset(qpath: &str, bytes: Vec<u8>) -> Result<RegisteredSound, String> {
+    let sound = decode_sound(bytes)?;
+    Ok(if is_river_loop_qpath(qpath) { prepare_ambient_loop(sound) } else { sound })
 }
 
 pub(crate) fn decode_sound(bytes: Vec<u8>) -> Result<RegisteredSound, String> {
@@ -3198,6 +3231,27 @@ impl AudioBackend {
         self.voices.push(Voice { loop_start, player, wet_player, sound: retained_sound, gains, request, steam_audio_capable, volume, doppler: 1.0 });
     }
 
+    /// Sparse river drop arrivals use the same positional route as other
+    /// world SFX, but never evict a gameplay voice to enter the pool.
+    pub fn try_play_river_drip(&mut self, qpath: &str, sound: Arc<RegisteredSound>, origin: [f32; 3], volume: f32) -> bool {
+        if self.rate <= 0.0 || volume <= 0.0 || !RIVER_DRIP_PATHS.contains(&qpath) { return false; }
+        self.reap_finished_voices();
+        if self.voices.len() >= MAX_VOICES - 8
+            || self.voices.iter().any(|voice| is_river_drip(&voice.request)) { return false; }
+        self.play_ambient(SoundRequest {
+            qpath: qpath.to_owned(), entity: RIVER_DRIP_ENTITY, channel: CHAN_AUTO,
+            origin: SoundOrigin::Fixed(origin),
+        }, sound, volume);
+        true
+    }
+
+    pub fn clear_river_drips(&mut self) {
+        if let Some(index) = self.voices.iter().position(|voice| is_river_drip(&voice.request)) {
+            let voice = self.voices.remove(index);
+            self.retire(voice.player, voice.wet_player, &voice.gains);
+        }
+    }
+
     /// `S_StartAmbientSound`: a one-shot at `volume` (0..=1 of full).
     pub fn play_ambient(&mut self, request: SoundRequest, sound: Arc<RegisteredSound>, volume: f32) {
         self.play_scaled(request, sound, volume.clamp(0.0, 1.0));
@@ -3444,6 +3498,30 @@ fn spatialize_detail(origin: [f32; 3], listener: Listener, channel: i32, separat
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn river_recordings_keep_exact_positional_loop_identity() {
+        use super::*;
+        let mut paths = std::collections::HashSet::new();
+        for path in RIVER_LOOP_BANKS.iter().flat_map(|bank| bank.iter().copied()) {
+            assert!(paths.insert(path), "one path must not belong to two hydraulic roles");
+            assert!(is_river_loop_qpath(path));
+        }
+        assert_eq!(paths.len(), 13);
+        for path in RIVER_DRIP_PATHS {
+            assert!(!is_river_loop_qpath(path));
+        }
+        assert!(!is_river_loop_qpath("sound/japro/still.wav"));
+        assert!(!is_river_loop_qpath("sound/japro/rain/rain_03.ogg"));
+        let (backend, _output) = AudioBackend::offline();
+        let request = |emitter| LoopRequest {
+            emitter, qpath: RIVER_LOOP_BANKS[1][0].into(),
+            origin: SoundOrigin::Fixed([0.0; 3]), volume: 0.2,
+        };
+        assert!(request(1u64 << 63).is_river());
+        assert!(!request(1).is_river());
+        assert_ne!(backend.loop_key(&request(1u64 << 63)), backend.loop_key(&request((1u64 << 63) | 1)));
+    }
+
     #[test]
     fn menu_rain_mp3_padding_and_loop_seam() {
         use super::*;

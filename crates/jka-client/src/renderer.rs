@@ -256,7 +256,7 @@ use api::{
     DYNAMIC_MODEL_ALPHA_ORDER, DYNAMIC_MODEL_VERTEX_WORDS, MAX_CLOUD_FOREGROUND_BLADES,
 };
 pub use api::{
-    ClientFramePerf, ClothGpuCollider, ClothGpuFrame, ClothGpuGarment, ClothGpuSurface, ClothGpuTuning,
+    ClientFramePerf, ClothGpuCollider, ClothGpuFrame, ClothGpuGarment, ClothGpuSurface, ClothGpuTuning, UnifiedClothSettings,
     CloudForegroundBlade, CompanionId, CompanionSceneView, DynamicModelAlphaMode,
     DynamicModelSurface, DynamicModelVertex, DynamicWireframeClass, EguiRenderData, ModelGeometrySource,
     FxGpuSpriteInstance, FxGpuSprites, FxGpuResidentSprites, FxGpuResidentFrame, Ghoul2GpuBone, Ghoul2GpuSkinning, Ghoul2GpuVertex, Ghoul2SkinGore,
@@ -952,7 +952,7 @@ struct Renderer {
     ocean_inert_bind_group: wgpu::BindGroup,
     ocean_spray_albedo: GpuImage,
     lake_normal: wgpu::TextureView,
-    /// HL2 `materials/dev/water_normal.vtf` frames for lake water:
+    /// HL2 `textures/japro/water_normal.vtf` frames for lake water:
     /// `None` until first selected, then the load result (kept on failure).
     source_water_normal: Option<Option<wgpu::TextureView>>,
     detail_texture: GpuImage,

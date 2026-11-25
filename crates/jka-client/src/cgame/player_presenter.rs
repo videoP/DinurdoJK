@@ -14,6 +14,8 @@ mod cloth;
 mod cloak;
 mod cosmetics;
 mod disintegration;
+mod dynamic_gibs;
+pub(crate) use dynamic_gibs::DynamicGib;
 mod diagnostics;
 mod effects;
 mod events;
@@ -398,7 +400,8 @@ pub struct PlayerPresenter {
     preview_source_jiggles: HashMap<String, jka_assets::source1_jiggle::SourceJiggleAnimator>,
     /// r_jigglePhysics target selection by the loaded model's authored sex.
     jiggle_sex_filter: u8,
-    /// cg_hairPhysics: 0 off, 1 authored only, 2 authored and promoted native GLM hair.
+    /// cg_hairPhysics: 0 off, 1 authored only, 2 authored and promoted native GLM hair,
+    /// 3 authored springs + native GLM hair as CPU cloth (else as 2).
     hair_physics_mode: u8,
     /// Topology-only breast/glute height offsets. A change invalidates the cached
     /// player-model meshes so wireframe and promoted geometry update immediately.
@@ -440,6 +443,8 @@ pub struct PlayerPresenter {
     /// Last fully evaluated player/body pose, used to clone the severed Ghoul2
     /// subset at the exact visual frame the server part first appears.
     dismember_source_snaps: HashMap<u16, DismemberSourceSnap>,
+    dynamic_gibs_enabled: bool,
+    dynamic_gib_sources: HashMap<u16, dynamic_gibs::GibSource>,
     detached_limb_visuals: HashMap<u16, DetachedLimbVisual>,
     /// OpenJK clientInfo_t saber blade current/desired lengths.
     saber_blade_lengths: HashMap<SaberBladeLengthKey, SaberBladeLengthState>,

@@ -303,6 +303,11 @@ impl App {
                 {
                     add(entry.name, entry.name, entry.description);
                 }
+                if source != Source::Commands {
+                    for cvar in self.network.user_cvars.values() {
+                        add(&cvar.name, &cvar.name, "User-created cvar.");
+                    }
+                }
                 if source == Source::Commands {
                     // Commands in binds include +movement actions, which aren't all
                     // part of the registered console command/cvar set.

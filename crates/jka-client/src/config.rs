@@ -228,7 +228,8 @@ pub struct GameOptions {
     /// `cg_ambientSounds`: level ambience (`sound.txt` general/local sets).
     pub ambient: bool,
     /// `cg_blood`: 0 off, 1 Ninja blood/SkinGore and one skull/brain gib,
-    /// 2 the same blood plus TaystJK's complete 10-fragment gib burst.
+    /// 2 the same blood plus TaystJK's complete 10-fragment gib burst;
+    /// 3 model-derived Ghoul2 fragments instead of stock MD3 gibs.
     pub blood: u8,
     /// `cg_autoSwitch`: 0 never, 1 switch to a better *safe* weapon on pickup (and
     /// when one runs dry), 2 any better weapon.

@@ -393,6 +393,7 @@ impl VideoSection {
 pub(in crate::app) enum SetupSection {
     GameSystem,
     GameGameplay,
+    GamePlayerVisibility,
     GamePresentation,
     AudioGeneral,
     AudioPositional,
@@ -407,7 +408,8 @@ impl SetupSection {
         match self {
             Self::GameSystem => "Launch & updates",
             Self::GameGameplay => "Gameplay & animations",
-            Self::GamePresentation => "Spectating & effects",
+            Self::GamePlayerVisibility => "Player visibility & effects",
+            Self::GamePresentation => "Spectating",
             Self::AudioGeneral => "General Audio",
             Self::AudioPositional => "Positional Audio",
             Self::InterfaceHud => "HUD & appearance",
@@ -419,7 +421,7 @@ impl SetupSection {
 
     fn tab(self) -> usize {
         match self {
-            Self::GameSystem | Self::GameGameplay | Self::GamePresentation => SETUP_TAB_GAME,
+            Self::GameSystem | Self::GameGameplay | Self::GamePlayerVisibility | Self::GamePresentation => SETUP_TAB_GAME,
             Self::AudioGeneral | Self::AudioPositional => SETUP_TAB_AUDIO,
             Self::InterfaceHud | Self::InterfaceMovement | Self::InterfaceOverlays | Self::InterfaceChat => SETUP_TAB_INTERFACE,
         }
@@ -429,7 +431,8 @@ impl SetupSection {
 const GAME_SECTIONS: &[(SetupSection, &str)] = &[
     (SetupSection::GameSystem, "Launch & updates"),
     (SetupSection::GameGameplay, "Gameplay & animations"),
-    (SetupSection::GamePresentation, "Spectating & effects"),
+    (SetupSection::GamePlayerVisibility, "Player visibility & effects"),
+    (SetupSection::GamePresentation, "Spectating"),
 ];
 const AUDIO_SECTIONS: &[(SetupSection, &str)] = &[
     (SetupSection::AudioGeneral, "General Audio"),

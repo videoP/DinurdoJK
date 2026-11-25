@@ -299,6 +299,34 @@ app_cvars! {
         ]
     }
 
+    APP_R_CLOTHSELFCOLLISION {
+        runtime: CvarDef::new(
+            "r_clothSelfCollision", "", "0..1",
+            "CPU cloth solver: keep layers of one garment (folds, cape over robe) from passing through each other.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(bool_value(app.video.cloth_self_collision)),
+            |app, value| App::cvar_set_r_clothselfcollision(app, APP_R_CLOTHSELFCOLLISION.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_clothselfcollision, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                settings.cloth_self_collision =
+                    parse_bool(value).unwrap_or(settings.cloth_self_collision);
+            }),
+            archive: Some((215, |state| format!("{}", u8::from(state.video.cloth_self_collision)))),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothselfcollision(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    self.video.cloth_self_collision = Self::parse_cvar_bool(name, value)?;
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_R_CLOTHPHYSICS {
         runtime: CvarDef::new(
                 "r_clothPhysics",
@@ -501,8 +529,8 @@ app_cvars! {
         runtime: CvarDef::new(
                 "r_clothSolver",
                 "",
-                "0..1",
-                "Cloth solver: 0 CPU (XPBD worker), 1 GPU (gpu-cloth-sim compute port; needs r_ghoul2Skinning gpu, otherwise the CPU solver runs).",
+                "0..2",
+                "Cloth solver: 0 CPU XPBD, 1 Godot GPU PBD, 2 Unified GPU XPBD. GPU modes need r_ghoul2Skinning gpu; otherwise CPU cloth runs.",
                 CvarType::String,
                 CvarFlags::ARCHIVE,
                 LatchScope::None,
@@ -513,7 +541,7 @@ app_cvars! {
         config: CvarBinding {
                 load_video: Some(|settings, _name, value, _context| {
                     if let Some(v) = value.trim().parse::<u8>().ok() {
-                        settings.cloth_solver = v.clamp(0, 1);
+                        settings.cloth_solver = v.clamp(0, 2);
                     }
                 }),
                 archive: Some((200, |state| state.video.cloth_solver.to_string())),
@@ -527,7 +555,307 @@ app_cvars! {
                         .parse::<u8>()
                         .ok()
                         .ok_or_else(|| format!("{name}: expected an integer"))?;
-                    self.video.cloth_solver = amount.clamp(0, 1);
+                    self.video.cloth_solver = amount.clamp(0, 2);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHUNIFIEDSUBSTEPS {
+        runtime: CvarDef::new(
+            "r_clothUnifiedSubsteps", "", "1..128", "Number of Small Steps substeps per fixed physics tick; one Jacobi solve per substep.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.cloth_unified.substeps.to_string()),
+            |app, value| App::cvar_set_r_clothunifiedsubsteps(app, APP_R_CLOTHUNIFIEDSUBSTEPS.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_clothunifiedsubsteps, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = value.trim().parse::<u32>().ok() {
+                    settings.cloth_unified.substeps = v.clamp(1, 128);
+                }
+            }),
+            archive: Some((200, |state| state.video.cloth_unified.substeps.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothunifiedsubsteps(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value.trim().parse::<u32>().ok()
+                        .ok_or_else(|| format!("{name}: invalid value"))?;
+                    self.video.cloth_unified.substeps = amount.clamp(1, 128);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHUNIFIEDCOMPLIANCE {
+        runtime: CvarDef::new(
+            "r_clothUnifiedCompliance", "", "0.0..100.0", "XPBD distance compliance alpha; zero is rigid, not the legacy cloth stiffness.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.cloth_unified.compliance.to_string()),
+            |app, value| App::cvar_set_r_clothunifiedcompliance(app, APP_R_CLOTHUNIFIEDCOMPLIANCE.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_clothunifiedcompliance, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = value.trim().parse::<f32>().ok().filter(|v| v.is_finite()) {
+                    settings.cloth_unified.compliance = v.clamp(0.0, 100.0);
+                }
+            }),
+            archive: Some((200, |state| state.video.cloth_unified.compliance.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothunifiedcompliance(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value.trim().parse::<f32>().ok().filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("{name}: invalid value"))?;
+                    self.video.cloth_unified.compliance = amount.clamp(0.0, 100.0);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHUNIFIEDCONSTRAINTDAMPING {
+        runtime: CvarDef::new(
+            "r_clothUnifiedConstraintDamping", "", "0.0..1000000.0", "XPBD distance damping beta (independent of global velocity damping).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.cloth_unified.constraint_damping.to_string()),
+            |app, value| App::cvar_set_r_clothunifiedconstraintdamping(app, APP_R_CLOTHUNIFIEDCONSTRAINTDAMPING.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_clothunifiedconstraintdamping, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = value.trim().parse::<f32>().ok().filter(|v| v.is_finite()) {
+                    settings.cloth_unified.constraint_damping = v.clamp(0.0, 1000000.0);
+                }
+            }),
+            archive: Some((200, |state| state.video.cloth_unified.constraint_damping.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothunifiedconstraintdamping(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value.trim().parse::<f32>().ok().filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("{name}: invalid value"))?;
+                    self.video.cloth_unified.constraint_damping = amount.clamp(0.0, 1000000.0);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHUNIFIEDRADIUS {
+        runtime: CvarDef::new(
+            "r_clothUnifiedRadius", "", "0.0001..1.0", "Particle radius in metres. Hash cell size is twice this radius.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.cloth_unified.particle_radius.to_string()),
+            |app, value| App::cvar_set_r_clothunifiedradius(app, APP_R_CLOTHUNIFIEDRADIUS.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_clothunifiedradius, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = value.trim().parse::<f32>().ok().filter(|v| v.is_finite()) {
+                    settings.cloth_unified.particle_radius = v.clamp(0.0001, 1.0);
+                }
+            }),
+            archive: Some((200, |state| state.video.cloth_unified.particle_radius.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothunifiedradius(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value.trim().parse::<f32>().ok().filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("{name}: invalid value"))?;
+                    self.video.cloth_unified.particle_radius = amount.clamp(0.0001, 1.0);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHUNIFIEDSOR {
+        runtime: CvarDef::new(
+            "r_clothUnifiedSOR", "", "1.0..2.0", "Successive over-relaxation factor (upstream range 1..2).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.cloth_unified.sor.to_string()),
+            |app, value| App::cvar_set_r_clothunifiedsor(app, APP_R_CLOTHUNIFIEDSOR.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_clothunifiedsor, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = value.trim().parse::<f32>().ok().filter(|v| v.is_finite()) {
+                    settings.cloth_unified.sor = v.clamp(1.0, 2.0);
+                }
+            }),
+            archive: Some((200, |state| state.video.cloth_unified.sor.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothunifiedsor(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value.trim().parse::<f32>().ok().filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("{name}: invalid value"))?;
+                    self.video.cloth_unified.sor = amount.clamp(1.0, 2.0);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHUNIFIEDFRICTIONSTATIC {
+        runtime: CvarDef::new(
+            "r_clothUnifiedFrictionStatic", "", "0.0..2.0", "Coulomb static friction coefficient (upstream range 0..2).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.cloth_unified.friction_static.to_string()),
+            |app, value| App::cvar_set_r_clothunifiedfrictionstatic(app, APP_R_CLOTHUNIFIEDFRICTIONSTATIC.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_clothunifiedfrictionstatic, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = value.trim().parse::<f32>().ok().filter(|v| v.is_finite()) {
+                    settings.cloth_unified.friction_static = v.clamp(0.0, 2.0);
+                }
+            }),
+            archive: Some((200, |state| state.video.cloth_unified.friction_static.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothunifiedfrictionstatic(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value.trim().parse::<f32>().ok().filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("{name}: invalid value"))?;
+                    self.video.cloth_unified.friction_static = amount.clamp(0.0, 2.0);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHUNIFIEDFRICTIONKINETIC {
+        runtime: CvarDef::new(
+            "r_clothUnifiedFrictionKinetic", "", "0.0..2.0", "Coulomb kinetic friction coefficient; keep it at or below static friction, as upstream recommends.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.cloth_unified.friction_kinetic.to_string()),
+            |app, value| App::cvar_set_r_clothunifiedfrictionkinetic(app, APP_R_CLOTHUNIFIEDFRICTIONKINETIC.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_clothunifiedfrictionkinetic, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = value.trim().parse::<f32>().ok().filter(|v| v.is_finite()) {
+                    settings.cloth_unified.friction_kinetic = v.clamp(0.0, 2.0);
+                }
+            }),
+            archive: Some((200, |state| state.video.cloth_unified.friction_kinetic.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothunifiedfrictionkinetic(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value.trim().parse::<f32>().ok().filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("{name}: invalid value"))?;
+                    self.video.cloth_unified.friction_kinetic = amount.clamp(0.0, 2.0);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHUNIFIEDMAXDEPENETRATIONSPEED {
+        runtime: CvarDef::new(
+            "r_clothUnifiedMaxDepenetrationSpeed", "", "0.0..100.0", "Maximum particle-contact depenetration speed in metres/second.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(app.video.cloth_unified.max_depenetration_speed.to_string()),
+            |app, value| App::cvar_set_r_clothunifiedmaxdepenetrationspeed(app, APP_R_CLOTHUNIFIEDMAXDEPENETRATIONSPEED.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_clothunifiedmaxdepenetrationspeed, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = value.trim().parse::<f32>().ok().filter(|v| v.is_finite()) {
+                    settings.cloth_unified.max_depenetration_speed = v.clamp(0.0, 100.0);
+                }
+            }),
+            archive: Some((200, |state| state.video.cloth_unified.max_depenetration_speed.to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothunifiedmaxdepenetrationspeed(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value.trim().parse::<f32>().ok().filter(|v| v.is_finite())
+                        .ok_or_else(|| format!("{name}: invalid value"))?;
+                    self.video.cloth_unified.max_depenetration_speed = amount.clamp(0.0, 100.0);
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHUNIFIEDSELFCOLLISION {
+        runtime: CvarDef::new(
+            "r_clothUnifiedSelfCollision", "", "0..1", "Enable same-garment particle contacts (phase zero), including adjacent particles, exactly as upstream ClothGenerator.",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(u8::from(app.video.cloth_unified.self_collision).to_string()),
+            |app, value| App::cvar_set_r_clothunifiedselfcollision(app, APP_R_CLOTHUNIFIEDSELFCOLLISION.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_clothunifiedselfcollision, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = value.trim().parse::<u8>().ok().filter(|v| *v <= 1).map(|v| v != 0) {
+                    settings.cloth_unified.self_collision = v;
+                }
+            }),
+            archive: Some((200, |state| u8::from(state.video.cloth_unified.self_collision).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothunifiedselfcollision(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value.trim().parse::<u8>().ok().filter(|v| *v <= 1).map(|v| v != 0)
+                        .ok_or_else(|| format!("{name}: invalid value"))?;
+                    self.video.cloth_unified.self_collision = amount;
+                    self.mark_config_dirty();
+                    self.publish_ui();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
+    APP_R_CLOTHUNIFIEDPARTICLECOLLISION {
+        runtime: CvarDef::new(
+            "r_clothUnifiedParticleCollision", "", "0..1", "Enable upstream particle hashing and contact dispatches (including inter-garment contacts).",
+            CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app: &App| CvarValue::String(u8::from(app.video.cloth_unified.particle_collision).to_string()),
+            |app, value| App::cvar_set_r_clothunifiedparticlecollision(app, APP_R_CLOTHUNIFIEDPARTICLECOLLISION.entry.name, &value.to_string()),
+        ).with_text_setter(App::cvar_set_r_clothunifiedparticlecollision, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(v) = value.trim().parse::<u8>().ok().filter(|v| *v <= 1).map(|v| v != 0) {
+                    settings.cloth_unified.particle_collision = v;
+                }
+            }),
+            archive: Some((200, |state| u8::from(state.video.cloth_unified.particle_collision).to_string())),
+            ..CvarBinding::NONE
+        },
+        implementations: [
+            impl App {
+                fn cvar_set_r_clothunifiedparticlecollision(&mut self, name: &str, value: &str) -> Result<(), String> {
+                    let amount = value.trim().parse::<u8>().ok().filter(|v| *v <= 1).map(|v| v != 0)
+                        .ok_or_else(|| format!("{name}: invalid value"))?;
+                    self.video.cloth_unified.particle_collision = amount;
                     self.mark_config_dirty();
                     self.publish_ui();
                     Ok(())

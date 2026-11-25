@@ -154,6 +154,11 @@ pub(crate) struct ClothConfig {
     pub hz: u32,
     pub max_substeps: u32,
     pub body_collision: bool,
+    /// r_clothSelfCollision: layers of one garment collide (see `SelfContactSource`).
+    pub self_collision: bool,
+    /// cg_hairSelfCollision: hair particles (cg_hairPhysics 3) collide with
+    /// each other, and with garment fabric when r_clothSelfCollision is also on.
+    pub hair_self_collision: bool,
     pub body_clearance: f32,
     pub air_resistance: f32,
     pub turn_response: f32,
@@ -175,6 +180,8 @@ impl Default for ClothConfig {
             hz: 60,
             max_substeps: 4,
             body_collision: true,
+            self_collision: false,
+            hair_self_collision: false,
             body_clearance: 1.0,
             air_resistance: 1.0,
             turn_response: 1.8,
@@ -504,6 +511,9 @@ struct ClothInstance {
     tethers: Vec<(u32, f32)>,
     /// Deviation from reference beyond which state is invalid (metres).
     runaway_limit: f32,
+    self_collision: SelfCollisionCache,
+    /// Per particle: from a hair surface (cg_hairPhysics 3). Empty without hair.
+    hair_particles: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -637,6 +647,14 @@ impl ClothSystem {
                 .any(|needle| name.contains(needle))
     }
 
+    /// cg_hairPhysics 3: GLM surfaces whose name *begins* with `hair` (the
+    /// same rule as the spring promotion in jka_assets::source1_jiggle).
+    /// A garment name wins, so a surface is never both cloth and hair.
+    pub fn is_hair_surface_name(name: &str) -> bool {
+        name.get(..4).is_some_and(|prefix| prefix.eq_ignore_ascii_case("hair"))
+            && !Self::is_cloth_surface_name(name)
+    }
+
     /// Simulate all active cloth surfaces for one player as one garment.
     ///
     /// The important invariant is that GLM surface boundaries are a rendering
@@ -665,7 +683,9 @@ impl ClothSystem {
             return Err("invalid cloth render transform".to_owned());
         }
         for surface in surfaces {
-            if !Self::is_cloth_surface_name(&surface.surface_name) {
+            if !Self::is_cloth_surface_name(&surface.surface_name)
+                && !Self::is_hair_surface_name(&surface.surface_name)
+            {
                 return Err(format!(
                     "{model_label}: surface {:?} is not an auto-cloth surface",
                     surface.surface_name
@@ -804,7 +824,17 @@ impl ClothSystem {
                 instance.wind_time = now_ms as f32 * 0.001 - instance.accumulator + h;
                 drive_secondary_motion(instance, &tick_targets, tick_motion, h, config)?;
                 let tick_capsules = interpolate_capsules(&instance.frame_capsules, capsules, t);
-                let mut contacts = CapsuleContactSource {
+                let has_hair = !instance.hair_particles.is_empty();
+                let self_contacts =
+                    config.self_collision || (config.hair_self_collision && has_hair);
+                if self_contacts {
+                    instance.self_collision.ensure_topology(
+                        instance.reference.len(),
+                        &instance.debug_edges,
+                        &instance.pinned,
+                    );
+                }
+                let body_contacts = CapsuleContactSource {
                     capsules: if config.body_collision {
                         &tick_capsules
                     } else {
@@ -819,6 +849,17 @@ impl ClothSystem {
                     prepared: Vec::new(),
                     rest: Some(&instance.topology.contact.rest),
                     clearance: config.body_clearance.clamp(0.0, 4.0) * METRES_PER_JKA_UNIT,
+                };
+                let mut contacts = GarmentContacts {
+                    body: body_contacts,
+                    own: self_contacts.then(|| SelfContactSource {
+                        cache: &mut instance.self_collision,
+                        reference: &instance.reference,
+                        targets: &tick_targets,
+                        hair: &instance.hair_particles,
+                        fabric_enabled: config.self_collision,
+                        hair_enabled: config.hair_self_collision,
+                    }),
                 };
                 let follow_targets = build_follow_targets(
                     &instance.cloth,
@@ -1353,6 +1394,12 @@ fn build_instance(
     }
     let flat_posed = flatten_positions(surfaces, |surface| &surface.posed_positions);
     let flat_bind = flatten_positions(surfaces, |surface| &surface.bind_positions);
+    // cg_hairPhysics 3: hair shares this garment's solver, body contacts and
+    // self collision, but never its seams, anchors or follow falloff.
+    let hair_surfaces = surfaces
+        .iter()
+        .map(|surface| ClothSystem::is_hair_surface_name(&surface.surface_name))
+        .collect::<Vec<_>>();
     let mut dsu = DisjointSet::new(total_vertices);
 
     // First remove ordinary UV/normal duplication *within each GLM surface*.
@@ -1398,7 +1445,10 @@ fn build_instance(
     for a_index in 0..boundary_nodes.len() {
         let a = boundary_nodes[a_index];
         for &b in &boundary_nodes[a_index + 1..] {
-            if a.surface_ordinal == b.surface_ordinal {
+            // Hair is never sewn onto a hood or collar it happens to touch.
+            if a.surface_ordinal == b.surface_ordinal
+                || hair_surfaces[a.surface_ordinal] != hair_surfaces[b.surface_ordinal]
+            {
                 continue;
             }
             let distance_sq = (a.position - b.position).length_squared();
@@ -1546,6 +1596,17 @@ fn build_instance(
     let hanging = surfaces
         .iter()
         .any(|surface| is_hanging_garment_name(&surface.surface_name));
+    // Particles of hair surfaces (seam welds never cross hair/fabric).
+    let ordinal_of = |global: usize| offsets.partition_point(|&start| start <= global) - 1;
+    let hair_particles = if hair_surfaces.iter().any(|&hair| hair) {
+        particle_members
+            .iter()
+            .map(|members| members.first().is_some_and(|&first| hair_surfaces[ordinal_of(first)]))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let is_hair = |particle: usize| hair_particles.get(particle).copied().unwrap_or(false);
     let seam_particles = hanging.then(|| {
         particle_members
             .iter()
@@ -1563,11 +1624,27 @@ fn build_instance(
         &mut dsu,
         &root_to_particle,
         seam_particles.as_deref(),
+        &hair_surfaces,
     );
     // Small closed openings around the body act as sewn cuffs/collars. Large
     // free hems remain dynamic. This uses topology and proximity, not names.
-    let opening_pins = fitted_opening_anchors(&rest_positions, &sim_triangles, capsules);
+    // Hair attaches at its roots only (a ponytail tie is not a cuff).
+    let mut opening_pins = fitted_opening_anchors(&rest_positions, &sim_triangles, capsules);
+    opening_pins.retain(|&particle| !is_hair(particle as usize));
     pinned.extend(opening_pins.iter().copied());
+    if !hair_particles.is_empty() {
+        let bind_particles = particle_targets(&particle_members, &flat_bind);
+        let hair_pins = hair_root_anchors(
+            surfaces,
+            &hair_surfaces,
+            &offsets,
+            &global_render_to_particle,
+            &bind_particles,
+            capsules,
+        );
+        devprintln!(1, "CLOTHDBG hair root anchors={}", hair_pins.len());
+        pinned.extend(hair_pins);
+    }
     pinned.sort_unstable();
     pinned.dedup();
     devprintln!(1, "CLOTHDBG fitted opening anchors={}", opening_pins.len());
@@ -1591,12 +1668,28 @@ fn build_instance(
     };
     let mut follow_strengths =
         compute_follow_strengths(&rest_positions, &sim_triangles, &pinned, follow);
+    // Hair and fabric are separate components, so each particle's geodesic
+    // distance only reaches its own kind of attachment.
+    if !hair_particles.is_empty() {
+        let hair_strengths =
+            compute_follow_strengths(&rest_positions, &sim_triangles, &pinned, HAIR_FOLLOW);
+        for (particle, strength) in follow_strengths.iter_mut().enumerate() {
+            if is_hair(particle) {
+                *strength = hair_strengths[particle];
+            }
+        }
+    }
+    let follow_of = |particle: usize| if is_hair(particle) { HAIR_FOLLOW } else { follow };
     // Collision padding tapers into sewn attachments, which cannot move outward.
     let clearance_weights = follow_strengths
         .iter()
-        .map(|&strength| follow.freedom(strength).sqrt())
+        .enumerate()
+        .map(|(particle, &strength)| follow_of(particle).freedom(strength).sqrt())
         .collect::<Vec<_>>();
-    for (layout, surface) in layouts.iter().zip(surfaces) {
+    for ((layout, surface), &hair) in layouts.iter().zip(surfaces).zip(&hair_surfaces) {
+        if hair {
+            continue;
+        }
         let name = surface.surface_name.to_ascii_lowercase();
         let minimum = if name.contains("hood") || name.contains("head") {
             0.16
@@ -1628,7 +1721,7 @@ fn build_instance(
             if pinned.binary_search(&(particle as u32)).is_ok() {
                 0.0
             } else {
-                follow.freedom(*strength)
+                follow_of(particle).freedom(*strength)
             }
         })
         .collect();
@@ -1785,6 +1878,8 @@ fn build_instance(
         iterations: solver_iterations(config.stiffness),
         tethers,
         runaway_limit,
+        self_collision: SelfCollisionCache::default(),
+        hair_particles,
     })
 }
 
@@ -1997,6 +2092,8 @@ fn choose_structural_surface_anchors(
     // Hanging garments: particles stitched across authored surfaces. Those
     // are mid-fabric seams and never attachments.
     seams: Option<&[bool]>,
+    // Per surface: hair (cg_hairPhysics 3), anchored by `hair_root_anchors`.
+    hair: &[bool],
 ) -> (Vec<u32>, Vec<(String, usize)>) {
     fn anchor_priority(name: &str) -> u8 {
         let name = name.to_ascii_lowercase();
@@ -2029,13 +2126,18 @@ fn choose_structural_surface_anchors(
         .iter()
         .map(|surface| anchor_priority(&surface.surface_name))
         .collect::<Vec<_>>();
-    let has_central = priorities.iter().any(|&priority| priority >= 2);
+    let is_hair = |ordinal: usize| hair.get(ordinal).copied().unwrap_or(false);
+    let has_central = priorities
+        .iter()
+        .enumerate()
+        .any(|(ordinal, &priority)| priority >= 2 && !is_hair(ordinal));
     let fallback = if has_central {
         None
     } else {
         priorities
             .iter()
             .enumerate()
+            .filter(|(ordinal, _)| !is_hair(*ordinal))
             .max_by_key(|(_, priority)| **priority)
             .map(|(index, _)| index)
     };
@@ -2044,7 +2146,9 @@ fn choose_structural_surface_anchors(
     let mut debug = Vec::with_capacity(surfaces.len());
     for (surface_ordinal, surface) in surfaces.iter().enumerate() {
         let priority = priorities[surface_ordinal];
-        let use_surface = if has_central {
+        let use_surface = if is_hair(surface_ordinal) {
+            false
+        } else if has_central {
             priority >= 2
         } else {
             fallback == Some(surface_ordinal)
@@ -2119,11 +2223,125 @@ fn choose_structural_surface_anchors(
 
     if pinned.is_empty() && seams.is_some() {
         // Never leave a garment without attachments.
-        return choose_structural_surface_anchors(surfaces, offsets, dsu, root_to_particle, None);
+        return choose_structural_surface_anchors(surfaces, offsets, dsu, root_to_particle, None, hair);
     }
     pinned.sort_unstable();
     pinned.dedup();
     (pinned, debug)
+}
+
+/// Hair (cg_hairPhysics 3) roots: the fraction of each hair surface's
+/// root-to-tip span that is fixed to the scalp. Matches the zero-motion band
+/// of the spring promotion in jka_assets::source1_jiggle.
+const HAIR_ROOT_FRACTION: f32 = 0.12;
+/// Hair lying on the head in the bind pose is also attached, up to this
+/// fraction of the span, so a cap or fringe does not slide off the skull.
+const HAIR_SCALP_REACH_FRACTION: f32 = 0.5;
+const HAIR_SCALP_CONTACT_JKA: f32 = 1.0;
+/// Hair hangs from its roots like a cape but keeps more of its styled shape.
+const HAIR_FOLLOW: FollowFalloff = FollowFalloff {
+    near: HANGING_FOLLOW_NEAR_STRENGTH,
+    far: 0.03,
+    distance_jka: 10.0,
+    concentrated: true,
+};
+
+/// Hard attachments for hair surfaces: every particle in the root band along
+/// the surface's root-to-tip axis, plus particles resting on a bind-pose body
+/// proxy within the upper half. Uses geometry only, never bone names.
+fn hair_root_anchors(
+    surfaces: &[ClothSurfaceFrame],
+    hair_surfaces: &[bool],
+    offsets: &[usize],
+    render_to_particle: &[u32],
+    bind_particles: &[Vec3],
+    capsules: &[ClothCapsule],
+) -> Vec<u32> {
+    let shapes = capsules
+        .iter()
+        .filter_map(|capsule| capsule.rest.map(ClothRestCapsule::shape))
+        .collect::<Vec<_>>();
+    let on_body = |particle: u32| {
+        bind_particles.get(particle as usize).is_some_and(|&point| {
+            shapes.iter().any(|shape| {
+                shape.may_contact(point, HAIR_SCALP_CONTACT_JKA * METRES_PER_JKA_UNIT)
+                    && shape.surface(point).0 <= HAIR_SCALP_CONTACT_JKA * METRES_PER_JKA_UNIT
+            })
+        })
+    };
+    let mut pinned = Vec::new();
+    for (ordinal, surface) in surfaces.iter().enumerate() {
+        if !hair_surfaces.get(ordinal).copied().unwrap_or(false) {
+            continue;
+        }
+        let points = surface
+            .bind_positions
+            .iter()
+            .map(|&p| Vec3::from_array(p))
+            .collect::<Vec<_>>();
+        if points.is_empty() {
+            continue;
+        }
+        let particle_of = |local: usize| {
+            render_to_particle
+                .get(offsets[ordinal] + local)
+                .copied()
+                .filter(|&particle| particle != u32::MAX)
+        };
+        let min_z = points.iter().map(|p| p.z).fold(f32::INFINITY, f32::min);
+        let max_z = points.iter().map(|p| p.z).fold(f32::NEG_INFINITY, f32::max);
+        let height = (max_z - min_z).max(0.0);
+        let band = height * HAIR_ROOT_FRACTION;
+        let mean = |selected: &mut dyn Iterator<Item = Vec3>| {
+            let (sum, count) = selected.fold((Vec3::ZERO, 0.0f32), |(s, c), p| (s + p, c + 1.0));
+            sum / count.max(1.0)
+        };
+        let root = mean(&mut points.iter().copied().filter(|p| p.z >= max_z - band));
+        // A horizontal hair card has no Z range: its free end is the point
+        // farthest from the roots in the horizontal plane.
+        let tip = if height > 0.5 {
+            mean(&mut points.iter().copied().filter(|p| p.z <= min_z + band))
+        } else {
+            points
+                .iter()
+                .copied()
+                .max_by(|a, b| {
+                    (*a - root).truncate().length_squared()
+                        .total_cmp(&(*b - root).truncate().length_squared())
+                })
+                .unwrap_or(root)
+        };
+        let direction = (tip - root).normalize_or_zero();
+        let reach = points
+            .iter()
+            .map(|p| (*p - root).dot(direction))
+            .fold(0.0f32, f32::max);
+        let before = pinned.len();
+        if direction != Vec3::ZERO && reach >= 0.5 {
+            for (local, point) in points.iter().enumerate() {
+                let Some(particle) = particle_of(local) else {
+                    continue;
+                };
+                let t = ((*point - root).dot(direction) / reach).max(0.0);
+                if t <= HAIR_ROOT_FRACTION || (t <= HAIR_SCALP_REACH_FRACTION && on_body(particle)) {
+                    pinned.push(particle);
+                }
+            }
+        }
+        if pinned.len() == before {
+            // Degenerate span: attach the top band so the piece cannot fall.
+            pinned.extend(
+                points
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.z >= max_z - band.max(0.5))
+                    .filter_map(|(local, _)| particle_of(local)),
+            );
+        }
+    }
+    pinned.sort_unstable();
+    pinned.dedup();
+    pinned
 }
 
 fn choose_spread_anchors(candidates: &[(u32, Vec3)]) -> Vec<u32> {
@@ -3109,6 +3327,274 @@ impl ContactSource for CapsuleContactSource<'_> {
                 }
                 out.push(contact);
             }
+        }
+        Ok(())
+    }
+}
+
+/// r_clothSelfCollision: minimum gap kept between layers of one stitched
+/// garment (cape over robe, a fold over itself), metres.
+const SELF_COLLISION_THICKNESS: f32 = 0.75 * METRES_PER_JKA_UNIT;
+/// Broadphase pairs are gathered once per step within thickness + margin and
+/// re-tested exactly in every iteration query.
+const SELF_COLLISION_MARGIN: f32 = SELF_COLLISION_THICKNESS;
+/// Particles within this many mesh edges never collide with each other: they
+/// are held apart by the distance/bend constraints, and contacts would fight them.
+const SELF_COLLISION_RINGS: usize = 2;
+/// Cap on candidate pairs per step (each yields up to two contacts), well inside
+/// the solver's contact budget alongside the one body contact per particle.
+const SELF_COLLISION_MAX_PAIRS: usize = 16384;
+const SELF_CONTACT_EXTERNAL: u64 = u64::MAX;
+const SELF_CONTACT_FRICTION: f32 = 0.1;
+
+/// Per-garment scratch for self collision. Topology exclusions are built once
+/// per instance; the grid and pair lists keep their capacity between steps.
+#[derive(Default)]
+struct SelfCollisionCache {
+    /// Per particle: sorted particles within `SELF_COLLISION_RINGS` edges.
+    excluded: Vec<Vec<u32>>,
+    pinned: Vec<bool>,
+    /// Per particle, refreshed each step: fabric/hair toggle allows contacts.
+    active: Vec<bool>,
+    cells: Vec<(u64, u32)>,
+    /// (a, b, required separation) with a < b.
+    pairs: Vec<(u32, u32, f32)>,
+    posed: Vec<Vec3>,
+}
+
+impl SelfCollisionCache {
+    fn ensure_topology(&mut self, particle_count: usize, edges: &[(u32, u32, f32)], pinned: &[u32]) {
+        if self.excluded.len() == particle_count {
+            return;
+        }
+        let mut adjacency = vec![Vec::new(); particle_count];
+        for &(a, b, _) in edges {
+            let (a, b) = (a as usize, b as usize);
+            if a < particle_count && b < particle_count && a != b {
+                adjacency[a].push(b as u32);
+                adjacency[b].push(a as u32);
+            }
+        }
+        self.excluded = (0..particle_count)
+            .map(|start| {
+                let mut ring = vec![start as u32];
+                let mut frontier = vec![start as u32];
+                for _ in 0..SELF_COLLISION_RINGS {
+                    let mut next = Vec::new();
+                    for &p in &frontier {
+                        for &q in &adjacency[p as usize] {
+                            if !ring.contains(&q) {
+                                ring.push(q);
+                                next.push(q);
+                            }
+                        }
+                    }
+                    frontier = next;
+                }
+                ring.sort_unstable();
+                ring
+            })
+            .collect();
+        self.pinned = vec![false; particle_count];
+        for &p in pinned {
+            if let Some(flag) = self.pinned.get_mut(p as usize) {
+                *flag = true;
+            }
+        }
+    }
+}
+
+fn self_cell(position: Vec3) -> [i32; 3] {
+    let size = SELF_COLLISION_THICKNESS + SELF_COLLISION_MARGIN;
+    [
+        (position.x / size).floor() as i32,
+        (position.y / size).floor() as i32,
+        (position.z / size).floor() as i32,
+    ]
+}
+
+fn self_cell_key(cell: [i32; 3]) -> u64 {
+    const MASK: u64 = (1 << 21) - 1;
+    ((cell[0] as u64 & MASK) << 42) | ((cell[1] as u64 & MASK) << 21) | (cell[2] as u64 & MASK)
+}
+
+/// Particle-particle contacts between non-neighbouring parts of one garment.
+/// Works on posed positions (solver state + animation delta, as the body
+/// contacts do). The required gap is limited to the rest-pose and current
+/// animated-target distances, so layers the garment or animation authored
+/// closer than the thickness keep that gap and are never pushed apart.
+struct SelfContactSource<'a> {
+    cache: &'a mut SelfCollisionCache,
+    /// Solver reference = the mesh rest pose the distance constraints use.
+    reference: &'a [Vec3],
+    targets: &'a [Vec3],
+    /// Per particle: belongs to a hair surface. Empty when the garment has no hair.
+    hair: &'a [bool],
+    /// r_clothSelfCollision: fabric particles take part.
+    fabric_enabled: bool,
+    /// cg_hairSelfCollision: hair particles take part. A fabric-hair pair
+    /// needs both toggles.
+    hair_enabled: bool,
+}
+
+impl SelfContactSource<'_> {
+    fn participates(&self, particle: usize) -> bool {
+        if self.hair.get(particle).copied().unwrap_or(false) {
+            self.hair_enabled
+        } else {
+            self.fabric_enabled
+        }
+    }
+
+    fn update_posed(&mut self, positions: &[Vec3]) {
+        let cache = &mut *self.cache;
+        cache.posed.clear();
+        cache.posed.extend(
+            positions
+                .iter()
+                .enumerate()
+                .map(|(p, x)| *x + self.targets[p] - self.reference[p]),
+        );
+    }
+
+    fn gather_pairs(&mut self) {
+        let mut active = std::mem::take(&mut self.cache.active);
+        active.clear();
+        active.extend((0..self.cache.posed.len()).map(|particle| self.participates(particle)));
+        self.cache.active = active;
+        let cache = &mut *self.cache;
+        cache.cells.clear();
+        cache.cells.extend(
+            cache
+                .posed
+                .iter()
+                .enumerate()
+                .filter(|(p, _)| cache.active[*p])
+                .map(|(p, x)| (self_cell_key(self_cell(*x)), p as u32)),
+        );
+        cache.cells.sort_unstable();
+        cache.pairs.clear();
+        let reach = SELF_COLLISION_THICKNESS + SELF_COLLISION_MARGIN;
+        'particles: for a in 0..cache.posed.len() {
+            if !cache.active[a] {
+                continue;
+            }
+            let position = cache.posed[a];
+            let [cx, cy, cz] = self_cell(position);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        let key = self_cell_key([cx + dx, cy + dy, cz + dz]);
+                        let start = cache.cells.partition_point(|&(k, _)| k < key);
+                        for &(k, b) in &cache.cells[start..] {
+                            if k != key {
+                                break;
+                            }
+                            let b = b as usize;
+                            if b <= a
+                                || (cache.pinned[a] && cache.pinned[b])
+                                || cache.excluded[a].binary_search(&(b as u32)).is_ok()
+                                || position.distance_squared(cache.posed[b]) >= reach * reach
+                            {
+                                continue;
+                            }
+                            let required = SELF_COLLISION_THICKNESS
+                                .min(self.reference[a].distance(self.reference[b]))
+                                .min(self.targets[a].distance(self.targets[b]));
+                            if required <= 1.0e-4 {
+                                continue;
+                            }
+                            cache.pairs.push((a as u32, b as u32, required));
+                            if cache.pairs.len() >= SELF_COLLISION_MAX_PAIRS {
+                                break 'particles;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl ContactSource for SelfContactSource<'_> {
+    fn contacts(
+        &mut self,
+        _previous: &[Vec3],
+        positions: &[Vec3],
+        radius: Real,
+        stage: ContactStage,
+        out: &mut Vec<Contact>,
+    ) -> Result<(), ClothError> {
+        // Stabilization would teleport overlaps without velocity accounting and
+        // Final only feeds diagnostics; the solve stages carry the constraint.
+        if !matches!(stage, ContactStage::Prediction | ContactStage::Iteration) {
+            return Ok(());
+        }
+        if positions.len() != self.cache.excluded.len() {
+            return Ok(());
+        }
+        self.update_posed(positions);
+        if stage == ContactStage::Prediction {
+            self.gather_pairs();
+        }
+        let cache = &*self.cache;
+        for &(a, b, required) in &cache.pairs {
+            let (ai, bi) = (a as usize, b as usize);
+            let delta = cache.posed[ai] - cache.posed[bi];
+            let distance = delta.length();
+            if distance >= required || distance <= 1.0e-6 {
+                continue;
+            }
+            let normal = delta / distance;
+            let midpoint = (cache.posed[ai] + cache.posed[bi]) * 0.5;
+            // Each side's plane in its own solver frame: geometric boundary
+            // minus that particle's animation delta, offset by the solver's
+            // plane radius. A pinned partner leaves the free side the full gap.
+            for (particle, other, normal) in [(ai, bi, normal), (bi, ai, -normal)] {
+                if cache.pinned[particle] {
+                    continue;
+                }
+                let boundary = if cache.pinned[other] {
+                    cache.posed[other] + normal * required
+                } else {
+                    midpoint + normal * (required * 0.5)
+                };
+                let pose_delta = self.targets[particle] - self.reference[particle];
+                out.push(Contact {
+                    key: ContactKey {
+                        particle: particle as u32,
+                        external: SELF_CONTACT_EXTERNAL,
+                        feature: other as u32,
+                    },
+                    normal,
+                    point: boundary - pose_delta - normal * radius,
+                    surface_velocity: Vec3::ZERO,
+                    friction: SELF_CONTACT_FRICTION,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Body contacts plus optional garment self contacts for one solver step.
+struct GarmentContacts<'a> {
+    body: CapsuleContactSource<'a>,
+    own: Option<SelfContactSource<'a>>,
+}
+
+impl ContactSource for GarmentContacts<'_> {
+    fn contacts(
+        &mut self,
+        previous: &[Vec3],
+        positions: &[Vec3],
+        radius: Real,
+        stage: ContactStage,
+        out: &mut Vec<Contact>,
+    ) -> Result<(), ClothError> {
+        self.body.contacts(previous, positions, radius, stage, out)?;
+        if let Some(own) = &mut self.own {
+            own.contacts(previous, positions, radius, stage, out)?;
         }
         Ok(())
     }

@@ -80,6 +80,7 @@ impl App {
         if let Some(playback) = &mut self.game_session {
             playback.weapon_fx.set_footprint_mode(footprints);
             playback.weapon_fx.set_blood_mode(options.blood);
+            playback.player_presenter.set_dynamic_gibs_enabled(options.blood == 3);
             playback.weapon_fx.set_score_plums(options.score_plums);
             playback
                 .player_presenter

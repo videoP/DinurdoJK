@@ -80,16 +80,6 @@ pub(crate) fn set_enabled(requested: bool) {
     });
 }
 
-pub(crate) fn is_stock_saber_effect(effect: &str) -> bool {
-    [
-        "saber/blood_sparks_mp.efx",
-        "saber/blood_sparks_25_mp.efx",
-        "saber/blood_sparks_50_mp.efx",
-    ]
-    .iter()
-    .any(|name| effect.eq_ignore_ascii_case(name))
-}
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub(crate) struct BloodVertex {

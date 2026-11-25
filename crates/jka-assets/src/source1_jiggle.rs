@@ -232,6 +232,63 @@ fn promote_named_hair_with_head(
     added
 }
 
+/// Body proxy for promoted hair springs, in posed model space (JKA units):
+/// segment `a..b` swept by the unit sphere mapped through `basis` (columns).
+/// A round capsule of radius r has `basis = r * I`.
+#[derive(Clone, Copy, Debug)]
+pub struct SpringCollider {
+    pub a: [f32; 3],
+    pub b: [f32; 3],
+    pub basis: [[f32; 3]; 3],
+}
+
+/// Gap kept between a hair spring and a body proxy, model units.
+const HAIR_BODY_RADIUS: f32 = 0.75;
+/// Points along the spring (fraction of its length) tested against the body.
+const HAIR_BODY_SAMPLES: [f32; 3] = [0.5, 0.75, 1.0];
+
+/// A collider in world space with its inverse basis (rows of the inverse).
+struct WorldCollider {
+    a: [f32; 3],
+    columns: [[f32; 3]; 3],
+    inverse: [[f32; 3]; 3],
+    local_segment: [f32; 3],
+}
+
+impl WorldCollider {
+    fn new(collider: &SpringCollider, actor: &Matrix3x4) -> Option<Self> {
+        let a = transform(actor, collider.a);
+        let b = transform(actor, collider.b);
+        let columns = collider.basis.map(|column| rotate(actor, column));
+        // Rows of the inverse of the column matrix [c0 c1 c2].
+        let [c0, c1, c2] = columns;
+        let det = dot(c0, cross(c1, c2));
+        if !det.is_finite() || det.abs() < 1.0e-9 {
+            return None;
+        }
+        let inverse = [cross(c1, c2), cross(c2, c0), cross(c0, c1)].map(|row| scale(row, 1.0 / det));
+        let apply = |v: [f32; 3]| [dot(inverse[0], v), dot(inverse[1], v), dot(inverse[2], v)];
+        Some(Self { a, columns, inverse, local_segment: apply(sub(b, a)) })
+    }
+
+    /// Signed distance to the proxy surface (world units) and outward normal.
+    fn surface(&self, point: [f32; 3]) -> (f32, [f32; 3]) {
+        let inv = &self.inverse;
+        let local = [0, 1, 2].map(|r| dot(inv[r], sub(point, self.a)));
+        let segment = self.local_segment;
+        let t = (dot(local, segment) / dot(segment, segment).max(1.0e-12)).clamp(0.0, 1.0);
+        let center = scale(segment, t);
+        let radial = sub(local, center);
+        let radial = if norm(radial) > 1.0e-6 { unit(radial) } else { [0.0, 0.0, 1.0] };
+        let on = add(center, radial);
+        let c = &self.columns;
+        let surface = add(self.a, add(add(scale(c[0], on[0]), scale(c[1], on[1])), scale(c[2], on[2])));
+        // Normal = inverse-transpose * radial.
+        let normal = unit(add(add(scale(inv[0], radial[0]), scale(inv[1], radial[1])), scale(inv[2], radial[2])));
+        (dot(sub(point, surface), normal), normal)
+    }
+}
+
 #[derive(Clone, Default)]
 struct JiggleState {
     initialized: bool,
@@ -254,6 +311,9 @@ impl SourceJiggleAnimator {
     /// Update the supplemental spring-bone palette. `pose[..gla_bones]` is
     /// untouched. The `actor_axis` has the same basis/scale as the final draw;
     /// simulation happens in world space so walking and turning create inertia.
+    /// `colliders` (posed model space) push springs out of the body; overlap
+    /// the animated rest direction already has is kept.
+    #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
         bindings: &[SourceJiggleBinding],
@@ -262,6 +322,7 @@ impl SourceJiggleAnimator {
         actor_axis: [[f32; 3]; 3],
         actor_origin: [f32; 3],
         time_ms: i32,
+        colliders: &[SpringCollider],
     ) {
         if bindings.is_empty() || pose.len() < gla_bones + bindings.len() { return; }
         if self.states.len() != bindings.len() {
@@ -280,6 +341,8 @@ impl SourceJiggleAnimator {
         let actor = from_axis(actor_axis, actor_origin);
         let inverse_actor = inverse_similarity(&actor);
         let actor_scale = norm(actor_axis[0]).clamp(0.01, 100.0);
+        let body = colliders.iter().filter_map(|c| WorldCollider::new(c, &actor)).collect::<Vec<_>>();
+        let gap = HAIR_BODY_RADIUS * actor_scale;
         let mut goals = Vec::with_capacity(bindings.len());
         let mut simulated = Vec::with_capacity(bindings.len());
         for (index, binding) in bindings.iter().enumerate() {
@@ -374,6 +437,31 @@ impl SourceJiggleAnimator {
                     state.tip_velocity = sub(state.tip_velocity, scale(normal, dot(state.tip_velocity, normal)));
                 }
                 state.tip = bounded_tip;
+                if !body.is_empty() {
+                    let mut tip = state.tip;
+                    for collider in &body {
+                        for t in HAIR_BODY_SAMPLES {
+                            let point = add(state.base, scale(sub(tip, state.base), t));
+                            let (distance, normal) = collider.surface(point);
+                            let push = gap - distance;
+                            if push <= 0.0 { continue; }
+                            let rest = add(anchor, scale(sub(target_tip, anchor), t));
+                            let allowed = (gap - collider.surface(rest).0).max(0.0);
+                            let push = push - allowed;
+                            if push <= 0.0 { continue; }
+                            // Lever: moving the tip by push/t moves this sample by push.
+                            tip = add(tip, scale(normal, push / t));
+                            let inward = dot(state.tip_velocity, normal);
+                            if inward < 0.0 {
+                                state.tip_velocity = sub(state.tip_velocity, scale(normal, inward));
+                            }
+                        }
+                    }
+                    let span = sub(tip, state.base);
+                    if norm(span) > 1.0e-5 {
+                        state.tip = add(state.base, scale(unit(span), length));
+                    }
+                }
             }
             let tip_direction = sub(state.tip, state.base);
             let orientation = mul(&rotate_between(rotate(&goal, [0., 0., 1.]), tip_direction), &goal);
@@ -471,11 +559,11 @@ mod tests {
         let mut pose = vec![ident(), ident()];
         let mut sim = SourceJiggleAnimator::default();
         sim.update(&[binding.clone()], 1, &mut pose,
-            [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], [0., 0., 0.], 1000);
+            [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], [0., 0., 0.], 1000, &[]);
         assert!((pose[1][2][3]).abs() < 0.001);
         pose[0][0][3] = 8.0;
         sim.update(&[binding], 1, &mut pose,
-            [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], [0., 0., 0.], 1016);
+            [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]], [0., 0., 0.], 1016, &[]);
         assert_eq!(pose[0][0][3], 8.0);
         // The dynamic tip must lag the animated head, not snap to it.
         assert!((pose[1][0][0] - 1.0).abs() > 0.0001 || pose[1][0][3] != 8.0);

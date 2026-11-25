@@ -65,6 +65,8 @@ impl UserCvarFlags {
 pub struct UserCvar {
     pub name: String,
     pub value: String,
+    /// Like TaystJK resetString, the value at creation in this process.
+    pub reset_value: String,
     pub flags: UserCvarFlags,
 }
 
@@ -191,7 +193,7 @@ impl Default for NetworkSettings {
         // Transmission is separately limited to JK2 1.02 below.
         let mut user_cvars = BTreeMap::new();
         user_cvars.insert("nwh".to_owned(), UserCvar {
-            name: "nwh".to_owned(), value: "1".to_owned(), flags: UserCvarFlags::USERINFO,
+            name: "nwh".to_owned(), value: "1".to_owned(), reset_value: "1".to_owned(), flags: UserCvarFlags::USERINFO,
         });
         Self {
             user_cvars,
@@ -289,7 +291,7 @@ impl NetworkSettings {
         use std::collections::btree_map::Entry;
         match self.user_cvars.entry(key) {
             Entry::Vacant(entry) => {
-                entry.insert(UserCvar { name: name.to_owned(), value: value.to_owned(), flags });
+                entry.insert(UserCvar { name: name.to_owned(), value: value.to_owned(), reset_value: value.to_owned(), flags });
                 Ok(true)
             }
             Entry::Occupied(mut entry) => {
@@ -3862,6 +3864,21 @@ mod tests {
         assert_eq!(settings.user_cvars.len(), 2);
         assert!(settings.set_user_cvar("oops\\hack", "x", UserCvarFlags::USERINFO).is_err());
         assert!(settings.set_user_cvar("safe", "evil\\payload", UserCvarFlags::USERINFO).is_err());
+    }
+
+    #[test]
+    fn user_created_cvars_keep_their_initial_reset_value() {
+        let mut settings = NetworkSettings::default();
+        settings.set_user_cvar("NWH", "2", UserCvarFlags::ARCHIVE).unwrap();
+        assert_eq!(settings.user_cvar("nwh").unwrap().reset_value, "1");
+        settings.set_user_cvar("my_script", "echo first; echo second", UserCvarFlags::NONE).unwrap();
+        settings.set_user_cvar("MY_SCRIPT", "echo changed", UserCvarFlags::ARCHIVE).unwrap();
+        let reset = settings.user_cvar("my_script").unwrap().reset_value.clone();
+        assert_eq!(reset, "echo first; echo second");
+        settings.set_user_cvar("MY_SCRIPT", &reset, UserCvarFlags::NONE).unwrap();
+        let cvar = settings.user_cvar("my_script").unwrap();
+        assert_eq!(cvar.value, reset);
+        assert!(cvar.flags.contains(UserCvarFlags::ARCHIVE));
     }
 
     #[test]

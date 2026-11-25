@@ -405,6 +405,11 @@ pub(in crate::cgame::player_presenter) fn detached_limb_surface_set(
         for part in parts.iter().copied().filter(|part| *part != current) {
             let prior = part.spec();
             if let Some(prior_root) = resolve_dismember_root(&model.glm, prior.limb_root) {
+                // An ancestor sever (e.g. waist) cannot erase the detached
+                // child copy (e.g. hand). Only subtract nested child cuts.
+                if !subtree.contains(&prior_root) {
+                    continue;
+                }
                 let mut hidden = HashSet::new();
                 collect_surface_subtree(&model.glm, prior_root, &mut hidden);
                 visible.retain(|index| !hidden.contains(index));
@@ -559,7 +564,7 @@ impl PlayerPresenter {
             let Some(source) = self.dismember_source_snaps.get(&source_num).cloned() else {
                 // OpenJK waits for a valid source Ghoul2/death pose too. The
                 // next presentation frame will retry after the source is posed.
-                return Ok(Vec::new());
+                return Err(format!("owner={source_num} part={part:?} waiting for Ghoul2 source pose"));
             };
             let spec = part.spec();
             let surfaces =
@@ -770,6 +775,7 @@ impl PlayerPresenter {
             None,
             true,
             Some(&visual.surfaces),
+            false,
         )?;
         // Detached pieces are one rigid caster, not another articulated skin.
         // CPU and GPU skinning both retain the frozen sever pose; the entity
