@@ -188,10 +188,6 @@ impl Renderer {
         // Legacy console name retained for A/B configs; the path now draws
         // the original BSP world mesh, never the collision/acoustic mesh.
         let collision_world_only = crate::renderer::collision_world_only() && self.world.is_some();
-        // Stable frame-level admission; never borrow the whole renderer again
-        // while atmosphere or render targets are held mutably below.
-        let native_sky_visible = self.native_sky_surface_visible()
-            && self.blue_water_sky.as_ref().is_some_and(|sky| sky.can_display_sky());
         let competitive_no_world = self.competitive_ab == 10
             || competitive_mask & (probe::WORLD_DRAW | probe::WORLD_PREP_AND_DRAW) != 0;
         // A/B bit 0 disables optional split encoder finishing while preserving
@@ -290,6 +286,10 @@ impl Renderer {
         }
         self.build_blob_shadow_marks(dynamic_models);
         self.ensure_native_atmosphere(camera);
+        // The worker may install or retire an atmosphere above. Decide sky
+        // ownership only AFTER that transition, consistently for this frame.
+        let native_sky_visible = self.native_sky_surface_visible()
+            && self.blue_water_sky.as_ref().is_some_and(|sky| sky.can_display_sky());
         self.ensure_legacy_global_fog_pipeline();
 
         // Resolved before any pass borrows the renderer mutably.
@@ -590,6 +590,11 @@ impl Renderer {
         }
         if render_ocean {
             self.ocean_visibility.begin_frame(&self.device);
+            if self.photo_capture_active {
+                // The previous query describes a different capture view.
+                self.ocean_visibility.primed = false;
+                self.ocean_hidden_time = 0.0;
+            }
         }
         prepare_laps.lap("GPU profiler begin + ocean");
         self.ensure_realtime_sky_normals();
@@ -2186,7 +2191,11 @@ impl Renderer {
                 ocean.set_clipmap_center(&self.queue, camera.position.to_array(), coarsest);
             }
             if !ocean_sim_hidden {
-                ocean.encode_frame(&self.queue, &mut encoder, frame_delta);
+                if self.photo_capture_active {
+                    ocean.encode_capture_frame(&self.queue, &mut encoder);
+                } else {
+                    ocean.encode_frame(&self.queue, &mut encoder, frame_delta);
+                }
                 if !ninja_ocean {
                     // Ocean2 instead samples after its per-pool solver is prepared.
                     ocean.encode_eye_wave_probe(
@@ -2233,7 +2242,11 @@ impl Renderer {
                 .unwrap_or(0.0);
             ocean.set_clipmap_center(&self.queue, camera.position.to_array(), coarsest);
             if !ocean_sim_hidden {
-                ocean.encode_frame(&self.queue, &mut encoder, frame_delta);
+                if self.photo_capture_active {
+                    ocean.encode_capture_frame(&self.queue, &mut encoder);
+                } else {
+                    ocean.encode_frame(&self.queue, &mut encoder, frame_delta);
+                }
             }
         }
         } // End optional native-ocean wave/river simulation.
@@ -2927,6 +2940,7 @@ impl Renderer {
         if ninja_fire_active {
             let flame_format = if plan.use_post { self.scene_format() } else { self.config.format };
             self.encode_ninja_fire(&mut encoder, camera, view_proj, unjittered_view_proj, flame_format, frame_delta);
+            self.ninja_fire.plan_heat_haze(plan.use_post);
         }
         if ninja_blood_active {
             let format = if plan.use_post { self.scene_format() } else { self.config.format };
@@ -8669,6 +8683,14 @@ impl Renderer {
                 self.world.as_ref().and_then(|world| world.froxel_bind_group.as_ref()),
             );
         }
+        if ninja_fire_active {
+            // Heat haze refracts the HDR background (fog and smoke included)
+            // over the drawn flame quads only; the flame composites on top.
+            Self::encode_ninja_fire_heat_haze(
+                &mut self.ninja_fire, &self.device, &self.queue, &mut encoder,
+                &self.targets.scene_view, &self.targets._scene_texture,
+            );
+        }
 
         self.gpu_profiler
             .write_encoder_timestamp(&mut encoder, GpuPass::Post, false);
@@ -8807,7 +8829,7 @@ impl Renderer {
             }
         }
 
-        if auto_exposure_effective {
+        if auto_exposure_effective && !self.photo_capture_active {
             // Inlined rather than called via &self methods: a live borrow of
             // self.smaa_target (through smaa_frame) is in scope here, and a
             // method call would reborrow all of *self.

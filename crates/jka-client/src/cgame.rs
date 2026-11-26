@@ -2598,6 +2598,39 @@ impl ClientGameState {
         Ok(presented)
     }
 
+    /// Read-only snapshot interpolation for the independent physics benchmark.
+    /// This must not update centity lerps, prediction, events or remote smoothing.
+    pub(crate) fn physics_reference_entities(&self, time_ms: f64) -> Result<Vec<PresentedEntity>, String> {
+        let current = self.current_snapshot.as_ref().ok_or("reference: no snapshot")?;
+        let next = self.next_snapshot.as_ref();
+        let fraction = next.filter(|n| n.server_time > current.server_time).map_or(0.0, |n| {
+            ((time_ms - f64::from(current.server_time)) / f64::from(n.server_time - current.server_time)) as f32
+        });
+        let local = current.player_state.field_i32("clientNum").unwrap_or(-1);
+        let mut result = Vec::new();
+        for state in &current.entities {
+            if i32::from(state.number) == local { continue; }
+            let Some(source) = self.entities.get(usize::from(state.number)) else { continue; };
+            let mut cent = source.clone();
+            calc_entity_lerp_positions(&mut cent, time_ms, fraction, current.server_time,
+                next.map(|n| n.server_time), false, false, [0.0; 3])?;
+            let entity_type = field_i32(state, "eType");
+            if entity_type >= ET_EVENTS || !cent.lerp_origin.iter().chain(&cent.lerp_angles).all(|v| v.is_finite()) { continue; }
+            result.push(PresentedEntity { number: state.number, entity_type,
+                origin: cent.lerp_origin, angles: cent.lerp_angles, state: state.clone() });
+        }
+        result.sort_unstable_by_key(|e| e.number);
+        Ok(result)
+    }
+
+    pub(crate) fn physics_reference_player_state(&self, time_ms: f64) -> Option<PlayerState> {
+        Some(player_state::interpolate_player_state_at(self.current_snapshot.as_ref()?, self.next_snapshot.as_ref(), time_ms))
+    }
+
+    pub(crate) fn physics_reference_next_time(&self) -> Option<i32> {
+        self.next_snapshot.as_ref().map(|s| s.server_time)
+    }
+
     /// Test fixture adapter. Production constructs this entity from the session's
     /// cached presented_player_state, with no downstream interpolation.
     #[cfg(test)]

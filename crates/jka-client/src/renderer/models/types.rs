@@ -229,7 +229,14 @@ pub(in crate::renderer) struct Ghoul2GpuMesh {
     pub(in crate::renderer) index_buffer: wgpu::Buffer,
     pub(in crate::renderer) index_count: u32,
     pub(in crate::renderer) batch_keys: super::prepare::BatchKeyCache,
+    /// `ghoul2_prepare_serial` of the last prepare that drew this mesh.
+    pub(in crate::renderer) last_used: u64,
 }
+
+/// Mesh keys carrying this marker belong to transient dynamic-cut pieces.
+/// They are evicted once unused instead of living until the next map.
+pub(in crate::renderer) const DYNAMIC_CUT_MESH_MARKER: &str = "#dyncut";
+pub(in crate::renderer) const DYNAMIC_CUT_MESH_IDLE_PREPARES: u64 = 600;
 
 pub(in crate::renderer) struct Ghoul2RtComputeMesh {
     pub(in crate::renderer) input_buffer: wgpu::Buffer,
@@ -652,6 +659,7 @@ pub(in crate::renderer) struct DynamicModelRenderer {
     pub(in crate::renderer) blob_mesh_vertices: Vec<DynamicModelVertex>,
     pub(in crate::renderer) blob_mesh_indices: Vec<u32>,
     pub(in crate::renderer) ghoul2_meshes: HashMap<Arc<str>, Ghoul2GpuMesh>,
+    pub(in crate::renderer) ghoul2_prepare_serial: u64,
     pub(in crate::renderer) skin_bone_buffer: wgpu::Buffer,
     pub(in crate::renderer) skin_draw_buffer: wgpu::Buffer,
     pub(in crate::renderer) skin_bone_capacity: u64,

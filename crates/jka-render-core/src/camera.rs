@@ -846,6 +846,8 @@ pub struct Camera {
     /// preview. Unlike the model-only asset viewport this preserves the native
     /// BSP/entity/FX renderer, including its post-processing path.
     studio_viewport: Option<[u32; 4]>,
+    // Capture-only crop: full-face size, signed pixel origin, tile size.
+    photo_tile: Option<[f32; 4]>,
 }
 impl Camera {
     #[cfg(any(test, feature = "test-support"))]
@@ -865,6 +867,7 @@ impl Camera {
             near: 1.0,
             far: far_distance_for_cull(DEFAULT_DISTANCE_CULL),
             studio_viewport: None,
+            photo_tile: None,
         }
     }
 
@@ -939,7 +942,39 @@ impl Camera {
     /// enabled. `cg_fov` is authored as horizontal FOV on the legacy 4:3
     /// baseline; widescreen expands horizontally (Hor+) while preserving the
     /// corresponding vertical framing.
+    pub fn set_photo_tile(&mut self, face: u32, x: i32, y: i32, side: u32) {
+        self.photo_tile = Some([face as f32, x as f32, y as f32, side as f32]);
+    }
+
+    pub fn has_photo_tile(&self) -> bool { self.photo_tile.is_some() }
+
+    /// Shared by BSP, native sky, clouds and water. Keep the same eye and
+    /// reverse-Z depth convention; crop only homogeneous X/Y.
+    pub fn projection_for_viewport(&self, width: u32, height: u32, near: f32, far: f32) -> Mat4 {
+        if let Some([face, x, y, side]) = self.photo_tile {
+            let base = glam::camera::rh::proj::directx::perspective(self.base_fov_y(1, 1), 1.0, far, near);
+            return Mat4::from_translation(Vec3::new((face - 2.0*x - side)/side, (2.0*y + side - face)/side, 0.0))
+                * Mat4::from_scale(Vec3::new(face/side, face/side, 1.0)) * base;
+        }
+        glam::camera::rh::proj::directx::perspective(self.base_fov_y(width, height), width.max(1) as f32 / height.max(1) as f32, far, near)
+    }
+
+    pub fn view_at(&self, position: Vec3) -> Mat4 {
+        let forward = self.forward();
+        let right = Vec3::new(self.yaw.sin(), 0.0, self.yaw.cos());
+        let up = glam::Quat::from_axis_angle(forward, self.roll) * right.cross(forward).normalize_or_zero();
+        glam::camera::rh::view::look_to_mat4(position, forward, up)
+    }
+
     pub fn fov_y_for_viewport(&self, width: u32, height: u32) -> f32 {
+        let base = self.base_fov_y(width, height);
+        if let Some([face, _, _, side]) = self.photo_tile {
+            return 2.0 * ((base * 0.5).tan() * side / face).atan();
+        }
+        base
+    }
+
+    fn base_fov_y(&self, width: u32, height: u32) -> f32 {
         let width = width.max(1) as f32;
         let height = height.max(1) as f32;
         let aspect = width / height;
@@ -965,6 +1000,19 @@ impl Camera {
         near_distance: f32,
         far_distance: f32,
     ) -> [Vec3; 8] {
+        if self.has_photo_tile() {
+            let inverse = self.view_projection(width, height).inverse();
+            let forward = self.forward();
+            let mut corners = [Vec3::ZERO; 8];
+            for (plane, distance) in [near_distance.max(self.near), far_distance.min(self.far)].into_iter().enumerate() {
+                for (i, (x, y)) in [(-1.,-1.),(1.,-1.),(1.,1.),(-1.,1.)].into_iter().enumerate() {
+                    let p = inverse * glam::Vec4::new(x, y, 1., 1.);
+                    let ray = p.truncate() / p.w - self.position;
+                    corners[plane*4+i] = self.position + ray * (distance / ray.dot(forward));
+                }
+            }
+            return corners;
+        }
         let (width, height) = self.studio_viewport.map_or((width, height), |v| (v[2], v[3]));
         let fov_y = self.fov_y_for_viewport(width, height);
         let width = width.max(1) as f32;
@@ -972,7 +1020,7 @@ impl Camera {
         let aspect = width / height;
         let tan_half_fov = (fov_y * 0.5).tan();
         let forward = self.forward();
-        let right = forward.cross(Vec3::Y).normalize_or_zero();
+        let right = Vec3::new(self.yaw.sin(), 0.0, self.yaw.cos());
         let up = right.cross(forward).normalize_or_zero();
         let rotation = glam::Quat::from_axis_angle(forward, self.roll);
         let right = rotation * right;
@@ -1026,18 +1074,12 @@ impl Camera {
     ) -> Mat4 {
         let rect = self.studio_viewport;
         let (proj_width, proj_height) = rect.map_or((width, height), |v| (v[2], v[3]));
-        let fov_y = self.fov_y_for_viewport(proj_width, proj_height);
         let width = width.max(1) as f32;
         let height = height.max(1) as f32;
-        let aspect = proj_width.max(1) as f32 / proj_height.max(1) as f32;
-        let forward = self.forward();
-        let right = forward.cross(Vec3::Y).normalize_or_zero();
-        let base_up = right.cross(forward).normalize_or_zero();
-        let up = glam::Quat::from_axis_angle(forward, self.roll) * base_up;
-        let view = glam::camera::rh::view::look_to_mat4(self.position, forward, up);
+        let view = self.view_at(self.position);
         // Camera depth is permanently reversed-Z: near -> 1, far -> 0.
         // Shadow maps keep their own conventional depth convention.
-        let projection = glam::camera::rh::proj::directx::perspective(fov_y, aspect, self.far, self.near);
+        let projection = self.projection_for_viewport(proj_width, proj_height, self.near, self.far);
         let jitter = Mat4::from_translation(Vec3::new(
             2.0 * jitter_pixels[0] / width,
             -2.0 * jitter_pixels[1] / height,
@@ -1061,6 +1103,29 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn photo_tile_is_exact_crop_of_cube_projection() {
+        let mut camera = Camera::new_with_fov([0., 0., 0.], 0., 90.);
+        camera.set_presentation_fov((4.0_f32/3.0).atan().to_degrees()*2.0);
+        for pitch in [0., std::f32::consts::FRAC_PI_2, -std::f32::consts::FRAC_PI_2] {
+            camera.pitch = pitch;
+            let whole = camera.view_projection(8192,8192);
+            let mut tile = camera;
+            tile.set_photo_tile(8192, 1024-128, 2048-128, 1280);
+            let cropped = tile.view_projection(1280,1280);
+            let p = camera.forward()*100. + Vec3::new(0., 2., 3.);
+            let a = whole * p.extend(1.);
+            let b = cropped * p.extend(1.);
+            let ax = (a.x/a.w+1.)*4096.;
+            let ay = (1.-a.y/a.w)*4096.;
+            let bx = (b.x/b.w+1.)*640.;
+            let by = (1.-b.y/b.w)*640.;
+            assert!((ax-(bx+896.)).abs()<0.01);
+            assert!((ay-(by+1920.)).abs()<0.01);
+            assert!((a.z/a.w-b.z/b.w).abs()<1e-6);
+        }
+    }
 
     #[test]
     fn studio_viewport_projects_center_into_embedded_rectangle() {

@@ -1608,6 +1608,11 @@ impl App {
     /// The current camera as a Ghoul2 LOD/cull view, for presenters that need
     /// screen-size LOD selection.
     pub(in crate::app) fn current_ghoul2_view(&self) -> Option<Ghoul2PresentationView> {
+        // Only the pending panorama tick needs omnidirectional presentation.
+        // Keep ordinary menu/gameplay LOD and culling unchanged otherwise.
+        if self.pending_photo_capture.is_some_and(|options| options.panorama) {
+            return None;
+        }
         self.window.as_ref().map(|window| {
             let size = window.inner_size();
             let (width,height)=(size.width,size.height);
@@ -1837,6 +1842,7 @@ impl App {
                 lifetime_seconds: self.video.ragdoll_lifetime,
                 // cg_dismember controls presentation, not the optional Rapier world.
                 dismemberment: self.video.dismemberment,
+                dismember_style: self.video.dismember_style,
                 max_detached_limbs: self.video.dismember_max,
                 detached_limb_lifetime_seconds: self.video.dismember_lifetime,
                 self_collision: self.video.ragdoll_self_collision,
@@ -1847,6 +1853,10 @@ impl App {
                 debug: self.video.physics_debug_draw,
                 stats: self.video.physics_stats,
             });
+            if !playback.player_presenter.has_background_cpu() {
+                // Dynamic saber cuts run their mesh work on the shared lane.
+                playback.player_presenter.set_background_cpu(self.background_jobs.cpu_handle());
+            }
             let rt_rigid_casters_enabled = self.video.dynamic_lights == DynamicLightsMode::RayTracedHardware;
             let blob_shadow_settings = self.video.player_blob_shadow_settings();
             playback

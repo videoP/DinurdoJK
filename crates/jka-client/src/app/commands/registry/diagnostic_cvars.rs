@@ -59,6 +59,11 @@ CvarDef::new("r_ninjaFireEmbers", "0", "0|1", "Fire_Smoke_Explosive flamethrower
     }
     Ok(())
 }),
+CvarDef::new("r_ninjaFireHeatHaze", "0", "0|1", "Heat haze: the scene behind Ninja surface flames shimmers through scrolling curl noise, masked by the flame field's own density. Costs only the pixels under the flame quads; nothing while no flame is on screen. Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::ninja_fire_debug::heat_haze()), |_app, value| {
+    let CvarValue::Bool(enabled) = value else { unreachable!() };
+    crate::ninja_fire_debug::set_heat_haze(enabled);
+    Ok(())
+}),
 CvarDef::new("r_ninjaFireFlicker", "1", "0|1", "Animate the ninjafireon point light with the existing two-octave smooth flicker curve. 0 restores the authored steady intensity. Session only.", CvarType::Bool, CvarFlags::NONE, LatchScope::None, |_app| CvarValue::Bool(crate::ninja_fire_debug::flicker()), |_app, value| {
     let CvarValue::Bool(enabled) = value else { unreachable!() };
     crate::ninja_fire_debug::set_flicker(enabled);

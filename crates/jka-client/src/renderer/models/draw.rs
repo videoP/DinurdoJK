@@ -242,6 +242,14 @@ impl DynamicModelRenderer {
         self.perf_phase_cpu_ms.set(0.0);
         self.capture_prepare = crate::renderer::diagnostics::perf_capture::enabled();
         self.perf_prepare = PreparePerf::default();
+        self.ghoul2_prepare_serial = self.ghoul2_prepare_serial.wrapping_add(1);
+        if self.ghoul2_prepare_serial % 120 == 0 {
+            let now = self.ghoul2_prepare_serial;
+            self.ghoul2_meshes.retain(|key, mesh| {
+                !key.contains(super::types::DYNAMIC_CUT_MESH_MARKER)
+                    || now.saturating_sub(mesh.last_used) < super::types::DYNAMIC_CUT_MESH_IDLE_PREPARES
+            });
+        }
         if ray_traced_shadows {
             // RT preparation uses different buffers and may repack the scratch
             // streams. Re-enter raster through a cold, explicitly valid cache.
@@ -457,8 +465,10 @@ impl DynamicModelRenderer {
                         index_buffer,
                         index_count: u32::try_from(skin.indices.len()).unwrap_or(u32::MAX),
                         batch_keys: Default::default(),
+                        last_used: 0,
                     }
                 });
+                mesh.last_used = self.ghoul2_prepare_serial;
 
                 let pose_key = Arc::as_ptr(&skin.bones) as usize;
                 let bone_base = match bone_offsets.entry(pose_key) {

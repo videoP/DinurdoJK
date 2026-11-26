@@ -6,7 +6,7 @@ use crate::app::egui_menu::{
     selected_setup_section, select_setup_section, setup_sections,
     GUTTER, SETUP_TABS, SETUP_TAB_AUDIO, SETUP_TAB_CAMERA, SETUP_TAB_GAME, SETUP_TAB_INTERFACE,
     SETUP_TAB_MOD, SETUP_TAB_PK3, SETUP_TAB_EXTENSIONS, SETUP_TAB_STREAMER, SETUP_TAB_MOVEMENT, SETUP_TAB_NETWORK, SETUP_TAB_VIDEO, TOP_CONTROLS,
-    TOP_ITEMS, TOP_PROFILE, TOP_RESUME, TOP_SETUP, TOP_VOTE,
+    TOP_ITEMS, TOP_PROFILE, TOP_RESUME, TOP_SETUP, TOP_VOTE, TOP_SCREENSHOT,
 };
 
 impl App {
@@ -915,6 +915,7 @@ impl App {
                     "profile" | "profilestudio" | "studio" => TOP_PROFILE,
                     "controls" => TOP_CONTROLS,
                     "vote" => TOP_VOTE,
+                    "screenshot" => TOP_SCREENSHOT,
                     _ => TOP_RESUME,
                 };
                 self.set_overlay(OverlayMode::Game);
@@ -1205,6 +1206,7 @@ impl App {
             TOP_PROFILE => self.egui_profile_studio(ui),
             TOP_CONTROLS => self.egui_controls_page(ui),
             TOP_VOTE => self.egui_vote_page(ui),
+            TOP_SCREENSHOT => egui::ScrollArea::vertical().show(ui, |ui| self.egui_photo_capture_page(ui)).inner,
             _ => {}
         }
     }

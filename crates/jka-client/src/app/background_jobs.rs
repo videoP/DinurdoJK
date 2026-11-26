@@ -51,6 +51,12 @@ impl BackgroundJobs {
         Self::submit(&self.cpu, job)
     }
 
+    /// Cloneable CPU-lane submitter for presentation systems that live
+    /// outside `app` (dynamic saber cuts). Same rules as `cpu`.
+    pub(super) fn cpu_handle(&self) -> CpuJobHandle {
+        CpuJobHandle(self.cpu.clone())
+    }
+
     /// At shutdown, wait for earlier I/O to finish. Do not block a normal
     /// frame, and do not wait indefinitely if a disk stalls.
     pub(super) fn flush_io(&self, timeout: Duration) -> bool {
@@ -83,6 +89,18 @@ fn run_lane(
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
             eprintln!("Background job panicked; continuing worker loop");
         }
+    }
+}
+
+/// Submit handle for the shared `jka-background-cpu` lane. Jobs must be
+/// non frame-critical and must not touch stateful physics; results go back
+/// through the caller's own channel.
+#[derive(Clone)]
+pub(crate) struct CpuJobHandle(SyncSender<Work>);
+
+impl CpuJobHandle {
+    pub(crate) fn submit(&self, job: impl FnOnce() + Send + 'static) -> Result<(), String> {
+        BackgroundJobs::submit(&self.0, job)
     }
 }
 

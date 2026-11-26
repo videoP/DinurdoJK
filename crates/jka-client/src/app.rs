@@ -119,6 +119,7 @@ use session::types::{
 };
 
 mod background_jobs;
+pub(crate) use background_jobs::CpuJobHandle;
 mod companion;
 mod egui_dev_radial;
 mod emote_wheel;
@@ -340,6 +341,9 @@ pub struct App {
     asset_viewer_model_zoom: f32,
     screenshot_entries: Vec<crate::screenshot::ScreenshotEntry>,
     screenshot_catalog_loaded: bool,
+    pending_photo_capture: Option<crate::renderer::PhotoOptions>,
+    photo_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    photo_progress: Option<crate::runtime::PhotoProgress>,
     screenshot_catalog_error: Option<String>,
     screenshot_selected: Option<PathBuf>,
     screenshot_search: String,

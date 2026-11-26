@@ -730,18 +730,15 @@ impl AtmosphereRenderer {
         let position = (camera.position - glam::Vec3::Y * sea_plane)
             / crate::ocean::OCEAN_UNITS_PER_METER
             + glam::Vec3::Y * reference_drop;
-        let view = glam::camera::rh::view::look_to_mat4(position, camera.forward(), glam::Vec3::Y);
+        let view = if camera.has_photo_tile() { camera.view_at(position) } else { glam::camera::rh::view::look_to_mat4(position, camera.forward(), glam::Vec3::Y) };
         let fov = camera.fov_y_for_viewport(key.0, key.1);
         let projection = glam::Mat4::from_translation(glam::Vec3::new(
             2.0 * jitter[0] / key.0.max(1) as f32,
             -2.0 * jitter[1] / key.1.max(1) as f32,
             0.0,
-        )) * glam::camera::rh::proj::directx::perspective(
-            fov,
-            key.0 as f32 / key.1.max(1) as f32,
-            camera.far_distance() / crate::ocean::OCEAN_UNITS_PER_METER,
+        )) * camera.projection_for_viewport(key.0, key.1,
             camera.near_distance() / crate::ocean::OCEAN_UNITS_PER_METER,
-        );
+            camera.far_distance() / crate::ocean::OCEAN_UNITS_PER_METER);
         let sky_view = SkyView {
             position: math::Vec3::from_array(position.to_array()),
             camera_to_world: math::Mat4::from_cols_array_2d(&view.inverse().to_cols_array_2d()),
@@ -751,12 +748,9 @@ impl AtmosphereRenderer {
 
         // Cloud temporal reconstruction owns its subpixel pattern, so its view is unjittered.
         let cloud_projection = math::Mat4::from_cols_array_2d(
-            &glam::camera::rh::proj::directx::perspective(
-                fov,
-                key.0 as f32 / key.1.max(1) as f32,
-                camera.far_distance() / crate::ocean::OCEAN_UNITS_PER_METER,
+            &camera.projection_for_viewport(key.0, key.1,
                 camera.near_distance() / crate::ocean::OCEAN_UNITS_PER_METER,
-            )
+                camera.far_distance() / crate::ocean::OCEAN_UNITS_PER_METER)
             .to_cols_array_2d(),
         );
         let cloud_view = ::blue_water_clouds::CloudView {

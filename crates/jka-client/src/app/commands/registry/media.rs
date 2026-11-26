@@ -113,6 +113,42 @@ commands! {
         }
     }
 
+    cmd_screenshot_360 ["screenshot_360"] ("screenshot_360 [projection width png|jpg]", "Capture a full spherical screenshot. Without arguments, use Screenshot menu preferences.", CommandScope::Always) |self, command| {
+        let words: Vec<_> = command.split_whitespace().collect();
+        let mut options = self.video.photo;
+        options.panorama = true;
+        if let [_verb, projection, width, format] = words.as_slice() {
+            let parsed = crate::renderer::PhotoProjection::parse(projection)
+                .and_then(|p| width.parse::<u32>().ok().filter(|&v| crate::renderer::PhotoOptions::valid_panorama_width(p, v)).map(|v| (p,v)))
+                .zip(crate::renderer::PhotoOptions::parse_format(format));
+            let Some(((projection, width), format)) = parsed else {
+                self.push_console_line("^1Invalid panorama projection, width or format");
+                return CommandResult::Handled;
+            };
+            options.projection = projection;
+            options.panorama_width = width;
+            options.format = format;
+        } else if words.len() != 1 {
+            self.push_console_line("usage: screenshot_360 [projection width png|jpg]");
+            return CommandResult::Handled;
+        }
+        self.request_photo_capture(options);
+        CommandResult::Status
+    }
+
+    cmd_screenshot_cancel ["screenshot_cancel"] ("screenshot_cancel", "Cancel an in-progress Screenshot menu capture.", CommandScope::Always) |self, _command| {
+        self.cancel_photo_capture();
+        CommandResult::Status
+    }
+
+    cmd_screenshot_clean ["screenshot_clean"] ("screenshot_clean", "Save a standard screenshot without menus or 2D UI.", CommandScope::Always) |self, _command| {
+        let mut options = self.video.photo;
+        options.panorama = false;
+        options.hide_ui = true;
+        self.request_photo_capture(options);
+        CommandResult::Status
+    }
+
     cmd_screenshot_png ["screenshot_png", ] ("screenshot_png", "Save a PNG screenshot with embedded DinurdoJK metadata.", CommandScope::Always) |self, command| {
         let words: Vec<_> = command.split_whitespace().collect();
         match words.as_slice() {

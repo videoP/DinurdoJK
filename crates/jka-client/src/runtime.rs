@@ -256,6 +256,14 @@ pub fn clear_video_frame_pool() {
 
 pub use jka_studio::render_studio_profile::VideoFrameTiming;
 
+#[derive(Clone, Debug)]
+pub struct PhotoProgress {
+    pub status: String,
+    pub completed: u64,
+    pub total: u64,
+    pub eta_seconds: Option<u64>,
+}
+
 pub enum UserEvent {
     Update(crate::updater::Event),
     BlueWaterThunder { volume: f32, sample: Option<u8> },
@@ -266,6 +274,8 @@ pub enum UserEvent {
     GammaPrepared(u64),
     HardwareGamma(crate::display_gamma::Status),
     ScreenshotFinished(Result<ScreenshotOutput, String>),
+    PhotoCaptureProgress(PhotoProgress),
+    PhotoCaptureFinished(Result<Vec<ScreenshotOutput>, String>),
     /// `vram` is process dedicated-VRAM (usage, OS budget) after the scene
     /// settled; `scenes` counts the retained Studio scenes at that point.
     StudioSourceReady { id: u64, error: Option<String>, vram: Option<(u64, u64)>, scenes: usize },

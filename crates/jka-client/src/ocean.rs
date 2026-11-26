@@ -2507,6 +2507,9 @@ pub struct OceanGpu {
     phase_started_at: f32,
     phase_period: f32,
     spectrum_dirty: bool,
+    // The capture renderer has a frozen clock. Publish the legacy FFT once
+    // per sea state, rather than integrating foam again for every face/tile.
+    capture_fft_ready: bool,
     params_buffer: wgpu::Buffer,
     params_upload_buffer: wgpu::Buffer,
     _spectrum_buffer: wgpu::Buffer,
@@ -2940,7 +2943,7 @@ impl OceanGpu {
             ],
         });
 
-        let mut ocean = Self { blue_water, lakes:None, lake_normal:lake_normal.clone(), source_water_normal:None, lake_actors:std::sync::Arc::new(Vec::new()), eye_wave:None, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
+        let mut ocean = Self { blue_water, lakes:None, lake_normal:lake_normal.clone(), source_water_normal:None, lake_actors:std::sync::Arc::new(Vec::new()), eye_wave:None, sky_extend_enabled:false,sky_infinite_enabled:false,sky_extend_regions:[None;OCEAN_MAX_SURFACES],enabled:false,settings,clipmap_center:[0.0;4],environment:OceanEnvironment::default(),surfaces:[OceanSurface{plane_height:0.0,minimum:[0.0;2],maximum:[0.0;2]};OCEAN_MAX_SURFACES],surface_count:0,masks:std::sync::Arc::new(OceanMasks::default()),times:[120.0,120.0+std::f32::consts::PI,120.0+2.0*std::f32::consts::PI],elapsed:0.0,next_update:0.0,lod_snapshots,lod_pipeline,lod_due:[0.0;2],lod_valid:[false;2],last_windrow_update:None,staged_params:[CascadeGpu::zeroed();OCEAN_CASCADES],foam_parity:[0;OCEAN_CASCADES],phase:0,phase_count:0,phase_spectrum:false,phase_started_at:0.0,phase_period:0.0,spectrum_dirty:true,capture_fft_ready:false,params_buffer,params_upload_buffer,_spectrum_buffer:spectrum_buffer,_butterfly_buffer:butterfly_buffer,_fft_buffer:fft_buffer,_foam_buffer:foam_buffer,_displacement:displacement,_normal:normal,compute_bind_groups,spectrum_pipeline,butterfly_pipeline,modulate_pipeline,fft_pipeline,transpose_pipeline,unpack_pipeline,_windrow_field_buffer:windrow_field_buffer,windrow_bind_group,windrow_pipeline,windrow_params_buffer,windrow_front:0,render_buffer,render_bind_group, render_layout:render_layout.clone(),
             render_displacement_view, render_normal_view,
             render_sampler:sampler, spray_view:spray_albedo_view.clone(), promoted_surfaces:Vec::new(),
             sky_admission: None,
@@ -3006,6 +3009,9 @@ impl OceanGpu {
 
 
 
+    /// Capture the actual simulation clock, including map/server time sync.
+    pub(crate) fn capture_time(&self) -> f32 { self.elapsed }
+
     pub fn set_time(&mut self, seconds: f32) {
         // Screenshot A/Bs already freeze the render clock with this variable.
         // The render-thread scene clock must not advance the ocean behind it.
@@ -3016,6 +3022,7 @@ impl OceanGpu {
         if (seconds - self.elapsed).abs() > 0.05 {
             if self.settings.ninja_requested(){self.eye_wave=None;}
             self.elapsed = seconds;
+            self.capture_fft_ready = false;
             if let Some(blue) = &mut self.blue_water { blue.set_time(seconds); }
             self.times = std::array::from_fn(|i| seconds + 120.0 + i as f32 * std::f32::consts::PI);
             self.next_update = seconds;
@@ -3267,6 +3274,7 @@ impl OceanGpu {
         {
             return;
         }
+        self.capture_fft_ready = false;
         let mut previous = std::mem::take(&mut self.promoted_surfaces);
         for descriptor in descriptors {
             let (settings, manual) = desired_settings(descriptor);
@@ -3404,6 +3412,7 @@ impl OceanGpu {
         let settings=requested.sanitize();
         debug_assert_eq!(settings.map_size,self.settings.map_size,"map-size changes recreate OceanGpu");
         if settings == self.settings { return; }
+        self.capture_fft_ready = false;
         let old_updates=self.settings.updates_per_second;
         let change_schedule = settings.updates_per_second != old_updates;
         if settings.dynamic_update_rates && !self.settings.dynamic_update_rates {
@@ -3690,6 +3699,33 @@ impl OceanGpu {
     }
 
     pub fn encode_frame(&mut self, queue:&wgpu::Queue, encoder:&mut wgpu::CommandEncoder, delta:f32) {
+        self.encode_frame_at_rate(queue, encoder, delta, self.settings.updates_per_second);
+    }
+
+    /// Offline screenshots never advance the simulation clock. Execute a whole
+    /// FFT update at the captured time using the existing 0-UPS path. Do not
+    /// change the live UPS cvar or the process-wide Blue Water spread switch.
+    pub(crate) fn encode_capture_frame(&mut self, queue:&wgpu::Queue, encoder:&mut wgpu::CommandEncoder) {
+        if !self.enabled { return; }
+        if self.settings.backend == 0 {
+            if self.capture_fft_ready { return; }
+            // Abandon any incomplete scratch cycle before the unthrottled update.
+            // A fresh screenshot ocean has no published field yet.
+            if self.phase_count != 0 {
+                self.spectrum_dirty |= self.phase_spectrum;
+                self.phase = 0;
+                self.phase_count = 0;
+            }
+        }
+        // Blue Water's WaveField skips repeated zero-delta updates at an
+        // unchanged phase. That also allows a newly dirty spectrum to publish.
+        self.encode_frame_at_rate(queue, encoder, 0.0, 0.0);
+        if self.settings.backend == 0 {
+            self.capture_fft_ready = self.phase_count == 0;
+        }
+    }
+
+    fn encode_frame_at_rate(&mut self, queue:&wgpu::Queue, encoder:&mut wgpu::CommandEncoder, delta:f32, updates:f32) {
         if !self.enabled { return; }
         if self.settings.backend == 3 {
             self.elapsed += delta.max(0.0);
@@ -3702,7 +3738,7 @@ impl OceanGpu {
         }
         if let Some(blue) = &mut self.blue_water {
             blue.adapter_enabled = self.settings.blue_water_adapter;
-            blue.encode(queue, encoder, delta, self.settings.updates_per_second, self.settings.blue_water_waves,
+            blue.encode(queue, encoder, delta, updates, self.settings.blue_water_waves,
                 hybrid_swell_uniform(&self.settings,self.elapsed+delta.max(0.0)),
                 if self.settings.backend == 2 { self.settings.hybrid_breaker } else { 0 },
                 [self.settings.long_waves, self.settings.medium_waves],
@@ -3713,7 +3749,6 @@ impl OceanGpu {
         }
         let delta=delta.max(0.0);
         let now=self.elapsed;
-        let updates=self.settings.updates_per_second;
         // 0 Hz is the original unthrottled per-render-frame mode.
         let (fine_fft_completed, completed_cycle) =
             self.encode_original_cascades(queue,encoder,now,delta,updates);
@@ -5009,6 +5044,56 @@ mod ocean_fft_heading_tests {
 
     fn angle_difference(a: f32, b: f32) -> f32 {
         (a - b + 540.0).rem_euclid(360.0) - 180.0
+    }
+
+    /// A screenshot must publish waves on the first render even when its
+    /// configured gameplay UPS is nonzero and the clock never advances.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn frozen_capture_publishes_fft_once() {
+        block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::VULKAN,
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+            let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+            let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+                required_limits: adapter.limits(), ..Default::default()
+            }).await.unwrap();
+            let layout = OceanGpu::create_render_layout(&device);
+            let albedo = device.create_texture(&wgpu::TextureDescriptor {
+                label: None, size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm, usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = albedo.create_view(&Default::default());
+            for backend in [0, 1, 2] {
+                let settings = OceanSettings { backend, map_size: 256,
+                    updates_per_second: 48.0, ..Default::default() };
+                let mut ocean = OceanGpu::new(&device, &queue, &layout, &view, settings);
+                ocean.set_enabled(&queue, true);
+                ocean.set_time(37.25);
+                let clock = ocean.capture_time();
+                for face in 0..6 {
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    ocean.encode_capture_frame(&queue, &mut encoder);
+                    let submission = queue.submit([encoder.finish()]);
+                    device.poll(wgpu::PollType::Wait { submission_index: Some(submission),
+                        timeout: Some(std::time::Duration::from_secs(60)) }).unwrap();
+                    assert_eq!(ocean.capture_time(), clock);
+                    assert_eq!(ocean.settings.updates_per_second, 48.0);
+                    if let Some(blue) = ocean.blue_water.as_ref() {
+                        assert_eq!(blue.wave_revision, 1, "backend {backend}, face {face}");
+                        assert_eq!(blue.updated_this_frame, face == 0);
+                    } else {
+                        assert!(ocean.capture_fft_ready);
+                        assert_eq!(ocean.phase_count, 0);
+                        assert!(!ocean.spectrum_dirty);
+                    }
+                }
+            }
+        });
     }
 
     /// Measures which way the FFT crests (and so the Jacobian whitecap foam

@@ -274,6 +274,33 @@ impl ApplicationHandler<UserEvent> for App {
             },
             #[cfg(test)]
             UserEvent::StudioTestScenePresented {..} => {},
+            UserEvent::PhotoCaptureProgress(progress) => {
+                if self.photo_cancel.as_ref().is_some_and(|c| !c.load(std::sync::atomic::Ordering::Acquire)) {
+                    self.console_status = progress.status.clone();
+                    self.photo_progress = Some(progress);
+                    self.publish_ui();
+                }
+            }
+            UserEvent::PhotoCaptureFinished(result) => {
+                self.photo_cancel = None;
+                self.photo_progress = None;
+                match result {
+                    Ok(outputs) => for output in outputs {
+                        if let ScreenshotOutput::Saved(path) = output {
+                            self.screenshot_catalog_loaded = false;
+                            self.screenshot_preview_pending = None;
+                            self.console_status = format!("WROTE {}", path.display());
+                            self.push_console_path_line(format!("^2{}", self.console_status), path);
+                        }
+                    },
+                    Err(error) => {
+                        self.console_status = if error == "Screenshot cancelled" { "SCREENSHOT CANCELLED".into() }
+                            else { format!("SCREENSHOT CAPTURE FAILED: {error}") };
+                        self.push_console_line(self.console_status.clone());
+                    }
+                }
+                self.publish_ui();
+            }
             UserEvent::ScreenshotFinished(result) => {
                 match result {
                     Ok(ScreenshotOutput::FrontendSceneSaved(path)) => {

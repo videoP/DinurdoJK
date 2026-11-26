@@ -99,6 +99,15 @@ impl App {
                 .as_ref()
                 .is_some_and(|session| session.client_game.gametype() >= crate::cgame::GT_TEAM);
         if team_gametype {
+            if menu_action(
+                ui,
+                "Auto join team",
+                "Let the server automatically select your team.",
+                true,
+            ) {
+                self.join_live_team("auto", "AUTO JOIN REQUEST SENT");
+                return;
+            }
             if menu_action(ui, "Join red", "Ask the server to join the red team.", true) {
                 self.join_live_team("red", "JOIN RED REQUEST SENT");
                 return;
@@ -176,7 +185,7 @@ impl App {
     }
 
     pub(in crate::app::egui_menu) fn join_live_team(&mut self, team: &str, status: &str) {
-        debug_assert!(matches!(team, "red" | "blue"));
+        debug_assert!(matches!(team, "red" | "blue" | "auto"));
         self.forward_command_to_server(&format!("team {team}"));
         self.console_status = status.into();
         self.set_overlay(OverlayMode::None);

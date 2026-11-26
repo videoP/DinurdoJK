@@ -207,12 +207,20 @@ impl GameSession {
             }
         }
 
+        self.player_presenter.prepare_physics_reference(&self.client_game);
         let mut camera_teleported = false;
         while self
             .next_snapshot
             .as_ref()
             .is_some_and(|snapshot| target_server_time >= snapshot.server_time)
         {
+            if crate::cgame::player_presenter::physics_reference_enabled() {
+                for command in self.client_game.drain_ghoul2_commands() {
+                    self.player_presenter.physics_reference_command(command);
+                    self.player_presenter.apply_ghoul2_server_command(command);
+                }
+                self.player_presenter.advance_physics_reference(&self.client_game, &self.siege_classes, target_server_time);
+            }
             if let (Some(current), Some(next)) = (&self.current_snapshot, &self.next_snapshot) {
                 camera_teleported |= snapshot_discontinuity(current, next);
                 // CG_TransitionPlayerState -> CG_DamageFeedback -> cg.attackerTime.
@@ -263,14 +271,17 @@ impl GameSession {
             self.next_snapshot = self.read_next_snapshot()?;
             self.client_game
                 .set_next_snapshot(self.next_snapshot.as_ref())?;
+            self.player_presenter.prepare_physics_reference(&self.client_game);
         }
 
         // CG_ExecuteNewServerCommands runs before entity presentation. In
         // OpenJK, reliable ircg/rcg commands mutate Ghoul2 instances before
         // CG_AddPacketEntities sees the corresponding body/respawn state.
         for command in self.client_game.drain_ghoul2_commands() {
+            self.player_presenter.physics_reference_command(command);
             self.player_presenter.apply_ghoul2_server_command(command);
         }
+        self.player_presenter.advance_physics_reference(&self.client_game, &self.siege_classes, target_server_time);
         for action in self.client_game.drain_audio_server_actions() {
             if let Some(sound) = self.sound_presenter.as_mut() {
                 match action {
@@ -1371,6 +1382,9 @@ impl GameSession {
             .view_kick()
             .offset(target_server_time, !render_followed_body);
         self.player_presenter.finish_saber_gore(target_server_time, &dynamic_models);
+        if let Some(reference) = self.player_presenter.physics_reference_overlay(target_server_time) {
+            dynamic_models.push(reference);
+        }
         self.dynamic_models = Arc::new(dynamic_models);
         if fx_cpu_trace {
             fx_cpu_times[0] = fx_cpu_stage.elapsed().as_secs_f64() * 1000.0;

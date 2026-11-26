@@ -638,6 +638,45 @@ app_cvars! {
         ]
     }
 
+    APP_CG_DISMEMBERSTYLE {
+        runtime: CvarDef::new(
+                "cg_dismemberStyle",
+                "0",
+                "0|1",
+                "Sever style when cg_dismember is on: 0 authored seam (server limb entity), 1 dynamic client saber cut (needs r_physics and r_ragdolls).",
+                CvarType::String,
+                CvarFlags::ARCHIVE,
+                LatchScope::None,
+                |app: &App| CvarValue::String(app.video.dismember_style.to_string()),
+                |app, value| {
+                    App::cvar_set_cg_dismemberstyle(app, APP_CG_DISMEMBERSTYLE.entry.name, &value.to_string())
+                },
+            )
+            .with_text_setter(App::cvar_set_cg_dismemberstyle, None),
+        config: CvarBinding {
+                load_video: Some(|settings, _name, value, _context| {
+                    if let Ok(value) = value.parse::<u8>() {
+                        settings.dismember_style = value.min(1);
+                    }
+                }),
+                archive: Some((201, |state| format!("{}", state.video.dismember_style))),
+                ..CvarBinding::NONE
+            },
+        implementations: [
+            impl App {
+                fn cvar_set_cg_dismemberstyle(&mut self, _name: &str, value: &str) -> Result<(), String> {
+                    let requested = value
+                        .trim()
+                        .parse::<u8>()
+                        .map_err(|_| "cg_dismemberStyle expects 0 or 1".to_owned())?;
+                    self.video.dismember_style = requested.min(1);
+                    self.physics_menu_changed();
+                    Ok(())
+                }
+            }
+        ]
+    }
+
     APP_CG_DYNAMICCROSSHAIR {
         runtime: CvarDef::new("cg_dynamicCrosshair", "", "0|1|2", "Dynamic crosshair: 0 fixed at screen center, 1 trace from the weapon/player muzzle, 2 dynamic except for melee/saber/race/strafehelper static overrides. The jaPRO Line crosshair always stays centered.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None, |app| CvarValue::String(App::cvar_get_cg_dynamiccrosshair(app)), |app, value| App::cvar_set_cg_dynamiccrosshair(app, APP_CG_DYNAMICCROSSHAIR.entry.name, &value.to_string())).with_text_setter(App::cvar_set_cg_dynamiccrosshair, None),
         config: CvarBinding {

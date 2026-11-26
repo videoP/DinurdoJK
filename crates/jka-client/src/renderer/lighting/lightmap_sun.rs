@@ -2203,6 +2203,9 @@ impl StaticSun {
     pub(in crate::renderer) fn replace_geometry(&mut self, geometry: Geometry) {
         *self = Self::new(Some(geometry));
     }
+    pub(in crate::renderer) fn capture_pending(&self) -> bool {
+        self.pending.is_some()
+    }
     pub(in crate::renderer) fn local_ready(&self) -> bool {
         self.key.is_some() && !self.local_flux.is_empty() && !self.local_totals.is_empty()
             && !self.local_lights.is_empty()

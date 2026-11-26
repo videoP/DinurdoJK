@@ -131,6 +131,7 @@ impl PlayerPresenter {
     }
 
     pub(crate) fn finish_saber_gore(&mut self, now: i32, draws: &[DynamicModelSurface]) {
+        self.finish_dynamic_cuts(now);
         if self.saber_gore_blades.is_empty() { return; }
         let Some(world) = self.collision_world.as_mut() else {
             self.saber_gore_blades.clear();

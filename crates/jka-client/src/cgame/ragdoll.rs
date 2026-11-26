@@ -16,6 +16,13 @@ use rapier3d::{
 };
 use std::collections::{HashMap, HashSet};
 
+mod cut;
+pub(crate) use cut::{RagdollCut, RagdollCutGroup, CUT_PIECE_KEY_BASE};
+
+fn is_cut_piece_key(key: u16) -> bool {
+    key >= CUT_PIECE_KEY_BASE
+}
+
 /// JKA uses large Quake-style map units. Keeping Rapier near meter-ish scales
 /// improves solver tolerances without changing anything visible to the game.
 const JKA_TO_RAPIER: f32 = 1.0 / 32.0;
@@ -65,6 +72,8 @@ pub struct RagdollConfig {
     pub lifetime_seconds: f32,
     /// OpenJK cg_dismember semantics: 0 off, 1 limbs only, 2 full (head/waist too).
     pub dismemberment: u8,
+    /// cg_dismemberStyle: 0 authored seams (server limbs), 1 dynamic saber cuts.
+    pub dismember_style: u8,
     pub max_detached_limbs: u32,
     pub detached_limb_lifetime_seconds: f32,
     pub self_collision: bool,
@@ -94,6 +103,7 @@ impl Default for RagdollConfig {
             max_ragdolls: 8,
             lifetime_seconds: 20.0,
             dismemberment: 0,
+            dismember_style: 0,
             max_detached_limbs: 24,
             detached_limb_lifetime_seconds: 16.0,
             self_collision: false,
@@ -303,6 +313,12 @@ struct RagdollInstance {
     soft_joints: Vec<SoftJoint>,
     corpse_smear_points: Vec<CorpseSmearPoint>,
     next_corpse_smear_ms: i32,
+    /// Unique per spawn; dynamic-cut meshes are valid only for this serial.
+    serial: u64,
+    /// Unscaled entity matrix of the most recent `apply_to_pose`.
+    last_frame: Matrix3x4,
+    /// Set on dynamic-cut pieces (keys >= `CUT_PIECE_KEY_BASE`).
+    piece: Option<cut::PieceState>,
 }
 
 /// Stable identity of one server-authored `G2_MODEL_PART` presentation entity.
@@ -399,6 +415,7 @@ struct PlayerCollider {
 
 pub struct RagdollWorld {
     config: RagdollConfig,
+    fixed_reference: bool,
     pipeline: PhysicsPipeline,
     integration: IntegrationParameters,
     islands: IslandManager,
@@ -423,6 +440,8 @@ pub struct RagdollWorld {
     accumulator: f32,
     last_stats_print: Option<i32>,
     debug_candidates: HashMap<u16, CorpseGeneration>,
+    next_serial: u64,
+    next_piece_key: u16,
 }
 
 impl Default for RagdollWorld {
@@ -435,6 +454,7 @@ impl RagdollWorld {
     pub fn new() -> Self {
         Self {
             config: RagdollConfig::default(),
+            fixed_reference: false,
             pipeline: PhysicsPipeline::new(),
             integration: IntegrationParameters::default(),
             islands: IslandManager::new(),
@@ -459,11 +479,107 @@ impl RagdollWorld {
             accumulator: 0.0,
             last_stats_print: None,
             debug_candidates: HashMap::new(),
+            next_serial: 0,
+            next_piece_key: CUT_PIECE_KEY_BASE,
         }
+    }
+
+    /// Actual reference collider geometry, not a proxy copied from live physics.
+    /// Thin crossed ribbons use the existing unlit/no-depth overlay pipeline.
+    pub(crate) fn reference_wireframe(&self) -> Option<crate::renderer::DynamicModelSurface> {
+        use crate::renderer::{DynamicModelSurface, DynamicModelVertex, DynamicModelAlphaMode,
+            DynamicWireframeClass, ModelGeometrySource};
+        use std::sync::Arc;
+        use glam::Vec3;
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut line = |a: Vector, b: Vector| {
+            let convert = |v: Vector| Vec3::from_array(crate::scene::render_position(
+                [v.x * RAPIER_TO_JKA, v.y * RAPIER_TO_JKA, v.z * RAPIER_TO_JKA]));
+            let (a, b) = (convert(a), convert(b));
+            let direction = (b-a).normalize_or_zero();
+            if direction == Vec3::ZERO { return; }
+            let u = direction.any_orthonormal_vector();
+            let v = direction.cross(u);
+            for side in [u, v] {
+                let side = side * 0.22;
+                let n = vertices.len() as u32;
+                for p in [a-side, a+side, b+side, b-side] {
+                    vertices.push(DynamicModelVertex { position: p.to_array(), normal: [0.0,1.0,0.0],
+                        uv: [0.0;2], color: [0.05,0.85,0.12,1.0], depth_hack: 0.0,
+                        water_wetness: 0.0, foliage_wind: 0.0 });
+                }
+                // Both windings keep this visible independent of backface culling.
+                indices.extend_from_slice(&[n,n+1,n+2,n,n+2,n+3,n+2,n+1,n,n+3,n+2,n]);
+            }
+        };
+        // Only actual ragdoll/fragment colliders; omit map and player proxies.
+        for instance in self.instances.values() {
+            for driven in &instance.driven {
+                let Some(body) = self.bodies.get(driven.body) else { continue; };
+                for &handle in body.colliders() {
+                    let Some(collider) = self.colliders.get(handle) else { continue; };
+                    let world = |p: Vector| {
+                        let local = collider.position_wrt_parent().map_or(p, |pose| pose.translation + pose.rotation * p);
+                        body.position().translation + body.position().rotation * local
+                    };
+                    let shape = collider.shape();
+                    if let Some(box_shape) = shape.as_cuboid() {
+                        let h = box_shape.half_extents;
+                        let points = std::array::from_fn::<_, 8, _>(|i| Vector::new(
+                            if i & 1 == 0 {-h.x} else {h.x}, if i & 2 == 0 {-h.y} else {h.y},
+                            if i & 4 == 0 {-h.z} else {h.z}));
+                        for i in 0..8 { for bit in [1,2,4] { if i & bit == 0 {
+                            line(world(points[i]), world(points[i|bit]));
+                        } } }
+                    } else if let Some((a,b,radius)) = shape.as_capsule().map(|c| (c.segment.a,c.segment.b,c.radius))
+                        .or_else(|| shape.as_ball().map(|b| (Vector::ZERO,Vector::ZERO,b.radius))) {
+                        let axis = (b-a).normalize_or_zero();
+                        let axis = if axis == Vector::ZERO { Vector::Z } else { axis };
+                        let helper = if axis.z.abs() < 0.9 { Vector::Z } else { Vector::X };
+                        let u = axis.cross(helper).normalize_or_zero();
+                        let v = axis.cross(u);
+                        let ring = |center: Vector, angle: f32| center + radius * (u*angle.cos()+v*angle.sin());
+                        const N: usize = 12;
+                        for i in 0..N {
+                            let angle = i as f32 * std::f32::consts::TAU / N as f32;
+                            let next = (i+1) as f32 * std::f32::consts::TAU / N as f32;
+                            line(world(ring(a,angle)),world(ring(a,next)));
+                            if a != b { line(world(ring(b,angle)),world(ring(b,next))); }
+                            if i % 3 == 0 {
+                                let radial = u*angle.cos()+v*angle.sin();
+                                if a != b { line(world(a+radial*radius),world(b+radial*radius)); }
+                                for (center, sign) in [(a,-1.0),(b,1.0)] {
+                                    for j in 0..4 {
+                                        let t0 = j as f32 * std::f32::consts::FRAC_PI_2 / 4.0;
+                                        let t1 = (j+1) as f32 * std::f32::consts::FRAC_PI_2 / 4.0;
+                                        let point = |t:f32| center+radius*(radial*t.cos()+axis*(sign*t.sin()));
+                                        line(world(point(t0)),world(point(t1)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if vertices.is_empty() { return None; }
+        Some(DynamicModelSurface { geometry_source: ModelGeometrySource::Fx, authored_lighting: false,
+            material_trace: None, entity_num: u16::MAX, wireframe_class: DynamicWireframeClass::Effect,
+            raster_visible: true, portal_only: false, vertices: Arc::new(vertices), indices: Arc::new(indices),
+            lighting_origin: None, rt_rigid: None, rt_skinned_key: None, ghoul2_gpu: None,
+            cloth_gpu: None, fx_gpu_sprites: None, authored_glow: false, texture: None,
+            alpha_mode: DynamicModelAlphaMode::SightShellNoDepth })
     }
 
     pub fn active(&self) -> bool {
         self.config.enabled && self.static_world_ready
+    }
+
+    /// Dynamic cuts need the Rapier corpse they split; otherwise the
+    /// authored server-limb path stays in charge.
+    pub fn dynamic_cuts_active(&self) -> bool {
+        self.config.dismember_style == 1 && self.config.dismemberment > 0 && self.active()
     }
 
     pub fn dismemberment_level(&self) -> u8 {
@@ -559,6 +675,7 @@ impl RagdollWorld {
             debris_lifetime_seconds: config.debris_lifetime_seconds.clamp(1.0, 300.0),
             lifetime_seconds: config.lifetime_seconds.clamp(0.0, 300.0),
             dismemberment: config.dismemberment.min(2),
+            dismember_style: config.dismember_style.min(1),
             joint_model: config.joint_model.min(1),
             max_detached_limbs: config.max_detached_limbs.min(128),
             detached_limb_lifetime_seconds: config.detached_limb_lifetime_seconds.clamp(0.0, 300.0),
@@ -706,8 +823,9 @@ impl RagdollWorld {
                 teleport_bit: player.teleport_bit, sampled_at: current_time,
             });
         }
-        let stale = self.player_colliders.keys().filter(|entity| !live.contains(entity))
+        let mut stale = self.player_colliders.keys().filter(|entity| !live.contains(entity))
             .copied().collect::<Vec<_>>();
+        if self.fixed_reference { stale.sort_unstable(); }
         for entity in stale {
             if let Some(proxy) = self.player_colliders.remove(&entity) { self.remove_body(proxy.body); }
         }
@@ -720,6 +838,22 @@ impl RagdollWorld {
     }
 
     pub fn begin_frame(&mut self, current_time: i32) {
+        self.begin_frame_inner(current_time, false);
+    }
+
+    /// Called once per absolute 60 Hz reference tick. Integer millisecond
+    /// timestamps are for entity timers only, never the integration delta.
+    pub(crate) fn begin_reference_tick(&mut self, current_time: i32) {
+        self.begin_frame_inner(current_time, true);
+    }
+
+    pub(crate) fn config(&self) -> RagdollConfig { self.config }
+    pub(crate) fn enable_fixed_reference(&mut self) { self.fixed_reference = true; }
+    pub(crate) fn reference_counts(&self) -> (usize, usize, usize) {
+        (self.corpse_instance_count(), self.instances.len() - self.corpse_instance_count(), self.player_colliders.len())
+    }
+
+    fn begin_frame_inner(&mut self, current_time: i32, reference: bool) {
         self.living_recoveries.retain(|_, recovery| {
             current_time.saturating_sub(recovery.started_at) < recovery.duration_ms
         });
@@ -759,7 +893,11 @@ impl RagdollWorld {
         let frame_dt = ((current_time - previous) as f32 * 0.001).min(0.1);
         let step_dt = 1.0 / self.config.hz.max(1) as f32;
         self.integration.dt = step_dt;
-        self.accumulator += frame_dt;
+        if reference {
+            self.accumulator = step_dt;
+        } else {
+            self.accumulator += frame_dt;
+        }
 
         let mut steps = 0;
         let step_count = (((self.accumulator + 1.0e-6) / step_dt) as u32).min(self.config.max_substeps);
@@ -800,6 +938,10 @@ impl RagdollWorld {
             self.accumulator = self.accumulator.min(step_dt);
         }
 
+        // Reference is displayed at the solved tick, not the preceding pose.
+        // The next reference tick replaces (rather than adds to) this fraction.
+        if reference { self.accumulator = step_dt; }
+
         if self.config.stats
             && self.last_stats_print.map_or(true, |last| current_time.saturating_sub(last) >= 1000)
         {
@@ -825,7 +967,14 @@ impl RagdollWorld {
     /// these on positions; in Rapier the corresponding compliant angular
     /// correction is applied as paired velocity impulses ahead of integration.
     fn update_soft_joint_springs(&mut self, h: f32) {
-        for instance in self.instances.values() {
+        let mut ordered = Vec::new();
+        if self.fixed_reference {
+            ordered.extend(self.instances.iter());
+            ordered.sort_unstable_by_key(|(key, _)| **key);
+        }
+        let ordered_instances = ordered.into_iter().map(|(_, instance)| instance);
+        let live_instances = self.instances.values().filter(|_| !self.fixed_reference);
+        for instance in ordered_instances.chain(live_instances) {
             for joint in &instance.soft_joints {
                 let Some((qp, qc, angles)) = soft_joint_angles(&self.bodies, joint) else { continue; };
                 if joint_both_sleeping(&self.bodies, joint) { continue; }
@@ -860,7 +1009,14 @@ impl RagdollWorld {
     /// Velocity-constraint part of Better Ragdoll solver.py, executed AFTER
     /// Rapier's position/contact step, as in the original XPBD substep.
     fn update_soft_joint_damping(&mut self, h: f32) {
-        for instance in self.instances.values() {
+        let mut ordered = Vec::new();
+        if self.fixed_reference {
+            ordered.extend(self.instances.iter());
+            ordered.sort_unstable_by_key(|(key, _)| **key);
+        }
+        let ordered_instances = ordered.into_iter().map(|(_, instance)| instance);
+        let live_instances = self.instances.values().filter(|_| !self.fixed_reference);
+        for instance in ordered_instances.chain(live_instances) {
             for joint in &instance.soft_joints {
                 if joint_both_sleeping(&self.bodies, joint) { continue; }
                 let Some((qp, qc, angles)) = soft_joint_angles(&self.bodies, joint) else { continue; };
@@ -992,7 +1148,7 @@ impl RagdollWorld {
             // Prefer the newest death when the visual budget is full. This is
             // presentation-only, so evicting the oldest solved corpse cannot
             // affect authoritative entity state.
-            while self.instances.len() >= self.config.max_ragdolls as usize {
+            while self.corpse_instance_count() >= self.config.max_ragdolls as usize {
                 let Some(oldest) = self.oldest_instance() else {
                     break;
                 };
@@ -1088,42 +1244,18 @@ impl RagdollWorld {
         // guaranteed not to change model size or the frozen death pose.
         let (spawn_pose, driven_bones) = self
             .instances
-            .get(&entity.number)
-            .map(|instance| (instance.spawn_pose.clone(), instance.driven.clone()))
+            .get_mut(&entity.number)
+            .map(|instance| {
+                // Dynamic cuts split a corpse at the frame it was last solved in.
+                instance.last_frame = entity_matrix;
+                (instance.spawn_pose.clone(), instance.driven.clone())
+            })
             .unwrap_or_default();
         if spawn_pose.len() != pose.len() {
             return Ok(false);
         }
 
-        let mut driven_deltas = HashMap::<usize, Matrix3x4>::new();
-        for driven in &driven_bones {
-            let Some(body) = self.bodies.get(driven.body) else {
-                continue;
-            };
-            let current_pose = body.position();
-            let previous_pose = self
-                .previous_body_poses
-                .get(&driven.body)
-                .unwrap_or(current_pose);
-            let interpolated = interpolate_pose(
-                previous_pose,
-                current_pose,
-                self.interpolation_alpha(),
-            );
-            let world = pose_to_matrix(&interpolated);
-            let scaled_model_bone = multiply_3x4(&entity_inverse, &world);
-            let solved_model_rigid = scale_bone_translation(
-                &scaled_model_bone,
-                1.0 / model_scale.max(1.0e-6),
-            );
-            let Some(spawn_inverse) = inverse_affine(&driven.spawn_model_rigid) else {
-                continue;
-            };
-            driven_deltas.insert(
-                driven.bone_index,
-                multiply_3x4(&solved_model_rigid, &spawn_inverse),
-            );
-        }
+        let driven_deltas = self.driven_deltas(&driven_bones, &entity_inverse, model_scale);
 
         // Broadsword treats several helper bones as explicit rag effectors even
         // though they are not useful independent rigid bodies. Bind those skin
@@ -1143,6 +1275,46 @@ impl RagdollWorld {
             instance.last_applied_pose.extend_from_slice(pose);
         }
         Ok(true)
+    }
+
+    /// One rigid model-space delta per simulated segment, interpolated to the
+    /// render fraction. Shared by whole corpses and dynamic-cut pieces.
+    fn driven_deltas(
+        &self,
+        driven_bones: &[DrivenBone],
+        entity_inverse: &Matrix3x4,
+        model_scale: f32,
+    ) -> HashMap<usize, Matrix3x4> {
+        let mut driven_deltas = HashMap::<usize, Matrix3x4>::new();
+        for driven in driven_bones {
+            let Some(body) = self.bodies.get(driven.body) else {
+                continue;
+            };
+            let current_pose = body.position();
+            let previous_pose = self
+                .previous_body_poses
+                .get(&driven.body)
+                .unwrap_or(current_pose);
+            let interpolated = interpolate_pose(
+                previous_pose,
+                current_pose,
+                self.interpolation_alpha(),
+            );
+            let world = pose_to_matrix(&interpolated);
+            let scaled_model_bone = multiply_3x4(entity_inverse, &world);
+            let solved_model_rigid = scale_bone_translation(
+                &scaled_model_bone,
+                1.0 / model_scale.max(1.0e-6),
+            );
+            let Some(spawn_inverse) = inverse_affine(&driven.spawn_model_rigid) else {
+                continue;
+            };
+            driven_deltas.insert(
+                driven.bone_index,
+                multiply_3x4(&solved_model_rigid, &spawn_inverse),
+            );
+        }
+        driven_deltas
     }
 
     /// Begin a short visual recovery from the final living ragdoll pose to
@@ -1221,12 +1393,14 @@ impl RagdollWorld {
     }
 
     pub fn retain_visible(&mut self, visible_bodies: &HashSet<u16>) {
-        let stale = self
+        // Dynamic-cut pieces have no entity; their own lifetime/budget applies.
+        let mut stale = self
             .instances
             .keys()
             .copied()
-            .filter(|entity| !visible_bodies.contains(entity))
+            .filter(|entity| !is_cut_piece_key(*entity) && !visible_bodies.contains(entity))
             .collect::<Vec<_>>();
+        if self.fixed_reference { stale.sort_unstable(); }
         for entity in stale {
             self.remove_instance(entity);
         }
@@ -1519,6 +1693,12 @@ impl RagdollWorld {
             soft_joints,
             corpse_smear_points,
             next_corpse_smear_ms: current_time,
+            serial: {
+                self.next_serial = self.next_serial.wrapping_add(1);
+                self.next_serial
+            },
+            last_frame: entity_matrix,
+            piece: None,
         })
     }
 
@@ -1677,6 +1857,7 @@ impl RagdollWorld {
         }
 
         let detached_lifetime_ms = (self.config.detached_limb_lifetime_seconds * 1000.0) as i32;
+        self.expire_cut_pieces(current_time, detached_lifetime_ms);
         let expired = self
             .detached_limbs
             .iter()
@@ -1844,7 +2025,7 @@ impl RagdollWorld {
     fn oldest_detached_limb(&self) -> Option<u16> {
         self.detached_limbs
             .iter()
-            .min_by_key(|(_, limb)| limb.spawned_at)
+            .min_by_key(|(entity, limb)| (limb.spawned_at, if self.fixed_reference { **entity } else { 0 }))
             .map(|(&entity, _)| entity)
     }
 
@@ -1870,12 +2051,17 @@ impl RagdollWorld {
     fn oldest_instance(&self) -> Option<u16> {
         self.instances
             .iter()
-            .min_by_key(|(_, instance)| instance.spawned_at)
+            .filter(|(&entity, _)| !is_cut_piece_key(entity))
+            .min_by_key(|(entity, instance)| (instance.spawned_at, if self.fixed_reference { **entity } else { 0 }))
             .map(|(&entity, _)| entity)
     }
 
+    fn corpse_instance_count(&self) -> usize {
+        self.instances.keys().filter(|&&entity| !is_cut_piece_key(entity)).count()
+    }
+
     fn trim_to_budget(&mut self) {
-        while self.instances.len() > self.config.max_ragdolls as usize {
+        while self.corpse_instance_count() > self.config.max_ragdolls as usize {
             let Some(oldest) = self.oldest_instance() else {
                 break;
             };
@@ -2747,6 +2933,15 @@ fn apply_soft_joint_spring(
     apply_joint_torque_impulse(bodies, joint, axis * (length / (h * denom)));
 }
 
+/// Simulated-segment geometry for a driven bone: (name, end bone, radius)
+/// at modelScale 1. Dynamic cuts test the swing against these same segments.
+pub(crate) fn body_segment_spec(bone_name: &str) -> Option<(&'static str, Option<&'static str>, f32)> {
+    BODY_SPECS
+        .iter()
+        .find(|spec| spec.name.eq_ignore_ascii_case(bone_name))
+        .map(|spec| (spec.name, spec.end, spec.radius))
+}
+
 fn bone_index(gla: &GlaAnimation, name: &str) -> Option<usize> {
     gla.skeleton
         .iter()
@@ -2774,34 +2969,45 @@ fn nearest_driven_parent(
 /// physical segment, then fall back to the nearest driven skeleton ancestor.
 /// This keeps stock humanoid face/twist weighting coherent without giving every
 /// helper its own Rapier rigid body.
-fn ragdoll_driver_for_bone(
+pub(crate) fn ragdoll_driver_for_bone(
     gla: &GlaAnimation,
     skin_bone_index: usize,
     driven_deltas: &HashMap<usize, Matrix3x4>,
 ) -> Option<usize> {
-    fn explicit_driver_name(name: &str) -> Option<&'static str> {
-        match name.to_ascii_lowercase().as_str() {
-            // These are explicit Broadsword rag effectors in q_shared.h but are
-            // helper/twist/skin bones rather than useful separate rigid bodies.
-            "model_root" | "motion" => Some("pelvis"),
-            "rradiusx" => Some("rradius"),
-            "lradiusx" => Some("lradius"),
-            "rfemurx" => Some("rfemurYZ"),
-            "lfemurx" => Some("lfemurYZ"),
-            "ceyebrow" => Some("cranium"),
-            _ => None,
-        }
-    }
+    ragdoll_driver_for_bone_by(gla, skin_bone_index, |bone| driven_deltas.contains_key(&bone))
+}
+
+/// `ragdoll_driver_for_bone` over any driven-bone predicate.
+pub(crate) fn ragdoll_driver_for_bone_by(
+    gla: &GlaAnimation,
+    skin_bone_index: usize,
+    is_driven: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    // These are explicit Broadsword rag effectors in q_shared.h but are
+    // helper/twist/skin bones rather than useful separate rigid bodies.
+    // Case-insensitive compare without allocating: this runs per bone per
+    // ragdoll per frame.
+    const EXPLICIT_DRIVERS: [(&str, &str); 7] = [
+        ("model_root", "pelvis"),
+        ("motion", "pelvis"),
+        ("rradiusx", "rradius"),
+        ("lradiusx", "lradius"),
+        ("rfemurx", "rfemurYZ"),
+        ("lfemurx", "lfemurYZ"),
+        ("ceyebrow", "cranium"),
+    ];
 
     let mut current = Some(skin_bone_index);
     while let Some(index) = current {
-        if driven_deltas.contains_key(&index) {
+        if is_driven(index) {
             return Some(index);
         }
         let bone = gla.skeleton.get(index)?;
-        if let Some(driver_name) = explicit_driver_name(&bone.name) {
+        if let Some(&(_, driver_name)) =
+            EXPLICIT_DRIVERS.iter().find(|(name, _)| bone.name.eq_ignore_ascii_case(name))
+        {
             if let Some(driver) = bone_index(gla, driver_name) {
-                if driven_deltas.contains_key(&driver) {
+                if is_driven(driver) {
                     return Some(driver);
                 }
             }

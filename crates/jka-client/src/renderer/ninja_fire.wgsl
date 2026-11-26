@@ -194,3 +194,109 @@ fn spark_layer_fragment(in_vertex: SparkVertex, @builtin(front_facing) front: bo
     let fade = select(1.0, clamp(gap / max(in_vertex.shape.z, 1e-4), 0.0, 1.0), in_vertex.shape.z > 0.0);
     return vec4<f32>(shaded.rgb, shaded.a * fade);
 }
+
+// Heat haze (r_ninjaFireHeatHaze). While it is on, the flame layer is
+// composited after this, so these passes refract the background only (also
+// behind the translucent flame) and the flame lands sharp on top.
+// `haze_gather` writes the displaced HDR scene and its mask into a scratch,
+// `haze_apply` blends that back. Group 1 stays reserved for the ember pools.
+struct HazeUniform {
+    // x: time (s), y: strength, z: 1 / RMS of the curl field's xy, w: rise (noise tiles / s).
+    params: vec4<f32>,
+    // xy: 1 / gather target size (render size), zw: 1 / scene target size.
+    inv_size: vec4<f32>,
+}
+
+@group(2) @binding(0) var<uniform> haze: HazeUniform;
+@group(2) @binding(1) var haze_source: texture_2d<f32>;
+@group(2) @binding(2) var haze_curl: texture_3d<f32>;
+@group(2) @binding(3) var haze_repeat: sampler;
+@group(2) @binding(4) var haze_clamp: sampler;
+
+// The haze quad reaches this many flame-window heights above the window,
+// where the hot column keeps rising past the flame tips.
+const HAZE_RISE: f32 = 0.25;
+
+struct HazeVertex {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) world: vec3<f32>,
+    // 0..1 across the (extended) haze quad.
+    @location(2) quad: vec2<f32>,
+    // Screen-UV displacement per map unit along the plane's right (xy) and up (zw).
+    @location(3) axes: vec4<f32>,
+}
+
+fn haze_screen_uv(clip: vec4<f32>) -> vec2<f32> {
+    let ndc = clip.xy / max(clip.w, 1e-3);
+    return vec2<f32>(0.5 * ndc.x, -0.5 * ndc.y);
+}
+
+@vertex
+fn haze_vertex(@builtin(vertex_index) vertex: u32) -> HazeVertex {
+    let quad = array(
+        vec2<f32>(0.0, 0.0), vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0),
+        vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0),
+    )[vertex];
+    // Plane v runs from HAZE_RISE above the flame window (negative) to its base.
+    let plane = vec2<f32>(quad.x, mix(-HAZE_RISE, 1.0, quad.y));
+    let field_uv = vec2<f32>(0.5) + (plane - vec2<f32>(0.5)) * flame.crop.xy;
+    let base = flame_plane_vertex(plane, field_uv);
+    let here = haze_screen_uv(base.position);
+    let right = haze_screen_uv(flame.view_proj * vec4<f32>(base.world + flame.right_extent.xyz, 1.0)) - here;
+    let up = haze_screen_uv(flame.view_proj * vec4<f32>(base.world + flame.up_extent.xyz, 1.0)) - here;
+    return HazeVertex(base.position, field_uv, base.world, quad, vec4<f32>(right, up));
+}
+
+fn haze_density(uv: vec2<f32>) -> f32 {
+    return textureSampleLevel(flame_velocity_density, flame_clamp, uv, 0.0).b;
+}
+
+@fragment
+fn haze_gather(in_vertex: HazeVertex) -> @location(0) vec4<f32> {
+    let pixel = vec2<i32>(in_vertex.position.xy);
+    let eye_distance = length(in_vertex.world - flame.eye_time.xyz);
+    // Geometry in front of the hot air is not refracted.
+    if (textureLoad(flame_radial_depth, pixel, 0).r < eye_distance) { discard; }
+    let vd = textureSampleLevel(flame_velocity_density, flame_clamp, in_vertex.uv, 0.0);
+    // Hot air rises: fire below this point (towards the base, +v) heats the
+    // column above it, fading with height. Taps are in flame-window heights.
+    let tap = flame.crop.y;
+    let heat = max(max(vd.b, 0.85 * haze_density(in_vertex.uv + vec2<f32>(0.0, 0.06 * tap))),
+        max(0.65 * haze_density(in_vertex.uv + vec2<f32>(0.0, 0.14 * tap)),
+            0.45 * haze_density(in_vertex.uv + vec2<f32>(0.0, 0.25 * tap))));
+    let q = in_vertex.quad;
+    let edge = smoothstep(0.0, 0.4, q.x) * smoothstep(1.0, 0.6, q.x)
+        * smoothstep(0.0, 0.6, q.y) * smoothstep(1.0, 0.8, q.y);
+    let mask = smoothstep(0.01, 0.15, heat) * edge;
+    if (mask < 0.004) { discard; }
+    let width = flame.right_extent.w;
+    let height = flame.up_extent.w * (1.0 + HAZE_RISE);
+    let time = haze.params.x;
+    // One trilinear curl fetch: rising in v, evolving through the volume in w.
+    let cell = 0.4 * min(width, flame.up_extent.w);
+    let p = vec3<f32>(q.x * width / cell, q.y * height / cell + haze.params.w * time, 0.4 * time);
+    let curl = textureSampleLevel(haze_curl, haze_repeat, p, 0.0).xy * haze.params.z;
+    // Field-UV velocity (y down) leans the shimmer with the flow.
+    let flow = clamp(vd.rg, vec2<f32>(-2.0), vec2<f32>(2.0)) * 0.25;
+    let wobble = clamp(curl + flow, vec2<f32>(-2.0), vec2<f32>(2.0));
+    let amplitude = haze.params.y * 0.05 * min(width, flame.up_extent.w) * mask;
+    let offset = clamp(
+        (in_vertex.axes.xy * wobble.x - in_vertex.axes.zw * wobble.y) * amplitude,
+        vec2<f32>(-0.03), vec2<f32>(0.03),
+    );
+    let uv = in_vertex.position.xy * haze.inv_size.xy;
+    // Never pull a foreground object into the haze.
+    let size = vec2<i32>(textureDimensions(flame_radial_depth));
+    let moved = clamp(pixel + vec2<i32>(offset / haze.inv_size.xy), vec2<i32>(0), size - vec2<i32>(1));
+    let valid = textureLoad(flame_radial_depth, moved, 0).r >= eye_distance;
+    let color = textureSampleLevel(haze_source, haze_clamp, uv + select(vec2<f32>(0.0), offset, valid), 0.0).rgb;
+    return vec4<f32>(color, mask);
+}
+
+@fragment
+fn haze_apply(in_vertex: HazeVertex) -> @location(0) vec4<f32> {
+    let gathered = textureSampleLevel(haze_source, haze_clamp, in_vertex.position.xy * haze.inv_size.zw, 0.0);
+    if (gathered.a < 0.004) { discard; }
+    return gathered;
+}

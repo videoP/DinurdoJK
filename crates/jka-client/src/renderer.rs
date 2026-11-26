@@ -194,6 +194,8 @@ use world::videos::{Mp4Video, RoqWorker, VideoDecoder, WorldVideoPlayer};
 mod api;
 mod bindings;
 mod capture;
+mod photo_capture;
+pub use photo_capture::{PhotoOptions, PhotoProjection, PhotoCaptureRequest};
 mod companion;
 mod context;
 mod collision_world;
@@ -880,6 +882,8 @@ struct Renderer {
     studio_entity_mask: Option<studio_entity_mask::StudioEntityMask>,
     studio_revision: u64,
     scene_time: Option<f32>,
+    // Photo views use frozen exposure and no cross-view visibility history.
+    photo_capture_active: bool,
     /// CGame's multiplayer/demo serverTime for deterministic native lightning.
     weather_server_time_ms: Option<i32>,
     river_wake_debug_subject: Option<jka_river::river_ninja::WakeDebugSubject>,
@@ -1322,6 +1326,9 @@ struct Renderer {
     dlss: dlss::DlssState,
     rt_taa_mode: u32,
     contact_shadows_enabled: bool,
+    // Last applied effective scene controls (including command/server overrides).
+    // Offscreen capture must not reconstruct these from menu preferences.
+    scene_post_effects: Option<PostEffects>,
     relighting_mode: u8,
     sun_override: bool,
     sky_sun_custom: bool,

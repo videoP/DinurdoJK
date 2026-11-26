@@ -502,6 +502,7 @@ impl DynamicModelRenderer {
             blob_mesh_vertices: Vec::new(),
             blob_mesh_indices: Vec::new(),
             ghoul2_meshes: HashMap::new(),
+            ghoul2_prepare_serial: 0,
             skin_bone_buffer,
             skin_draw_buffer,
             skin_bone_capacity,

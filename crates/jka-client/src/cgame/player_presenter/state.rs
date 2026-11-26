@@ -118,6 +118,7 @@ impl PlayerPresenter {
     /// Reset only per-entity/time-dependent presentation state for demo seeking.
     /// Asset/model caches stay hot so scrubbing does not turn into a reload path.
     pub fn reset_for_seek(&mut self) {
+        self.physics_reference = None;
         self.fx_requests.clear();
         self.breath_puff_times.clear();
         self.breath_talking.clear();
@@ -160,6 +161,7 @@ impl PlayerPresenter {
         self.dismember_source_snaps.clear();
         self.dynamic_gib_sources.clear();
         self.detached_limb_visuals.clear();
+        self.dynamic_cuts.clear();
         self.saber_blade_lengths.clear();
         self.blob_shadow_instances.clear();
         self.cloth.reset();
@@ -376,6 +378,8 @@ impl PlayerPresenter {
             cloth_remeshes: HashMap::new(),
             cloth_gpu_garments: HashMap::new(),
             ragdolls: RagdollWorld::new(),
+            physics_reference: None,
+            physics_reference_map: Default::default(),
             force_grip_targets: HashMap::new(),
             force_gripped_entities: HashSet::new(),
             pending_impulse_ragdolls: HashMap::new(),
@@ -390,6 +394,7 @@ impl PlayerPresenter {
             dynamic_gibs_enabled: false,
             dynamic_gib_sources: HashMap::new(),
             detached_limb_visuals: HashMap::new(),
+            dynamic_cuts: Default::default(),
             saber_blade_lengths: HashMap::new(),
             failed_models: HashMap::new(),
             player_diagnostics: HashMap::new(),

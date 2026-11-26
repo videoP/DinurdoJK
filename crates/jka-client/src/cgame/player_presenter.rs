@@ -20,6 +20,8 @@ mod diagnostics;
 mod effects;
 mod events;
 mod physics;
+mod physics_reference;
+pub(crate) use physics_reference::{physics_reference_enabled, set_physics_reference_enabled};
 mod pose;
 mod powerups;
 mod presentation;
@@ -419,6 +421,8 @@ pub struct PlayerPresenter {
     cloth_gpu_garments: HashMap<Arc<str>, cloth::ClothGpuGarmentSlot>,
     /// Broadsword-compatible presentation seam backed by Rapier.
     ragdolls: RagdollWorld,
+    physics_reference: Option<Box<physics_reference::PhysicsReference>>,
+    physics_reference_map: crate::cgame::ragdoll::PhysicsMapMesh,
     /// Vanilla entityState does not transmit forceGripEntityNum. Preserve the
     /// last target per active gripper and reacquire with OpenJK's 256-unit
     /// view trace when needed. The local victim uses the exact playerState
@@ -446,6 +450,8 @@ pub struct PlayerPresenter {
     dynamic_gibs_enabled: bool,
     dynamic_gib_sources: HashMap<u16, dynamic_gibs::GibSource>,
     detached_limb_visuals: HashMap<u16, DetachedLimbVisual>,
+    /// cg_dismemberStyle 1: saber swings, cut corpse meshes and cut pieces.
+    dynamic_cuts: bodies::dynamic_cut::DynamicCuts,
     /// OpenJK clientInfo_t saber blade current/desired lengths.
     saber_blade_lengths: HashMap<SaberBladeLengthKey, SaberBladeLengthState>,
     failed_models: HashMap<String, String>,

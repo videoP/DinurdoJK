@@ -76,6 +76,7 @@ impl PlayerPresenter {
                 // live-player -> ET_BODY ownership transfer. OpenJK copies the
                 // existing Ghoul2 instance here rather than replaying death.
                 self.ragdolls.body_queue_copy(source_client, body_entity);
+                self.dynamic_cuts.body_queue_copy(source_client, body_entity);
                 self.body_queue_copies.insert(
                     body_entity,
                     BodyQueueCopyState {

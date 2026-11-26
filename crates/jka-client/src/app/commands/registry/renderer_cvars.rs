@@ -7,6 +7,27 @@ use crate::ui::InlineTransformMode;
 type CvarDef = crate::console::cvars::CvarDef<App>;
 
 app_cvars! {
+    APP_R_SCREENSHOTOPTIONS {
+        runtime: CvarDef::new("r_screenshotOptions", "0,equirectangular,0,8192,png,1,1,1,0,1,1", "mode,projection,width,panoramaWidth,format,supersample,hideUI,hideWeapon,hidePlayer,maxMSAA,embedGameMetadata", "Archived preferences for the Screenshot page.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
+            |app| CvarValue::String(app.video.photo.archive()),
+            |app, value| App::cvar_set_r_screenshotoptions(app, APP_R_SCREENSHOTOPTIONS.entry.name, &value.to_string())).with_text_setter(App::cvar_set_r_screenshotoptions, None),
+        config: CvarBinding {
+            load_video: Some(|settings, _name, value, _context| {
+                if let Some(options) = crate::renderer::PhotoOptions::parse(value) { settings.photo = options; }
+            }),
+            archive: Some((70, |state| state.video.photo.archive())),
+            ..CvarBinding::NONE
+        },
+        implementations: [impl App {
+            fn cvar_set_r_screenshotoptions(&mut self, name: &str, value: &str) -> Result<(), String> {
+                self.video.photo = crate::renderer::PhotoOptions::parse(value)
+                    .ok_or_else(|| format!("{name}: invalid screenshot options"))?;
+                self.mark_config_dirty();
+                Ok(())
+            }
+        }]
+    }
+
     APP_R_FOLIAGEWIND {
         runtime: CvarDef::new("r_foliageWind", "", "0|1", "Wind sway for automatically detected tree, leaf, plant and grass cards. Updates live; procedural Godot grass keeps its own wind animation.", CvarType::String, CvarFlags::ARCHIVE, LatchScope::None,
             |app| CvarValue::String(bool_value(app.video.foliage_wind)),

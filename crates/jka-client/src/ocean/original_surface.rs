@@ -875,14 +875,14 @@ pub(super) fn surface_camera(
     let aspect = width / height;
     let fov = camera.fov_y_for_viewport(width as u32, height as u32);
     let position = (camera.position - Vec3::Y * plane) / OCEAN_UNITS_PER_METER;
-    let view = glam::camera::rh::view::look_to_mat4(position, camera.forward(), Vec3::Y);
+    let view = if camera.has_photo_tile() { camera.view_at(position) } else { glam::camera::rh::view::look_to_mat4(position, camera.forward(), Vec3::Y) };
     let near = camera.near_distance() / OCEAN_UNITS_PER_METER;
     let far = camera.far_distance() / OCEAN_UNITS_PER_METER;
     let projection = Mat4::from_translation(Vec3::new(
         2.0 * jitter[0] / width,
         -2.0 * jitter[1] / height,
         0.0,
-    )) * glam::camera::rh::proj::directx::perspective(fov, aspect, far, near);
+    )) * camera.projection_for_viewport(width as u32, height as u32, near, far);
     let view_projection = projection * view;
     SurfaceCamera {
         view: view.to_cols_array_2d(),
@@ -908,6 +908,7 @@ pub(super) fn surface_camera(
 /// horizon (roll-free, as `surface_camera`), less 3% of the height for crests and lens
 /// jitter. 0 when the view looks steeply down or the horizon is off the top.
 fn water_copy_top_row(camera: &crate::camera::Camera, width: u32, height: u32) -> u32 {
+    if camera.has_photo_tile() { return 0; }
     let (w, h) = (width.max(1) as f32, height.max(1) as f32);
     let forward = camera.forward();
     let level = Vec3::new(forward.x, 0.0, forward.z);
@@ -929,6 +930,11 @@ fn water_copy_top_row(camera: &crate::camera::Camera, width: u32, height: u32) -
 
 /// How far (JKA units) the near plane's corners reach from the eye.
 pub(crate) fn near_plane_reach(camera: &crate::camera::Camera, width: u32, height: u32) -> f32 {
+    if camera.has_photo_tile() {
+        let near = camera.near_distance();
+        return camera.frustum_corners(width, height, near, near).iter()
+            .map(|p| p.distance(camera.position)).fold(near, f32::max) + near;
+    }
     let (width, height) = (width.max(1), height.max(1));
     let aspect = width as f32 / height as f32;
     let tan_half_fov_y = (camera.fov_y_for_viewport(width, height) * 0.5).tan();
@@ -2035,6 +2041,19 @@ impl OceanGpu {
     pub fn original_surface_prepared(&self) -> bool {
         if self.settings.backend == 3 { return self.lakes.is_some(); }
         self.blue_water.as_ref().is_some_and(|blue| blue.original_surface.is_some())
+    }
+
+    /// Capture readiness is a resource property, unlike the current camera's
+    /// pruned mesh/visibility. A pool becoming ready invalidates a face sweep.
+    pub(crate) fn capture_ninja_ready_mask(&self) -> u8 {
+        let Some(surface) = self.blue_water.as_ref()
+            .and_then(|blue| blue.original_surface.as_ref()) else { return 0; };
+        if surface.config.ninja_mode == 0 { return 0; }
+        let Some(ninja) = surface.ninja.as_ref() else { return 0; };
+        // slot.ready is reset per view, so use the retained material binding.
+        (0..surface.slots.len()).fold(0, |mask, index| {
+            if ninja.group(index).is_some() { mask | (1u8 << index) } else { mask }
+        })
     }
 
     /// Pools with a prepared Ocean2 replacement for their authored water.

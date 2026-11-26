@@ -1,7 +1,7 @@
 //! Effects.
 use crate::app::egui_settings::{
     index_of, segmented_row, theme, ui, App, FootprintMode, Ghoul2SkinningMode,
-    PHYS_DISMEMBERMENT,
+    PHYS_DISMEMBERMENT, PHYS_DISMEMBER_STYLE,
 };
 
 impl App {
@@ -325,6 +325,20 @@ impl App {
             self.video.dismemberment = mode;
             self.physics_menu_changed();
         }
+        const DISMEMBER_STYLE: [(u8, &str); 2] = [(0, "Authored seam"), (1, "Dynamic cut")];
+        ui.add_enabled_ui(self.video.dismemberment > 0, |ui| {
+            if let Some(style) = segmented_row(
+                ui,
+                "Sever style",
+                "cg_dismemberStyle. Authored seam: the server's limb entity splits at the model's cap surfaces.                  Dynamic cut: the actual saber swing slices corpses on the client, one swing can take several parts,                  and pieces become their own ragdolls with SkinGore caps. Needs client physics and ragdolls;                  a swing that separates nothing leaves a gash. Presentation only.",
+                theme::Reset::Physics(PHYS_DISMEMBER_STYLE),
+                self.video.dismember_style,
+                &DISMEMBER_STYLE,
+            ) {
+                self.video.dismember_style = style;
+                self.physics_menu_changed();
+            }
+        });
         ui.add_enabled_ui(
             self.video.ghoul2_skinning == Ghoul2SkinningMode::Gpu && self.audio.game.blood == 0,
             |ui| {
@@ -494,6 +508,7 @@ impl App {
                 self.ninja_toggle(ui, "r_ninjaFireAirflow", crate::ninja_fire_debug::airflow_response(), "Airflow response", "Thin the outer flame in fast air and flare as the airflow subsides.");
                 self.ninja_toggle(ui, "r_ninjaFireCollision", crate::ninja_fire_debug::collision(), "Brush collision", "Use Fluid Ninja MeshField collision against solid map brushes.");
                 self.ninja_toggle(ui, "r_ninjaFireEmbers", crate::ninja_fire_debug::embers(), "Fire embers", "Fire Smoke flamethrower-turret embers from every Ninja fire source: bright streaks and soft glowing dots that fall, bounce and settle on the floor.");
+                self.ninja_toggle(ui, "r_ninjaFireHeatHaze", crate::ninja_fire_debug::heat_haze(), "Heat haze", "The scene behind Ninja flames shimmers in the rising hot air. Cheap: only the pixels under the flames are touched.");
             }
 
             theme::section(ui, "FOG", "Fog Mist follows the player and reacts to movement.");
@@ -559,6 +574,6 @@ impl App {
 
 const NINJA_CVARS: &[&str] = &[
     "r_ninjaFirePromote", "r_ninjaSmokePromote", "r_ninjaFireFlicker", "r_ninjaFireAirflow",
-    "r_ninjaFireCollision", "r_ninjaFireEmbers",
+    "r_ninjaFireCollision", "r_ninjaFireEmbers", "r_ninjaFireHeatHaze",
     "r_ninjaFog",
 ];

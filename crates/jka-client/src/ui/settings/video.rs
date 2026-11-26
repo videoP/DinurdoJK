@@ -24,6 +24,7 @@ pub(crate) const OPENJK_R_MODES: [[u32; 2]; 13] = [
 
 #[derive(Debug, Clone, Copy)]
 pub struct VideoSettings {
+    pub photo: crate::renderer::PhotoOptions,
     pub patch_subdivisions: f32,
     pub patch_stitching: bool,
     pub lod_curve_error: f32,
@@ -311,6 +312,8 @@ pub struct VideoSettings {
     pub jiggle_jp_gravity: f32,
     /// OpenJK cg_dismember: 0 off, 1 limbs only, 2 full.
     pub dismemberment: u8,
+    /// cg_dismemberStyle: 0 authored seams (server limbs), 1 dynamic saber cuts.
+    pub dismember_style: u8,
     pub dismember_max: u32,
     pub dismember_lifetime: f32,
     /// Experimental Ghoul2 cape/cloak/robe presentation cloth.
@@ -830,6 +833,7 @@ impl VideoSettings {
 impl Default for VideoSettings {
     fn default() -> Self {
         let mut settings = Self {
+            photo: crate::renderer::PhotoOptions::default(),
             patch_subdivisions: 4.0,
             patch_stitching: true,
             lod_curve_error: 250.0,
@@ -995,6 +999,7 @@ impl Default for VideoSettings {
             jiggle_jp_soften: 0.0,
             jiggle_jp_gravity: 0.0,
             dismemberment: 0,
+            dismember_style: 0,
             dismember_max: 24,
             dismember_lifetime: 16.0,
             cloth_physics: false,

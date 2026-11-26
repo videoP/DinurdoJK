@@ -1598,6 +1598,7 @@ pub enum RenderCommand {
         metadata: crate::screenshot::ScreenshotMetadata,
         format: ScreenshotFormat,
     },
+    PhotoCapture(Box<crate::renderer::PhotoCaptureRequest>),
     CopyFrameToClipboard,
     /// Write the Hybrid wave-classification log and a settings summary to `path`.
     HybridWaveDump { path: PathBuf },

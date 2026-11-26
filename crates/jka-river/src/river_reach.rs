@@ -14,12 +14,13 @@
 //!    step, else a drop into the gap below, else (ponding) the lowest floor it
 //!    can rise to. No floor above the source level plus a run-up margin is
 //!    reachable, and a sealed lower floor is never entered.
-//! 3. Groups. Anything starting above the lowest reached floor of some column
-//!    (bridge decks, roofs, arches, tunnel ceilings) is an Actor, captured from
-//!    above and below. Everything else that can hold water is Landscape.
-//! 4. Reference. The lowest reached floor of each column is the WaterInfo
-//!    height for stage 6: an actor above it is passed under; one resting on
-//!    it (a footing, a crate, a deck end on its abutment) stays solid.
+//! 3. Groups. Anything starting above the bed floor of some column (bridge
+//!    decks, roofs, arches, tunnel ceilings) is an Actor, captured from above
+//!    and below. Everything else that can hold water is Landscape.
+//! 4. Reference. The bed floor of each column (the reached floor the flood
+//!    arrived at first) is the WaterInfo height for stage 6: an actor above
+//!    it is passed under; one resting on it (a footing, a crate, a deck end on
+//!    its abutment) stays solid.
 //!
 //! 5. Overhangs past the cap. A discharge flood rises above the source
 //!    level, and unreached columns keep every actor solid, which dammed the
@@ -29,7 +30,11 @@
 //! The source level bounds reach only; it never clips geometry, so a bridge
 //! below the source but above the local river is passed under however far
 //! downstream it is. Stacked waterways (two reachable floors in one column)
-//! keep the lowest: the one-layer solver cannot carry both. They're counted.
+//! keep the one reached first, and the later layer does not flow on through
+//! that column: the one-layer solver cannot carry both, and a source on an
+//! upper floor (a deck over a pit) must keep its own floor rather than the
+//! pit floor the overflow reaches by falling off the edge and running back
+//! underneath. They're counted.
 //! All work happens once at spawn; nothing runs per solver step.
 
 use crate::river_capture::wall_slab;
@@ -370,6 +375,16 @@ struct Columns {
     spans: Vec<(u32, u32)>,
     cells: Vec<[u32; 2]>,
     gaps: Vec<Gap>,
+    /// Per column: the one gap the flood claimed (its bed), or UNSET.
+    claims: Vec<u32>,
+    /// Per column: the highest floor whose water found it solid at its own
+    /// level (-inf: never). Gaps wholly below it are never claimed later.
+    blocked: Vec<f32>,
+    /// Per column: cells from the blocking layer's water (`block`), UNSET
+    /// when unblocked; a shallower block spreads again.
+    block_depth: Vec<u32>,
+    /// Per column: another layer reached it after it was claimed or blocked.
+    refused: Vec<bool>,
 }
 
 impl Columns {
@@ -381,6 +396,10 @@ impl Columns {
             spans: Vec::new(),
             cells: Vec::new(),
             gaps: Vec::new(),
+            claims: Vec::new(),
+            blocked: Vec::new(),
+            block_depth: Vec::new(),
+            refused: Vec::new(),
         }
     }
 
@@ -411,6 +430,10 @@ impl Columns {
         let id = self.spans.len() as u32;
         self.spans.push((start, self.gaps.len() as u32 - start));
         self.cells.push(c);
+        self.claims.push(UNSET);
+        self.blocked.push(f32::NEG_INFINITY);
+        self.block_depth.push(UNSET);
+        self.refused.push(false);
         self.chunks[chunk][offset] = id;
         id
     }
@@ -420,11 +443,41 @@ impl Columns {
         &self.gaps[start as usize..(start + count) as usize]
     }
 
-    /// Lowest reached floor (-inf for a reached void), or None.
-    fn lowest(&self, id: u32) -> Option<f32> {
-        self.gaps_of(id).iter().find(|g| g.dist != UNREACHED).map(|g| g.floor)
+    /// The column's bed: the floor of the gap the flood claimed (-inf for a
+    /// reached void), or None when unreached.
+    fn bed(&self, id: u32) -> Option<f32> {
+        let g = self.claims[id as usize];
+        (g != UNSET).then(|| self.gaps[g as usize].floor)
+    }
+
+    /// Water standing on `level` found column `start` solid (`step` gave no
+    /// gap). Block it, and spread the block through 4-connected columns that
+    /// are also solid at that height, up to `cells` away: a wall thicker
+    /// than a cell, and its corners, which touch the water only diagonally,
+    /// stay walls instead of being claimed by a layer below.
+    fn block(&mut self, start: [u32; 2], level: f32, cells: u32, context: &Context<'_>, scratch: &mut Vec<(f32, f32, u32)>) {
+        let height = level + CLEARANCE;
+        let mut queue = VecDeque::from([(start, 0u32)]);
+        while let Some((c, depth)) = queue.pop_front() {
+            let id = self.column(c, context, scratch) as usize;
+            if self.claims[id] != UNSET || (self.blocked[id] >= level && self.block_depth[id] <= depth) {
+                continue;
+            }
+            let solid = !self.gaps_of(id as u32).iter().any(|g| g.floor <= height && height < g.ceil);
+            if depth > 0 && !solid {
+                continue;
+            }
+            self.blocked[id] = self.blocked[id].max(level);
+            self.block_depth[id] = depth;
+            if solid && depth < cells {
+                queue.extend(context.region.neighbours(c).map(|n| (n, depth + 1)));
+            }
+        }
     }
 }
+
+/// How far (map units) a block spreads through solid at the water's level.
+const WALL_DEPTH: f32 = 64.0;
 
 /// The one gap of a neighbouring column that water standing on `a` enters.
 fn step(a: Gap, b: &[Gap], climb: f32, cap: f32) -> Option<usize> {
@@ -453,7 +506,7 @@ fn step(a: Gap, b: &[Gap], climb: f32, cap: f32) -> Option<usize> {
     b.iter().position(|g| g.floor > a.floor + climb && g.floor <= cap && g.floor <= a.ceil - CLEARANCE)
 }
 
-/// Lowest reached floor per cell plus the reference handed to stage 6.
+/// Bed floor per cell (`Columns::bed`) plus the reference handed to stage 6.
 pub struct References {
     region: Region,
     chunks_x: u32,
@@ -508,7 +561,7 @@ pub struct Stats {
     pub columns: usize,
     pub reached: usize,
     pub voids: usize,
-    /// Columns with two or more reachable floors (stacked; lowest kept).
+    /// Reached columns another layer also reached (stacked; the first kept).
     pub stacked: usize,
     pub actor_items: usize,
     /// Unreached cells opened under an actor (`open_overhangs`).
@@ -564,6 +617,19 @@ pub fn classify(geometry: &CaptureGeometry, region: Region, seed: [f32; 3], leve
         .ok_or("no floor under the river source (r_riverCaptureMode 1)")?;
     let seed_gap = start + seed_k as u32;
     columns.gaps[seed_gap as usize].dist = 0;
+    columns.claims[id as usize] = seed_gap;
+    // One layer per column, claimed by the first water to arrive (breadth
+    // first: fewest steps from the source). A later layer neither claims the
+    // column nor flows on through it: overflow falling off a deck must not
+    // run back under the deck. A column whose solid stands at an arriving
+    // layer's level is blocked for gaps wholly below that level (spreading
+    // through thick walls and their corners, `Columns::block`), so a post or
+    // wall standing on the deck stays a wall instead of being claimed by the
+    // pit beneath it. Taking the lowest floor (or claiming those columns from
+    // below) made the deck an actor: stage 6 then passed water under it, or,
+    // with any higher actor in the column (a roof slab), raised the bed to
+    // that actor's top, so the source's own floor held no water.
+    let wall_cells = ((f64::from(WALL_DEPTH) / region.cell).ceil() as u32).max(1);
     let mut queue = VecDeque::from([(seed_cell, seed_gap)]);
     while let Some((c, g)) = queue.pop_front() {
         let a = columns.gaps[g as usize];
@@ -571,13 +637,20 @@ pub fn classify(geometry: &CaptureGeometry, region: Region, seed: [f32; 3], leve
             continue; // water falling into the void goes no further
         }
         for n in region.neighbours(c) {
-            let id = columns.column(n, &context, &mut scratch);
-            let (start, _) = columns.spans[id as usize];
-            if let Some(k) = step(a, columns.gaps_of(id), climb, cap) {
-                let target = &mut columns.gaps[start as usize + k];
-                if target.dist == UNREACHED {
-                    target.dist = a.dist + 1;
-                    queue.push_back((n, start + k as u32));
+            let id = columns.column(n, &context, &mut scratch) as usize;
+            let (start, _) = columns.spans[id];
+            let entered = step(a, columns.gaps_of(id as u32), climb, cap).map(|k| start + k as u32);
+            let claim = columns.claims[id];
+            match entered {
+                None => columns.block(n, a.floor, wall_cells, &context, &mut scratch),
+                Some(target) if claim != UNSET => columns.refused[id] |= target != claim,
+                Some(target) if columns.gaps[target as usize].ceil <= columns.blocked[id] => {
+                    columns.refused[id] = true;
+                }
+                Some(target) => {
+                    columns.gaps[target as usize].dist = a.dist + 1;
+                    columns.claims[id] = target;
+                    queue.push_back((n, target));
                 }
             }
         }
@@ -587,13 +660,12 @@ pub fn classify(geometry: &CaptureGeometry, region: Region, seed: [f32; 3], leve
     let mut reached = Vec::new();
     let mut references = References::new(region);
     for id in 0..columns.spans.len() as u32 {
-        let Some(floor) = columns.lowest(id) else { continue };
+        let Some(floor) = columns.bed(id) else { continue };
         let c = columns.cells[id as usize];
         reached.push((c, floor));
         stats.reached += 1;
         stats.voids += usize::from(floor == f32::NEG_INFINITY);
-        stats.stacked +=
-            usize::from(columns.gaps_of(id).iter().filter(|g| g.dist != UNREACHED && g.floor.is_finite()).count() > 1);
+        stats.stacked += usize::from(columns.refused[id as usize]);
         references.set(c, floor + REFERENCE_LIFT);
     }
     dilate(&mut references, &reached, region);
@@ -603,7 +675,7 @@ pub fn classify(geometry: &CaptureGeometry, region: Region, seed: [f32; 3], leve
     // tessellated patch spans) vote at their centroid's column.
     let floor_at = |p: [f32; 2]| {
         let c = region.cell_of(p)?;
-        Some((c, columns.lowest(columns.get(c)?)?))
+        Some((c, columns.bed(columns.get(c)?)?))
     };
     for (i, item) in context.items.iter().enumerate() {
         if seen[i] {
@@ -894,43 +966,57 @@ fn open_overhangs(
     landscape_floor
 }
 
-/// Which items start above the lowest reached floor of a column they cross,
-/// and which items any reached column sampled at all.
+/// Which items start above the bed floor of a reached column they cross
+/// (and are buried under no reached column's bed), and which items any
+/// reached column sampled at all. An item wholly below some column's bed is
+/// underground there: as an actor its underside (below that column's
+/// reference) made stage 6 treat every actor in the column as resting on
+/// the floor and raise the bed to the highest actor top (a lower level's
+/// floor under a deck, hanging over a pit elsewhere, lifted the deck's bed
+/// to the roof). It stays Landscape, under that bed's own top.
 fn vote(context: &Context<'_>, reached: &[([u32; 2], f32)]) -> (Vec<bool>, Vec<bool>) {
     let count = context.items.len();
     let run = |part: &[([u32; 2], f32)]| {
         let mut above = vec![false; count];
         let mut seen = vec![false; count];
+        let mut buried = vec![false; count];
         let mut scratch = Vec::new();
         for &(c, floor) in part {
             context.collect(c, &mut scratch);
-            for &(lo, _, i) in &scratch {
+            for &(lo, hi, i) in &scratch {
                 seen[i as usize] = true;
                 above[i as usize] |= lo > floor + ABOVE;
+                buried[i as usize] |= hi < floor - ABOVE;
             }
         }
-        (above, seen)
+        (above, seen, buried)
     };
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
-    if threads < 2 || reached.len() < 8192 {
-        return run(reached);
-    }
-    let parts: Vec<_> = std::thread::scope(|scope| {
-        reached
-            .chunks(reached.len().div_ceil(threads))
-            .map(|part| scope.spawn(move || run(part)))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|h| h.join().expect("river capture vote worker"))
-            .collect()
-    });
-    let mut parts = parts.into_iter();
-    let (mut above, mut seen) = parts.next().unwrap_or_default();
-    for (a, s) in parts {
-        for i in 0..count {
-            above[i] |= a[i];
-            seen[i] |= s[i];
+    let (mut above, seen, buried) = if threads < 2 || reached.len() < 8192 {
+        run(reached)
+    } else {
+        let parts: Vec<_> = std::thread::scope(|scope| {
+            reached
+                .chunks(reached.len().div_ceil(threads))
+                .map(|part| scope.spawn(move || run(part)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("river capture vote worker"))
+                .collect()
+        });
+        let mut parts = parts.into_iter();
+        let (mut above, mut seen, mut buried) = parts.next().unwrap_or_default();
+        for (a, s, b) in parts {
+            for i in 0..count {
+                above[i] |= a[i];
+                seen[i] |= s[i];
+                buried[i] |= b[i];
+            }
         }
+        (above, seen, buried)
+    };
+    for (a, b) in above.iter_mut().zip(&buried) {
+        *a &= !b;
     }
     (above, seen)
 }

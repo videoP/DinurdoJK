@@ -6,6 +6,7 @@ use crate::renderer::{
 
 impl Renderer {
     pub(in crate::renderer) fn set_post_effects(&mut self, effects: PostEffects) {
+        self.scene_post_effects = Some(effects);
         let old_scene_format = self.scene_format();
         self.thermal_vision = effects.thermal_vision.min(6);
         let old_auto_exposure_effective = self.effective_auto_exposure_strength() > 0.0;

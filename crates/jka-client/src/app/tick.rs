@@ -534,6 +534,7 @@ impl App {
         self.ensure_inline_instance_capacity();
         let snapshot_started = Instant::now();
         self.refresh_ninja_fog_surface();
+        self.dispatch_photo_capture();
         self.publish_snapshot();
         if let Some(export) = self.render_studio.export.as_mut() {
             export.app_cost(super::render_studio_profile::StudioAppCost::Snapshot,

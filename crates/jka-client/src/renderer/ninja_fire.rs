@@ -13,6 +13,7 @@ use crate::renderer::{Camera, CloudForegroundBlade, Renderer, textures::GpuImage
 mod brush_collision;
 mod demo_bloom;
 mod embers;
+mod heat_haze;
 mod local_post;
 mod volume;
 use brush_collision::{BrushCapture, CaptureEncode, CapturePipeline};
@@ -136,6 +137,9 @@ pub(in crate::renderer) struct NinjaFireState {
     player_ignition: f32,
     player_light_level: f32,
     player_light_position: Vec3,
+    /// Format passed by the last frame; photo warm-up must match it so the
+    /// flame GPU targets are not recreated (which would drop the fields).
+    last_format: Option<wgpu::TextureFormat>,
     /// A live HVOL smoke volume wants transient-only cluster lists even in
     /// Legacy/Vertex (`LightingSettings.feature_flags.z & 0x1000`).
     pub(in crate::renderer) hvol_cluster_lights: bool,
@@ -148,6 +152,14 @@ pub(in crate::renderer) struct NinjaFireState {
     ember_compute_failed: bool,
     spark_curl: Option<wgpu::TextureView>,
     spark_curl_failed: bool,
+    /// 1 / RMS of the TilingCurl64 xy lanes (heat haze normalisation).
+    spark_curl_inv_rms: f32,
+    /// r_ninjaFireHeatHaze resources, created on first use.
+    heat_haze: Option<heat_haze::HeatHaze>,
+    heat_haze_failed: bool,
+    /// This frame the flame composite moves from the world pass to the HDR
+    /// post point, after the heat haze has refracted the background.
+    composite_after_haze: bool,
     /// GPU MeshField brush capture, created when brush collision is first used.
     capture_pipeline: Option<CapturePipeline>,
     capture_failed: bool,
@@ -176,6 +188,8 @@ struct FlameGpu {
     shader: wgpu::ShaderModule,
     /// Heterogeneous-volume presentation (shared HVOL live shading).
     volume: Option<volume::SmokeVolume>,
+    /// Heat haze gather/apply pipelines, built on first use.
+    haze: Option<heat_haze::HazePipelines>,
 }
 
 struct FlameDraw {
@@ -532,8 +546,18 @@ impl NinjaFireState {
         });
     }
 
+    /// Decide, before the world pass, whether the flame composite waits for
+    /// the heat haze at the HDR post point this frame.
+    pub(in crate::renderer) fn plan_heat_haze(&mut self, use_post: bool) {
+        self.composite_after_haze = use_post && crate::ninja_fire_debug::heat_haze() && !self.heat_haze_failed
+            && self.spark_curl.is_some() && self.local_post.is_some() && self.local_post_ready;
+    }
+
     pub(in crate::renderer) fn draw(&self, pass: &mut wgpu::RenderPass<'_>) -> bool {
         if let Some(local) = &self.local_post {
+            if self.composite_after_haze {
+                return false;
+            }
             if self.local_post_ready {
                 local.draw(pass);
             }
@@ -604,7 +628,68 @@ impl NinjaFireState {
     }
 }
 
+/// View-independent CPU fire state copied from the live renderer into an
+/// independent photo-capture renderer (its own GPU fields start empty).
+#[derive(Clone, Copy, Default)]
+pub(in crate::renderer) struct FireCaptureState {
+    time: f32,
+    fuel_off_seconds: f32,
+    player_ignition: f32,
+    player_light_level: f32,
+    player_light_position: Vec3,
+}
+
 impl Renderer {
+    pub(in crate::renderer) fn ninja_fire_capture_state(&self) -> FireCaptureState {
+        let fire = &self.ninja_fire;
+        FireCaptureState { time: fire.time, fuel_off_seconds: fire.fuel_off_seconds, player_ignition: fire.player_ignition,
+            player_light_level: fire.player_light_level, player_light_position: fire.player_light_position }
+    }
+
+    /// Call after `set_ninja_fire_scene` on the capture renderer: a fresh
+    /// scene would otherwise restart Burning Man ignition from zero.
+    pub(in crate::renderer) fn install_ninja_fire_capture_state(&mut self, state: FireCaptureState) {
+        let fire = &mut self.ninja_fire;
+        fire.time = state.time;
+        fire.fuel_off_seconds = state.fuel_off_seconds;
+        fire.player_ignition = state.player_ignition;
+        fire.player_light_level = state.player_light_level;
+        fire.player_light_position = state.player_light_position;
+    }
+
+    /// Photo capture only. The independent renderer's flame fields are empty
+    /// and its capture clock is frozen, so they would never simulate (and a
+    /// promoted map flame stays suppressed by the live renderer's ACK). Step
+    /// only the fire simulation (no world render) for `seconds` of game time
+    /// from `camera`, then refreeze the clock so every face/tile presents the
+    /// same field. Requires one prior capture render (GPU targets/format).
+    /// This reproduces a settled fire, not the live field's exact history.
+    pub(in crate::renderer) fn warm_ninja_fire_for_capture(&mut self, camera: &Camera, seconds: f32,
+        cancel: &std::sync::atomic::AtomicBool) -> Result<u32, String> {
+        let Some(format) = self.ninja_fire.last_format else { return Ok(0); };
+        if !self.ninja_fire.wants_frame() || self.world.is_none() { return Ok(0); }
+        const STEP_MS: i32 = 16;
+        let size = [self.targets._scene_texture.width().max(1), self.targets._scene_texture.height().max(1)];
+        let view_proj = camera.view_projection(size[0], size[1]);
+        let clock = self.ninja_fire.clock_ms;
+        let steps = (seconds * 1000.0 / STEP_MS as f32).ceil() as u32;
+        let mut last = None;
+        for step in 0..steps {
+            if step % 32 == 0 { super::photo_capture::check_cancel(cancel)?; }
+            // One simulation tick per call (the Ninja clock never bursts).
+            self.ninja_fire.previous_ms = clock.map(|now| now.wrapping_sub(STEP_MS));
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Photo fire warm-up") });
+            self.encode_ninja_fire(&mut encoder, camera, view_proj, view_proj, format, STEP_MS as f32 * 0.001);
+            last = Some(self.queue.submit([encoder.finish()]));
+        }
+        self.ninja_fire.previous_ms = clock;
+        if let Some(last) = last {
+            self.device.poll(wgpu::PollType::Wait { submission_index: Some(last), timeout: Some(std::time::Duration::from_secs(60)) })
+                .map_err(|e| format!("Screenshot fire warm-up wait failed: {e:?}"))?;
+        }
+        Ok(steps)
+    }
+
     pub(in crate::renderer) fn set_ninja_fire_scene(&mut self, scene: Option<FireScene>, time_ms: Option<i32>) {
         self.ninja_fire.set_scene(scene, time_ms);
         // A new scene may omit a runner that was ready on the previous frame;
@@ -627,6 +712,7 @@ impl Renderer {
         let Some(scene) = self.ninja_fire.scene.clone() else {
             return;
         };
+        self.ninja_fire.last_format = Some(format);
         let delta = self.ninja_fire.delta(frame_delta);
         let wind_time = self.scene_time.or_else(|| self.weather_server_time_ms.map(|ms| ms as f32 * 0.001))
             .unwrap_or_else(|| self.frame_time());
@@ -649,13 +735,22 @@ impl Renderer {
                 }
             }
         }
-        if sparks_wanted && self.ninja_fire.ember_compute.is_some()
+        // The heat haze shares the sparks' TilingCurl64 as its noise.
+        let haze_wanted = crate::ninja_fire_debug::heat_haze() && !self.ninja_fire.heat_haze_failed;
+        if !crate::ninja_fire_debug::heat_haze() {
+            // Release the render-size scratch while the haze is off.
+            self.ninja_fire.heat_haze = None;
+        }
+        if ((sparks_wanted && self.ninja_fire.ember_compute.is_some()) || haze_wanted)
             && self.ninja_fire.spark_curl.is_none() && !self.ninja_fire.spark_curl_failed
         {
             match self.load_ninja_spark_curl() {
-                Ok(curl) => self.ninja_fire.spark_curl = Some(curl),
+                Ok((curl, inv_rms)) => {
+                    self.ninja_fire.spark_curl = Some(curl);
+                    self.ninja_fire.spark_curl_inv_rms = inv_rms;
+                }
                 Err(error) => {
-                    log::warn!("[NINJA FIRE] Burning Man sparks unavailable ({error})");
+                    log::warn!("[NINJA FIRE] Burning Man sparks and heat haze unavailable ({error})");
                     self.ninja_fire.spark_curl_failed = true;
                 }
             }
@@ -1062,14 +1157,100 @@ impl Renderer {
         }));
     }
 
-    fn load_ninja_spark_curl(&self) -> Result<wgpu::TextureView, String> {
+    fn load_ninja_spark_curl(&self) -> Result<(wgpu::TextureView, f32), String> {
         let mut search = super::AssetSearchPath::open_game(&self.base, self.detail_texture_game.as_deref())
             .map_err(|error| error.to_string())?;
         let bytes = search.read(embers::SPARK_CURL_QPATH, embers::SPARK_CURL_BYTES)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| format!("required local vector field missing: {}", embers::SPARK_CURL_QPATH))?;
         let rgba16f = embers::curl_rgba16f(&bytes.bytes)?;
-        embers::curl_texture(&self.device, &self.queue, "Ninja Burning Man TilingCurl64", 64, &rgba16f)
+        let view = embers::curl_texture(&self.device, &self.queue, "Ninja Burning Man TilingCurl64", 64, &rgba16f)?;
+        Ok((view, heat_haze::curl_inv_rms(&bytes.bytes)))
+    }
+
+    /// r_ninjaFireHeatHaze on the HDR scene before post: refract the
+    /// background over the drawn surface-flame quads only, then composite the
+    /// flame layer on top so the flame itself stays sharp. Takes disjoint
+    /// renderer fields: the frame's SMAA target keeps `self` mutably borrowed
+    /// where this runs.
+    pub(in crate::renderer) fn encode_ninja_fire_heat_haze(
+        fire: &mut NinjaFireState,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &wgpu::TextureView,
+        scene_texture: &wgpu::Texture,
+    ) {
+        if !std::mem::take(&mut fire.composite_after_haze) {
+            return;
+        }
+        Self::encode_heat_haze_passes(fire, device, queue, encoder, scene, scene_texture);
+        // The world pass skipped the flame this frame; it must always land.
+        if let Some(local) = fire.local_post.as_mut() {
+            if let Err(error) = local.draw_onto_scene(device, encoder, scene, scene_texture.format()) {
+                log::warn!("[NINJA FIRE] Heat haze unavailable ({error})");
+                fire.heat_haze_failed = true;
+            }
+        }
+    }
+
+    fn encode_heat_haze_passes(
+        fire: &mut NinjaFireState,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &wgpu::TextureView,
+        scene_texture: &wgpu::Texture,
+    ) {
+        let scene_format = scene_texture.format();
+        let scene_size = [scene_texture.width(), scene_texture.height()];
+        if fire.heat_haze_failed {
+            return;
+        }
+        let (Some(local), Some(curl)) = (fire.local_post.as_ref(), fire.spark_curl.as_ref()) else { return };
+        if fire.heat_haze.is_none() {
+            match heat_haze::HeatHaze::new(device) {
+                Ok(haze) => fire.heat_haze = Some(haze),
+                Err(error) => {
+                    log::warn!("[NINJA FIRE] Heat haze unavailable ({error})");
+                    fire.heat_haze_failed = true;
+                    return;
+                }
+            }
+        }
+        let haze = fire.heat_haze.as_mut().expect("heat haze initialized");
+        // Same selection as `draw_fields`: drawn surface presets only.
+        let fuel_left = fire.fuel_off_seconds < PLAYER_FIRE_DRAIN_SECONDS;
+        let promoted_smoke = fire.scene.as_ref().is_some_and(|scene| !scene.promoted_smoke.is_empty());
+        let drawn = |preset: FlamePreset| !preset.body_driven() || fuel_left
+            || (preset == PROMOTED_SMOKE_PRESET && promoted_smoke);
+        let mut any = false;
+        for (preset, slot) in FlamePreset::ALL.into_iter().zip(&mut fire.slots) {
+            let Some(gpu) = slot.gpu.as_mut()
+                .filter(|gpu| gpu.volume.is_none() && drawn(preset)
+                    && gpu.fields.iter().any(|draw| draw.bindings.is_some())) else {
+                continue;
+            };
+            if let Err(error) = gpu.ensure_haze_pipelines(device, &haze.layout, scene_format) {
+                log::warn!("[NINJA FIRE] Heat haze unavailable ({error})");
+                fire.heat_haze_failed = true;
+                return;
+            }
+            any = true;
+        }
+        if !any {
+            return;
+        }
+        haze.prepare(
+            device, queue, scene, scene_size, local.layer(), local.size(),
+            curl, fire.spark_curl_inv_rms, fire.time,
+        );
+        let fields = FlamePreset::ALL.into_iter().zip(&fire.slots)
+            .filter_map(move |(preset, slot)| slot.gpu.as_ref().filter(|gpu| gpu.volume.is_none() && drawn(preset)))
+            .filter_map(|gpu| gpu.haze.as_ref().map(|pipelines| (pipelines, &gpu.fields)))
+            .flat_map(|(pipelines, fields)| fields.iter()
+                .filter_map(move |draw| draw.bindings.as_ref().map(|(_, group)| (pipelines, group))));
+        haze.encode(encoder, scene, fields);
     }
 }
 
@@ -1261,6 +1442,7 @@ impl FlameGpu {
             ember_pipeline: None,
             shader,
             volume,
+            haze: None,
         })
     }
 

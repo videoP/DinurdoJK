@@ -27,7 +27,9 @@ ttf-parser = { version = "=0.25.1", default-features = false, features = ["std"]
 glam.workspace = true
 image = { version = "=0.25.10", default-features = false, features = ["jpeg", "png", "tga", "hdr"] }
 image_dds = { version = "=0.7.2", default-features = false, features = ["ddsfile"] }
+png = "=0.18.1"
 libjpeg-turbo-rs = "=0.8.0"
+jpeg-encoder = "=0.6.1"
 jka-assets = { path = "../jka-assets" }
 jka-audio = { path = "../jka-audio" }
 jka-client-services = { path = "../jka-client-services" }

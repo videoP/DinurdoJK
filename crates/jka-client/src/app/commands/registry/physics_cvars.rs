@@ -2,6 +2,25 @@
 use super::cvar_prelude::*;
 
 app_cvars! {
+    APP_R_PHYSICSREFERENCE {
+        runtime: CvarDef::new(
+            "r_physicsReference", "0", "0|1",
+            "Debug only: independent snapshot-driven 60 Hz enhanced dismemberment collider wireframe. Requires enhanced dismemberment and ragdolls.",
+            CvarType::String, CvarFlags::NONE, LatchScope::None,
+            |_app| CvarValue::String(u8::from(crate::cgame::player_presenter::physics_reference_enabled()).to_string()),
+            |_app, value| {
+                match value.to_string().trim() {
+                    "0" => crate::cgame::player_presenter::set_physics_reference_enabled(false),
+                    "1" => crate::cgame::player_presenter::set_physics_reference_enabled(true),
+                    _ => return Err("r_physicsReference expects 0 or 1".to_owned()),
+                }
+                Ok(())
+            },
+        ),
+        config: CvarBinding::NONE,
+        implementations: []
+    }
+
     APP_R_BREAKABLES {
         runtime: CvarDef::<App>::new(
             "r_breakables", "", "0..1",

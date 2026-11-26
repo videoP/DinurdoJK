@@ -359,6 +359,10 @@ impl PlayerPresenter {
                 if entity_alpha >= 8.0 / 255.0 {
                     self.queue_saber_gore_blade(entity.number, &definition, (saber_num, blade_index),
                         origin_world, dir_world, presented_length, current_time);
+                    if !definition.blade_hidden(blade_index) {
+                        self.note_cut_blade(entity.number, (saber_num, blade_index),
+                            origin_world, dir_world, presented_length, current_time);
+                    }
                 }
                 if let Some(request) = saber_blade_fx_request(
                     origin_world,
@@ -660,6 +664,10 @@ impl PlayerPresenter {
             if entity_alpha >= 8.0 / 255.0 {
                 self.queue_saber_gore_blade(owner.number, &definition, (0, blade_index),
                     origin_world, dir_world, presented_length, current_time);
+                if !definition.blade_hidden(blade_index) {
+                    self.note_cut_blade(owner.number, (0, blade_index),
+                        origin_world, dir_world, presented_length, current_time);
+                }
             }
             if let Some(request) = saber_blade_fx_request(
                 origin_world,

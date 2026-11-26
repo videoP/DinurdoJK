@@ -285,7 +285,7 @@ impl PlayerPresenter {
         }
         self.studio_bones.clear();
         self.studio_saber_tips.clear();
-        crate::emotes::network::set_render_time(current_time);
+        if !self.dynamic_cuts.reference_inline { crate::emotes::network::set_render_time(current_time); }
         self.japro_cinfo2 = game.japro_cinfo2();
         self.cold_breath_effects = game.cold_breath_effects();
         self.breath_view_contents = match (view, self.collision_world.as_mut()) {
@@ -378,7 +378,9 @@ impl PlayerPresenter {
         // Apply the source surface mutation before CG_Player draws the corpse,
         // then draw the detached copies after source poses have been evaluated.
         let dismemberment_level = self.ragdolls.dismemberment_level();
-        if dismemberment_level == 0 {
+        // cg_dismemberStyle 1 replaces the server's G2_MODEL_PART limbs with
+        // client saber cuts; the authored sever path then stays idle.
+        if dismemberment_level == 0 || self.dynamic_cuts_on() {
             self.dismembered.clear();
             self.dismember_source_snaps.clear();
             self.detached_limb_visuals.clear();
@@ -720,6 +722,8 @@ impl PlayerPresenter {
         self.ragdolls.retain_detached_limbs(&live_detached_limbs);
         self.detached_limb_visuals
             .retain(|entity, _| live_detached_limbs.contains(entity));
+        // cg_dismemberStyle 1 pieces have no entity; each owns a sub-ragdoll.
+        draws.append(&mut self.present_dynamic_cut_pieces(current_time));
 
         // The followed/local player may not exist in packet entities but can
         // still be an exact forceGripCripple victim. Keep that live ragdoll
@@ -1081,7 +1085,7 @@ impl PlayerPresenter {
         let local_emote = if entity.entity_type == ET_PLAYER
             && npc_model_request.is_none()
         {
-            if let Some(active) = crate::emotes::network::player_preview(entity.number, self.viewer_client, current_time) {
+            if let Some(active) = (!self.dynamic_cuts.reference_inline).then(|| crate::emotes::network::player_preview(entity.number, self.viewer_client, current_time)).flatten() {
                 match self.load_emote_gla(&active.emote.gla) {
                     Ok(gla) if crate::emotes::pose_plan(&gla, &model.gla).is_ok()
                         && active.emote.end_frame as usize <= active.emote.pose.as_ref().map_or(gla.num_frames, |p| p.frames) => Some((active, gla)),
@@ -1192,6 +1196,7 @@ impl PlayerPresenter {
         let move_lean_strength = self.move_lean;
         let jk2_lean_fix = self.jk2_lean_fix;
         let hair_spring_mode = self.hair_spring_mode();
+        let cut_hand_detached = self.dynamic_cut_hand_detached(entity.number);
         let runtime = self
             .entities
             .get_mut(&entity.number)
@@ -1400,6 +1405,11 @@ impl PlayerPresenter {
                 attached_weapon = None;
                 attached_sabers[0] = false;
             }
+        }
+        if cut_hand_detached {
+            // The weapon hand left with a dynamic-cut piece.
+            attached_weapon = None;
+            attached_sabers = [false, false];
         }
 
         // OpenJK renders ET_BODY through CG_General using the Ghoul2 instance
@@ -2348,6 +2358,13 @@ impl PlayerPresenter {
         };
         let dismember_selection =
             source_dismember_surface_set(&model, self.dismembered.get(&entity.number));
+        if rapier_corpse {
+            let client = entity.state.field_i32("clientNum").unwrap_or(i32::from(entity.number));
+            self.capture_cut_source(entity.number, client, &model, &pose, render_axis, render_origin,
+                body_rgba, body_rgb, current_time);
+        }
+        // A dynamic cut replaces the corpse mesh with its cut root piece.
+        let cut_body = self.dynamic_cut_body_model(entity.number);
         if dismember_selection.is_some() {
             self.dismember_source_snaps.insert(
                 entity.number,
@@ -2406,24 +2423,32 @@ impl PlayerPresenter {
         } else {
             body_rgba
         };
-        let mut draws = self.render_glm_surfaces_tinted_selected(
-            entity.number,
-            &model.key,
-            &model.glm,
-            &model.gla,
-            body_surfaces,
-            self.jiggle_profile_for_sex(model.jiggle.as_deref(), model.female),
-            &pose,
-            body_lod,
-            render_axis,
-            render_origin,
-            body_rgba,
-            body_rgb,
-            body_custom,
-            true,
-            dismember_selection.as_ref(),
-            false,
-        )?;
+        let mut draws = if let Some(cut) = cut_body.as_deref() {
+            // One-LOD cut topology; cloth/jiggle stay off on the cut mesh.
+            self.render_glm_surfaces_tinted_selected(
+                entity.number, &cut.key, &cut.glm, &cut.gla, &cut.surfaces, None, &pose, 0,
+                render_axis, render_origin, body_rgba, body_rgb, body_custom, true, None, true,
+            )?
+        } else {
+            self.render_glm_surfaces_tinted_selected(
+                entity.number,
+                &model.key,
+                &model.glm,
+                &model.gla,
+                body_surfaces,
+                self.jiggle_profile_for_sex(model.jiggle.as_deref(), model.female),
+                &pose,
+                body_lod,
+                render_axis,
+                render_origin,
+                body_rgba,
+                body_rgb,
+                body_custom,
+                true,
+                dismember_selection.as_ref(),
+                false,
+            )?
+        };
 
         // TaystJK CG_Disintegration: submit precisely the body, twice, with
         // RF_DISINTEGRATE2 (gfx/effects/burn) then RF_DISINTEGRATE1 (skin).

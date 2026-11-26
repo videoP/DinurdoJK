@@ -33,6 +33,7 @@ mod render_studio_spatial;
 mod render_studio_layout;
 mod render_studio_ui;
 mod screenshots;
+mod photo_capture;
 mod servers;
 mod server_browser_layout;
 pub(in crate::app) mod settings_search;
@@ -58,7 +59,7 @@ use super::ui_catalog::CatalogPayload;
 use super::*;
 pub(in crate::app) use neon_main::NeonMenuState;
 
-const TOP_ITEMS: [&str; 6] = ["JOIN", "SERVERS", "PROFILE", "CONTROLS", "SETUP", "VOTE"];
+const TOP_ITEMS: [&str; 7] = ["JOIN", "SERVERS", "PROFILE", "CONTROLS", "SETUP", "VOTE", "SCREENSHOT"];
 const SETUP_TABS: [&str; 10] = [
     "GAME", "MOVEMENT", "CAMERA", "VIDEO", "AUDIO", "NETWORK", "INTERFACE", "EXTENSIONS", "STREAMER MODE", "PACKAGE MANAGER",
 ];
@@ -68,6 +69,7 @@ const TOP_PROFILE: usize = 2;
 const TOP_CONTROLS: usize = 3;
 pub(super) const TOP_SETUP: usize = 4;
 const TOP_VOTE: usize = 5;
+const TOP_SCREENSHOT: usize = 6;
 
 pub(in crate::app) const SETUP_TAB_GAME: usize = 0;
 const SETUP_TAB_MOVEMENT: usize = 1;

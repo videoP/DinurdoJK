@@ -61,6 +61,13 @@ impl Drop for DirectionPending {
     fn drop(&mut self) { self.cancelled.store(true, Ordering::Relaxed); }
 }
 
+/// CPU-only selection, independent of a renderer's mutable lightmap uploads.
+#[derive(Clone, Copy)]
+pub(in crate::renderer) struct SunBakeSelection {
+    fit: Option<DirectionFit>,
+    detected: bool,
+}
+
 pub(in crate::renderer) struct SunBake {
     source: Option<Arc<Source>>,
     pending: Option<Pending>,
@@ -170,6 +177,14 @@ impl SunBake {
     /// The original baked direction can differ from the current/edited map sun.
     pub(in crate::renderer) fn baked_direction(&self) -> Option<scene::DirectionalSun> {
         self.selected_sun
+    }
+
+    pub(in crate::renderer) fn selection(&self) -> SunBakeSelection {
+        SunBakeSelection { fit: self.fitted_direction, detected: self.using_detected }
+    }
+
+    pub(in crate::renderer) fn capture_pending(&self) -> bool {
+        self.pending.is_some() || self.direction_pending.is_some()
     }
 
     pub(in crate::renderer) fn has_masks(&self) -> bool {
@@ -479,6 +494,14 @@ impl Renderer {
     /// Switch the *baked* sun source, never the live sky. A detected fit is
     /// retained for the current map so both sources can be selected repeatedly
     /// without running the expensive directional search again.
+    pub(in crate::renderer) fn apply_sun_bake_selection(&mut self, selection: SunBakeSelection) {
+        let Some(world) = self.world.as_mut().filter(|w| !w.source_map) else { return; };
+        world.sun_bake.fitted_direction = selection.fit;
+        if selection.fit.is_some() {
+            self.select_baked_sun_direction_impl(selection.detected, true);
+        }
+    }
+
     pub(in crate::renderer) fn select_baked_sun_direction(&mut self, detected: bool) {
         self.select_baked_sun_direction_impl(detected, false);
     }

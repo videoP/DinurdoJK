@@ -593,6 +593,11 @@ impl App {
             "DEBUG",
             "Development-only diagnostics for the Rapier world.",
         );
+        theme::row(ui, "Server-time reference", "Green x-ray collider wireframes from a separate 60 Hz snapshot-only enhanced dismemberment simulation. No local prediction; enable before the test. Session only.", theme::Reset::None, |ui| {
+            if let Some(value) = theme::switch(ui, crate::cgame::player_presenter::physics_reference_enabled()) {
+                crate::cgame::player_presenter::set_physics_reference_enabled(value);
+            }
+        });
         self.egui_physics_toggle(
             ui,
             "Physics diagnostics",

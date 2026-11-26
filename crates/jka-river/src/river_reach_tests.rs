@@ -147,6 +147,47 @@ fn downhill_bridge_below_source_level_is_passed_under() {
     assert!(crate::river_capture::clip_collision(&[[448.0, 0.0, 640.0], [576.0, 0.0, 640.0], [576.0, 256.0, 640.0]], Some(600.0), Some(1000.0)).is_some());
 }
 
+/// A source on a deck high over a pit floor (cool_cool_m): the overflow drops
+/// off the deck's edge and would run back under it. The deck must stay the
+/// bed, the source column included; only past its edge is the pit the bed.
+/// Any column the pit claims under the deck's footprint (a post or a wall
+/// two cells thick, solid at deck level) made the deck an actor, and a lower
+/// slab lying under the deck but hanging over the pit beyond it was an actor
+/// whose underside sat below the deck's reference; either way stage 6 then
+/// raised the deck's bed to the roof slab's top.
+#[test]
+fn source_on_a_deck_over_a_reachable_pit_keeps_the_deck() {
+    let mut g = CaptureGeometry::default();
+    slab(&mut g, [0.0, 768.0], [0.0, 256.0], [-64.0, 100.0]);
+    slab(&mut g, [0.0, 384.0], [0.0, 256.0], [376.0, 400.0]);
+    // Post on the deck at cell (5, 3), above the cap (1016).
+    slab(&mut g, [160.0, 192.0], [96.0, 128.0], [400.0, 1050.0]);
+    // Wall along the deck's edge, cells 10 and 11 of rows 0..3.
+    slab(&mut g, [328.0, 384.0], [0.0, 128.0], [400.0, 1050.0]);
+    // Lower slab: under the deck, and over the pit past the deck's edge.
+    slab(&mut g, [128.0, 640.0], [0.0, 128.0], [200.0, 220.0]);
+    // Roof slab over the whole map, well above the cap.
+    slab(&mut g, [0.0, 768.0], [0.0, 256.0], [1100.0, 1116.0]);
+    let s = run(&g, [24, 8], [2, 4], 400.0, 1000.0);
+    assert!(s.classified.stats.stacked > 0, "the pit reaches the deck's edge columns");
+    for x in 0..12 {
+        assert_eq!(s.bed(x, 4), 400.0, "deck bed at cell {x}");
+    }
+    for x in 12..24 {
+        assert_eq!(s.bed(x, 4), 100.0, "pit bed past the edge at cell {x}");
+    }
+    for y in 0..4 {
+        for x in (0..10).filter(|&x| (x, y) != (5, 3)) {
+            assert_eq!(s.bed(x, y), 400.0, "deck bed over the lower slab at ({x},{y})");
+        }
+        assert_eq!(s.bed(10, y), 1050.0, "edge wall at row {y}");
+        assert_eq!(s.bed(11, y), 1050.0, "outer edge wall at row {y}");
+        assert_eq!(s.bed(14, y), 220.0, "the lower slab is ground over the pit at row {y}");
+    }
+    assert_eq!(s.bed(5, 3), 1050.0, "the post stays a wall");
+    assert_eq!(s.classified.stats.actor_items, 1, "only the roof slab is an actor");
+}
+
 #[test]
 fn pier_under_a_bridge_stays_an_obstacle() {
     let mut g = CaptureGeometry::default();

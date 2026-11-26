@@ -273,6 +273,7 @@ fn menu_trace_command_name(command: &RenderCommand) -> &'static str {
         RenderCommand::ClearSurfaceInspection => "ClearSurfaceInspection",
         RenderCommand::AddSurfaceDeformation(..) => "AddSurfaceDeformation",
         RenderCommand::Screenshot { .. } => "Screenshot",
+        RenderCommand::PhotoCapture(..) => "PhotoCapture",
         RenderCommand::CopyFrameToClipboard => "CopyFrameToClipboard",
         RenderCommand::CaptureFrontendScene { .. } => "CaptureFrontendScene",
         RenderCommand::CaptureVideoFrame { .. } => "CaptureVideoFrame",
@@ -494,6 +495,10 @@ impl RenderThread {
 
     pub fn command(&self, command: RenderCommand) {
         let _ = self.command_tx.send(command);
+    }
+
+    pub fn try_command(&self, command: RenderCommand) -> Result<(), String> {
+        self.command_tx.send(command).map_err(|_| "Render thread unavailable".into())
     }
 
     pub fn publish(&self, snapshot: RenderSnapshot) {
@@ -1149,6 +1154,7 @@ pub(in crate::renderer) fn render_thread_main(
     )> = None;
     let mut hdr_capabilities_last_checked = Instant::now();
     let mut studio_scene_loads: Vec<StudioSceneLoad> = Vec::new();
+    let mut photo_worker: Option<JoinHandle<()>> = None;
 
     loop {
         // Shader/pipeline initialization must not stop presentation of an
@@ -2087,6 +2093,17 @@ pub(in crate::renderer) fn render_thread_main(
                             }
                         });
                         renderer.request_screenshot(directory, metadata, format)
+                    }
+                    Ok(RenderCommand::PhotoCapture(request)) => {
+                        if photo_worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
+                            let _ = proxy.send_event(UserEvent::PhotoCaptureFinished(Err("Screenshot capture already in progress".into())));
+                        } else {
+                            if let Some(worker) = photo_worker.take() { let _ = worker.join(); }
+                            match super::photo_capture::start(&renderer, *request, proxy.clone()) {
+                                Ok(worker) => photo_worker = Some(worker),
+                                Err(error) => { let _ = proxy.send_event(UserEvent::PhotoCaptureFinished(Err(error))); }
+                            }
+                        }
                     }
                     Ok(RenderCommand::CopyFrameToClipboard) => renderer.request_clipboard_capture(),
                     Ok(RenderCommand::CaptureFrontendScene { path, neutral_gamma, token }) => {

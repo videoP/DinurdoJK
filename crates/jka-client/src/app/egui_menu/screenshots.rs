@@ -334,7 +334,9 @@ impl App {
                                     .id_salt("screenshot_metadata_inspector")
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
-                                        Self::screenshot_metadata_row(ui, "TIME", metadata.captured_at.clone());
+                                        // ISO 8601 → "YYYY-MM-DD HH:MM:SS.mmm" (local capture time).
+                                        let time = metadata.captured_at.get(..23).unwrap_or(&metadata.captured_at);
+                                        Self::screenshot_metadata_row(ui, "TIME", time.replacen('T', " ", 1));
                                         Self::screenshot_metadata_row(
                                             ui,
                                             "MAP",

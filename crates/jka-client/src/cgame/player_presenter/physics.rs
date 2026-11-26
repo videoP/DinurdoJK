@@ -268,8 +268,12 @@ impl PlayerPresenter {
 
     pub fn set_ragdoll_config(&mut self, config: RagdollConfig) {
         let previous_dismemberment = self.ragdolls.dismemberment_level();
+        let previous_dynamic = self.ragdolls.dynamic_cuts_active();
         let dismemberment = config.dismemberment;
         self.ragdolls.set_config(config);
+        if previous_dynamic != self.ragdolls.dynamic_cuts_active() {
+            self.dynamic_cuts.clear();
+        }
         if previous_dismemberment != dismemberment {
             // Surface mutations are presentation state. Rebuild them from the
             // currently transmitted G2_MODEL_PART entities on the next frame.
@@ -334,6 +338,8 @@ impl PlayerPresenter {
 
 
     pub fn set_physics_map_mesh(&mut self, mesh: &PhysicsMapMesh) -> Result<(), String> {
+        self.physics_reference = None;
+        self.physics_reference_map = mesh.clone();
         self.ragdolls.set_map_mesh(mesh)
     }
 
@@ -729,6 +735,7 @@ impl PlayerPresenter {
                 });
             }
         }
+        if self.dynamic_cuts.reference_inline { players.sort_unstable_by_key(|p| p.entity); }
         self.ragdolls.set_players(&players, current_time);
         self.ragdolls.observe_breakable_missiles(entities, current_time);
     }

@@ -1862,6 +1862,10 @@ impl App {
         if pending.stage != PendingRendererRestartStage::ShowLoadingScreen { return; }
         pending.stage = PendingRendererRestartStage::WaitRenderExit;
         pending.ready_at = Instant::now();
+        if let Some(cancel) = &self.photo_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.pending_photo_capture = None;
         if let Some(render) = self.render.take() {
             render.request_shutdown();
             self.retiring_render = Some((render, Instant::now()));

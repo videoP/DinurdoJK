@@ -16,6 +16,8 @@ pub(in crate::renderer) enum ScreenshotDestination {
         directory: PathBuf,
         metadata: crate::screenshot::ScreenshotMetadata,
         format: ScreenshotFormat,
+        suffix: Option<String>,
+        spherical: bool,
     },
     Clipboard,
     FrontendScene { path: PathBuf, neutral_gamma: f32, captured_gamma: f32, is_neutral: bool, surface_is_srgb: bool },
@@ -283,6 +285,8 @@ pub(in crate::renderer) fn encode_screenshot_job(
             directory: screenshot_dir,
             metadata,
             format,
+            suffix,
+            spherical,
         } => {
             let encode_started = Instant::now();
             let (bytes, extension, codec_detail) = match format {
@@ -294,7 +298,7 @@ pub(in crate::renderer) fn encode_screenshot_job(
                         job.padded_bytes_per_row,
                         job.pixel_format,
                     )?;
-                    crate::screenshot::embed_metadata(&mut jpeg, &metadata)?;
+                    crate::screenshot::embed_xmp(&mut jpeg, &metadata, spherical.then_some([job.width, job.height]))?;
                     (jpeg, "jpg", input_mode)
                 }
                 ScreenshotFormat::Png => {
@@ -305,7 +309,7 @@ pub(in crate::renderer) fn encode_screenshot_job(
                         job.padded_bytes_per_row,
                         job.pixel_format,
                     )?;
-                    crate::screenshot::embed_png_metadata(&mut png, &metadata)?;
+                    crate::screenshot::embed_xmp(&mut png, &metadata, spherical.then_some([job.width, job.height]))?;
                     (png, "png", "rgba8")
                 }
             };
@@ -316,8 +320,9 @@ pub(in crate::renderer) fn encode_screenshot_job(
                 format!("could not create {}: {error}", screenshot_dir.display())
             })?;
             let path = screenshot_dir.join(format!(
-                "shot{}.{}",
+                "shot{}{}.{}",
                 screenshot_timestamp(),
+                suffix.as_deref().unwrap_or(""),
                 extension
             ));
             std::fs::write(&path, &bytes)
@@ -489,6 +494,8 @@ impl Renderer {
             directory,
             metadata,
             format,
+            suffix: None,
+            spherical: false,
         });
     }
 
@@ -597,10 +604,10 @@ impl Renderer {
                 format: ScreenshotFormat::Jpeg,
                 ..
             }
-        ) && (width > u16::MAX as u32 || height > u16::MAX as u32)
+        ) && (width > crate::renderer::PhotoOptions::JPEG_MAX_DIMENSION || height > crate::renderer::PhotoOptions::JPEG_MAX_DIMENSION)
         {
             self.screenshot_result = Some(Err(format!(
-                "screenshot dimensions {width}x{height} exceed JPEG's 65535-pixel limit"
+                "screenshot dimensions {width}x{height} exceed libjpeg's 65500-pixel JPEG limit"
             )));
             return None;
         }

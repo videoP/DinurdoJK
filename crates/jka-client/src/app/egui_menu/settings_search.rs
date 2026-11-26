@@ -222,7 +222,7 @@ mod tests {
         }
         assert!(items.iter().any(|item| item.label == "Follow the fastest player"
             && item.subsection == Some(SetupSection::GamePresentation)));
-        for label in ["Blood effects", "Dismemberment", "Legacy burn marks"] {
+        for label in ["Blood effects", "Dismemberment", "Sever style", "Legacy burn marks"] {
             let matches: Vec<_> = items.iter().filter(|item| item.label == label).collect();
             assert_eq!(matches.len(), 1, "{label} should have a single search destination");
             assert_eq!(matches[0].tab, SETUP_TAB_VIDEO);

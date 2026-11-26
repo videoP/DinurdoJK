@@ -1985,7 +1985,7 @@ impl Renderer {
                     target_ev: 0.0,
                     reserved: 0.0,
                 }),
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             });
         let auto_exposure_settings_buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2483,6 +2483,7 @@ impl Renderer {
             studio_entity_mask: None,
             studio_revision: 0,
             scene_time: None,
+            photo_capture_active: false,
             weather_server_time_ms: None,
             river_wake_debug_subject: None,
             studio_settings_signature: String::new(),
@@ -2804,6 +2805,7 @@ impl Renderer {
             dlss: Default::default(),
             rt_taa_mode: 1,
             contact_shadows_enabled: false,
+            scene_post_effects: None,
             relighting_mode: 0,
             sun_override: false,
             sky_sun_custom: false,

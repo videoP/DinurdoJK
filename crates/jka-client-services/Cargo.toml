@@ -12,6 +12,7 @@ jka-llm = { path = "../jka-llm" }
 jka-movement = { path = "../jka-movement" }
 jka-protocol = { path = "../jka-protocol" }
 jka-render-core = { path = "../jka-render-core" }
+quick-xml = { version = "=0.41.0", default-features = false }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.151"
 taffy = { version = "=0.15.0", default-features = false, features = ["std", "flexbox", "taffy_tree"] }

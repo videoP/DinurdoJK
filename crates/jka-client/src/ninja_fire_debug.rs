@@ -170,6 +170,7 @@ static COLLISION: AtomicBool = AtomicBool::new(true);
 static FLICKER: AtomicBool = AtomicBool::new(true);
 static AIRFLOW_RESPONSE: AtomicBool = AtomicBool::new(false);
 static EMBERS: AtomicBool = AtomicBool::new(false);
+static HEAT_HAZE: AtomicBool = AtomicBool::new(false);
 static PLAYER_ID: AtomicU64 = AtomicU64::new(0);
 static PLAYER_EFFECT: AtomicU8 = AtomicU8::new(0);
 
@@ -453,6 +454,15 @@ pub(crate) fn embers() -> bool {
 
 pub(crate) fn set_embers(enabled: bool) {
     EMBERS.store(enabled, Ordering::Relaxed);
+}
+
+/// Screen-space heat haze behind Ninja surface flames.
+pub(crate) fn heat_haze() -> bool {
+    HEAT_HAZE.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_heat_haze(enabled: bool) {
+    HEAT_HAZE.store(enabled, Ordering::Relaxed);
 }
 
 /// Ember collision or MeshField collision needs the map's solid brushes.
